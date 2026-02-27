@@ -28,31 +28,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--input",
         type=Path,
-        default=Path("/Users/jonathan/new-wikipedia-article-checker/state/wiki_candidates.jsonl"),
+        default=Path("state/wiki_candidates.jsonl"),
         help="Input JSONL (MediaWiki candidates)",
     )
     parser.add_argument(
         "--pass-output",
         type=Path,
-        default=Path(
-            "/Users/jonathan/new-wikipedia-article-checker/state/wiki_candidates_pass.jsonl"
-        ),
+        default=Path("state/wiki_candidates_pass.jsonl"),
         help="Output JSONL for records that should proceed to LLM Gate 3",
     )
     parser.add_argument(
         "--skip-output",
         type=Path,
-        default=Path(
-            "/Users/jonathan/new-wikipedia-article-checker/state/wiki_candidates_skip.jsonl"
-        ),
+        default=Path("state/wiki_candidates_skip.jsonl"),
         help="Output JSONL (always empty; kept for backwards-compatible CLI compatibility)",
     )
     parser.add_argument(
         "--known-pages",
         type=Path,
-        default=Path(
-            "/Users/jonathan/new-wikipedia-article-checker/state/wiki_known_pages.json"
-        ),
+        default=Path("state/wiki_known_pages.json"),
         help="No-op; kept for backwards-compatible CLI compatibility",
     )
     parser.add_argument(

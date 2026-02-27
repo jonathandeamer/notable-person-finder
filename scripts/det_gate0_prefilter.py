@@ -60,19 +60,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--events",
         type=Path,
-        default=Path("/Users/jonathan/new-wikipedia-article-checker/state/events.jsonl"),
+        default=Path("state/events.jsonl"),
         help="Input events JSONL",
     )
     parser.add_argument(
         "--pass-output",
         type=Path,
-        default=Path("/Users/jonathan/new-wikipedia-article-checker/state/prefilter_pass.jsonl"),
+        default=Path("state/prefilter_pass.jsonl"),
         help="Output JSONL for prefilter pass events",
     )
     parser.add_argument(
         "--skip-output",
         type=Path,
-        default=Path("/Users/jonathan/new-wikipedia-article-checker/state/prefilter_skip.jsonl"),
+        default=Path("state/prefilter_skip.jsonl"),
         help="Output JSONL for prefilter skip events",
     )
     parser.add_argument(
@@ -83,9 +83,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--known-pages",
         type=Path,
-        default=Path(
-            "/Users/jonathan/new-wikipedia-article-checker/state/wiki_known_pages.json"
-        ),
+        default=Path("state/wiki_known_pages.json"),
         help="Known Wikipedia page index used to skip already-covered names",
     )
     parser.add_argument(
