@@ -16,7 +16,7 @@ def load_module(module_name: str, path: Path):
 class TestGate3Runner(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        root = Path("/Users/jonathan/new-wikipedia-article-checker")
+        root = Path(__file__).resolve().parents[1]
         cls.mod = load_module("llm_gate3_runner", root / "scripts" / "llm_gate3_runner.py")
 
     # --- select_candidates ---

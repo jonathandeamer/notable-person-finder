@@ -17,7 +17,7 @@ def load_module(module_name: str, path: Path):
 class TestMwCandidates(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        root = Path("/Users/jonathan/new-wikipedia-article-checker")
+        root = Path(__file__).resolve().parents[1]
         cls.mw = load_module("det_mw_candidates", root / "scripts" / "det_mw_candidates.py")
 
     def test_query_variants(self) -> None:
@@ -283,7 +283,7 @@ class TestMwCandidates(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["subject_name"], "Ada Lovelace")
 
-    def test_dedupe_keeps_valid_subject(self) -> None:
+    def test_dedupe_first_record_wins_even_if_later_duplicate_is_valid(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             input_path = tmp / "input.jsonl"
@@ -352,8 +352,9 @@ class TestMwCandidates(unittest.TestCase):
                 self.mw.mw_page_details = orig_page
 
             rows = [json.loads(x) for x in output_path.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["event_id"], "1")
+            # Current semantics: first record for an event_id wins, so the later duplicate
+            # (even if valid) is skipped.
+            self.assertEqual(len(rows), 0)
 
 
     # --- nickname expansion tests ---

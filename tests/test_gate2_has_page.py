@@ -17,7 +17,7 @@ def load_module(module_name: str, path: Path):
 class TestGate2HasPage(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        root = Path("/Users/jonathan/new-wikipedia-article-checker")
+        root = Path(__file__).resolve().parents[1]
         cls.mod = load_module("det_gate2_has_page", root / "scripts" / "det_gate2_has_page.py")
 
     def test_levenshtein_normalization(self) -> None:

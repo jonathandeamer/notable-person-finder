@@ -17,7 +17,7 @@ def load_module(module_name: str, path: Path):
 class TestGate2IndexUpdate(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        root = Path("/Users/jonathan/new-wikipedia-article-checker")
+        root = Path(__file__).resolve().parents[1]
         cls.mod = load_module(
             "det_gate2_index_update", root / "scripts" / "det_gate2_index_update.py"
         )

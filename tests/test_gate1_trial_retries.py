@@ -15,7 +15,7 @@ def load_module(module_name: str, path: Path):
 class TestGate1TrialRetries(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        root = Path("/Users/jonathan/new-wikipedia-article-checker")
+        root = Path(__file__).resolve().parents[1]
         cls.gate1 = load_module("llm_gate1_runner", root / "scripts" / "llm_gate1_runner.py")
 
     def test_codex_retry_succeeds_after_failure(self) -> None:

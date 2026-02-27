@@ -14,7 +14,7 @@ def load_module(module_name: str, path: Path):
     return module
 
 
-ROOT = Path("/Users/jonathan/new-wikipedia-article-checker")
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestReliableFilter(unittest.TestCase):
