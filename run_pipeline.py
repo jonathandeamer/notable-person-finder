@@ -13,6 +13,8 @@ Usage examples:
 """
 
 import argparse
+import atexit
+import fcntl
 import json
 import os
 import subprocess
@@ -480,6 +482,32 @@ def main(argv=None) -> None:
             output_dir / "runs",
         ]:
             d.mkdir(parents=True, exist_ok=True)
+
+    # ── Acquire exclusive run lock ─────────────────────────────────────────────
+    if not args.dry_run:
+        lock_path = state_dir / ".pipeline.lock"
+        lock_fd = lock_path.open("w")
+        lock_fd.write(str(os.getpid()))
+        lock_fd.flush()
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_fd.close()
+            fatal(
+                f"Another pipeline run is already in progress.\n"
+                f"Lock file: {lock_path.resolve()}\n"
+                f"If no other run is active, delete the lock file and retry."
+            )
+
+        def _release_lock() -> None:
+            try:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+                lock_fd.close()
+                lock_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        atexit.register(_release_lock)
 
     # ── Build ordered stage list ──────────────────────────────────────────────
     # Each entry: (stage_name, cmd_list)
