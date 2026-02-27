@@ -37,3 +37,6 @@ state/
 # Editor/IDE
 .vscode/
 .idea/
+
+# External agent platform documentation
+what-is-openclaw.md
