@@ -446,6 +446,41 @@ def run(args: argparse.Namespace) -> int:
             subject_name = record.get("subject_name") or ""
             source_context = build_source_context(record)
             gate3_status = record.get("gate3_status")
+
+            # Short-circuit: subject already confirmed to have a Wikipedia page
+            if gate3_status == "HAS_PAGE":
+                result_record = {
+                    "trial_at_utc": utc_now_iso(),
+                    "model": args.model,
+                    "backend": "deterministic",
+                    "event_id": event_id,
+                    "subject_name": subject_name,
+                    "source_context": source_context,
+                    "gate3_status": gate3_status,
+                    "results_sent": [],
+                    "results_excluded_count": 0,
+                    "duration_ms": 0,
+                    "llm_error": None,
+                    "json_parse_ok": True,
+                    "json_parse_error": None,
+                    "gate4b_status": "SKIPPED_HAS_PAGE",
+                    "confirmed_count": 0,
+                    "parsed_output": None,
+                    "raw_output": "",
+                    "second_pass_results_sent": [],
+                    "second_pass_confirmed_count": 0,
+                    "second_pass_llm_error": None,
+                    "second_pass_json_parse_ok": None,
+                    "second_pass_raw_output": "",
+                    "second_pass_parsed_output": None,
+                }
+                out_f.write(
+                    json.dumps(result_record, ensure_ascii=False, sort_keys=True) + "\n"
+                )
+                out_f.flush()
+                print(f"[{idx}/{sample_size}] SKIPPED_HAS_PAGE - {subject_name}")
+                continue
+
             all_results = record.get("brave_results") or []
 
             # Pre-filter: exclude results from the original RSS source
