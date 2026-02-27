@@ -152,7 +152,7 @@ def _extract_domain_from_result(result: dict[str, Any]) -> str | None:
     if domain:
         return domain
     url = result.get("url") or ""
-    parsed = urlparse(url)
+    parsed = urlparse.urlparse(url)
     return _normalize_domain(parsed.hostname)
 
 
@@ -165,6 +165,22 @@ def _dedup_ordered(values: list[str]) -> list[str]:
         seen.add(value)
         ordered.append(value)
     return ordered
+
+
+def _domain_by_rank(
+    model_result: dict[str, Any],
+    sent_results_by_rank: dict[int, dict[str, Any]],
+) -> str | None:
+    # LLM result rows usually include rank, but not URL/domain. Resolve domain
+    # from the exact candidate we sent for that rank, then fall back if needed.
+    rank = model_result.get("rank")
+    if isinstance(rank, int):
+        sent = sent_results_by_rank.get(rank)
+        if isinstance(sent, dict):
+            domain = _extract_domain_from_result(sent)
+            if domain:
+                return domain
+    return _extract_domain_from_result(model_result)
 
 
 def format_gate4b_prompt(
@@ -602,24 +618,29 @@ def run(args: argparse.Namespace) -> int:
             # Deterministic post-processing
             gate4b_status: str | None = None
             confirmed_count = 0
-            if parse_ok and isinstance(parsed_output, dict):
-            results_list = parsed_output.get("results") or []
             first_pass_domains: list[str] = []
-            for r in results_list:
-                if r.get("about_subject") is True:
-                    domain = _extract_domain_from_result(r)
-                    if domain:
-                        first_pass_domains.append(domain)
-            first_pass_domains = _dedup_ordered(first_pass_domains)
-            confirmed_count = len(first_pass_domains)
-            if confirmed_count >= 2:
-                gate4b_status = "LIKELY_NOTABLE"
-            elif confirmed_count == 1:
-                gate4b_status = "UNCERTAIN"
-            else:
-                gate4b_status = "NOT_NOTABLE"
-        else:
-            first_pass_domains = []
+            if parse_ok and isinstance(parsed_output, dict):
+                results_list = parsed_output.get("results") or []
+                # Keep rank->result lookup so domain counting reflects what we
+                # actually sent to the model, not sparse model output fields.
+                first_pass_by_rank = {
+                    int(r.get("rank")): r
+                    for r in included_results
+                    if isinstance(r, dict) and isinstance(r.get("rank"), int)
+                }
+                for r in results_list:
+                    if r.get("about_subject") is True:
+                        domain = _domain_by_rank(r, first_pass_by_rank)
+                        if domain:
+                            first_pass_domains.append(domain)
+                first_pass_domains = _dedup_ordered(first_pass_domains)
+                confirmed_count = len(first_pass_domains)
+                if confirmed_count >= 2:
+                    gate4b_status = "LIKELY_NOTABLE"
+                elif confirmed_count == 1:
+                    gate4b_status = "UNCERTAIN"
+                else:
+                    gate4b_status = "NOT_NOTABLE"
 
             # ── Second pass: POSSIBLY_NOTABLE check ──────────────────────────
             second_pass_results_sent: list[dict] = []
@@ -660,14 +681,21 @@ def run(args: argparse.Namespace) -> int:
                         second_pass_json_parse_ok = sp_ok
                         second_pass_parsed_output = sp_parsed
                         if sp_ok and isinstance(sp_parsed, dict):
+                            second_pass_by_rank = {
+                                int(r.get("rank")): r
+                                for r in candidates
+                                if isinstance(r, dict) and isinstance(r.get("rank"), int)
+                            }
                             domains: list[str] = []
                             for r in (sp_parsed.get("results") or []):
                                 if r.get("about_subject") is True and r.get("is_reliable_source") is True:
-                                    domain = _extract_domain_from_result(r)
+                                    domain = _domain_by_rank(r, second_pass_by_rank)
                                     if domain:
                                         domains.append(domain)
                             second_pass_domains = _dedup_ordered(domains)
                             second_pass_confirmed_count = len(second_pass_domains)
+                            # POSSIBLY_NOTABLE requires combined distinct domains
+                            # across first and second pass to hit the same bar.
                             combined_domains = _dedup_ordered(first_pass_domains + second_pass_domains)
                             if len(combined_domains) >= 2:
                                 gate4b_status = "POSSIBLY_NOTABLE"
