@@ -19,6 +19,7 @@ import random
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -258,6 +259,87 @@ def call_claude_cli_with_retries(
     raise RuntimeError(f"claude cli failed after {max_attempts} attempts: {last_error}")
 
 
+def call_codex_cli(
+    prompt_text: str,
+    model: str,
+    codex_cwd: Path,
+    output_schema: dict,
+) -> tuple[str, dict]:
+    with tempfile.TemporaryDirectory() as td:
+        tmp_dir = Path(td)
+        schema_path = tmp_dir / "gate4b_schema.json"
+        out_path = tmp_dir / "last_message.txt"
+        schema_path.write_text(json.dumps(output_schema), encoding="utf-8")
+
+        cmd = [
+            "codex",
+            "exec",
+            "--skip-git-repo-check",
+            "--cd",
+            str(codex_cwd),
+            "--model",
+            model,
+            "--output-schema",
+            str(schema_path),
+            "--output-last-message",
+            str(out_path),
+            "-",
+        ]
+
+        proc = subprocess.run(
+            cmd,
+            input=prompt_text,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        response_meta = {
+            "backend": "codex-cli",
+            "returncode": proc.returncode,
+            "stderr_excerpt": (proc.stderr or "")[:1000],
+            "stdout_excerpt": (proc.stdout or "")[:1000],
+        }
+
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"codex exec failed (code {proc.returncode}): {(proc.stderr or proc.stdout).strip()}"
+            )
+
+        if not out_path.exists():
+            return "", response_meta
+
+        return out_path.read_text(encoding="utf-8"), response_meta
+
+
+def call_codex_cli_with_retries(
+    prompt_text: str,
+    model: str,
+    codex_cwd: Path,
+    output_schema: dict,
+    max_attempts: int,
+) -> tuple[str, dict]:
+    attempt = 0
+    delay = 0.5
+    last_error: Exception | None = None
+    while attempt < max_attempts:
+        attempt += 1
+        try:
+            return call_codex_cli(
+                prompt_text=prompt_text,
+                model=model,
+                codex_cwd=codex_cwd,
+                output_schema=output_schema,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt >= max_attempts:
+                break
+            time.sleep(delay + random.random() * 0.2)
+            delay = min(delay * 2, 5.0)
+    raise RuntimeError(f"codex exec failed after {max_attempts} attempts: {last_error}")
+
+
 def load_input(input_path: Path) -> list[dict]:
     rows: list[dict] = []
     with input_path.open("r", encoding="utf-8") as f:
@@ -422,12 +504,21 @@ def run(args: argparse.Namespace) -> int:
                     source_context=source_context,
                     results=included_results,
                 )
-                raw_output, call_meta = call_claude_cli_with_retries(
-                    prompt_text=trial_prompt,
-                    model=args.model,
-                    cwd=args.cwd,
-                    max_attempts=args.max_attempts,
-                )
+                if args.backend == "codex-cli":
+                    raw_output, call_meta = call_codex_cli_with_retries(
+                        prompt_text=trial_prompt,
+                        model=args.model,
+                        codex_cwd=args.codex_cwd,
+                        output_schema=gate4b_output_schema(),
+                        max_attempts=args.max_attempts,
+                    )
+                else:
+                    raw_output, call_meta = call_claude_cli_with_retries(
+                        prompt_text=trial_prompt,
+                        model=args.model,
+                        cwd=args.cwd,
+                        max_attempts=args.max_attempts,
+                    )
                 parse_ok, parsed_output, parse_error = safe_json_parse(raw_output)
             except Exception as exc:  # noqa: BLE001
                 error = str(exc)
@@ -467,10 +558,21 @@ def run(args: argparse.Namespace) -> int:
                         sp_prompt = format_gate4b_unlisted_prompt(
                             unlisted_prompt_body, subject_name, source_context, candidates
                         )
-                        sp_raw, _ = call_claude_cli_with_retries(
-                            prompt_text=sp_prompt, model=args.model,
-                            cwd=args.cwd, max_attempts=args.max_attempts,
-                        )
+                        if args.backend == "codex-cli":
+                            sp_raw, _ = call_codex_cli_with_retries(
+                                prompt_text=sp_prompt,
+                                model=args.model,
+                                codex_cwd=args.codex_cwd,
+                                output_schema=gate4b_unlisted_output_schema(),
+                                max_attempts=args.max_attempts,
+                            )
+                        else:
+                            sp_raw, _ = call_claude_cli_with_retries(
+                                prompt_text=sp_prompt,
+                                model=args.model,
+                                cwd=args.cwd,
+                                max_attempts=args.max_attempts,
+                            )
                         second_pass_raw_output = sp_raw
                         sp_ok, sp_parsed, _ = safe_json_parse(sp_raw)
                         second_pass_json_parse_ok = sp_ok
@@ -551,14 +653,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model",
-        default="claude-haiku-4-5-20251001",
-        help="Claude model name (default: claude-haiku-4-5-20251001)",
+        default="gpt-5.1-codex-mini",
+        help="Model name (default: gpt-5.1-codex-mini)",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["claude-cli", "codex-cli"],
+        default="codex-cli",
+        help="LLM backend to use (default: codex-cli)",
     )
     parser.add_argument(
         "--cwd",
         type=Path,
         default=Path.cwd(),
         help="Working directory for claude cli (default: current directory)",
+    )
+    parser.add_argument(
+        "--codex-cwd",
+        type=Path,
+        default=Path.cwd(),
+        help="Working directory for codex exec (default: current directory)",
     )
     parser.add_argument(
         "--min-reliable-results",
@@ -582,7 +696,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-attempts",
         type=int,
         default=3,
-        help="Max retry attempts for claude cli failures (default: 3)",
+        help="Max retry attempts for LLM CLI failures (default: 3)",
     )
     parser.add_argument(
         "--fresh-output",
