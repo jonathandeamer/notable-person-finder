@@ -402,21 +402,39 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument(
         "--model-gate1",
-        default="claude-haiku-4-5-20251001",
+        default="gpt-5.1-codex-mini",
         metavar="MODEL",
-        help="LLM model for Gate 1 (default: claude-haiku-4-5-20251001)",
+        help="LLM model for Gate 1 (default: gpt-5.1-codex-mini)",
     )
     p.add_argument(
         "--model-gate3",
-        default="claude-haiku-4-5-20251001",
+        default="gpt-5.1-codex-mini",
         metavar="MODEL",
-        help="LLM model for Gate 3 (default: claude-haiku-4-5-20251001)",
+        help="LLM model for Gate 3 (default: gpt-5.1-codex-mini)",
     )
     p.add_argument(
         "--model-gate4b",
-        default="claude-haiku-4-5-20251001",
+        default="gpt-5.1-codex-mini",
         metavar="MODEL",
-        help="LLM model for Gate 4b (default: claude-haiku-4-5-20251001)",
+        help="LLM model for Gate 4b (default: gpt-5.1-codex-mini)",
+    )
+    p.add_argument(
+        "--backend-gate1",
+        default="codex-cli",
+        choices=["codex-cli", "openai-api", "claude-cli"],
+        help="LLM backend for Gate 1 (default: codex-cli)",
+    )
+    p.add_argument(
+        "--backend-gate3",
+        default="codex-cli",
+        choices=["codex-cli", "claude-cli"],
+        help="LLM backend for Gate 3 (default: codex-cli)",
+    )
+    p.add_argument(
+        "--backend-gate4b",
+        default="codex-cli",
+        choices=["codex-cli", "claude-cli"],
+        help="LLM backend for Gate 4b (default: codex-cli)",
     )
     return p.parse_args(argv)
 
@@ -490,7 +508,7 @@ def main(argv=None) -> None:
                 "--events", str(state_dir / "prefilter_pass.jsonl"),
                 "--prompt", "prompts/gate1.md",
                 "--output", str(state_dir / "gate1_llm_results.jsonl"),
-                "--backend", "claude-cli",
+                "--backend", args.backend_gate1,
                 "--model", args.model_gate1,
                 "--sample-size", str(args.gate1_budget),
             ],
@@ -520,6 +538,7 @@ def main(argv=None) -> None:
                 "--input", str(state_dir / "wiki_candidates_pass.jsonl"),
                 "--prompt", "prompts/gate3.md",
                 "--output", str(state_dir / "gate3_llm_results.jsonl"),
+                "--backend", args.backend_gate3,
                 "--model", args.model_gate3,
             ],
         ),
@@ -551,6 +570,7 @@ def main(argv=None) -> None:
             [
                 python, "scripts/llm_gate4b_runner.py",
                 "--prompt", "prompts/gate4b.md",
+                "--backend", args.backend_gate4b,
                 "--model", args.model_gate4b,
                 "--brave-input", str(state_dir / "brave_coverage.jsonl"),
                 "--unlisted-prompt", "prompts/gate4b_unlisted.md",
