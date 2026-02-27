@@ -21,6 +21,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from glob import glob
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any
 
 SCRIPT_PATH = Path(__file__).resolve()
@@ -84,6 +85,17 @@ def dedup_preserve_order(values: list[str]) -> list[str]:
         seen.add(value)
         out.append(value)
     return out
+
+
+def extract_domain_from_url(value: str | None) -> str | None:
+    if not value:
+        return None
+    parsed = urlparse(value)
+    host = parsed.hostname or ""
+    host = host.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host or None
 
 
 def pick_run_for_trial(
@@ -176,6 +188,19 @@ def collect_people(
             reliable_urls = [u for u in reliable_urls if u != rss_url]
         reliable_urls = dedup_preserve_order(reliable_urls)
 
+        raw_domains = rec.get("all_reliable_brave_domains")
+        if isinstance(raw_domains, list):
+            event_domains = [d for d in raw_domains if isinstance(d, str) and d]
+        else:
+            event_domains = []
+        if not event_domains:
+            event_domains = [
+                domain
+                for url in reliable_urls
+                if (domain := extract_domain_from_url(url))
+            ]
+        event_domains = dedup_preserve_order(event_domains)
+
         source_context = rec.get("source_context") if isinstance(rec.get("source_context"), dict) else {}
         event_obj = {
             "event_id": event_id,
@@ -185,6 +210,8 @@ def collect_people(
             "rss_published_at_utc": event_row.get("published_at_utc"),
             "source_article_title": source_context.get("entry_title"),
             "reliable_brave_urls": reliable_urls,
+            "reliable_brave_domains": event_domains,
+            "reliable_brave_domain_count": len(event_domains),
         }
 
         if subject_key not in grouped:
@@ -194,6 +221,7 @@ def collect_people(
                 "run_ids": [],
                 "events": [],
                 "all_reliable_brave_urls": [],
+                "all_reliable_brave_domains": [],
             }
 
         group = grouped[subject_key]
@@ -217,6 +245,9 @@ def collect_people(
         group["all_reliable_brave_urls"] = dedup_preserve_order(
             group["all_reliable_brave_urls"] + reliable_urls
         )
+        group["all_reliable_brave_domains"] = dedup_preserve_order(
+            group["all_reliable_brave_domains"] + event_domains
+        )
 
     people = list(grouped.values())
     for person in people:
@@ -224,6 +255,7 @@ def collect_people(
         person["events"].sort(key=lambda e: (e.get("trial_at_utc") or "", e.get("event_id") or ""))
         person["event_count"] = len(person["events"])
         person["reliable_brave_url_count"] = len(person["all_reliable_brave_urls"])
+        person["reliable_brave_domain_count"] = len(person["all_reliable_brave_domains"])
 
     people.sort(key=lambda p: p.get("subject_name", "").casefold())
     return people

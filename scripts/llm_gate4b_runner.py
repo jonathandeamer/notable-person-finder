@@ -23,6 +23,9 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+
+from urllib import parse as urlparse
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
@@ -133,6 +136,35 @@ def _is_original_source(result: dict, source_context: dict) -> bool:
             return True
 
     return False
+
+
+def _normalize_domain(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = value.strip().lower()
+    if normalized.startswith("www."):
+        normalized = normalized[4:]
+    return normalized or None
+
+
+def _extract_domain_from_result(result: dict[str, Any]) -> str | None:
+    domain = _normalize_domain(result.get("source_domain"))
+    if domain:
+        return domain
+    url = result.get("url") or ""
+    parsed = urlparse(url)
+    return _normalize_domain(parsed.hostname)
+
+
+def _dedup_ordered(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
 
 
 def format_gate4b_prompt(
@@ -571,20 +603,28 @@ def run(args: argparse.Namespace) -> int:
             gate4b_status: str | None = None
             confirmed_count = 0
             if parse_ok and isinstance(parsed_output, dict):
-                results_list = parsed_output.get("results") or []
-                confirmed_count = sum(
-                    1 for r in results_list if r.get("about_subject") is True
-                )
-                if confirmed_count >= 2:
-                    gate4b_status = "LIKELY_NOTABLE"
-                elif confirmed_count == 1:
-                    gate4b_status = "UNCERTAIN"
-                else:
-                    gate4b_status = "NOT_NOTABLE"
+            results_list = parsed_output.get("results") or []
+            first_pass_domains: list[str] = []
+            for r in results_list:
+                if r.get("about_subject") is True:
+                    domain = _extract_domain_from_result(r)
+                    if domain:
+                        first_pass_domains.append(domain)
+            first_pass_domains = _dedup_ordered(first_pass_domains)
+            confirmed_count = len(first_pass_domains)
+            if confirmed_count >= 2:
+                gate4b_status = "LIKELY_NOTABLE"
+            elif confirmed_count == 1:
+                gate4b_status = "UNCERTAIN"
+            else:
+                gate4b_status = "NOT_NOTABLE"
+        else:
+            first_pass_domains = []
 
             # ── Second pass: POSSIBLY_NOTABLE check ──────────────────────────
             second_pass_results_sent: list[dict] = []
             second_pass_confirmed_count: int = 0
+            second_pass_domains: list[str] = []
             second_pass_llm_error: str | None = None
             second_pass_json_parse_ok: bool | None = None  # None = not run
             second_pass_raw_output: str = ""
@@ -620,15 +660,24 @@ def run(args: argparse.Namespace) -> int:
                         second_pass_json_parse_ok = sp_ok
                         second_pass_parsed_output = sp_parsed
                         if sp_ok and isinstance(sp_parsed, dict):
-                            second_pass_confirmed_count = sum(
-                                1 for r in (sp_parsed.get("results") or [])
-                                if r.get("about_subject") is True and r.get("is_reliable_source") is True
-                            )
-                            if second_pass_confirmed_count >= 2:
+                            domains: list[str] = []
+                            for r in (sp_parsed.get("results") or []):
+                                if r.get("about_subject") is True and r.get("is_reliable_source") is True:
+                                    domain = _extract_domain_from_result(r)
+                                    if domain:
+                                        domains.append(domain)
+                            second_pass_domains = _dedup_ordered(domains)
+                            second_pass_confirmed_count = len(second_pass_domains)
+                            combined_domains = _dedup_ordered(first_pass_domains + second_pass_domains)
+                            if len(combined_domains) >= 2:
                                 gate4b_status = "POSSIBLY_NOTABLE"
                     except Exception as exc:  # noqa: BLE001
                         second_pass_llm_error = str(exc)
                         second_pass_json_parse_ok = False
+
+            all_domains = _dedup_ordered(first_pass_domains + second_pass_domains)
+            if gate4b_status is None:
+                gate4b_status = "NOT_NOTABLE"
 
             result_record = {
                 "trial_at_utc": utc_now_iso(),
@@ -650,6 +699,10 @@ def run(args: argparse.Namespace) -> int:
                 "raw_output": (raw_output or "")[: args.max_output_chars],
                 "second_pass_results_sent": second_pass_results_sent,
                 "second_pass_confirmed_count": second_pass_confirmed_count,
+                "first_pass_domains": first_pass_domains,
+                "second_pass_domains": second_pass_domains,
+                "all_reliable_brave_domains": all_domains,
+                "reliable_domain_count": len(all_domains),
                 "second_pass_llm_error": second_pass_llm_error,
                 "second_pass_json_parse_ok": second_pass_json_parse_ok,
                 "second_pass_raw_output": (second_pass_raw_output or "")[: args.max_output_chars],
