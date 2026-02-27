@@ -735,6 +735,8 @@ def main() -> int:
                     parsed_items = parsed_output
 
                 if parse_ok and isinstance(parsed_items, list):
+                    # Key by event_id rather than array position so we can still
+                    # map outputs correctly if the model reorders items.
                     for item in parsed_items:
                         if isinstance(item, dict) and isinstance(item.get("event_id"), str):
                             batch_result_by_event_id[item["event_id"]] = item
@@ -788,6 +790,8 @@ def main() -> int:
                         missing_events.append(event)
 
                 if missing_events and args.retry_missing_event_ids:
+                    # Optional recovery path for partial batch outputs: retry
+                    # only missing event_ids as single-item calls.
                     for event in missing_events:
                         single_prompt = (
                             f"{prompt_body}\n\nInput:\n"

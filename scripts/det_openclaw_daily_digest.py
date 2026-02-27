@@ -117,7 +117,9 @@ def pick_run_for_trial(
         candidates.sort()
         return candidates[-1][1]
 
-    # Fallback: nearest run by finished_at only if very close (clock drift edge case).
+    # Fallback: nearest run by finished_at only if very close.
+    # This handles slight timestamp skew between writers while avoiding cross-day
+    # misattribution when gate4b history spans many runs.
     nearest: tuple[float, str] | None = None
     for run_id, (_, finished) in run_windows.items():
         if finished is None:
@@ -166,6 +168,8 @@ def collect_people(
         coverage_row = reliable_by_id.get(event_id, {})
         brave_results = coverage_row.get("brave_results")
         reliable_urls: list[str] = []
+        # Prefer deterministic Gate 4 reliable coverage output; it has already
+        # filtered to sources that passed the reliability list.
         if isinstance(brave_results, list):
             for item in brave_results:
                 if not isinstance(item, dict):
@@ -174,6 +178,8 @@ def collect_people(
                 if isinstance(url, str) and url:
                     reliable_urls.append(url)
 
+        # Backward compatibility for older records that may not have a matching
+        # reliable-coverage row but still include sent result snapshots.
         if not reliable_urls:
             results_sent = rec.get("results_sent")
             if isinstance(results_sent, list):
@@ -193,6 +199,8 @@ def collect_people(
             event_domains = [d for d in raw_domains if isinstance(d, str) and d]
         else:
             event_domains = []
+        # If domains were not persisted by gate4b, derive from URLs so digest
+        # output stays complete for mixed-schema historical rows.
         if not event_domains:
             event_domains = [
                 domain
@@ -228,7 +236,8 @@ def collect_people(
         if run_id not in group["run_ids"]:
             group["run_ids"].append(run_id)
 
-        # Keep latest event row when gate4b has multiple entries for same event.
+        # Keep latest event row when gate4b has multiple entries for same event
+        # (append/retry behavior writes new rows for the same event_id).
         existing_idx = None
         for idx, existing in enumerate(group["events"]):
             if isinstance(existing, dict) and existing.get("event_id") == event_id:
@@ -354,7 +363,8 @@ def main() -> int:
     events_path = resolve_path(args.events, project_root)
     output_path = resolve_path(args.output, project_root)
 
-    # Load summaries in window.
+    # Summaries define which runs belong to the reporting window; downstream
+    # event rows are then filtered to those runs.
     run_summaries: dict[str, dict[str, Any]] = {}
     for raw_path in sorted(glob(summary_glob)):
         path = Path(raw_path)
@@ -377,7 +387,8 @@ def main() -> int:
             "summary_path": str(path.resolve()),
         }
 
-    # Load manifests.
+    # Manifests provide run start/finish windows used to map gate4b rows
+    # (which are stored in one append-only file) back to a specific run_id.
     run_windows: dict[str, tuple[datetime | None, datetime | None]] = {}
     run_details: dict[str, dict[str, Any]] = {}
     for raw_path in sorted(glob(manifest_glob)):

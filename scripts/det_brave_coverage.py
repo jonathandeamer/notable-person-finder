@@ -221,6 +221,8 @@ def brave_news_search(
     all_items: list[dict] = []
     seen_urls: set[str] = set()
     for offset in range(pages):
+        # Cache key includes offset so each Brave page can be reused
+        # independently on retries/backfills.
         key = _cache_key(query, count, offset)
         cached = _cache_get(cache_dir, key, ttl_days)
         if cached is not None:
@@ -367,6 +369,8 @@ def run(
                 "fetched_at_utc": utc_now_iso(),
             }
 
+            # De-duplicate across all query variants for the same event so
+            # downstream gates see one merged ranked list.
             seen_urls: set[str] = set()
             all_results: list[dict] = []
 

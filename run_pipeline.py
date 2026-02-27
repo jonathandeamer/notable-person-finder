@@ -326,6 +326,8 @@ def _run_parse_failure_retry(
     if not failures:
         return None
 
+    # Track failing IDs so we can measure resolution after retry using
+    # last-wins semantics on the append-only JSONL output.
     failed_ids = {r.get("event_id") for r in failures if isinstance(r.get("event_id"), str)}
 
     retry_name = f"{stage_name}_retry"
@@ -635,7 +637,8 @@ def main(argv=None) -> None:
             stage_results.append(make_skipped(stage_name, "no new gate1 events"))
             continue
 
-        # Snapshot row counts for LLM stages (to detect new rows and scope error warnings)
+        # Snapshot row counts for LLM stages so post-stage metrics/warnings only
+        # consider records produced by this run.
         _llm_files = {
             "gate1": state_dir / "gate1_llm_results.jsonl",
             "gate3": state_dir / "gate3_llm_results.jsonl",
@@ -674,6 +677,8 @@ def main(argv=None) -> None:
             post_rows = count_jsonl_rows(state_dir / "gate1_llm_results.jsonl")
             new_gate1_events = post_rows - pre_rows
             result.notes = f"{new_gate1_events} new events (total: {post_rows})"
+            # If Gate 1 emitted no new rows, downstream stages would only
+            # reprocess existing state, so skip them for this run.
             if new_gate1_events == 0 and not args.dry_run:
                 print(
                     "\nNo new Gate 1 events — skipping downstream stages.",

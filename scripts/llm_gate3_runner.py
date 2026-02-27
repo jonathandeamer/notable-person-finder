@@ -85,6 +85,8 @@ def select_candidates(results: list[dict]) -> list[dict]:
     bio_positive = [c for c in results if (c.get("biography_score") or 0) > 0]
     if len(bio_positive) >= 2:
         return bio_positive
+    # Keep one fallback non-bio candidate so the model can still detect an
+    # obvious page match when scoring underestimates biography relevance.
     non_bio = [c for c in results if (c.get("biography_score") or 0) <= 0]
     return bio_positive + non_bio[:1]
 
