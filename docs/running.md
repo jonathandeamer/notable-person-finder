@@ -1,104 +1,114 @@
 # Running the Pipeline (Current Stages)
 
-This page documents the commands for the stages implemented so far.
+All commands execute from the project root (`/home/admin/notable-person-finder` by default).
 
 ## 1) RSS Ingest
 
 ```bash
 python3 -m ingest.rss_ingest \
-  --feeds /Users/jonathan/new-wikipedia-article-checker/config/feeds.md \
-  --state-dir /Users/jonathan/new-wikipedia-article-checker/state
+  --feeds config/feeds.md \
+  --state-dir state
 ```
 
-## 2) Gate 0 Prefilter (Deterministic)
+## 2) Gate 0 Prefilter (deterministic)
 
 ```bash
-python3 /Users/jonathan/new-wikipedia-article-checker/scripts/det_gate0_prefilter.py \
-  --events /Users/jonathan/new-wikipedia-article-checker/state/events.jsonl \
-  --pass-output /Users/jonathan/new-wikipedia-article-checker/state/prefilter_pass.jsonl \
-  --skip-output /Users/jonathan/new-wikipedia-article-checker/state/prefilter_skip.jsonl
+python3 scripts/det_gate0_prefilter.py \
+  --events state/events.jsonl \
+  --pass-output state/prefilter_pass.jsonl \
+  --skip-output state/prefilter_skip.jsonl \
+  --known-pages state/wiki_known_pages.json
 ```
 
-## 3) Gate 1 (LLM)
+## 3) Gate 1 (LLM triage)
 
 ```bash
-python3 /Users/jonathan/new-wikipedia-article-checker/scripts/llm_gate1_runner.py \
+python3 scripts/llm_gate1_runner.py \
   --backend codex-cli \
-  --codex-cwd /Users/jonathan/new-wikipedia-article-checker \
-  --events /Users/jonathan/new-wikipedia-article-checker/state/prefilter_pass.jsonl \
-  --prompt /Users/jonathan/new-wikipedia-article-checker/prompts/gate1.md \
-  --output /Users/jonathan/new-wikipedia-article-checker/state/gate1_llm_results.jsonl \
+  --codex-cwd . \
+  --events state/prefilter_pass.jsonl \
+  --prompt prompts/gate1.md \
+  --output state/gate1_llm_results.jsonl \
   --sample-size 60
 ```
 
-## 4) MediaWiki Candidate Search (Deterministic)
+## 4) MediaWiki candidate search
 
 ```bash
-python3 /Users/jonathan/new-wikipedia-article-checker/scripts/det_mw_candidates.py \
-  --input /Users/jonathan/new-wikipedia-article-checker/state/gate1_llm_results.jsonl \
-  --output /Users/jonathan/new-wikipedia-article-checker/state/wiki_candidates.jsonl \
+python3 scripts/det_mw_candidates.py \
+  --input state/gate1_llm_results.jsonl \
+  --output state/wiki_candidates.jsonl \
   --overwrite \
   --search-max-results 10 \
-  --progress-every 5 \
-  --log-file /Users/jonathan/new-wikipedia-article-checker/state/mw_candidates.log
+  --progress-every 10 \
+  --log-file state/mw_candidates.log
 ```
 
-Notes:
-- Output is written incrementally (one JSON line per record), so you can `tail -f` during a run.
-- Reduce `--throttle-ms` to speed up requests, but be mindful of rate limits.
-- `biography_score` is a heuristic (>= 3 means likely biography); `biography_prioritized` is true when the score is >= 3.
-
-## 5) Gate 2 (Deterministic Has-Page Filter)
+## 5) Gate 2 has-page filter
 
 ```bash
-python3 /Users/jonathan/new-wikipedia-article-checker/scripts/det_gate2_has_page.py \
-  --input /Users/jonathan/new-wikipedia-article-checker/state/wiki_candidates.jsonl \
-  --pass-output /Users/jonathan/new-wikipedia-article-checker/state/wiki_candidates_pass.jsonl \
-  --skip-output /Users/jonathan/new-wikipedia-article-checker/state/wiki_candidates_skip.jsonl \
-  --known-pages /Users/jonathan/new-wikipedia-article-checker/state/wiki_known_pages.json \
+python3 scripts/det_gate2_has_page.py \
+  --input state/wiki_candidates.jsonl \
+  --pass-output state/wiki_candidates_pass.jsonl \
+  --skip-output state/wiki_candidates_skip.jsonl \
+  --known-pages state/wiki_known_pages.json \
   --overwrite
 ```
 
-## 6) Gate 3 (LLM Page Match)
+## 6) Gate 3 (LLM page match) + index update
 
 ```bash
-python3 /Users/jonathan/new-wikipedia-article-checker/scripts/llm_gate3_runner.py \
+python3 scripts/llm_gate3_runner.py \
   --backend codex-cli \
-  --codex-cwd /Users/jonathan/new-wikipedia-article-checker \
-  --input /Users/jonathan/new-wikipedia-article-checker/state/wiki_candidates_pass.jsonl \
-  --prompt /Users/jonathan/new-wikipedia-article-checker/prompts/gate3.md \
-  --output /Users/jonathan/new-wikipedia-article-checker/state/gate3_llm_results.jsonl
+  --codex-cwd . \
+  --input state/wiki_candidates_pass.jsonl \
+  --prompt prompts/gate3.md \
+  --output state/gate3_llm_results.jsonl
+
+python3 scripts/det_gate3_index_update.py \
+  --input state/gate3_llm_results.jsonl \
+  --known-pages state/wiki_known_pages.json
 ```
 
-## 6a) Gate 3 Index Update (after Gate 3)
+## 7) Brave coverage + Gate 4 reliable filter
 
 ```bash
-python3 /Users/jonathan/new-wikipedia-article-checker/scripts/det_gate3_index_update.py \
-  --input /Users/jonathan/new-wikipedia-article-checker/state/gate3_llm_results.jsonl \
-  --known-pages /Users/jonathan/new-wikipedia-article-checker/state/wiki_known_pages.json
-```
+python3 scripts/det_brave_coverage.py \
+  --input state/gate3_llm_results.jsonl \
+  --overwrite \
+  --cache-dir state/brave_cache \
+  --api-key "$BRAVE_API_KEY"
 
-## 7) Coverage Search + Gate 4 Filter (Deterministic)
-
-```bash
-python3 /Users/jonathan/new-wikipedia-article-checker/scripts/det_brave_coverage.py \
-  --state-dir /Users/jonathan/new-wikipedia-article-checker/state \
+python3 scripts/det_gate4_reliable_filter.py \
+  --input state/brave_coverage.jsonl \
+  --output state/gate4_reliable_coverage.jsonl \
   --overwrite
 ```
 
-```bash
-python3 /Users/jonathan/new-wikipedia-article-checker/scripts/det_gate4_reliable_filter.py \
-  --state-dir /Users/jonathan/new-wikipedia-article-checker/state \
-  --overwrite
-```
-
-## 8) Gate 4b (LLM Coverage Verification)
+## 8) Gate 4b (LLM coverage verifier counting distinct domains)
 
 ```bash
-python3 /Users/jonathan/new-wikipedia-article-checker/scripts/llm_gate4b_runner.py \
+python3 scripts/llm_gate4b_runner.py \
   --backend codex-cli \
-  --codex-cwd /Users/jonathan/new-wikipedia-article-checker \
-  --prompt /Users/jonathan/new-wikipedia-article-checker/prompts/gate4b.md \
-  --unlisted-prompt /Users/jonathan/new-wikipedia-article-checker/prompts/gate4b_unlisted.md \
-  --brave-input /Users/jonathan/new-wikipedia-article-checker/state/brave_coverage.jsonl
+  --codex-cwd . \
+  --prompt prompts/gate4b.md \
+  --unlisted-prompt prompts/gate4b_unlisted.md \
+  --brave-input state/gate4_reliable_coverage.jsonl \
+  --output state/gate4b_llm_results.jsonl \
+  --fresh-output
 ```
+
+## 9) Digest + report for OpenClaw
+
+```bash
+python3 scripts/det_openclaw_daily_digest.py \
+  --window-hours 24 \
+  --output output/openclaw/daily_notability_digest.json
+
+python3 scripts/daily_notability_digest_report.py
+```
+
+### Notes
+- Use `run_pipeline.py` (default `--state-dir state --output output`) to chain all stages end-to-end; it writes `state/runs/*.json` and `output/runs/*_summary.json`.
+- Gate 4b now requires two distinct reliable Brave domains (first or second pass) to mark someone `LIKELY_NOTABLE`; otherwise it falls back to `POSSIBLY_NOTABLE` or `NOT_NOTABLE`.
+- The digest report script refreshes `output/openclaw/daily_notability_digest.json` before summarizing.

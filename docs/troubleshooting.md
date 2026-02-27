@@ -87,3 +87,11 @@ Strict exact title match and similarity check prevented skipping.
 Fix:
 Inspect `state/wiki_candidates_pass.jsonl` and consider adjusting Levenshtein threshold or
 allowing redirects or other signals.
+
+## Gate 4b not marking someone as likely notable?
+
+Gate 4b now requires coverage on at least two distinct reliable Brave domains before promoting `LIKELY_NOTABLE`. If you see `POSSIBLY_NOTABLE` instead:
+
+- Inspect `state/gate4b_llm_results.jsonl` for the `first_pass_domains`/`second_pass_domains` lists and the recorded domain count.
+- Ensure `state/gate4_reliable_coverage.jsonl` collected enough distinct domains (cut down on duplicate sources or config missing reliable domains).
+- The digest (`scripts/daily_notability_digest_report.py`) surfaces these domain counts at a glance.

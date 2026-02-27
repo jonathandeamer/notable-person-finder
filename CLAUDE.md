@@ -82,8 +82,8 @@ See `docs/running.md` for complete stage commands.
 7. **Gate 3 Index Update** — Writes `HAS_PAGE` decisions back to `state/wiki_known_pages.json`
 8. **Brave Coverage** — Deterministic Brave Search News API queries; caches results
 9. **Gate 4 Reliable Filter** — Keeps only Wikipedia-approved news source domains
-10. **Gate 4b LLM Coverage Verifier** — LLM judges whether each result is genuinely about the subject (not a namesake)
-11. **Report** — Generates summary output
+10. **Gate 4b LLM Coverage Verifier** — LLM judges whether each result is genuinely about the subject (not a namesake) by counting distinct reliable Brave domains across the first and second pass
+11. **Report + Digest** — Generates summary output plus `output/openclaw/daily_notability_digest.json` for external agents (see `scripts/daily_notability_digest_report.py`)
 
 ### Key Design Principles
 - **Deterministic control flow**: All state transitions managed by deterministic Python; LLM only at semantic gates
@@ -109,6 +109,10 @@ See `docs/running.md` for complete stage commands.
 - **`state/wiki_known_pages.json`** — Index of names with confirmed Wikipedia pages (used by Gate 0, Gate 2, Gate 3)
 - **`state/gate1_llm_results.jsonl`** — Gate 1 decisions + structured fields (name_completeness, confidence, etc.)
 - **`state/gate3_llm_results.jsonl`** — Gate 3 page-match results; decisions: `HAS_PAGE`/`MISSING`/`UNCERTAIN`
+- **`state/gate4_reliable_coverage.jsonl`** — Gate 4 Brave results filtered to Wikipedia reliable domains
+- **`state/gate4b_llm_results.jsonl`** — Gate 4b coverage verdicts plus deduped domain lists/counts
+- **`output/openclaw/daily_notability_digest.json`** — Daily digest of likely/possibly notable people used by OpenClaw
+- **`scripts/det_openclaw_daily_digest.py`** / **`scripts/daily_notability_digest_report.py`** — Build the digest, then print a concise summary
 - **`state/runs/YYYYMMDDTHHMMSS.json`** — Run manifest (metadata about each pipeline execution)
 
 ### Gate-Specific Details
@@ -139,11 +143,12 @@ See `docs/running.md` for complete stage commands.
 - `UNCERTAIN` — Can't determine; fallback to coverage search
 
 **Gate 4b Decisions:**
-- `NOTABLE` — Coverage result is genuine notability signal
-- `UNCERTAIN` — Can't verify (counted differently)
-- `NOT_NOTABLE` — Result is a namesake or false mention
-- `SKIPPED` — Original RSS source, excluded from count
-- `--min-reliable-results` default: 2 (minimum coverage results to pass notability bar)
+- `LIKELY_NOTABLE` — At least two distinct reliable Brave domains (first- or second-pass) clearly cover the subject
+- `POSSIBLY_NOTABLE` — One reliable domain; needs more coverage to confirm
+- `UNCERTAIN` — The LLM could not parse or verify results
+- `NOT_NOTABLE` — No reliable domains/coverage found
+- `SKIPPED`/`SKIPPED_HAS_PAGE` — Filtered early (original RSS, already has Wikipedia page)
+- `--min-reliable-results` default: 2 (minimum Brave results sent to the model per stage)
 
 ## Common Development Tasks
 

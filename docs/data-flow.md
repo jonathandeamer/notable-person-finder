@@ -10,16 +10,22 @@ flowchart TD
     E --> F["scripts/det_mw_candidates.py<br/>state/wiki_candidates.jsonl"]
     F --> G["scripts/det_gate2_has_page.py<br/>state/wiki_candidates_pass.jsonl"]
     F --> K["scripts/det_gate2_has_page.py<br/>state/wiki_candidates_skip.jsonl"]
-    G --> L["Gate 3 (LLM) - not implemented"]
-    K --> L
+    G --> M["scripts/llm_gate3_runner.py<br/>state/gate3_llm_results.jsonl"]
+    M --> N["scripts/det_gate3_index_update.py<br/>state/wiki_known_pages.json"]
+    N --> J
     G --> J
     K --> J
-    L --> H["Coverage search + Gate 4 - not implemented"]
-    H --> I["output/* (future)"]
+    M --> O["scripts/det_brave_coverage.py<br/>state/brave_coverage.jsonl"]
+    O --> P["scripts/det_gate4_reliable_filter.py<br/>state/gate4_reliable_coverage.jsonl"]
+    P --> Q["scripts/llm_gate4b_runner.py<br/>state/gate4b_llm_results.jsonl"]
+    Q --> R["output/openclaw/daily_notability_digest.json"]
+    R --> S["scripts/daily_notability_digest_report.py"]
 ```
 
 ## Notes
 
-- Deterministic stages: ingest, Gate 0 prefilter, MediaWiki candidates.
-- LLM stages: Gate 1, Gate 2, Gate 3.
-- All intermediate artifacts live under `state/`.
+- Deterministic stages: ingest, Gate 0 prefilter, MediaWiki candidates, Gate 2 has-page, Gate 4 reliable filtering.
+- LLM stages: Gate 1 triage, Gate 3 page-match, Gate 4b coverage verifier (counts distinct reliable Brave domains).
+- Summary artifacts:
+  - `state/gate4b_llm_results.jsonl` (per-event domain counts)
+  - `output/openclaw/daily_notability_digest.json` + `scripts/daily_notability_digest_report.py`
