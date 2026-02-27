@@ -1,0 +1,40 @@
+{
+  "run_id": "20260227T150212",
+  "started_at": "2026-02-27T15:02:12.870147+00:00",
+  "finished_at": "2026-02-27T15:04:51.206558+00:00",
+  "stages": [
+    {
+      "name": "rss_ingest",
+      "duration_s": 29.76,
+      "exit_code": 0,
+      "notes": "4936 total events"
+    },
+    {
+      "name": "gate0",
+      "duration_s": 0.35,
+      "exit_code": 0,
+      "notes": "3367 pass / 1569 skip"
+    },
+    {
+      "name": "gate1",
+      "duration_s": 127.74,
+      "exit_code": 0,
+      "notes": "50 new events (total: 422)"
+    },
+    {
+      "name": "mw_candidates",
+      "duration_s": 0.31,
+      "exit_code": 0,
+      "notes": "78 candidates"
+    },
+    {
+      "name": "gate2",
+      "duration_s": 0.08,
+      "exit_code": 1,
+      "notes": ""
+    }
+  ],
+  "new_gate1_events": 50,
+  "likely_notable_subjects": [],
+  "possibly_notable_subjects": []
+}

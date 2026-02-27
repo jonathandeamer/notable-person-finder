@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from name_utils import normalize_name
+from name_utils import normalize_name, sort_by_priority_recency
 
 FULL_NAME_PATTERN = re.compile(r"\b[A-Z][a-z]{1,29}\s+[A-Z][a-z]{1,39}\b")
 INITIAL_SURNAME_PATTERN = re.compile(
@@ -273,6 +273,9 @@ def run_prefilter(
             pass_rows.append(out_row)
         else:
             skip_rows.append(out_row)
+
+    # Sort by feed priority tier, then by recency (newest first)
+    pass_rows = sort_by_priority_recency(pass_rows)
 
     _write_jsonl(pass_output, pass_rows)
     _write_jsonl(skip_output, skip_rows)

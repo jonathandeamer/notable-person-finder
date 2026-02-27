@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from name_utils import normalize_name
+from name_utils import normalize_name, sort_by_priority_recency
 
 
 BIO_SCORE_THRESHOLD = 3
@@ -202,6 +202,9 @@ def run_gate2(
 ) -> int:
     _check_output_paths(pass_output, skip_output, overwrite)
     rows = read_jsonl(input_path)
+
+    # Sort by feed priority tier, then by recency (newest first)
+    rows = sort_by_priority_recency(rows)
 
     pass_rows: list[dict] = []
     skip_rows: list[dict] = []

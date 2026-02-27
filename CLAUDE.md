@@ -38,9 +38,9 @@ Key options:
 - `--dry-run` — Preview stages without executing
 - `--from-gate STAGE_NAME` — Resume from a specific stage (useful for iterative development)
 - `--gate1-budget N` — Limit Gate 1 LLM calls to N records (default 50)
-- `--model-gate1 MODEL` — Override Gate 1 model (default: `gpt-5.1-codex-mini`)
-- `--model-gate3 MODEL` — Override Gate 3 model (default: `gpt-5.1-codex-mini`)
-- `--model-gate4b MODEL` — Override Gate 4b model (default: `gpt-5.1-codex-mini`)
+- `--model-gate1 MODEL` — Override Gate 1 model (default: `gpt-5.2`)
+- `--model-gate3 MODEL` — Override Gate 3 model (default: `gpt-5.2`)
+- `--model-gate4b MODEL` — Override Gate 4b model (default: `gpt-5.2`)
 - `--backend-gate1 BACKEND` — LLM backend for Gate 1 (default: `codex-cli`)
 - `--backend-gate3 BACKEND` — LLM backend for Gate 3 (default: `codex-cli`)
 - `--backend-gate4b BACKEND` — LLM backend for Gate 4b (default: `codex-cli`)

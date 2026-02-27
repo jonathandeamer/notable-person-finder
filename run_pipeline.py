@@ -402,21 +402,21 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument(
         "--model-gate1",
-        default="gpt-5.1-codex-mini",
+        default="gpt-5.2",
         metavar="MODEL",
-        help="LLM model for Gate 1 (default: gpt-5.1-codex-mini)",
+        help="LLM model for Gate 1 (default: gpt-5.2)",
     )
     p.add_argument(
         "--model-gate3",
-        default="gpt-5.1-codex-mini",
+        default="gpt-5.2",
         metavar="MODEL",
-        help="LLM model for Gate 3 (default: gpt-5.1-codex-mini)",
+        help="LLM model for Gate 3 (default: gpt-5.2)",
     )
     p.add_argument(
         "--model-gate4b",
-        default="gpt-5.1-codex-mini",
+        default="gpt-5.2",
         metavar="MODEL",
-        help="LLM model for Gate 4b (default: gpt-5.1-codex-mini)",
+        help="LLM model for Gate 4b (default: gpt-5.2)",
     )
     p.add_argument(
         "--backend-gate1",

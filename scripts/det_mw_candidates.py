@@ -680,6 +680,8 @@ def run(
                 },
                 "errors": [],
                 "fetched_at_utc": utc_now_iso(),
+                "feed_priority": row.get("feed_priority"),
+                "published_at_utc": _gi.get("publication_date"),
             }
 
             try:

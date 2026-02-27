@@ -7,7 +7,7 @@ Error:
 
 Fix:
 Use a Codex-supported model or omit `--model` to use the default. The current default in
-`scripts/llm_gate1_runner.py` is `gpt-5.1-codex-mini`.
+`scripts/llm_gate1_runner.py` is `gpt-5.2`.
 
 ## Invalid schema error in batch mode
 

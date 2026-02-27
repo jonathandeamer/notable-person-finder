@@ -1,0 +1,22 @@
+{
+  "run_id": "20260227T145732",
+  "started_at": "2026-02-27T14:57:32.095674+00:00",
+  "finished_at": "2026-02-27T14:58:02.758526+00:00",
+  "stages": [
+    {
+      "name": "rss_ingest",
+      "duration_s": 30.57,
+      "exit_code": 0,
+      "notes": "4934 total events"
+    },
+    {
+      "name": "gate0",
+      "duration_s": 0.06,
+      "exit_code": 1,
+      "notes": ""
+    }
+  ],
+  "new_gate1_events": 0,
+  "likely_notable_subjects": [],
+  "possibly_notable_subjects": []
+}

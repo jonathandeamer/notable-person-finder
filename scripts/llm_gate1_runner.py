@@ -46,7 +46,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--prompt", type=Path, required=True, help="Path to Gate 1 prompt file"
     )
     parser.add_argument("--output", type=Path, required=True, help="Path to output jsonl")
-    parser.add_argument("--model", default="gpt-5.1-codex-mini", help="Model name")
+    parser.add_argument("--model", default="gpt-5.2", help="Model name")
     parser.add_argument(
         "--backend",
         choices=["openai-api", "codex-cli", "claude-cli"],

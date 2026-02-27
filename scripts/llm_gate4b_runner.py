@@ -24,6 +24,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+from name_utils import sort_by_priority_recency
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -426,6 +430,9 @@ def run(args: argparse.Namespace) -> int:
     else:
         sampled = records
 
+    # Sort by feed priority tier, then by recency (newest first)
+    sampled = sort_by_priority_recency(sampled)
+
     sample_size = len(sampled)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -653,8 +660,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model",
-        default="gpt-5.1-codex-mini",
-        help="Model name (default: gpt-5.1-codex-mini)",
+        default="gpt-5.2",
+        help="Model name (default: gpt-5.2)",
     )
     parser.add_argument(
         "--backend",
