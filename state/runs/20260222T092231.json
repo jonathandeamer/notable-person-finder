@@ -1,0 +1,83 @@
+{
+  "run_id": "20260222T092231",
+  "started_at": "2026-02-22T09:22:31.003699+00:00",
+  "finished_at": "2026-02-22T09:22:35.137442+00:00",
+  "stages": [
+    {
+      "name": "rss_ingest",
+      "duration_s": 0.0,
+      "exit_code": 0,
+      "notes": "skipped (--from-gate)",
+      "skipped": true
+    },
+    {
+      "name": "gate0",
+      "duration_s": 0.0,
+      "exit_code": 0,
+      "notes": "skipped (--from-gate)",
+      "skipped": true
+    },
+    {
+      "name": "gate1",
+      "duration_s": 0.0,
+      "exit_code": 0,
+      "notes": "skipped (--from-gate)",
+      "skipped": true
+    },
+    {
+      "name": "mw_candidates",
+      "duration_s": 0.0,
+      "exit_code": 0,
+      "notes": "skipped (--from-gate)",
+      "skipped": true
+    },
+    {
+      "name": "gate2",
+      "duration_s": 0.0,
+      "exit_code": 0,
+      "notes": "skipped (--from-gate)",
+      "skipped": true
+    },
+    {
+      "name": "gate3",
+      "duration_s": 0.0,
+      "exit_code": 0,
+      "notes": "skipped (--from-gate)",
+      "skipped": true
+    },
+    {
+      "name": "gate3_index",
+      "duration_s": 0.0,
+      "exit_code": 0,
+      "notes": "skipped (--from-gate)",
+      "skipped": true
+    },
+    {
+      "name": "brave",
+      "duration_s": 4.05,
+      "exit_code": 0,
+      "notes": "3 subjects covered"
+    },
+    {
+      "name": "gate4_filter",
+      "duration_s": 0.04,
+      "exit_code": 0,
+      "notes": "3 subjects with reliable coverage"
+    },
+    {
+      "name": "gate4b",
+      "duration_s": 0.04,
+      "exit_code": 0,
+      "notes": "3 new / 17 total gate4b results"
+    },
+    {
+      "name": "report",
+      "duration_s": 0.0,
+      "exit_code": 0,
+      "notes": "0 notable, 0 uncertain"
+    }
+  ],
+  "new_gate1_events": 0,
+  "notable_subjects": [],
+  "uncertain_subjects": []
+}

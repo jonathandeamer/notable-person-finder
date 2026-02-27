@@ -1,0 +1,87 @@
+{
+  "run_id": "20260222T084833",
+  "started_at": "2026-02-22T08:48:33.195497+00:00",
+  "finished_at": "2026-02-22T08:52:01.926997+00:00",
+  "stages": [
+    {
+      "name": "rss_ingest",
+      "duration_s": 0.0,
+      "exit_code": 0,
+      "notes": "skipped (--from-gate)",
+      "skipped": true
+    },
+    {
+      "name": "gate0",
+      "duration_s": 0.0,
+      "exit_code": 0,
+      "notes": "skipped (--from-gate)",
+      "skipped": true
+    },
+    {
+      "name": "gate1",
+      "duration_s": 0.0,
+      "exit_code": 0,
+      "notes": "skipped (--from-gate)",
+      "skipped": true
+    },
+    {
+      "name": "mw_candidates",
+      "duration_s": 0.0,
+      "exit_code": 0,
+      "notes": "skipped (--from-gate)",
+      "skipped": true
+    },
+    {
+      "name": "gate2",
+      "duration_s": 0.0,
+      "exit_code": 0,
+      "notes": "skipped (--from-gate)",
+      "skipped": true
+    },
+    {
+      "name": "gate3",
+      "duration_s": 140.45,
+      "exit_code": 0,
+      "notes": "15 new / 51 total gate3 results"
+    },
+    {
+      "name": "gate3_retry",
+      "duration_s": 67.98,
+      "exit_code": 0,
+      "notes": "resolved 0/12 failure(s); 12 still failing"
+    },
+    {
+      "name": "gate3_index",
+      "duration_s": 0.07,
+      "exit_code": 0,
+      "notes": "wiki_known_pages.json updated"
+    },
+    {
+      "name": "brave",
+      "duration_s": 0.11,
+      "exit_code": 0,
+      "notes": "2 subjects covered"
+    },
+    {
+      "name": "gate4_filter",
+      "duration_s": 0.04,
+      "exit_code": 0,
+      "notes": "2 subjects with reliable coverage"
+    },
+    {
+      "name": "gate4b",
+      "duration_s": 0.05,
+      "exit_code": 0,
+      "notes": "2 new / 6 total gate4b results"
+    },
+    {
+      "name": "report",
+      "duration_s": 0.0,
+      "exit_code": 0,
+      "notes": "0 notable, 0 uncertain"
+    }
+  ],
+  "new_gate1_events": 0,
+  "notable_subjects": [],
+  "uncertain_subjects": []
+}

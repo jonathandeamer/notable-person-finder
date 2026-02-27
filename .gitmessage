@@ -1,0 +1,9 @@
+<type>(optional-scope): <description>
+
+# Allowed types:
+# build, chore, ci, docs, feat, fix, perf, refactor, revert, style, test
+
+# Examples:
+# feat: add daily DYK parser
+# fix(parser): handle bolded links
+# docs: add contribution guidelines

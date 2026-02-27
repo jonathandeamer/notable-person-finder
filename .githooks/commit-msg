@@ -1,0 +1,23 @@
+#!/usr/bin/env sh
+set -eu
+
+MSG_FILE="$1"
+MSG="$(cat "$MSG_FILE")"
+
+# Allow merge commits and revert commits
+case "$MSG" in
+  "Merge "*|"Revert "*)
+    exit 0
+    ;;
+esac
+
+# Conventional Commits regex
+# type(scope?): description
+PATTERN='^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([a-z0-9-]+\))?: .+'
+
+if ! printf "%s" "$MSG" | grep -Eq "$PATTERN"; then
+  echo "Commit message does not follow Conventional Commits." >&2
+  echo "Expected: <type>(optional-scope): <description>" >&2
+  echo "Allowed types: build, chore, ci, docs, feat, fix, perf, refactor, revert, style, test" >&2
+  exit 1
+fi
