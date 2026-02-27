@@ -2,31 +2,78 @@
 """Refresh the daily notability digest and print a concise summary."""
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
-WORKDIR = Path("/home/admin/notable-person-finder")
-OUTPUT_FILE = WORKDIR / "output/openclaw/daily_notability_digest.json"
-REFRESH_CMD = [
-    "python3",
-    "scripts/det_openclaw_daily_digest.py",
-    "--window-hours",
-    "24",
-    "--output",
-    str(OUTPUT_FILE),
-]
+SCRIPT_PATH = Path(__file__).resolve()
+DEFAULT_PROJECT_ROOT = SCRIPT_PATH.parent.parent
 
 
-def refresh_digest() -> None:
-    subprocess.run(REFRESH_CMD, check=True, cwd=WORKDIR)
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Refresh daily_notability_digest.json and print a concise summary."
+    )
+    parser.add_argument(
+        "--project-root",
+        type=Path,
+        default=DEFAULT_PROJECT_ROOT,
+        help="Project root used to resolve relative paths (default: repo root)",
+    )
+    parser.add_argument(
+        "--digest-output",
+        type=Path,
+        default=Path("output/openclaw/daily_notability_digest.json"),
+        help="Path to digest JSON (relative to --project-root by default)",
+    )
+    parser.add_argument(
+        "--window-hours",
+        type=int,
+        default=24,
+        help="Window passed to det_openclaw_daily_digest.py (default: 24)",
+    )
+    parser.add_argument(
+        "--now-utc",
+        type=str,
+        default=None,
+        help="Optional --now-utc override passed through to digest generator",
+    )
+    parser.add_argument(
+        "--skip-refresh",
+        action="store_true",
+        help="Print summary from existing digest file without regenerating it",
+    )
+    return parser
 
 
-def load_digest() -> dict:
-    with OUTPUT_FILE.open() as fh:
+def resolve_path(path: Path, project_root: Path) -> Path:
+    return path if path.is_absolute() else (project_root / path)
+
+
+def refresh_digest(
+    project_root: Path,
+    digest_output: Path,
+    window_hours: int,
+    now_utc: str | None,
+) -> None:
+    cmd = [
+        sys.executable,
+        "scripts/det_openclaw_daily_digest.py",
+        "--window-hours",
+        str(window_hours),
+        "--output",
+        str(digest_output),
+    ]
+    if now_utc:
+        cmd.extend(["--now-utc", now_utc])
+    subprocess.run(cmd, check=True, cwd=project_root)
+
+
+def load_digest(path: Path) -> dict:
+    with path.open(encoding="utf-8") as fh:
         return json.load(fh)
 
 
@@ -76,12 +123,27 @@ def format_section(title: str, people: list[dict]) -> list[str]:
 
 
 def main() -> int:
-    try:
-        refresh_digest()
-    except subprocess.CalledProcessError as exc:
-        print(f"Failed to refresh digest: {exc}", file=sys.stderr)
+    args = build_arg_parser().parse_args()
+    project_root = args.project_root.resolve()
+    digest_output = resolve_path(args.digest_output, project_root)
+
+    if not args.skip_refresh:
+        try:
+            refresh_digest(
+                project_root=project_root,
+                digest_output=digest_output,
+                window_hours=args.window_hours,
+                now_utc=args.now_utc,
+            )
+        except subprocess.CalledProcessError as exc:
+            print(f"Failed to refresh digest: {exc}", file=sys.stderr)
+            return 1
+
+    if not digest_output.exists():
+        print(f"Digest file not found: {digest_output}", file=sys.stderr)
         return 1
-    data = load_digest()
+
+    data = load_digest(digest_output)
     counts = data.get("counts", {})
     runs = data.get("runs_in_window", [])
     latest_run = select_latest_run(runs)
