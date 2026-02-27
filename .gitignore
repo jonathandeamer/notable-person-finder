@@ -27,6 +27,10 @@ ENV/
 # Scratch
 working/
 
+# Project outputs/state
+output/
+state/
+
 # Logs
 *.log
 
