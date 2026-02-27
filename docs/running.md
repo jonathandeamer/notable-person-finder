@@ -63,10 +63,11 @@ python3 /Users/jonathan/new-wikipedia-article-checker/scripts/det_gate2_has_page
 
 ```bash
 python3 /Users/jonathan/new-wikipedia-article-checker/scripts/llm_gate3_runner.py \
+  --backend codex-cli \
+  --codex-cwd /Users/jonathan/new-wikipedia-article-checker \
   --input /Users/jonathan/new-wikipedia-article-checker/state/wiki_candidates_pass.jsonl \
   --prompt /Users/jonathan/new-wikipedia-article-checker/prompts/gate3.md \
-  --output /Users/jonathan/new-wikipedia-article-checker/state/gate3_llm_results.jsonl \
-  --model claude-sonnet-4-6
+  --output /Users/jonathan/new-wikipedia-article-checker/state/gate3_llm_results.jsonl
 ```
 
 ## 6a) Gate 3 Index Update (after Gate 3)
@@ -77,6 +78,27 @@ python3 /Users/jonathan/new-wikipedia-article-checker/scripts/det_gate3_index_up
   --known-pages /Users/jonathan/new-wikipedia-article-checker/state/wiki_known_pages.json
 ```
 
-## 7) Coverage Search + Gate 4 (LLM Notability Signal)
+## 7) Coverage Search + Gate 4 Filter (Deterministic)
 
-Not implemented yet.
+```bash
+python3 /Users/jonathan/new-wikipedia-article-checker/scripts/det_brave_coverage.py \
+  --state-dir /Users/jonathan/new-wikipedia-article-checker/state \
+  --overwrite
+```
+
+```bash
+python3 /Users/jonathan/new-wikipedia-article-checker/scripts/det_gate4_reliable_filter.py \
+  --state-dir /Users/jonathan/new-wikipedia-article-checker/state \
+  --overwrite
+```
+
+## 8) Gate 4b (LLM Coverage Verification)
+
+```bash
+python3 /Users/jonathan/new-wikipedia-article-checker/scripts/llm_gate4b_runner.py \
+  --backend codex-cli \
+  --codex-cwd /Users/jonathan/new-wikipedia-article-checker \
+  --prompt /Users/jonathan/new-wikipedia-article-checker/prompts/gate4b.md \
+  --unlisted-prompt /Users/jonathan/new-wikipedia-article-checker/prompts/gate4b_unlisted.md \
+  --brave-input /Users/jonathan/new-wikipedia-article-checker/state/brave_coverage.jsonl
+```
