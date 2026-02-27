@@ -15,7 +15,7 @@ def load_module(module_name: str, path: Path):
     return module
 
 
-ROOT = Path("/Users/jonathan/new-wikipedia-article-checker")
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _make_result(rank: int, domain: str = "reuters.com", title: str = "Subject does things") -> dict:
@@ -85,7 +85,9 @@ def _make_args(
         output=output_path,
         prompt=prompt_path,
         model=model,
+        backend="claude-cli",
         cwd=Path("/tmp"),
+        codex_cwd=Path("/tmp"),
         min_reliable_results=min_reliable_results,
         max_output_chars=max_output_chars,
         delay_seconds=delay_seconds,
@@ -307,7 +309,7 @@ class TestGate4bRunner(unittest.TestCase):
                 self.assertEqual(len(rows), 1)
                 self.assertIsNotNone(rows[0]["llm_error"])
                 self.assertIn("connection refused", rows[0]["llm_error"])
-                self.assertIsNone(rows[0]["gate4b_status"])
+                self.assertEqual(rows[0]["gate4b_status"], "NOT_NOTABLE")
                 self.assertEqual(rows[0]["confirmed_count"], 0)
                 self.assertEqual(rows[0]["second_pass_results_sent"], [])
                 self.assertIsNone(rows[0]["second_pass_json_parse_ok"])
@@ -335,9 +337,87 @@ class TestGate4bRunner(unittest.TestCase):
                 self.assertEqual(len(rows), 1)
                 self.assertFalse(rows[0]["json_parse_ok"])
                 self.assertIsNotNone(rows[0]["json_parse_error"])
-                self.assertIsNone(rows[0]["gate4b_status"])
+                self.assertEqual(rows[0]["gate4b_status"], "NOT_NOTABLE")
                 self.assertEqual(rows[0]["second_pass_results_sent"], [])
                 self.assertIsNone(rows[0]["second_pass_json_parse_ok"])
+        finally:
+            self.mod.call_claude_cli = orig
+
+    def test_distinct_domains_required_for_likely_notable(self) -> None:
+        llm_response = json.dumps({
+            "results": [
+                {"rank": 1, "about_subject": True, "confidence": 0.9, "reasoning": "About subject."},
+                {"rank": 2, "about_subject": True, "confidence": 0.88, "reasoning": "About subject too."},
+            ]
+        })
+
+        def fake_llm(*_args, **_kwargs):
+            return llm_response, {"backend": "claude-cli"}
+
+        orig = self.mod.call_claude_cli
+        try:
+            self.mod.call_claude_cli = fake_llm
+            with tempfile.TemporaryDirectory() as td:
+                tmp = Path(td)
+                # Two URLs, same domain => one distinct domain.
+                records = [_make_input_record(brave_results=[_make_result(1, "bbc.com"), _make_result(2, "bbc.com")])]
+                input_path = _write_input(tmp, records)
+                output_path = tmp / "out.jsonl"
+                args = _make_args(input_path, output_path, self.prompt_path)
+                rc = self.mod.run(args)
+                self.assertEqual(rc, 0)
+                rows = _read_output(output_path)
+                self.assertEqual(rows[0]["gate4b_status"], "UNCERTAIN")
+                self.assertEqual(rows[0]["confirmed_count"], 1)
+                self.assertEqual(rows[0]["first_pass_domains"], ["bbc.com"])
+        finally:
+            self.mod.call_claude_cli = orig
+
+    def test_second_pass_promotes_when_combined_domains_reach_two(self) -> None:
+        call_count = {"n": 0}
+        first_pass_response = json.dumps({
+            "results": [
+                {"rank": 1, "about_subject": True, "confidence": 0.9, "reasoning": "About subject."},
+                {"rank": 2, "about_subject": False, "confidence": 0.6, "reasoning": "Different subject."},
+            ]
+        })
+        second_pass_response = json.dumps({
+            "results": [
+                {"rank": 2, "about_subject": True, "is_reliable_source": True, "confidence": 0.9, "reasoning": "About subject and reliable."},
+            ]
+        })
+
+        def fake_llm(*_args, **_kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return first_pass_response, {"backend": "claude-cli"}
+            return second_pass_response, {"backend": "claude-cli"}
+
+        orig = self.mod.call_claude_cli
+        try:
+            self.mod.call_claude_cli = fake_llm
+            with tempfile.TemporaryDirectory() as td:
+                tmp = Path(td)
+                brave_results = [_make_result(1, "reuters.com"), _make_result(2, "apnews.com")]
+                brave_record = _make_input_record(brave_results=brave_results, event_id="event-abc")
+                brave_path = tmp / "brave_coverage.jsonl"
+                brave_path.write_text(json.dumps(brave_record) + "\n", encoding="utf-8")
+                unlisted_prompt_path = tmp / "gate4b_unlisted.md"
+                unlisted_prompt_path.write_text("Unlisted prompt body.", encoding="utf-8")
+
+                records = [_make_input_record(brave_results=[_make_result(1, "reuters.com"), _make_result(2, "bbc.com")])]
+                input_path = _write_input(tmp, records)
+                output_path = tmp / "out.jsonl"
+                args = _make_args(
+                    input_path, output_path, self.prompt_path,
+                    brave_input=brave_path, unlisted_prompt=unlisted_prompt_path,
+                )
+                self.mod.run(args)
+                rows = _read_output(output_path)
+                self.assertEqual(rows[0]["confirmed_count"], 1)
+                self.assertEqual(rows[0]["second_pass_confirmed_count"], 1)
+                self.assertEqual(rows[0]["gate4b_status"], "POSSIBLY_NOTABLE")
+                self.assertEqual(set(rows[0]["all_reliable_brave_domains"]), {"reuters.com", "apnews.com"})
         finally:
             self.mod.call_claude_cli = orig
 
