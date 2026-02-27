@@ -144,7 +144,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("/Users/jonathan/new-wikipedia-article-checker/state/wiki_candidates.jsonl"),
+        default=Path("state/wiki_candidates.jsonl"),
         help="Output JSONL for MediaWiki candidates",
     )
     parser.add_argument("--srlimit", type=int, default=10, help="Search result limit")
@@ -159,7 +159,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cache-dir",
         type=Path,
-        default=Path("/Users/jonathan/new-wikipedia-article-checker/state/mw_cache"),
+        default=Path("state/mw_cache"),
         help="Cache directory for MW responses",
     )
     parser.add_argument(

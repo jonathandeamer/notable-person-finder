@@ -41,9 +41,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--known-pages",
         type=Path,
-        default=Path(
-            "/Users/jonathan/new-wikipedia-article-checker/state/wiki_known_pages.json"
-        ),
+        default=Path("state/wiki_known_pages.json"),
         help="Known pages index JSON",
     )
     parser.add_argument(

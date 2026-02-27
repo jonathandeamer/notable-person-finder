@@ -3,9 +3,9 @@
 
 Example:
   OPENAI_API_KEY=... python3 scripts/llm_gate1_runner.py \
-    --events /Users/jonathan/new-wikipedia-article-checker/state/events.jsonl \
-    --prompt /Users/jonathan/new-wikipedia-article-checker/prompts/gate1.md \
-    --output /Users/jonathan/new-wikipedia-article-checker/state/gate1_llm_results.jsonl \
+    --events state/prefilter_pass.jsonl \
+    --prompt prompts/gate1.md \
+    --output state/gate1_llm_results.jsonl \
     --sample-size 20 \
     --model gpt-5.1-codex-mini
 """
@@ -140,10 +140,8 @@ def load_events(events_path: Path) -> list[dict]:
 
 def resolve_events_path(
     explicit_events: Path | None,
-    prefilter_pass_path: Path = Path(
-        "/Users/jonathan/new-wikipedia-article-checker/state/prefilter_pass.jsonl"
-    ),
-    raw_events_path: Path = Path("/Users/jonathan/new-wikipedia-article-checker/state/events.jsonl"),
+    prefilter_pass_path: Path = Path("state/prefilter_pass.jsonl"),
+    raw_events_path: Path = Path("state/events.jsonl"),
 ) -> Path:
     if explicit_events is not None:
         return explicit_events
