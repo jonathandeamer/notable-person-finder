@@ -39,8 +39,11 @@ Key options:
 - `--from-gate STAGE_NAME` — Resume from a specific stage (useful for iterative development)
 - `--gate1-budget N` — Limit Gate 1 LLM calls to N records (default 50)
 - `--model-gate1 MODEL` — Override Gate 1 model (default: `gpt-5.1-codex-mini`)
-- `--model-gate3 MODEL` — Override Gate 3 model (default: `claude-haiku-4-5-20251001`)
-- `--model-gate4b MODEL` — Override Gate 4b model (default: `claude-haiku-4-5-20251001`)
+- `--model-gate3 MODEL` — Override Gate 3 model (default: `gpt-5.1-codex-mini`)
+- `--model-gate4b MODEL` — Override Gate 4b model (default: `gpt-5.1-codex-mini`)
+- `--backend-gate1 BACKEND` — LLM backend for Gate 1 (default: `codex-cli`)
+- `--backend-gate3 BACKEND` — LLM backend for Gate 3 (default: `codex-cli`)
+- `--backend-gate4b BACKEND` — LLM backend for Gate 4b (default: `codex-cli`)
 
 Example:
 ```bash
@@ -174,6 +177,7 @@ grep "llm_error" state/gate1_llm_results.jsonl | head -5
 ### Handling API Keys
 - **OpenAI**: Set `OPENAI_API_KEY` env var
 - **Brave**: Set `BRAVE_API_KEY` env var or store in `~/.brave`
+- **Codex CLI**: Uses local `codex` CLI (respects `~/.codex/` config)
 - **Claude CLI**: Uses local `claude` CLI (respects `~/.clauderc`)
 - Pipeline checks for Brave API key only if brave stage will run (respects `--from-gate`)
 
