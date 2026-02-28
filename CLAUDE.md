@@ -72,18 +72,19 @@ See `docs/running.md` for complete stage commands.
 
 ## Architecture & Design
 
-### Pipeline Stages (11 total)
+### Pipeline Stages (12 total)
 1. **RSS Ingest** — Fetches feeds from `config/feeds.md`, appends to `state/events.jsonl`
 2. **Gate 0** — Deterministic name-heuristic filter; uses `state/wiki_known_pages.json` to skip already-known names
-3. **Gate 1** — LLM triage (name-strict, high-recall); outputs structured JSON with decisions: `STRONG_PASS`/`WEAK_PASS`/`FAIL`
-4. **MediaWiki Candidates** — Deterministic Wikipedia API search; fetches article metadata
-5. **Gate 2** — Deterministic annotation pass; scores candidates using biography score + Levenshtein distance; all records proceed to Gate 3 (skip output is always empty)
-6. **Gate 3** — LLM page-match decision; compares candidate to parsed Wikipedia content
-7. **Gate 3 Index Update** — Writes `HAS_PAGE` decisions back to `state/wiki_known_pages.json`
-8. **Brave Coverage** — Deterministic Brave Search News API queries; caches results
-9. **Gate 4 Reliable Filter** — Keeps only Wikipedia-approved news source domains
-10. **Gate 4b LLM Coverage Verifier** — Two-pass LLM coverage verifier: first pass counts distinct domains from a curated Wikipedia-reliable source list (`LIKELY_NOTABLE` if ≥2); second pass asks the LLM to judge source reliability itself from the full Brave result set (`POSSIBLY_NOTABLE` if combined domains ≥2)
-11. **Report + Digest** — Generates summary output plus `output/openclaw/daily_notability_digest.json` for external agents (see `scripts/daily_notability_digest_report.py`)
+3. **Gate 1** — LLM triage (name-strict, high-recall); outputs structured JSON with decisions: `STRONG_PASS`/`WEAK_PASS`/`FAIL`/`SKIP_GLOBALLY_KNOWN`
+4. **Gate 1 Index Update** — Writes `SKIP_GLOBALLY_KNOWN` decisions to `state/wiki_known_pages.json` so future articles about globally famous people skip Gate 1
+5. **MediaWiki Candidates** — Deterministic Wikipedia API search; fetches article metadata
+6. **Gate 2** — Deterministic annotation pass; scores candidates using biography score + Levenshtein distance; all records proceed to Gate 3 (skip output is always empty)
+7. **Gate 3** — LLM page-match decision; compares candidate to parsed Wikipedia content
+8. **Gate 3 Index Update** — Writes `HAS_PAGE` decisions back to `state/wiki_known_pages.json`; also writes a Gate-0-style alias key (regex-extracted from source article text) so name variations are recognized at Gate 0 on future runs
+9. **Brave Coverage** — Deterministic Brave Search News API queries; caches results
+10. **Gate 4 Reliable Filter** — Keeps only Wikipedia-approved news source domains
+11. **Gate 4b LLM Coverage Verifier** — Two-pass LLM coverage verifier: first pass counts distinct domains from a curated Wikipedia-reliable source list (`LIKELY_NOTABLE` if ≥2); second pass asks the LLM to judge source reliability itself from the full Brave result set (`POSSIBLY_NOTABLE` if combined domains ≥2)
+12. **Report + Digest** — Generates summary output plus `output/openclaw/daily_notability_digest.json` for external agents (see `scripts/daily_notability_digest_report.py`)
 
 ### Key Design Principles
 - **Deterministic control flow**: All state transitions managed by deterministic Python; LLM only at semantic gates
@@ -103,7 +104,7 @@ See `docs/running.md` for complete stage commands.
 - **`docs/`** — Architecture docs (overview, data-flow, running, troubleshooting)
 
 ### Critical Files
-- **`run_pipeline.py`** — Orchestrator; chains all 11 stages; respects `--from-gate`, `--dry-run`
+- **`run_pipeline.py`** — Orchestrator; chains all 12 stages; respects `--from-gate`, `--dry-run`
 - **`name_utils.py`** — Shared utility; `normalize_name()` strips parens, applies NFKD normalization
 - **`state/events.jsonl`** — Raw RSS events (starting point for pipeline)
 - **`state/wiki_known_pages.json`** — Index of names with confirmed Wikipedia pages (used by Gate 0, Gate 2, Gate 3)
@@ -138,9 +139,9 @@ See `docs/running.md` for complete stage commands.
 - BIO_SCORE_THRESHOLD = 3
 
 **Gate 3 Decisions:**
-- `HAS_PAGE` — High confidence that subject has a Wikipedia page; written to known pages index
+- `HAS_PAGE` — High confidence that subject has a Wikipedia page; written to known pages index (with Gate-0-style alias key from source article text)
 - `MISSING` — Subject likely doesn't have a page; passed to Brave coverage search
-- `UNCERTAIN` — Can't determine; fallback to coverage search
+- `UNCERTAIN` — Can't determine, or LLM parse failure (fallback); passed to Brave coverage search
 
 **Gate 4b Decisions:**
 - `LIKELY_NOTABLE` — ≥2 distinct domains from the curated Wikipedia-reliable source list confirm the subject is the primary focus (first pass)

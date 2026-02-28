@@ -32,7 +32,15 @@ python3 scripts/llm_gate1_runner.py \
   --sample-size 60
 ```
 
-## 4) MediaWiki candidate search
+## 4) Gate 1 index update (deterministic)
+
+```bash
+python3 scripts/det_gate1_index_update.py \
+  --input state/gate1_llm_results.jsonl \
+  --known-pages state/wiki_known_pages.json
+```
+
+## 5) MediaWiki candidate search
 
 ```bash
 python3 scripts/det_mw_candidates.py \
@@ -44,7 +52,7 @@ python3 scripts/det_mw_candidates.py \
   --log-file state/mw_candidates.log
 ```
 
-## 5) Gate 2 has-page filter
+## 6) Gate 2 has-page filter
 
 ```bash
 python3 scripts/det_gate2_has_page.py \
@@ -55,7 +63,7 @@ python3 scripts/det_gate2_has_page.py \
   --overwrite
 ```
 
-## 6) Gate 3 (LLM page match) + index update
+## 7) Gate 3 (LLM page match) + index update
 
 ```bash
 python3 scripts/llm_gate3_runner.py \
@@ -70,7 +78,7 @@ python3 scripts/det_gate3_index_update.py \
   --known-pages state/wiki_known_pages.json
 ```
 
-## 7) Brave coverage + Gate 4 reliable filter
+## 8) Brave coverage + Gate 4 reliable filter
 
 ```bash
 python3 scripts/det_brave_coverage.py \
@@ -85,7 +93,7 @@ python3 scripts/det_gate4_reliable_filter.py \
   --overwrite
 ```
 
-## 8) Gate 4b (LLM coverage verifier counting distinct domains)
+## 9) Gate 4b (LLM coverage verifier counting distinct domains)
 
 ```bash
 python3 scripts/llm_gate4b_runner.py \
@@ -98,7 +106,7 @@ python3 scripts/llm_gate4b_runner.py \
   --fresh-output
 ```
 
-## 9) Digest + report for OpenClaw
+## 10) Digest + report for OpenClaw
 
 ```bash
 python3 scripts/det_openclaw_daily_digest.py \
