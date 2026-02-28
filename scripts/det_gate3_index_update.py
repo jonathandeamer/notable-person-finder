@@ -20,8 +20,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
+sys.path.append(str(Path(__file__).resolve().parent))
 
 from name_utils import normalize_name
+from det_gate0_prefilter import extract_candidate_name
 
 
 def utc_now_iso() -> str:
@@ -162,6 +164,20 @@ def run_update(
         }
         entries[normalized] = entry
         counts["updated"] += 1
+
+        # Write a Gate-0-style alias so future articles whose title/summary yields a
+        # different regex name (e.g. "Nick" vs LLM full name "Nicholas Smith") will
+        # still hit the index at Gate 0, avoiding redundant Gate 1+3 LLM calls.
+        src_ctx = row.get("source_context") or {}
+        event_text = f"{src_ctx.get('entry_title') or ''} {src_ctx.get('summary') or ''}".strip()
+        alias_name = extract_candidate_name(event_text)
+        if alias_name:
+            alias_key = normalize_name(alias_name)
+            if alias_key and alias_key != normalized:
+                existing_alias = entries.get(alias_key)
+                alias_added_at = existing_alias.get("added_at_utc") if isinstance(existing_alias, dict) else now
+                entries[alias_key] = {**entry, "normalized_name": alias_key, "added_at_utc": alias_added_at}
+                counts["alias_written"] += 1
 
     index["updated_at_utc"] = now
     write_index(known_pages_path, index)
