@@ -249,6 +249,8 @@ def gate1_output_schema() -> dict:
                     "EDITORIAL_OBIT",
                     "CAREER_PROFILE",
                     "PUBLIC_ROLE",
+                    "NATIONAL_POLITICIAN",
+                    "AWARD_RECIPIENT",
                     "MID_TIER_PROFESSIONAL",
                     "SINGLE_EVENT",
                     "COLLECTIVE",

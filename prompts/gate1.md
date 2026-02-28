@@ -1,5 +1,5 @@
 # LLM Gate 1 Prompt — Person-Centric Notability Triage (High-Recall + Name-Strict)
-<!-- prompt-version: 3 -->
+<!-- prompt-version: 4 -->
 
 You are performing **Gate 1 triage** in a structured Wikipedia notability pipeline.
 
@@ -39,9 +39,27 @@ When unsure → prefer WEAK_PASS over FAIL, unless exclusion criteria apply.
 
 ---
 
-## Hard Auto-Pass Rule
+## Hard Auto-Pass Rule — WP:ANYBIO Categories
 
-If the article is clearly a **full editorial obituary written in the publication’s voice**  
+If the article clearly identifies the person as:
+- A **national politician** — MP, Senator, national Assembly member, Cabinet minister, head of
+  state, or equivalent national legislative/executive role in any country
+  → Return `STRONG_PASS` with `signal_type: "NATIONAL_POLITICIAN"`
+
+- A **significant award recipient** — clearly stated recipient (or multiple-time nominee) of a
+  named significant award: national honour (OBE, CBE, MBE, knighthood, Legion d’honneur, etc.),
+  Nobel Prize, Olympic medal, major literary prize (Booker, Pulitzer, Costa), major arts prize
+  (BAFTA, Oscar, Grammy, Turner Prize), or equivalent national/international prize
+  → Return `STRONG_PASS` with `signal_type: "AWARD_RECIPIENT"`
+
+No further evaluation required for either of these. A full name (2+ tokens) must still be present.
+Do NOT apply this rule if the award or role is only vaguely implied — it must be clearly stated.
+
+---
+
+## Hard Auto-Pass Rule — Editorial Obituary
+
+If the article is clearly a **full editorial obituary written in the publication’s voice**
 (NOT a letter, tribute, or personal reflection):
 
 → Return `STRONG_PASS`
@@ -116,7 +134,8 @@ Use when ALL are true:
 - A **full name** is present (2+ tokens, e.g. “Rachel Reeves”, “Donald Trump”, “Jane Smith”)
 - The article clearly indicates durable footprint such as:
   - sustained career/body of work
-  - public office/leadership role
+  - public office/leadership role (use NATIONAL_POLITICIAN for national legislators/ministers;
+    use PUBLIC_ROLE for senior public figures who don't clearly meet that bar)
   - recognised achievements (awards, books, exhibitions)
   - high-level professional sport
   - founder/executive of recognisable organisation
@@ -305,6 +324,62 @@ Output:
 }
 ```
 
+### Example — national politician (STRONG_PASS / NATIONAL_POLITICIAN)
+
+Input:
+```json
+{
+  "title": "MP John Ellis to stand down at next election",
+  "summary": "The Conservative MP for Linford, first elected in 2010, announced he will not seek re-election citing family reasons.",
+  "source": "BBC News",
+  "publication_date": "2026-02-01"
+}
+```
+Output:
+```json
+{
+  "person_detected": true,
+  "subject_name_as_written": "John Ellis",
+  "subject_name_full": "John Ellis",
+  "name_completeness": "FULL_NAME",
+  "primary_focus": true,
+  "gate1_decision": "STRONG_PASS",
+  "reasoning_summary": [
+    "John Ellis is explicitly identified as a sitting MP (national legislator); WP:ANYBIO auto-pass applies."
+  ],
+  "signal_type": "NATIONAL_POLITICIAN",
+  "confidence": "high"
+}
+```
+
+### Example — award recipient (STRONG_PASS / AWARD_RECIPIENT)
+
+Input:
+```json
+{
+  "title": "Ceramicist Mary Osei awarded OBE in New Year Honours",
+  "summary": "Mary Osei, known for her large-scale installation work, received the honour for services to craft.",
+  "source": "The Guardian",
+  "publication_date": "2026-01-01"
+}
+```
+Output:
+```json
+{
+  "person_detected": true,
+  "subject_name_as_written": "Mary Osei",
+  "subject_name_full": "Mary Osei",
+  "name_completeness": "FULL_NAME",
+  "primary_focus": true,
+  "gate1_decision": "STRONG_PASS",
+  "reasoning_summary": [
+    "Mary Osei is clearly stated to have received an OBE (national honour); WP:ANYBIO auto-pass applies."
+  ],
+  "signal_type": "AWARD_RECIPIENT",
+  "confidence": "high"
+}
+```
+
 ---
 
 ## Output Format (STRICT JSON ONLY)
@@ -323,7 +398,7 @@ Return exactly the following JSON object (and nothing else):
     "Bullet grounded explicitly in article text",
     "Optional second bullet"
   ],
-  "signal_type": "EDITORIAL_OBIT | CAREER_PROFILE | PUBLIC_ROLE | MID_TIER_PROFESSIONAL | SINGLE_EVENT | COLLECTIVE | GLOBALLY_FAMOUS | OTHER",
+  "signal_type": "EDITORIAL_OBIT | CAREER_PROFILE | PUBLIC_ROLE | NATIONAL_POLITICIAN | AWARD_RECIPIENT | MID_TIER_PROFESSIONAL | SINGLE_EVENT | COLLECTIVE | GLOBALLY_FAMOUS | OTHER",
   "confidence": "high | medium | low"
 }
 ```
