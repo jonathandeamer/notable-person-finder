@@ -30,7 +30,11 @@ This produces a set of credible, verifiable sources for each remaining candidate
 
 ### Phase D — Surface Candidates for Human Review
 
-An AI model reviews the filtered coverage and judges whether each result is genuinely about the subject (not a different person with the same name). To qualify as "likely notable," a person needs at least two distinct reliable sources that clearly cover them as an individual.
+An AI model reviews the coverage and judges whether each result is genuinely about the subject—ruling out passing mentions and people with the same name. The strength of the verdict depends on where the coverage comes from.
+
+**Likely notable** means at least two sources from a curated list of known reliable outlets (major wire services, national broadcasters, established newspapers) independently cover the person. The list is fixed and the threshold is objective.
+
+**Possibly notable** is the fallback for people who don't clear that bar. Here the AI itself judges whether the remaining sources look editorially credible—a softer signal that warrants attention but not yet a confident recommendation.
 
 The results are written to a daily digest (`output/openclaw/daily_notability_digest.json`) and a human-readable report. No edits to Wikipedia happen automatically.
 
@@ -55,7 +59,7 @@ A typical candidate entry looks like:
 }
 ```
 
-Possible verdicts: `LIKELY_NOTABLE`, `POSSIBLY_NOTABLE`, `NOT_NOTABLE`, `HAS_PAGE` (already on Wikipedia), `SKIPPED`.
+Possible verdicts: `LIKELY_NOTABLE` (≥2 curated reliable sources), `POSSIBLY_NOTABLE` (covered, but reliability judged by AI rather than a fixed list), `NOT_NOTABLE`, `HAS_PAGE` (already on Wikipedia), `SKIPPED`.
 
 ---
 

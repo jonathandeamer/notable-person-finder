@@ -90,8 +90,10 @@ allowing redirects or other signals.
 
 ## Gate 4b not marking someone as likely notable?
 
-Gate 4b now requires coverage on at least two distinct reliable Brave domains before promoting `LIKELY_NOTABLE`. If you see `POSSIBLY_NOTABLE` instead:
+Gate 4b uses a two-pass approach. `LIKELY_NOTABLE` requires ≥2 distinct domains from the curated Wikipedia-reliable source list (first pass). `POSSIBLY_NOTABLE` is the second-pass outcome: the curated threshold wasn't met, but the LLM judged ≥2 sources in the broader (unfiltered) Brave results to be editorially reliable and about the subject.
 
-- Inspect `state/gate4b_llm_results.jsonl` for the `first_pass_domains`/`second_pass_domains` lists and the recorded domain count.
-- Ensure `state/gate4_reliable_coverage.jsonl` collected enough distinct domains (cut down on duplicate sources or config missing reliable domains).
-- The digest (`scripts/daily_notability_digest_report.py`) surfaces these domain counts at a glance.
+If you see `POSSIBLY_NOTABLE` instead of `LIKELY_NOTABLE`:
+
+- Inspect `state/gate4b_llm_results.jsonl` for `first_pass_domains` and `second_pass_domains` — these show exactly which domains qualified in each pass.
+- Check `state/gate4_reliable_coverage.jsonl` to see how many curated-source results were collected; fewer than 2 distinct domains after deduplication means the curated threshold can't be reached.
+- The digest (`scripts/daily_notability_digest_report.py`) surfaces domain counts at a glance.

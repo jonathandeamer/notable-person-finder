@@ -82,7 +82,7 @@ See `docs/running.md` for complete stage commands.
 7. **Gate 3 Index Update** — Writes `HAS_PAGE` decisions back to `state/wiki_known_pages.json`
 8. **Brave Coverage** — Deterministic Brave Search News API queries; caches results
 9. **Gate 4 Reliable Filter** — Keeps only Wikipedia-approved news source domains
-10. **Gate 4b LLM Coverage Verifier** — LLM judges whether each result is genuinely about the subject (not a namesake) by counting distinct reliable Brave domains across the first and second pass
+10. **Gate 4b LLM Coverage Verifier** — Two-pass LLM coverage verifier: first pass counts distinct domains from a curated Wikipedia-reliable source list (`LIKELY_NOTABLE` if ≥2); second pass asks the LLM to judge source reliability itself from the full Brave result set (`POSSIBLY_NOTABLE` if combined domains ≥2)
 11. **Report + Digest** — Generates summary output plus `output/openclaw/daily_notability_digest.json` for external agents (see `scripts/daily_notability_digest_report.py`)
 
 ### Key Design Principles
@@ -143,11 +143,11 @@ See `docs/running.md` for complete stage commands.
 - `UNCERTAIN` — Can't determine; fallback to coverage search
 
 **Gate 4b Decisions:**
-- `LIKELY_NOTABLE` — At least two distinct reliable Brave domains (first- or second-pass) clearly cover the subject
-- `POSSIBLY_NOTABLE` — One reliable domain; needs more coverage to confirm
+- `LIKELY_NOTABLE` — ≥2 distinct domains from the curated Wikipedia-reliable source list confirm the subject is the primary focus (first pass)
+- `POSSIBLY_NOTABLE` — Didn't reach the curated-source threshold, but the LLM judged ≥2 sources in the broader (unfiltered) Brave results to be editorially reliable and about the subject (second pass)
 - `UNCERTAIN` — The LLM could not parse or verify results
-- `NOT_NOTABLE` — No reliable domains/coverage found
-- `SKIPPED`/`SKIPPED_HAS_PAGE` — Filtered early (original RSS, already has Wikipedia page)
+- `NOT_NOTABLE` — No reliable coverage found
+- `SKIPPED`/`SKIPPED_HAS_PAGE` — Filtered early (below minimum result threshold, or already has Wikipedia page)
 - `--min-reliable-results` default: 2 (minimum Brave results sent to the model per stage)
 
 ## Common Development Tasks
