@@ -460,6 +460,16 @@ def run(args: argparse.Namespace) -> int:
         print("No records found in input.", file=sys.stderr)
         return 1
 
+    # Build already-processed set: skip event_ids with a successful prior result.
+    # Bypassed when --fresh-output is set (empty set → nothing skipped).
+    already_processed: set[str] = set()
+    if not args.fresh_output:
+        for _rec in _read_existing_output(args.output):
+            if _rec.get("llm_error") is None and _rec.get("json_parse_ok"):
+                _eid = _rec.get("event_id")
+                if isinstance(_eid, str):
+                    already_processed.add(_eid)
+
     if args.retry_parse_failures:
         # Use last-wins per event_id so already-resolved records aren't retried again.
         last_by_id: dict[str, dict] = {}
@@ -476,6 +486,12 @@ def run(args: argparse.Namespace) -> int:
             return 0
         sampled = [r for r in records if r.get("event_id") in failed_ids]
     else:
+        records = [r for r in records if r.get("event_id") not in already_processed]
+        if already_processed:
+            print(
+                f"Skipping {len(already_processed)} already-processed event_id(s); "
+                f"{len(records)} unprocessed remaining."
+            )
         sampled = records
 
     # Sort by feed priority tier, then by recency (newest first)

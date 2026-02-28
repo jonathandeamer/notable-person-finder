@@ -419,6 +419,16 @@ def main() -> int:
         print("No records found in input.", file=sys.stderr)
         return 1
 
+    # Build already-processed set: skip event_ids with a successful prior result.
+    # Bypassed when --fresh-output is set (empty set → nothing skipped).
+    already_processed: set[str] = set()
+    if not args.fresh_output:
+        for _rec in _read_existing_output(args.output):
+            if _rec.get("llm_error") is None and _rec.get("json_parse_ok"):
+                _eid = _rec.get("event_id")
+                if isinstance(_eid, str):
+                    already_processed.add(_eid)
+
     if args.retry_parse_failures:
         # Use last-wins per event_id so already-resolved records aren't retried again.
         last_by_id: dict[str, dict] = {}
@@ -437,12 +447,22 @@ def main() -> int:
         sample_size = len(records)
         sampled = records
     elif args.sample_size is not None:
-        # Sort by priority + recency, then take top N
+        records = [r for r in records if r.get("event_id") not in already_processed]
+        if already_processed:
+            print(
+                f"Skipping {len(already_processed)} already-processed event_id(s); "
+                f"{len(records)} unprocessed remaining."
+            )
         records = sort_by_priority_recency(records)
         sample_size = min(args.sample_size, len(records))
         sampled = records[:sample_size]
     else:
-        # Process all records, sorted by priority + recency
+        records = [r for r in records if r.get("event_id") not in already_processed]
+        if already_processed:
+            print(
+                f"Skipping {len(already_processed)} already-processed event_id(s); "
+                f"{len(records)} unprocessed remaining."
+            )
         records = sort_by_priority_recency(records)
         sample_size = len(records)
         sampled = records
@@ -526,6 +546,10 @@ def main() -> int:
             gate3_status: str | None = None
             if parse_ok and isinstance(parsed_output, dict):
                 gate3_status = parsed_output.get("status")
+            # Fallback: LLM error or parse failure → emit UNCERTAIN so this record
+            # flows to Brave coverage rather than being silently dropped from output.
+            if gate3_status is None:
+                gate3_status = "UNCERTAIN"
 
             result_record = {
                 "trial_at_utc": utc_now_iso(),
