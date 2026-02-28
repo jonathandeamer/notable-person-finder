@@ -10,7 +10,7 @@ Wikipedia Notability Finder: A deterministic Python pipeline that identifies peo
 
 ### Python Environment
 - **Version**: Python 3.13 (configured in `.venv/pyvenv.cfg`)
-- **Virtual Environment**: Located at `.venv/` (already created)
+- **Virtual Environment**: Located at `.venv/` (not in repository; create with `python3 -m venv .venv`)
 - **Dependencies**: Minimal; uses mostly standard library + `requests`
 
 ### Running Tests
@@ -77,7 +77,7 @@ See `docs/running.md` for complete stage commands.
 2. **Gate 0** — Deterministic name-heuristic filter; uses `state/wiki_known_pages.json` to skip already-known names
 3. **Gate 1** — LLM triage (name-strict, high-recall); outputs structured JSON with decisions: `STRONG_PASS`/`WEAK_PASS`/`FAIL`
 4. **MediaWiki Candidates** — Deterministic Wikipedia API search; fetches article metadata
-5. **Gate 2** — Deterministic has-page filter using biography score + Levenshtein distance; updates known pages index
+5. **Gate 2** — Deterministic annotation pass; scores candidates using biography score + Levenshtein distance; all records proceed to Gate 3 (skip output is always empty)
 6. **Gate 3** — LLM page-match decision; compares candidate to parsed Wikipedia content
 7. **Gate 3 Index Update** — Writes `HAS_PAGE` decisions back to `state/wiki_known_pages.json`
 8. **Brave Coverage** — Deterministic Brave Search News API queries; caches results

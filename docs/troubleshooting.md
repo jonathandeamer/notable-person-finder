@@ -41,8 +41,8 @@ record take minutes.
 
 Checks:
 - Watch progress output (e.g., `progress: 5/30`).
-- Monitor output growth: `wc -l /Users/jonathan/new-wikipedia-article-checker/state/wiki_candidates.jsonl`
-- Use the request log: `tail -f /Users/jonathan/new-wikipedia-article-checker/state/mw_candidates.log`
+- Monitor output growth: `wc -l state/wiki_candidates.jsonl`
+- Use the request log: `tail -f state/mw_candidates.log`
 
 Mitigations:
 - Lower `--search-max-results` or `--srlimit`.

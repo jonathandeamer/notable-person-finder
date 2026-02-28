@@ -44,7 +44,7 @@ The results are written to a daily digest (`output/openclaw/daily_notability_dig
 
 Each pipeline run produces:
 
-- **`output/openclaw/daily_notability_digest.json`** — Structured digest consumed by the [OpenClaw](what-is-openclaw.md) agent platform; contains all candidates with their notability verdict and source count
+- **`output/openclaw/daily_notability_digest.json`** — Structured digest consumed by the OpenClaw agent platform; contains all candidates with their notability verdict and source count
 - **`output/runs/*_summary.json`** — Per-run summary with stage-by-stage record counts
 
 A typical candidate entry looks like:
@@ -73,7 +73,7 @@ git clone <repo-url>
 cd notable-person-finder
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt   # minimal deps; mostly stdlib + requests
+pip install requests   # only non-stdlib dependency
 
 # Set API keys
 export BRAVE_API_KEY="your-brave-key"
