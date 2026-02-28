@@ -2,9 +2,9 @@
 """
 run_pipeline.py — End-to-end orchestrator for the Wikipedia notability finder pipeline.
 
-Chains all 11 pipeline stages for daily/on-demand runs:
-  rss_ingest → gate0 → gate1 → mw_candidates → gate2 → gate3 → gate3_index
-  → brave → gate4_filter → gate4b → report
+Chains all 12 pipeline stages for daily/on-demand runs:
+  rss_ingest → gate0 → gate1 → gate1_index → mw_candidates → gate2 → gate3
+  → gate3_index → brave → gate4_filter → gate4b → report
 
 Usage examples:
   python3 run_pipeline.py --dry-run
@@ -36,6 +36,7 @@ STAGE_ORDER = [
     "rss_ingest",
     "gate0",
     "gate1",
+    "gate1_index",
     "mw_candidates",
     "gate2",
     "gate3",
@@ -368,8 +369,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         epilog=textwrap.dedent(
             """\
             Stage names (for --from-gate):
-              rss_ingest, gate0, gate1, mw_candidates, gate2, gate3,
-              gate3_index, brave, gate4_filter, gate4b, report
+              rss_ingest, gate0, gate1, gate1_index, mw_candidates, gate2,
+              gate3, gate3_index, brave, gate4_filter, gate4b, report
             """
         ),
     )
@@ -544,6 +545,14 @@ def main(argv=None) -> None:
             ],
         ),
         (
+            "gate1_index",
+            [
+                python, "scripts/det_gate1_index_update.py",
+                "--input", str(state_dir / "gate1_llm_results.jsonl"),
+                "--known-pages", str(state_dir / "wiki_known_pages.json"),
+            ],
+        ),
+        (
             "mw_candidates",
             [
                 python, "scripts/det_mw_candidates.py",
@@ -690,6 +699,9 @@ def main(argv=None) -> None:
             )
             if retry:
                 stage_results.append(retry)
+
+        elif stage_name == "gate1_index":
+            result.notes = "wiki_known_pages.json updated (SKIP_GLOBALLY_KNOWN)"
 
         elif stage_name == "mw_candidates":
             n = count_jsonl_rows(state_dir / "wiki_candidates.jsonl")
