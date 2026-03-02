@@ -201,7 +201,43 @@ Refer to `docs/troubleshooting.md` for:
 - **Pattern**: Load test fixtures from `state/fixtures/` or create inline
 - **Coverage**: Deterministic gates should have >95% coverage; LLM gates test schema/error handling
 
-Example test:
+### Smoke Test (End-to-End)
+
+`tests/test_smoke_pipeline.py` runs the full 12-stage pipeline with no real API calls:
+
+```bash
+python3 -m unittest tests.test_smoke_pipeline -v
+```
+
+**How it works:**
+- Writes a small fixture `prefilter_pass.jsonl` (5 events) into an isolated `tempfile` state dir
+- Pre-populates MW and Brave caches using SHA256-keyed JSON files so no network calls are made
+- Prepends `tests/mock_bin/` to `PATH`; the mock `claude` CLI returns canned responses driven by `SMOKE_MOCK_SCENARIO`
+- Sets `BRAVE_API_KEY=test` to suppress key-not-found errors
+
+**Test classes:**
+
+| Class | Tests | Scenario |
+|-------|-------|----------|
+| `TestSmokePipelineHappyPath` | 20 | Normal run; verifies records through all 12 stages |
+| `TestSmokePipelineGate1Malformed` | 2 | Malformed gate1 JSON → `json_parse_ok=False` records |
+| `TestSmokePipelineGate3AllHasPage` | 3 | Mock returns `HAS_PAGE` for all candidates; pipeline still exits 0 |
+| `TestSmokePipelineDryRun` | 3 | `--dry-run` exits 0 and writes no state files |
+
+**Fixture subjects (happy path):**
+
+| Subject | Gate 1 | Gate 3 | Gate 4b |
+|---------|--------|--------|---------|
+| Margaret Thatcher | `SKIP_GLOBALLY_KNOWN` | — | — |
+| James Worthington | `STRONG_PASS` | `HAS_PAGE` | `SKIPPED_HAS_PAGE` |
+| Clara Osei-Mensah | `STRONG_PASS` | `MISSING` | `LIKELY_NOTABLE` |
+| Bob Fielding | `WEAK_PASS` | `MISSING` | `SKIPPED` |
+| BuyNow Pro Software | `FAIL` | — | — |
+
+**Adding a new scenario:** Add a branch to `tests/mock_bin/claude` keyed on `SMOKE_MOCK_SCENARIO`, then write a new `SmokeTestBase` subclass in `test_smoke_pipeline.py`.
+
+### Unit Test Example
+
 ```python
 import unittest
 from name_utils import normalize_name
