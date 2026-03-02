@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import unittest
 from pathlib import Path
 
@@ -167,6 +168,57 @@ class TestGate1TrialRetries(unittest.TestCase):
 
         # Verify order: priority 1, 2, 3
         self.assertEqual([e["event_id"] for e in unprocessed], ["2", "3", "1"])
+
+    # ------------------------------------------------------------------
+    # safe_json_parse — error path coverage
+    # ------------------------------------------------------------------
+
+    def test_safe_json_parse_broken_json_with_brace(self) -> None:
+        """JSON with both braces but invalid syntax → json_decode_error branch."""
+        # Has '{' and '}' (required to reach the inner try) but still not valid JSON.
+        ok, parsed, err = self.gate1.safe_json_parse('{"gate1_decision": bad_value}')
+        self.assertFalse(ok)
+        self.assertIsNone(parsed)
+        self.assertIsNotNone(err)
+        self.assertIn("json_decode_error", err)
+
+    def test_safe_json_parse_truncated_no_brace(self) -> None:
+        """Truncated JSON with no closing brace → no_json_object_found branch."""
+        ok, parsed, err = self.gate1.safe_json_parse('{"gate1_decision": "STRONG_PASS"')
+        self.assertFalse(ok)
+        self.assertIsNone(parsed)
+        self.assertEqual(err, "no_json_object_found")
+
+    def test_safe_json_parse_missing_decision_field(self) -> None:
+        """Valid JSON dict that omits gate1_decision → parses OK, but decision is None on extraction."""
+        # Simulates a model returning valid JSON that partially matches the schema.
+        incomplete = json.dumps({
+            "person_detected": True,
+            "subject_name_as_written": "Alice Smith",
+            "subject_name_full": "Alice Smith",
+            # gate1_decision is intentionally absent
+        })
+        ok, parsed, err = self.gate1.safe_json_parse(incomplete)
+        self.assertTrue(ok)
+        self.assertIsInstance(parsed, dict)
+        self.assertIsNone(err)
+        # Downstream code does parsed_output.get("gate1_decision") — must return None, not raise.
+        decision = parsed.get("gate1_decision") if isinstance(parsed, dict) else None
+        self.assertIsNone(decision)
+
+    def test_safe_json_parse_extra_fields_ok(self) -> None:
+        """Unexpected extra fields in the JSON are silently accepted by the parser."""
+        full = json.dumps({
+            "person_detected": True,
+            "gate1_decision": "STRONG_PASS",
+            "unexpected_extra_field": "some_value",
+            "another_unknown": 42,
+        })
+        ok, parsed, err = self.gate1.safe_json_parse(full)
+        self.assertTrue(ok)
+        self.assertIsInstance(parsed, dict)
+        # The decision is still correctly extractable despite extra fields.
+        self.assertEqual(parsed.get("gate1_decision"), "STRONG_PASS")
 
     def test_sort_by_priority_none_last(self) -> None:
         """Events with feed_priority=None should sort after numbered priorities."""
