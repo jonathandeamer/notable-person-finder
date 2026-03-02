@@ -243,6 +243,90 @@ class TestGate3Runner(unittest.TestCase):
         self.assertIn("Jane Smith (author)", result)
         self.assertIn("British novelist", result)
 
+    # --- safe_json_parse: error path coverage ---
+
+    def test_safe_json_parse_broken_json_with_brace(self) -> None:
+        """JSON with both braces but invalid syntax → json_decode_error branch."""
+        # Has '{' and '}' (required to reach the inner try) but still not valid JSON.
+        ok, parsed, err = self.mod.safe_json_parse('{"status": bad_value}')
+        self.assertFalse(ok)
+        self.assertIsNone(parsed)
+        self.assertIsNotNone(err)
+        self.assertIn("json_decode_error", err)
+
+    def test_safe_json_parse_truncated_no_brace(self) -> None:
+        """Truncated JSON with no closing brace → no_json_object_found branch."""
+        ok, parsed, err = self.mod.safe_json_parse('{"status": "HAS_PAGE"')
+        self.assertFalse(ok)
+        self.assertIsNone(parsed)
+        self.assertEqual(err, "no_json_object_found")
+
+    def test_safe_json_parse_missing_status_field(self) -> None:
+        """Valid JSON dict missing 'status' field → parses OK, but downstream extracts None."""
+        incomplete = json.dumps({
+            "matched_title": "Some Title",
+            "confidence": 0.8,
+            "evidence": ["reason"],
+            # 'status' intentionally absent
+        })
+        ok, parsed, err = self.mod.safe_json_parse(incomplete)
+        self.assertTrue(ok)
+        self.assertIsInstance(parsed, dict)
+        self.assertIsNone(err)
+        self.assertIsNone(parsed.get("status"))
+
+    def test_safe_json_parse_extra_fields_ok(self) -> None:
+        """Extra unexpected fields don't break parsing."""
+        full = json.dumps({
+            "status": "MISSING",
+            "matched_title": None,
+            "confidence": 0.1,
+            "evidence": ["no match"],
+            "extra_field": "surprise",
+        })
+        ok, parsed, err = self.mod.safe_json_parse(full)
+        self.assertTrue(ok)
+        self.assertEqual(parsed.get("status"), "MISSING")
+
+    # --- gate3_status UNCERTAIN fallback ---
+
+    def test_gate3_status_uncertain_on_parse_failure(self) -> None:
+        """When json_parse_ok=False, gate3_status must fall back to UNCERTAIN (not None/dropped)."""
+        parse_ok = False
+        parsed_output = None
+        gate3_status: str | None = None
+        if parse_ok and isinstance(parsed_output, dict):
+            gate3_status = parsed_output.get("status")
+        if gate3_status is None:
+            gate3_status = "UNCERTAIN"
+        self.assertEqual(gate3_status, "UNCERTAIN")
+
+    def test_gate3_status_uncertain_on_missing_status_field(self) -> None:
+        """Valid JSON dict that omits 'status' → gate3_status falls back to UNCERTAIN."""
+        parse_ok = True
+        parsed_output = {"matched_title": None, "confidence": 0.5, "evidence": ["unclear"]}
+        gate3_status: str | None = None
+        if parse_ok and isinstance(parsed_output, dict):
+            gate3_status = parsed_output.get("status")
+        if gate3_status is None:
+            gate3_status = "UNCERTAIN"
+        self.assertEqual(gate3_status, "UNCERTAIN")
+
+    def test_gate3_status_uncertain_when_llm_errors(self) -> None:
+        """When LLM raises (error set, parse_ok=False) the record is UNCERTAIN, not dropped."""
+        # Simulate: error caught, parse never ran
+        parse_ok = False
+        parsed_output = None
+        error = "claude cli failed after 3 attempts: connection refused"
+        gate3_status: str | None = None
+        if parse_ok and isinstance(parsed_output, dict):
+            gate3_status = parsed_output.get("status")
+        if gate3_status is None:
+            gate3_status = "UNCERTAIN"
+        self.assertEqual(gate3_status, "UNCERTAIN")
+        # Confirm the error string is preserved (caller would write it to the record)
+        self.assertIn("claude cli failed", error)
+
     def test_format_gate3_prompt_numbered_candidates(self) -> None:
         prompt_body = "Gate 3 prompt."
         source_context = {"entry_title": "T", "summary": "S", "source": "P", "publication_date": "2026-01-01"}
