@@ -289,7 +289,7 @@ class TestGate4bRunner(unittest.TestCase):
             self.mod.call_claude_cli = orig
 
     # ------------------------------------------------------------------
-    # test 6: CLI failure → llm_error set, gate4b_status null
+    # test 6: CLI failure → llm_error set, gate4b_status UNCERTAIN
     # ------------------------------------------------------------------
     def test_llm_error_recorded(self) -> None:
         def fake_llm(*_args, **_kwargs):
@@ -309,7 +309,8 @@ class TestGate4bRunner(unittest.TestCase):
                 self.assertEqual(len(rows), 1)
                 self.assertIsNotNone(rows[0]["llm_error"])
                 self.assertIn("connection refused", rows[0]["llm_error"])
-                self.assertEqual(rows[0]["gate4b_status"], "NOT_NOTABLE")
+                # LLM error → we don't know notability; must be UNCERTAIN not NOT_NOTABLE
+                self.assertEqual(rows[0]["gate4b_status"], "UNCERTAIN")
                 self.assertEqual(rows[0]["confirmed_count"], 0)
                 self.assertEqual(rows[0]["second_pass_results_sent"], [])
                 self.assertIsNone(rows[0]["second_pass_json_parse_ok"])
@@ -317,7 +318,7 @@ class TestGate4bRunner(unittest.TestCase):
             self.mod.call_claude_cli = orig
 
     # ------------------------------------------------------------------
-    # test 7: non-JSON output → json_parse_ok=False
+    # test 7: non-JSON output → json_parse_ok=False, gate4b_status UNCERTAIN
     # ------------------------------------------------------------------
     def test_json_parse_failure_recorded(self) -> None:
         def fake_llm(*_args, **_kwargs):
@@ -337,7 +338,8 @@ class TestGate4bRunner(unittest.TestCase):
                 self.assertEqual(len(rows), 1)
                 self.assertFalse(rows[0]["json_parse_ok"])
                 self.assertIsNotNone(rows[0]["json_parse_error"])
-                self.assertEqual(rows[0]["gate4b_status"], "NOT_NOTABLE")
+                # Parse failure → we don't know notability; must be UNCERTAIN not NOT_NOTABLE
+                self.assertEqual(rows[0]["gate4b_status"], "UNCERTAIN")
                 self.assertEqual(rows[0]["second_pass_results_sent"], [])
                 self.assertIsNone(rows[0]["second_pass_json_parse_ok"])
         finally:

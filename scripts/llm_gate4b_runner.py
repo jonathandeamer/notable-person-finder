@@ -721,7 +721,12 @@ def run(args: argparse.Namespace) -> int:
 
             all_domains = _dedup_ordered(first_pass_domains + second_pass_domains)
             if gate4b_status is None:
-                gate4b_status = "NOT_NOTABLE"
+                # gate4b_status is only None here when the LLM call raised an
+                # exception or the JSON failed to parse — we don't know whether
+                # the subject is notable, so emit UNCERTAIN rather than NOT_NOTABLE.
+                # (When the LLM succeeds but finds nothing, NOT_NOTABLE is set
+                # explicitly inside the parse_ok block above.)
+                gate4b_status = "UNCERTAIN"
 
             result_record = {
                 "trial_at_utc": utc_now_iso(),
