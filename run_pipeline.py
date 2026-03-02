@@ -567,6 +567,8 @@ def main(argv=None) -> None:
             [
                 python, "scripts/det_gate2_has_page.py",
                 "--input", str(state_dir / "wiki_candidates.jsonl"),
+                "--pass-output", str(state_dir / "wiki_candidates_pass.jsonl"),
+                "--skip-output", str(state_dir / "wiki_candidates_skip.jsonl"),
                 "--overwrite",
             ],
         ),
@@ -593,6 +595,9 @@ def main(argv=None) -> None:
             "brave",
             [
                 python, "scripts/det_brave_coverage.py",
+                "--input", str(state_dir / "gate3_llm_results.jsonl"),
+                "--output", str(state_dir / "brave_coverage.jsonl"),
+                "--cache-dir", str(state_dir / "brave_cache"),
                 "--overwrite",
                 "--throttle-ms", "1100",
             ],
@@ -601,6 +606,8 @@ def main(argv=None) -> None:
             "gate4_filter",
             [
                 python, "scripts/det_gate4_reliable_filter.py",
+                "--input", str(state_dir / "brave_coverage.jsonl"),
+                "--output", str(state_dir / "gate4_reliable_coverage.jsonl"),
                 "--overwrite",
             ],
         ),
@@ -608,6 +615,8 @@ def main(argv=None) -> None:
             "gate4b",
             [
                 python, "scripts/llm_gate4b_runner.py",
+                "--input", str(state_dir / "gate4_reliable_coverage.jsonl"),
+                "--output", str(state_dir / "gate4b_llm_results.jsonl"),
                 "--prompt", "prompts/gate4b.md",
                 "--backend", args.backend_gate4b,
                 "--model", args.model_gate4b,
