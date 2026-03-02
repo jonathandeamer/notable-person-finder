@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Mock claude CLI for smoke tests.
+
+Reads a prompt from stdin (passed via -p -) and returns a canned JSON response
+that matches the expected schema for Gate 1, Gate 3, or Gate 4b.
+
+Gate detection (based on prompt content):
+  "about_subject" in prompt  → Gate 4b call
+  "matched_title" in prompt  → Gate 3 call
+  otherwise                  → Gate 1 call
+
+Second-pass Gate 4b detected by "is_reliable_source" in prompt
+(from gate4b_unlisted.md schema).
+
+Scenario controlled by SMOKE_MOCK_SCENARIO env var (default: happy_path):
+  happy_path     — correct decisions for each fixture subject
+  gate1_all_fail — always return FAIL for gate1; gate3/gate4b use happy_path
+  gate1_malformed — return garbage JSON for gate1; gate3/gate4b use happy_path
+  gate3_malformed — return garbage JSON for gate3; gate1/gate4b use happy_path
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+# Accept --model, -p, - flags but ignore them; prompt comes via stdin.
+# The claude CLI is called as: claude --model <model> -p -
+# We simply read stdin for the prompt.
+
+SCENARIO = os.environ.get("SMOKE_MOCK_SCENARIO", "happy_path")
+
+
+# ---------------------------------------------------------------------------
+# Response builders
+# ---------------------------------------------------------------------------
+
+def _gate1_response(
+    decision: str,
+    name_as_written: str | None = None,
+    name_full: str | None = None,
+    signal: str = "OTHER",
+) -> str:
+    person = decision not in ("FAIL",)
+    return json.dumps({
+        "person_detected": person,
+        "subject_name_as_written": name_as_written,
+        "subject_name_full": name_full,
+        "name_completeness": "FULL_NAME" if name_full else "UNKNOWN",
+        "primary_focus": person,
+        "gate1_decision": decision,
+        "reasoning_summary": ["Mock decision for smoke test"],
+        "signal_type": signal,
+        "confidence": "high",
+    })
+
+
+def _gate3_response(status: str, matched_title: str | None = None) -> str:
+    return json.dumps({
+        "status": status,
+        "matched_title": matched_title,
+        "confidence": 0.95 if status == "HAS_PAGE" else 0.9,
+        "evidence": ["Mock evidence for smoke test"],
+    })
+
+
+def _gate4b_first_response(about_bools: list[bool]) -> str:
+    results = [
+        {
+            "rank": i + 1,
+            "about_subject": b,
+            "confidence": 0.9,
+            "reasoning": "Mock reasoning",
+        }
+        for i, b in enumerate(about_bools)
+    ]
+    return json.dumps({"results": results})
+
+
+def _gate4b_second_response(pairs: list[tuple[bool, bool]]) -> str:
+    """pairs: list of (about_subject, is_reliable_source)."""
+    results = [
+        {
+            "rank": i + 1,
+            "about_subject": ab,
+            "is_reliable_source": rs,
+            "confidence": 0.9,
+            "reasoning": "Mock reasoning",
+        }
+        for i, (ab, rs) in enumerate(pairs)
+    ]
+    return json.dumps({"results": results})
+
+
+# ---------------------------------------------------------------------------
+# Per-gate handlers (happy_path)
+# ---------------------------------------------------------------------------
+
+def _handle_gate1(prompt: str) -> str:
+    if "Margaret Thatcher" in prompt:
+        return _gate1_response(
+            "SKIP_GLOBALLY_KNOWN",
+            "Margaret Thatcher",
+            "Margaret Thatcher",
+            "GLOBALLY_FAMOUS",
+        )
+    if "James Worthington" in prompt:
+        return _gate1_response(
+            "STRONG_PASS",
+            "James Worthington",
+            "James Worthington",
+            "CAREER_PROFILE",
+        )
+    if "Clara Osei" in prompt or "Osei-Mensah" in prompt:
+        return _gate1_response(
+            "STRONG_PASS",
+            "Clara Osei-Mensah",
+            "Clara Osei-Mensah",
+            "AWARD_RECIPIENT",
+        )
+    if "Bob Fielding" in prompt:
+        return _gate1_response(
+            "WEAK_PASS",
+            "Bob Fielding",
+            "Bob Fielding",
+            "MID_TIER_PROFESSIONAL",
+        )
+    # Default: FAIL for unrecognised subjects (e.g. BuyNow Pro Software)
+    return _gate1_response("FAIL", None, None, "COMMERCIAL_PRODUCT")
+
+
+def _handle_gate3(prompt: str) -> str:
+    if "James Worthington" in prompt:
+        return _gate3_response("HAS_PAGE", "James Worthington")
+    return _gate3_response("MISSING", None)
+
+
+def _handle_gate4b(prompt: str) -> str:
+    is_second_pass = "is_reliable_source" in prompt
+    if is_second_pass:
+        # Second pass: Bob Fielding is not notable
+        # Return false/false for all results so Bob stays NOT_NOTABLE
+        return _gate4b_second_response([(False, False)] * 3)
+    # First pass
+    if "Clara" in prompt:
+        # Clara: 2 results about her → LIKELY_NOTABLE
+        return _gate4b_first_response([True, True, False])
+    # Bob: none about him → NOT_NOTABLE
+    return _gate4b_first_response([False, False, False])
+
+
+# ---------------------------------------------------------------------------
+# Scenario dispatch
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    prompt = sys.stdin.read()
+
+    is_gate4b = "about_subject" in prompt
+    is_gate3 = "matched_title" in prompt
+    # is_gate1 = not is_gate4b and not is_gate3
+
+    if SCENARIO == "gate1_all_fail":
+        if is_gate4b:
+            print(_handle_gate4b(prompt))
+        elif is_gate3:
+            print(_handle_gate3(prompt))
+        else:
+            # Always fail for gate1
+            print(_gate1_response("FAIL", None, None, "UNKNOWN"))
+        return
+
+    if SCENARIO == "gate1_malformed":
+        if is_gate4b:
+            print(_handle_gate4b(prompt))
+        elif is_gate3:
+            print(_handle_gate3(prompt))
+        else:
+            # Malformed JSON for gate1
+            print("not valid json {{{")
+        return
+
+    if SCENARIO == "gate3_malformed":
+        if is_gate4b:
+            print(_handle_gate4b(prompt))
+        elif is_gate3:
+            # Malformed JSON for gate3
+            print("not valid json {{{")
+        else:
+            print(_handle_gate1(prompt))
+        return
+
+    if SCENARIO == "gate3_all_has_page":
+        if is_gate4b:
+            print(_handle_gate4b(prompt))
+        elif is_gate3:
+            # All subjects return HAS_PAGE with mock matched title
+            print(_gate3_response("HAS_PAGE", "Mock Title"))
+        else:
+            print(_handle_gate1(prompt))
+        return
+
+    # Default: happy_path
+    if is_gate4b:
+        print(_handle_gate4b(prompt))
+    elif is_gate3:
+        print(_handle_gate3(prompt))
+    else:
+        print(_handle_gate1(prompt))
+
+
+if __name__ == "__main__":
+    main()
