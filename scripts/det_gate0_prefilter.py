@@ -24,6 +24,11 @@ OBIT_CUE_PATTERN = re.compile(
 )
 OBIT_GUARDRAIL_TOKEN_PATTERN = re.compile(r"\b[A-Z][a-z]{2,39}\b")
 _LETTERS_RE = re.compile(r"^Letters?:\s", re.ASCII)
+_LETTERS_SUFFIX_RE = re.compile(r"\|\s*Letters?\s*$", re.IGNORECASE)
+_STRUCTURAL_SKIP_RE = re.compile(
+    r"(?:–|-)\s+in\s+pictures\b|\bin\s+pictures\b|\bTrivia\b",
+    re.IGNORECASE,
+)
 _PERSONAL_OBIT_RE = re.compile(
     r"(?:^|<p>)\s*(?:My|Our)\s+(?:late\s+)?"
     r"(?:husband|wife|father|mother|son|daughter|sister|brother|"
@@ -37,6 +42,7 @@ PREFILTER_SKIP = "PREFILTER_SKIP_NO_NAME"
 PREFILTER_SKIP_KNOWN = "PREFILTER_SKIP_HAS_WIKI_PAGE"
 PREFILTER_SKIP_LETTERS = "LETTERS_HEADER_SKIP"
 PREFILTER_SKIP_READER_OBIT = "PERSONAL_TRIBUTE_OBIT_SKIP"
+PREFILTER_SKIP_STRUCTURAL = "PREFILTER_SKIP_STRUCTURAL_PATTERN"
 
 
 def parse_feed_priorities(path: Path) -> dict[str, int]:
@@ -113,10 +119,23 @@ def extract_candidate_name(text: str) -> str | None:
 def classify_event(event: dict) -> dict:
     entry_title = event.get("entry_title") or ""
     summary = event.get("summary") or ""
-    if _LETTERS_RE.match(entry_title):
+    if _LETTERS_RE.match(entry_title) or _LETTERS_SUFFIX_RE.search(entry_title):
         return {
             "prefilter_decision": PREFILTER_SKIP_LETTERS,
             "prefilter_reason_codes": ["LETTERS_HEADER_SKIP"],
+            "prefilter_signals": {
+                "full_name_match": False,
+                "initial_surname_match": False,
+                "obit_cue_match": False,
+                "obit_guardrail_token_match": False,
+                "known_wiki_page_match": False,
+            },
+        }
+
+    if _STRUCTURAL_SKIP_RE.search(entry_title):
+        return {
+            "prefilter_decision": PREFILTER_SKIP_STRUCTURAL,
+            "prefilter_reason_codes": ["STRUCTURAL_TOPIC_SKIP"],
             "prefilter_signals": {
                 "full_name_match": False,
                 "initial_surname_match": False,

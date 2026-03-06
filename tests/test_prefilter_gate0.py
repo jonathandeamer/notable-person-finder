@@ -202,6 +202,42 @@ class TestPrefilterGate0(unittest.TestCase):
         self.assertEqual(out["prefilter_decision"], "PERSONAL_TRIBUTE_OBIT_SKIP")
         self.assertIn("PERSONAL_TRIBUTE_OBIT_SKIP", out["prefilter_reason_codes"])
 
+    def test_letters_pipe_suffix_skipped(self) -> None:
+        event = {
+            "entry_title": "Art and loss in the modern age | Letters",
+            "summary": "Readers respond",
+        }
+        out = self.prefilter.classify_event(event)
+        self.assertEqual(out["prefilter_decision"], "LETTERS_HEADER_SKIP")
+        self.assertIn("LETTERS_HEADER_SKIP", out["prefilter_reason_codes"])
+
+    def test_letter_pipe_suffix_singular_skipped(self) -> None:
+        event = {
+            "entry_title": "On memory and grief | Letter",
+            "summary": "A reader writes",
+        }
+        out = self.prefilter.classify_event(event)
+        self.assertEqual(out["prefilter_decision"], "LETTERS_HEADER_SKIP")
+        self.assertIn("LETTERS_HEADER_SKIP", out["prefilter_reason_codes"])
+
+    def test_in_pictures_structural_skip(self) -> None:
+        event = {
+            "entry_title": "Art Basel 2026 – in pictures",
+            "summary": "A gallery roundup",
+        }
+        out = self.prefilter.classify_event(event)
+        self.assertEqual(out["prefilter_decision"], "PREFILTER_SKIP_STRUCTURAL_PATTERN")
+        self.assertIn("STRUCTURAL_TOPIC_SKIP", out["prefilter_reason_codes"])
+
+    def test_trivia_structural_skip(self) -> None:
+        event = {
+            "entry_title": "Weekend Trivia: Famous Artists",
+            "summary": "Test your knowledge",
+        }
+        out = self.prefilter.classify_event(event)
+        self.assertEqual(out["prefilter_decision"], "PREFILTER_SKIP_STRUCTURAL_PATTERN")
+        self.assertIn("STRUCTURAL_TOPIC_SKIP", out["prefilter_reason_codes"])
+
     def test_personal_obit_father_skipped(self) -> None:
         event = {
             "entry_title": "Desmond McConnell obituary",
