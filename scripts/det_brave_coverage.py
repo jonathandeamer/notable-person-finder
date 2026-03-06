@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -19,6 +20,37 @@ from urllib import request as urlrequest
 
 
 BRAVE_NEWS_API = "https://api.search.brave.com/res/v1/news/search"
+_QUERY_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "by",
+    "for",
+    "from",
+    "has",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "the",
+    "to",
+    "was",
+    "were",
+    "with",
+}
+_OBIT_SIGNALS = (
+    " obituary",
+    " obituaries",
+    " dies",
+    " died",
+    " dead",
+    " death",
+    " passed away",
+    " passes away",
+)
 
 
 def utc_now_iso() -> str:
@@ -249,7 +281,9 @@ def build_result(rank: int, raw: dict) -> dict:
     # Derive source_domain from URL
     try:
         parts = urlparse.urlsplit(url)
-        source_domain = parts.netloc.lstrip("www.") if parts.netloc else ""
+        source_domain = parts.netloc.lower() if parts.netloc else ""
+        if source_domain.startswith("www."):
+            source_domain = source_domain[4:]
     except Exception:
         source_domain = ""
     return {
@@ -263,14 +297,75 @@ def build_result(rank: int, raw: dict) -> dict:
     }
 
 
-def build_queries(subject_name: str, entry_title: str | None) -> list[str]:
-    """Return 1–2 query strings for this subject."""
-    primary = f'"{subject_name}"'
-    queries = [primary]
-    if entry_title and "obituary" in entry_title.lower():
-        secondary = f'"{subject_name}" obituary'
-        queries.append(secondary)
-    return queries
+def _normalize_space(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _name_tokens(name: str) -> list[str]:
+    return re.findall(r"[A-Za-z][A-Za-z'\-]*", name)
+
+
+def _has_obit_signal(entry_title: str | None, summary: str | None) -> bool:
+    if entry_title is None and summary is None:
+        return False
+    text = f" {entry_title or ''} {summary or ''} ".lower()
+    return any(signal in text for signal in _OBIT_SIGNALS)
+
+
+def _context_terms(entry_title: str | None, subject_tokens: set[str]) -> str | None:
+    if not entry_title:
+        return None
+    terms: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(r"[A-Za-z][A-Za-z'\-]{2,}", entry_title):
+        lower = token.lower()
+        if lower in seen:
+            continue
+        if lower in _QUERY_STOPWORDS:
+            continue
+        if lower in subject_tokens:
+            continue
+        seen.add(lower)
+        terms.append(token)
+        if len(terms) >= 2:
+            break
+    if not terms:
+        return None
+    return " ".join(terms)
+
+
+def build_queries(
+    subject_name: str, entry_title: str | None, summary: str | None = None
+) -> list[str]:
+    """Return deterministic query variants for this subject."""
+    subject_name = _normalize_space(subject_name)
+    if not subject_name:
+        return []
+
+    queries: list[str] = [f'"{subject_name}"']
+    has_obit_signal = _has_obit_signal(entry_title, summary)
+    if has_obit_signal:
+        queries.append(f'"{subject_name}" obituary')
+
+    tokens = _name_tokens(subject_name)
+    if len(tokens) >= 3:
+        short_name = f"{tokens[0]} {tokens[-1]}"
+        queries.append(f'"{short_name}"')
+        queries.append(short_name)
+        if has_obit_signal:
+            queries.append(f'"{short_name}" obituary')
+        context = _context_terms(entry_title, {t.lower() for t in tokens})
+        if context:
+            queries.append(f'"{short_name}" {context}')
+
+    deduped: list[str] = []
+    seen_queries: set[str] = set()
+    for query in queries:
+        if query in seen_queries:
+            continue
+        seen_queries.add(query)
+        deduped.append(query)
+    return deduped
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -349,8 +444,9 @@ def run(
             gate3_status = row.get("gate3_status")
             src_ctx = row.get("source_context") or {}
             entry_title = src_ctx.get("entry_title")
+            summary = src_ctx.get("summary")
 
-            queries = build_queries(subject_name, entry_title)
+            queries = build_queries(subject_name, entry_title, summary)
 
             record: dict[str, Any] = {
                 "event_id": event_id,

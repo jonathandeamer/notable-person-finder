@@ -42,6 +42,25 @@ class TestBraveCoverage(unittest.TestCase):
         queries = self.bc.build_queries("Jane Doe", "Jane Doe Obituary")
         self.assertEqual(len(queries), 2)
 
+    def test_build_queries_middle_name_adds_alias_fallbacks(self) -> None:
+        queries = self.bc.build_queries(
+            "Juan Jose Valdez",
+            "Juan Jose Valdez, Last Marine Out of Saigon, Dies at 88",
+        )
+        self.assertIn('"Juan Jose Valdez"', queries)
+        self.assertIn('"Juan Jose Valdez" obituary', queries)
+        self.assertIn('"Juan Valdez"', queries)
+        self.assertIn("Juan Valdez", queries)
+        self.assertIn('"Juan Valdez" Last Marine', queries)
+
+    def test_build_queries_obit_signal_from_summary(self) -> None:
+        queries = self.bc.build_queries(
+            "Juan Jose Valdez",
+            "Last Marine Out of Saigon",
+            summary="He died in Tucson at 88.",
+        )
+        self.assertIn('"Juan Jose Valdez" obituary', queries)
+
     def test_build_result(self) -> None:
         raw = {
             "title": "Rose Freedman, activist",
@@ -58,6 +77,14 @@ class TestBraveCoverage(unittest.TestCase):
         self.assertEqual(result["age"], "2 days ago")
         self.assertEqual(result["page_age"], "2026-02-19")
         self.assertEqual(result["source_domain"], "bbc.co.uk")
+
+    def test_build_result_domain_www_prefix_only(self) -> None:
+        raw = {
+            "title": "Story",
+            "url": "https://www.washingtonpost.com/obituaries/2026/02/28/example/",
+        }
+        result = self.bc.build_result(1, raw)
+        self.assertEqual(result["source_domain"], "washingtonpost.com")
 
     # ------------------------------------------------------------------
     # Integration tests using mocked _fetch_json
