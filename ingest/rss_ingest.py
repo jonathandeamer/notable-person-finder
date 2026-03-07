@@ -75,10 +75,14 @@ def parse_feeds_markdown(path: Path) -> list[str]:
             continue
         if line.startswith("- "):
             maybe_url = line[2:].strip()
-            # Strip optional trailing priority number: "https://example.com 1" -> "https://example.com"
+            # Strip optional trailing priority number: "https://example.com 2.5" -> "https://example.com"
             parts = maybe_url.rsplit(None, 1)
-            if len(parts) == 2 and parts[1].isdigit():
-                maybe_url = parts[0]
+            if len(parts) == 2:
+                try:
+                    float(parts[1])
+                    maybe_url = parts[0]
+                except ValueError:
+                    pass
             if maybe_url.startswith("http://") or maybe_url.startswith("https://"):
                 urls.append(maybe_url)
     return urls

@@ -1,65 +1,15 @@
 ## Feeds
 
-- https://www.theatlantic.com/feed/all/ 2
-- https://www.manchestereveningnews.co.uk/news/?service=rss 2
+- https://www.theguardian.com/uk-news/rss 3
+- https://www.theguardian.com/uk/culture/rss 3
+- https://www.theguardian.com/lifeandstyle/women/rss 2
+- https://www.artforum.com/feed/ 2
 - https://www.theguardian.com/artanddesign/rss 2
 - https://www.theguardian.com/tone/obituaries/rss 1
 - https://rss.nytimes.com/services/xml/rss/nyt/Obituaries.xml 1
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/beds/bucks/herts/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/berkshire/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/bradford/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/bristol/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/cambridgeshire/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/cornwall/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/coventry_warwickshire/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/cumbria/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/derbyshire/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/devon/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/dorset/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/essex/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/gloucestershire/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/hampshire/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/hereford/worcs/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/humber/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/kent/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/lancashire/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/leicestershire/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/lincolnshire/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/london/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/manchester/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/merseyside/rss.xml 3
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/norfolk/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/north_yorkshire/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/northamptonshire/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/nottinghamshire/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/oxfordshire/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/rss.xml 3
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/shropshire/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/somerset/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/south_yorkshire/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/staffordshire/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/suffolk/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/surrey/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/sussex/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/tees/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/tyne/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/wear/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/west_midlands/black_country/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/west_midlands/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/west_yorkshire/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/england/wiltshire/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/scotland/edinburgh_and_east/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/scotland/glasgow_and_west/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/scotland/highlands_and_islands/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/scotland/north_east/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/scotland/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/scotland/scotland_politics/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/scotland/south_of_scotland/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/scotland/tayside_and_central/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/wales/mid/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/wales/north_east/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/wales/north_west/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/wales/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/wales/south_east/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/wales/south_west/rss.xml
-- http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/wales/wales_politics/rss.xml
+- https://rss.nytimes.com/services/xml/rss/nyt/SmallBusiness.xml 4
+- https://rss.nytimes.com/services/xml/rss/nyt/Arts.xml 4
+- https://rss.nytimes.com/services/xml/rss/nyt/ArtandDesign.xml 4
+- https://rss.nytimes.com/services/xml/rss/nyt/US.xml 4
+- https://rss.nytimes.com/services/xml/rss/nyt/World.xml 4
+- https://rss.nytimes.com/services/xml/rss/nyt/Europe.xml 4
