@@ -1,6 +1,6 @@
 # Wikipedia Notability Finder
 
-A deterministic pipeline that identifies people who may merit a Wikipedia biography. It scans RSS news feeds, checks whether each person already has a Wikipedia article, and evaluates the breadth of their press coverage using only Wikipedia-approved sources.
+A tool to identify people who may merit a Wikipedia biography. It scans RSS news feeds, checks whether each person already has a Wikipedia article, and evaluates the breadth of their press coverage using only Wikipedia-approved sources.
 
 **It does not create or edit Wikipedia articles.** All final decisions require human review.
 
