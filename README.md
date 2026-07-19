@@ -135,3 +135,7 @@ python3 -m unittest discover tests/
 - **Strict schemas**: All AI outputs are validated against JSON schemas and fail-safe to a conservative default
 - **Immutable state**: Every stage reads from and writes to separate JSONL files under `state/`; no in-place modification
 - **No auto-edits**: The pipeline never touches Wikipedia; it only surfaces candidates for a human editor to evaluate
+
+### License
+
+Released under the [MIT License](LICENSE). The prompt files in `prompts/` are part of the software and covered by the same license.
