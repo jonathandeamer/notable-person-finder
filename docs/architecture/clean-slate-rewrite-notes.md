@@ -14,9 +14,9 @@ The application will never create or edit Wikipedia articles.
 
 - The application is a personal, once-daily batch tool running on one machine.
 - The rewrite starts with no migration of existing events, caches, decisions, indices, or run history.
-- RSS remains the discovery source.
+- The initial [visual arts discovery profile](../product/arts-discovery-profile.md) monitors eight editor-selected publications through RSS.
 - MediaWiki remains the source for existing-biography checks.
-- Brave News Search remains the coverage-search provider.
+- Brave News Search remains the broad coverage-search provider.
 - Each external service is hidden behind an application-owned interface so it can be replaced without changing the workflow.
 - OpenRouter is the only LLM gateway.
 - The Codex CLI, Claude CLI, and direct OpenAI backends will be removed.
@@ -326,5 +326,6 @@ After those sections are reviewed, this note will be superseded by a complete de
 - [Promptfoo assertions and metrics](https://www.promptfoo.dev/docs/configuration/expected-outputs/)
 - [Dated OpenRouter model pricing and selection research](../research/openrouter-model-pricing-2026-07-23.md)
 - [Wikimania 2026 lightning talk](../product/wikimania-2026-lightning-talk.md)
+- [Visual arts discovery profile and evidence policy](../product/arts-discovery-profile.md)
 - [LangGraph overview](https://docs.langchain.com/oss/python/langgraph/overview)
 - [Preferred Python repository bootstrap](https://github.com/jonathandeamer/jd-claude-skills/blob/master/plugins/bootstrap-python-repo/skills/bootstrap-python-repo/SKILL.md)
