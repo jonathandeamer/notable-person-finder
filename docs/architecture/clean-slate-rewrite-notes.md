@@ -165,17 +165,52 @@ The project initially excludes repeated stochastic trials, confidence intervals,
 
 ## Baseline Engineering Practices
 
-- Manage the project and locked dependencies with `uv` and `pyproject.toml`.
-- Use Ruff for formatting and linting.
-- Use Pyright for static type checking.
-- Use pytest for unit, contract, integration, and end-to-end tests.
+### Repository foundation
+
+- Use the distribution name `notable-person-finder` and import package `notable_person_finder`.
+- Put production code under `src/notable_person_finder/` and expose one installed CLI entry point.
+- Use Python 3.13 consistently in `.python-version`, `project.requires-python`, and Pyright configuration.
+- Manage the project, runtime dependencies, and development dependency group in `pyproject.toml` with `uv`.
+- Use `uv_build` as the build backend and commit `uv.lock`.
+- Do not reinitialize Git or let generated bootstrap files overwrite the existing repository blindly.
+- Keep the existing MIT license.
+- Do not include `tests/__init__.py`; pytest does not require tests to be an importable package.
+- Do not include `py.typed` unless the package later becomes a supported library for external consumers.
+
+### Code quality
+
+- Use Ruff for formatting, import sorting, linting, and Python-version upgrades. Enable at least the `E`, `F`, `I`, and `UP` rule families with an 88-character line length.
+- Use Pyright in standard type-checking mode.
+- Require parameter and return annotations on every function signature.
+- Avoid `Any`; an unavoidable use requires an inline explanation.
+- Catch specific exceptions. A boundary-level broad exception is permitted only when it records the original failure and converts it into a defined application failure without hiding cancellation or shutdown signals.
+- Use structured logging in application and provider code, including run and candidate identifiers.
+- Direct terminal output is restricted to the CLI presentation and report-rendering boundary.
+
+### Tests and evaluations
+
+- Use pytest for unit, contract, migration, integration, and end-to-end tests.
+- Organize focused tests near the source structure where useful, without forcing integration, migration, or end-to-end tests into a one-to-one mirror.
+- Write the failing test before implementing domain behavior or a bug fix.
+- Prefer unit tests at stable interfaces over deep mocks of internal implementation details.
+- Mark tests that make real network requests with `@pytest.mark.integration` and run them only when explicitly selected.
+- Keep the default test suite offline and deterministic.
 - Use Promptfoo as a development-only prompt and model comparison tool.
 - Measure coverage, with emphasis on deterministic domain behavior rather than a repository-wide vanity percentage.
-- Keep network tests opt-in; the default suite is offline and deterministic.
-- Run formatting, linting, type checking, tests, and database migration checks in CI.
+
+### Local and CI enforcement
+
+- Commit `.githooks/pre-commit` to run Ruff lint and format checks on staged Python files.
+- Commit `.githooks/commit-msg` to enforce conventional commit subjects using `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`, `perf`, `ci`, or `build`.
+- Install the hooks locally with `git config core.hooksPath .githooks`.
+- CI runs Ruff over the entire repository, Pyright, the offline pytest suite, and database migration checks.
+- Document `uv sync`, `uv run pytest`, `uv run ruff check .`, `uv run ruff format .`, and `uv run pyright` as standard commands.
+
+### Runtime operations
+
 - Use schema migrations from the first release even though SQLite is local.
 - Keep secrets in environment variables or an OS-level secret mechanism, never in configuration files or the database.
-- Use structured logs with run and candidate identifiers.
+- Commit `.env.example` with `OPENROUTER_API_KEY`, `BRAVE_API_KEY`, and documented optional OpenRouter attribution settings, but no real credentials.
 - Make every run acquire a single-machine lock and create a durable run record before doing work.
 
 ## Deliberate Non-Goals
@@ -214,3 +249,4 @@ After those sections are reviewed, this note will be superseded by a complete de
 - [Promptfoo OpenRouter provider](https://www.promptfoo.dev/docs/providers/openrouter/)
 - [Promptfoo assertions and metrics](https://www.promptfoo.dev/docs/configuration/expected-outputs/)
 - [LangGraph overview](https://docs.langchain.com/oss/python/langgraph/overview)
+- [Preferred Python repository bootstrap](https://github.com/jonathandeamer/jd-claude-skills/blob/master/plugins/bootstrap-python-repo/skills/bootstrap-python-repo/SKILL.md)
