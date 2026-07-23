@@ -305,5 +305,6 @@ After those sections are reviewed, this note will be superseded by a complete de
 - [OpenRouter provider routing](https://openrouter.ai/docs/guides/routing/provider-selection)
 - [Promptfoo OpenRouter provider](https://www.promptfoo.dev/docs/providers/openrouter/)
 - [Promptfoo assertions and metrics](https://www.promptfoo.dev/docs/configuration/expected-outputs/)
+- [Dated OpenRouter model pricing and selection research](../research/openrouter-model-pricing-2026-07-23.md)
 - [LangGraph overview](https://docs.langchain.com/oss/python/langgraph/overview)
 - [Preferred Python repository bootstrap](https://github.com/jonathandeamer/jd-claude-skills/blob/master/plugins/bootstrap-python-repo/skills/bootstrap-python-repo/SKILL.md)
