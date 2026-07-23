@@ -2,7 +2,7 @@
 
 **Status:** Direction agreed; detailed design still in progress  
 **Date:** 2026-07-23  
-**Branch:** `design/clean-slate-rearchitecture`
+**Branch:** `refactor/rearchitecture`
 
 ## Purpose
 
@@ -24,6 +24,25 @@ The application will never create or edit Wikipedia articles.
 - Digest results are ranked by confidence and evidence strength. Roughly ten candidates is the initial operational preference, not a hard architectural limit.
 - Models, model routing, budgets, escalation thresholds, concurrency, and digest size are configuration values.
 - A budget such as GBP 1 per run may be supplied and enforced, but the architecture must not require that exact value or any budget to be configured.
+- People and their supporting evidence persist across daily runs. New coverage can make an older candidate newly worth surfacing.
+
+## Product Principles
+
+The Wikimania 2026 talk, [Who's Missing? Using AI to Spot Wikipedia's Coverage Gaps](../product/wikimania-2026-lightning-talk.md), provides the product charter for the rewrite.
+
+The system allocates scarce editor attention. It is not a notability oracle, an autonomous researcher, or an article-generation system.
+
+- **AI pays attention; people exercise judgment.** Models assist with monitoring, primary-subject detection, identity matching, and evidence triage. Editors decide whether a person is notable, assess the sources, write the article, and participate in normal community review.
+- **The output is a shortlist, not a verdict.** A label such as `likely_notable` means “worth an editor's attention,” not “meets Wikipedia's notability policy.”
+- **Every recommendation is inspectable.** A surfaced person includes the independent sources, relevant evidence, and the reason the system considers the candidate newly interesting.
+- **Uncertainty remains visible.** Ambiguous identity, incomplete evidence, and model or provider failure cannot silently become a confident rejection.
+- **Sources express editorial interest.** Editors choose the feeds and source sets that define the topics, regions, and communities to monitor. Source selection is part of the equity mechanism, not merely ingestion configuration.
+- **Evidence accumulates over time.** A person is a durable entity rather than a row passing through a daily pipeline. Coverage from multiple days can combine into a stronger case and cause a candidate to resurface when materially new evidence arrives.
+- **Reliability outranks automation.** The workflow uses independent reliable sources, keeps deterministic control flow, records provenance, and never creates or edits Wikimedia content.
+- **Success is attention saved.** A small, well-explained set of genuinely useful leads is better than a large volume of classifications.
+- **The method remains adaptable.** A technically curious editor can change source sets, policies, prompts, and models through configuration without modifying core workflow code.
+
+The longer-term possibility of community subscriptions and topic-specific notifications informs clean interfaces and durable data, but multi-user accounts, shared hosting, and notification infrastructure remain outside the initial personal batch rewrite.
 
 ## Current Repository Assessment
 
@@ -306,5 +325,6 @@ After those sections are reviewed, this note will be superseded by a complete de
 - [Promptfoo OpenRouter provider](https://www.promptfoo.dev/docs/providers/openrouter/)
 - [Promptfoo assertions and metrics](https://www.promptfoo.dev/docs/configuration/expected-outputs/)
 - [Dated OpenRouter model pricing and selection research](../research/openrouter-model-pricing-2026-07-23.md)
+- [Wikimania 2026 lightning talk](../product/wikimania-2026-lightning-talk.md)
 - [LangGraph overview](https://docs.langchain.com/oss/python/langgraph/overview)
 - [Preferred Python repository bootstrap](https://github.com/jonathandeamer/jd-claude-skills/blob/master/plugins/bootstrap-python-repo/skills/bootstrap-python-repo/SKILL.md)
