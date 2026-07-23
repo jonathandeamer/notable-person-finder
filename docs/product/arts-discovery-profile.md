@@ -1,7 +1,7 @@
 # Visual Arts Discovery Profile and Evidence Policy
 
 **Status:** Agreed direction; detailed implementation design still in progress  
-**Date:** 2026-07-23
+**Date:** 2026-07-24
 
 ## Purpose
 
@@ -11,22 +11,46 @@ The discovery profile controls where the system pays attention. It does not limi
 
 ## Discovery Sources
 
-The profile contains eight distinct publishers. The duplicate Artforum entry in the original proposal is represented once, and the Telegraph entry is its art section rather than an individual review.
+The profile contains ten distinct publishers. The duplicate Artforum entry in the original proposal is represented once, and the Telegraph entry is its art section rather than an individual review.
 
-| Publisher | Section | Discovery method |
-| --- | --- | --- |
-| The Art Newspaper | [Homepage](https://www.theartnewspaper.com/) | [RSS](https://www.theartnewspaper.com/rss.xml) |
-| ARTnews | [Homepage](https://www.artnews.com/) | [RSS](https://www.artnews.com/feed/) |
-| Artnet News | [Homepage](https://news.artnet.com/) | [RSS](https://news.artnet.com/feed) |
-| Artforum | [Homepage](https://www.artforum.com/) | [RSS](https://www.artforum.com/feed/) |
-| The New York Times | [Art & Design](https://www.nytimes.com/international/section/arts/design) | [RSS](https://rss.nytimes.com/services/xml/rss/nyt/ArtandDesign.xml) |
-| The Guardian | [Art & Design](https://www.theguardian.com/artanddesign) | [RSS](https://www.theguardian.com/artanddesign/rss) |
-| ArtReview | [Homepage](https://artreview.com/) | [RSS](https://artreview.com/rss.xml) |
-| The Telegraph | [Art](https://www.telegraph.co.uk/art/) | [RSS](https://www.telegraph.co.uk/art/rss.xml) |
+| Publisher | Section | Discovery method | Last verified |
+| --- | --- | --- | --- |
+| The Art Newspaper | [Homepage](https://www.theartnewspaper.com/) | [RSS](https://www.theartnewspaper.com/rss.xml) | 2026-07-24 |
+| ARTnews | [Homepage](https://www.artnews.com/) | [RSS](https://www.artnews.com/feed/) | 2026-07-24 |
+| Artnet News | [Homepage](https://news.artnet.com/) | [RSS](https://news.artnet.com/feed) | 2026-07-24 |
+| Artforum | [Homepage](https://www.artforum.com/) | [RSS](https://www.artforum.com/feed/) | 2026-07-24 |
+| The New York Times | [Art & Design](https://www.nytimes.com/international/section/arts/design) | [RSS](https://rss.nytimes.com/services/xml/rss/nyt/ArtandDesign.xml) | 2026-07-24 |
+| The Guardian | [Art & Design](https://www.theguardian.com/artanddesign) | [RSS](https://www.theguardian.com/artanddesign/rss) | 2026-07-24 |
+| ArtReview | [Homepage](https://artreview.com/) | [RSS](https://artreview.com/rss.xml) | 2026-07-24 |
+| The Telegraph | [Art](https://www.telegraph.co.uk/art/) | [RSS](https://www.telegraph.co.uk/art/rss.xml) | 2026-07-24 |
+| BBC News | [Art](https://www.bbc.com/news/topics/cjnwl8q4gjnt) | [RSS](https://feeds.bbci.co.uk/news/topics/cjnwl8q4gjnt/rss.xml) | 2026-07-24 |
+| Hyperallergic | [Homepage](https://hyperallergic.com/) | [RSS](https://hyperallergic.com/feed/) | 2026-07-24 |
 
 RSS is the discovery mechanism for the initial profile because it provides a stable title, excerpt, publication date, and canonical link without scraping article pages. The application will not add publisher-specific HTML scrapers or newsletter-ingestion subsystems for the initial rewrite.
 
 Discovery-source definitions will live in the versioned configuration file `config/discovery_profiles/art.toml`. The application core will not contain publisher-specific conditionals.
+
+### Selection rationale
+
+BBC News Art adds general-interest and local reporting that specialist international publications may not cover. This increases the chance of finding people outside the most prominent art-market and institutional networks. Its feed also contains video, community, and event stories, so ordinary subject-focus and significance filtering still applies.
+
+Hyperallergic is an established specialist publication focused on contemporary art, criticism, cultural policy, and underrepresented perspectives. It broadens the profile beyond the more market- and institution-oriented publications already selected.
+
+The ten-source limit is deliberate. It provides a varied but coherent pilot corpus for behavior review, Promptfoo cases, and acceptance testing without turning the first redesign into a general-purpose ingestion project.
+
+## Deferred Discovery Sources
+
+These publications are relevant enough to reconsider, but are not part of the initial profile:
+
+| Publisher | Reason deferred | Revisit when |
+| --- | --- | --- |
+| Frieze | No accessible official RSS feed was found; the site combines editorial publishing with art-fair and promotional coverage. | A stable official feed or another low-maintenance, permitted discovery channel becomes available. |
+| Apollo | Its expected WordPress RSS endpoint returned HTTP 500 when checked. | The official feed becomes consistently available. |
+| Artsy Editorial | A working news feed exists, but Artsy combines editorial publishing with a commercial marketplace. | The behavior review defines reliable separation of editorial and commercial content. |
+| Museums Journal | A working news feed exists, but its focus is museum institutions and professionals rather than artists. | Museum directors, curators, conservators, and heritage professionals are explicitly added to the pilot scope. |
+| Ocula | Likely feed endpoints rejected automated access, and the publication operates alongside a commercial gallery platform. | A permitted stable feed is available and the editorial/commercial boundary is defined. |
+
+Deferred sources remain candidates for future editor-selected profiles. The application will not scrape them or add special-case code merely to expand the initial source count.
 
 ## Discovery and Evidence Are Separate
 
