@@ -53,6 +53,62 @@ The current implementation contains sound product ideas but expresses them throu
 - Retry and last-write-wins behavior is reconstructed from append-only files instead of represented directly in durable state.
 - Configuration is distributed across CLI flags, environment variables, prompt files, Markdown tables, and hard-coded defaults.
 
+## Planned Legacy Behavior Review
+
+Before the detailed rewrite design is finalized, the existing tests and implementation will be reviewed as evidence of legacy behavior. Existing tests are not automatically requirements: copying them wholesale would preserve obsolete interfaces and accidental complexity.
+
+This review has not started. It is recorded here as a future brainstorming and design activity.
+
+### Review structure
+
+The review is organized by product capability rather than by legacy filename:
+
+1. discovery and feed ingestion;
+2. person detection and initial triage;
+3. Wikipedia identity matching;
+4. coverage discovery and source reliability;
+5. notability assessment and ranking;
+6. digest generation;
+7. failures, retries, budgets, and resumability.
+
+Each capability is reviewed separately. The relevant tests, prompts, documentation, and implementation are inspected together, and the resulting behavior decisions are approved before moving to the next capability.
+
+### Decision categories
+
+Every meaningful legacy behavior receives one disposition:
+
+- **Preserve:** a product, correctness, or safety requirement that should remain observable in the rewrite.
+- **Change:** valuable intent whose current implementation or exact semantics should be redesigned.
+- **Delete:** an obsolete feature, old-provider behavior, file-format concern, or other implementation artifact.
+- **Investigate:** ambiguous behavior that requires a product decision before it can be specified.
+
+Each entry records the behavior in user-visible terms, its evidence in the legacy repository, the decision and rationale, and how the new implementation will verify it. Verification may use pytest, Promptfoo, a manual acceptance check, or no replacement when the behavior is intentionally deleted.
+
+Example structure:
+
+| Behavior | Legacy evidence | Decision | New verification |
+| --- | --- | --- | --- |
+| Duplicate feed entries are processed once | RSS ingestion tests | Preserve | pytest |
+| Model failure cannot become a confident rejection | Gate 3 and Gate 4b tests | Preserve | pytest |
+| Two independent domains are required | Gate 4b tests and prompt | Investigate | Promptfoo and pytest after approval |
+| LLM JSON is recovered by searching for braces | LLM runner tests | Delete | Replaced by strict structured output |
+| Existing JSONL output prevents a stage from running | Stage collision tests | Delete | Replaced by SQLite idempotency |
+
+### Evidence rules
+
+- Tests demonstrate implemented behavior, not necessarily desired behavior.
+- Documentation and prompts are supporting evidence, not automatically authoritative when they disagree with tests or code.
+- Implementation details are translated into observable behavior before a decision is made.
+- Thresholds, heuristics, whitelists, and ranking rules are treated as product policy and require explicit approval.
+- Legacy output snapshots may be used as temporary characterization evidence but do not become permanent golden masters by default.
+- Deleted behavior does not receive a compatibility layer or replacement test merely to preserve historical structure.
+
+### Outputs
+
+The activity produces `docs/architecture/legacy-behavior-inventory.md`, containing the complete traceability table and approved dispositions. The final design specification includes only preserved behavior and intentionally changed behavior expressed as acceptance criteria.
+
+Implementation tests are written from those approved acceptance criteria rather than copied mechanically from the legacy suite. Temporary characterization tests may be used while investigating unclear behavior, but they are not automatically retained in the new test suite.
+
 ## Considered Architectures
 
 ### 1. Modular monolith with SQLite
@@ -229,6 +285,7 @@ The project initially excludes repeated stochastic trials, confidence intervals,
 
 The detailed design still needs agreement on:
 
+- the legacy behavior inventory and disposition decisions;
 - package and module boundaries;
 - the domain model and SQLite schema;
 - exact stage transitions and terminal outcomes;
