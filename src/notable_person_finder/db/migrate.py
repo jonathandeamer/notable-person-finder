@@ -9,6 +9,8 @@ from importlib import resources
 from pathlib import Path
 from typing import Iterable
 
+from notable_person_finder.db.connection import connect_database
+
 _MIGRATION_FILENAME = re.compile(
     r"^(?P<version>[0-9]{4})_(?P<name>[A-Za-z0-9][A-Za-z0-9_-]*)\.sql$"
 )
@@ -211,7 +213,7 @@ def _create_backup(
     backup_path = backup_dir / f"pre-migration-{timestamp}.sqlite3"
     backup_connection: sqlite3.Connection | None = None
     try:
-        backup_connection = sqlite3.connect(backup_path)
+        backup_connection = connect_database(backup_path)
         connection.backup(backup_connection)
     except sqlite3.Error as error:
         raise MigrationError(
