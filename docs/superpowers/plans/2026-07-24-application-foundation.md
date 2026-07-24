@@ -18,6 +18,8 @@
 - Migrations are forward-only, checksummed, transactional, and backed up before application when the database already exists.
 - The mutation lock is nonblocking, OS-managed, scoped to one data root, and never inferred from stale file contents.
 - Default pytest is offline and uses temporary configuration and storage paths.
+- Prototype tests are historical evidence, not a rewrite gate; run only the new
+  milestone tests unless a specific preserved legacy behavior is under investigation.
 - Do not delete or reorganize prototype code in this milestone.
 
 ---
@@ -164,7 +166,7 @@ dependencies = [
 notable = "notable_person_finder.cli.main:entrypoint"
 
 [dependency-groups]
-dev = ["jsonschema>=4.25,<5", "pytest>=8.4,<9"]
+dev = ["pytest>=8.4,<9"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/notable_person_finder"]
@@ -222,9 +224,7 @@ def entrypoint() -> NoReturn:
 ```
 
 Create empty `__init__.py` files for `cli`, `config`, `db`, `runs`, `tests`, and
-`tests/foundation`, then run `uv lock`. `jsonschema` remains a development-only
-dependency until the prototype suite is retired because existing schema tests
-still import it.
+`tests/foundation`, then run `uv lock`.
 
 - [ ] **Step 4: Run the package test**
 
@@ -1232,15 +1232,7 @@ Run: `uv run pytest tests/foundation -v`
 
 Expected: all foundation tests pass.
 
-- [ ] **Step 5: Run the complete existing test suite to identify only known prototype compatibility failures**
-
-Run: `uv run pytest -q`
-
-Expected: all new foundation tests pass. Any prototype-test failure must be
-recorded with its exact traceback before proceeding; do not weaken the new
-package or install undeclared legacy dependencies merely to conceal it.
-
-- [ ] **Step 6: Commit foundational CLI integration**
+- [ ] **Step 5: Commit foundational CLI integration**
 
 ```bash
 git add src/notable_person_finder/cli/main.py tests/foundation/test_foundation_cli.py
