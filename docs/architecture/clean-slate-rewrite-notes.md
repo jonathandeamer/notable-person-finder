@@ -6,7 +6,7 @@
 
 ## Purpose
 
-Reimplement Notable Person Finder as a maintainable personal batch application. The application runs once daily on one machine, discovers people appearing in news coverage, checks whether they already have an English Wikipedia biography, assesses the breadth and quality of independent coverage, and produces a short confidence-ranked digest for human review.
+Reimplement Notable Person Finder as a maintainable personal batch application. The application runs once daily on one machine, discovers people appearing in news coverage, checks whether they already have an English Wikipedia biography, assesses the breadth and quality of coverage leads, and produces a short evidence-prioritized digest for human review.
 
 The application will never create or edit Wikipedia articles.
 
@@ -21,7 +21,10 @@ The application will never create or edit Wikipedia articles.
 - OpenRouter is the only LLM gateway.
 - The Codex CLI, Claude CLI, and direct OpenAI backends will be removed.
 - The workflow optimizes for recall because a human reviews the final digest.
-- Digest results are ranked by confidence and evidence strength. Roughly ten candidates is the initial operational preference, not a hard architectural limit.
+- Digest results use transparent deterministic ordering based on lead outcome,
+  material improvement, Wikipedia identity, evidence strength, grounded
+  attention signals, access quality, and recency. Roughly ten candidates is
+  the initial operational preference, not a hard architectural limit.
 - Models, model routing, budgets, escalation thresholds, concurrency, and digest size are configuration values.
 - A budget such as GBP 1 per run may be supplied and enforced, but the architecture must not require that exact value or any budget to be configured.
 - People and their supporting evidence persist across daily runs. New coverage can make an older candidate newly worth surfacing.
@@ -33,7 +36,9 @@ The Wikimania 2026 talk, [Who's Missing? Using AI to Spot Wikipedia's Coverage G
 The system allocates scarce editor attention. It is not a notability oracle, an autonomous researcher, or an article-generation system.
 
 - **AI pays attention; people exercise judgment.** Models assist with monitoring, primary-subject detection, identity matching, and evidence triage. Editors decide whether a person is notable, assess the sources, write the article, and participate in normal community review.
-- **The output is a shortlist, not a verdict.** A label such as `likely_notable` means “worth an editor's attention,” not “meets Wikipedia's notability policy.”
+- **The output is a shortlist, not a verdict.** Labels such as
+  `promising_lead` and `possible_lead` mean “worth an editor's attention,” not
+  “meets Wikipedia's notability policy.”
 - **Every recommendation is inspectable.** A surfaced person includes the
   coverage leads, relevant evidence, and the reason the system considers the
   candidate newly interesting. The application does not infer cross-source
