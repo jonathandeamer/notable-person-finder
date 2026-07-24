@@ -26,6 +26,7 @@ ENV/
 
 # Scratch
 working/
+.worktrees/
 
 # Project outputs/state
 output/
