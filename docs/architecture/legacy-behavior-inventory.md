@@ -1,6 +1,6 @@
 # Legacy Behavior Inventory
 
-**Status:** In progress; three of seven capabilities approved
+**Status:** In progress; four of seven capabilities approved
 **Date:** 2026-07-24
 **Branch:** `refactor/rearchitecture`
 
@@ -32,7 +32,7 @@ for the focused design sessions.
 | Discovery and feed ingestion | Approved | [01-discovery-and-ingestion.md](legacy-behaviors/01-discovery-and-ingestion.md) |
 | Person detection and initial triage | Approved | [02-person-detection-and-triage.md](legacy-behaviors/02-person-detection-and-triage.md) |
 | Wikipedia identity matching | Approved | [03-wikipedia-identity-matching.md](legacy-behaviors/03-wikipedia-identity-matching.md) |
-| Coverage discovery and source reliability | Not started | `04-coverage-and-source-reliability.md` |
+| Coverage discovery and source reliability | Approved | [04-coverage-and-source-reliability.md](legacy-behaviors/04-coverage-and-source-reliability.md) |
 | Notability assessment and ranking | Not started | `05-assessment-and-ranking.md` |
 | Digest generation | Not started | `06-digest-generation.md` |
 | Failures, retries, budgets, and resumability | Not started | `07-failures-budgets-and-resumability.md` |

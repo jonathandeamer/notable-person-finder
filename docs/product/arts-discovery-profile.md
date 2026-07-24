@@ -49,6 +49,8 @@ These publications are relevant enough to reconsider, but are not part of the in
 | Artsy Editorial | A working news feed exists, but Artsy combines editorial publishing with a commercial marketplace. | The behavior review defines reliable separation of editorial and commercial content. |
 | Museums Journal | A working news feed exists, but its focus is museum institutions and professionals rather than artists. | Museum directors, curators, conservators, and heritage professionals are explicitly added to the pilot scope. |
 | Ocula | Likely feed endpoints rejected automated access, and the publication operates alongside a commercial gallery platform. | A permitted stable feed is available and the editorial/commercial boundary is defined. |
+| [AP Visual Arts](https://apnews.com/hub/visual-arts) | As checked on 2026-07-24, the current section does not advertise a public RSS or Atom feed. AP's [documented RSS delivery](https://api.ap.org/media/v/swagger/) is an authenticated product tied to an entitled plan. | AP publishes a stable public section feed suitable for personal monitoring. |
+| [Reuters](https://www.reuters.com/news/picture/world-of-art-idUSRTR29A4D/) | As checked on 2026-07-24, the proposed “World of Art” URL is an individual photo feature rather than a maintained arts section. [Reuters Ready](https://reutersagency.com/content/content-types/reuters-ready/) advertises licensed content feeds, but no public arts RSS feed was found. | Reuters publishes a stable public arts feed suitable for the discovery profile. |
 
 Deferred sources remain candidates for future editor-selected profiles. The application will not scrape them or add special-case code merely to expand the initial source count.
 
@@ -61,55 +63,55 @@ An article from a discovery publisher may count as evidence only when it passes 
 - it is substantially about the candidate rather than a passing mention;
 - it is editorial rather than sponsored, partner, advertorial, gallery, or press-release content;
 - it provides meaningful biographical or career coverage rather than a listing or announcement;
-- it is independent of the subject and of the other counted coverage;
-- the publisher has either curated reliable status or an explicitly provisional model assessment.
+- it is independent of the subject rather than self-published or affiliated;
+- the publisher is curated eligible or is retained as an explicitly
+  unclassified lead for human review.
 
 Brave research may find corroboration from any publisher, including arts sources outside the discovery profile and general reliable publications.
 
-## Evidence Reliability Tiers
+## Publisher Screening States
 
-### Curated reliable
+### Curated eligible
 
-The publisher domain appears in `config/reliable_sources.toml`, a checked-in and versioned policy file. Curated status is deterministic and reviewable; it is not embedded in Python constants.
+The publisher appears in a small, versioned local policy with its rationale,
+decision basis, source URL, and review date. Curated status is deterministic
+and reviewable. The domain-design session will decide whether the policy is
+represented as configuration, seed data, or database records.
 
-Curated publisher status is necessary but not sufficient. Each result must still pass subject-focus, significance, independence, and content-type checks.
+Curated eligibility is necessary for a result to become a non-provisional
+coverage lead, but it is not sufficient. Each result must still pass
+subject-focus, significance, subject-independence, and content-type checks.
 
-### Model-assessed provisional
+### Curated ineligible
 
-An unlisted publisher may be assessed by the configured LLM task as editorially reliable for the purpose of triage. The assessment records:
+Obvious poor-fit publishers and content channels, including social media,
+user-generated content, press-release distribution, and clear promotion, are
+retained with a deterministic rejection reason and are not fetched for model
+assessment.
 
-- the publisher and canonical domain;
-- the specific result being considered;
-- the recommendation and rationale;
-- the model, resolved provider, prompt version, and request parameters;
-- confidence, timestamp, and complete attempt provenance.
+### Unclassified
 
-The assessment is visibly provisional. It does not silently modify the curated reliable-source configuration and cannot produce the strongest recommendation tier.
+An unlisted or contextually complicated publisher remains unclassified. A
+capped number may be retrieved as fallback leads, but a model cannot promote
+the publisher to “Wikipedia reliable.” Repeatedly useful publishers can be
+researched and curated manually.
 
-## Recommendation Outcomes
+The [Wikipedia Reliable Sources/Perennial Sources page](https://en.wikipedia.org/wiki/Wikipedia:Reliable_sources/Perennial_sources)
+is dated provenance for individual local decisions, not a runtime allowlist or
+policy engine. Complex caveats remain unclassified. Updates are explicit,
+manual, and independently versioned.
 
-The coverage threshold is configurable. Its initial default is two independent, significant sources.
+## Assessment Boundary
 
-- **`likely_notable`:** the threshold is met using only curated reliable sources.
-- **`possibly_notable`:** the threshold is met only after including one or more model-assessed provisional sources.
-- **`uncertain`:** the available evidence has unresolved identity, reliability, independence, or model/provider uncertainty.
-- **`not_enough_evidence`:** the evaluated coverage does not meet the configured threshold.
+Coverage discovery returns classified articles, unresolved items, and
+search-completeness metadata. It does not emit notability recommendations.
+Configurable recommendation policy belongs to the subsequent assessment
+capability.
 
-These are attention-routing outcomes, not Wikipedia notability decisions. `Likely_notable` means that a candidate deserves stronger editor attention; it does not assert that the subject satisfies a particular guideline.
-
-## Independence and Duplication
-
-Different domains do not automatically constitute independent coverage. The system attempts to identify:
-
-- syndicated wire copies;
-- press-release rewrites;
-- substantially identical headlines and excerpts;
-- articles citing or summarizing the same original report;
-- publisher aliases and regional subdomains.
-
-When multiple results derive from the same underlying reporting, they form one evidence cluster. Thresholds count independent clusters, not raw URLs or domains.
-
-The system preserves the individual links and explains the grouping so a human can review or override it.
+The system deduplicates identical canonical URLs only. It does not infer
+cross-source syndication clusters or claim that a numeric result count proves
+independent sourcing. The human reviewer can judge relationships among the
+presented coverage leads.
 
 ## Access Boundaries
 

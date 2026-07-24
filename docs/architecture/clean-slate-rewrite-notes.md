@@ -16,7 +16,7 @@ The application will never create or edit Wikipedia articles.
 - The rewrite starts with no migration of existing events, caches, decisions, indices, or run history.
 - The initial [visual arts discovery profile](../product/arts-discovery-profile.md) monitors ten editor-selected publications through RSS.
 - MediaWiki remains the source for existing-biography checks.
-- Brave News Search remains the broad coverage-search provider.
+- Brave Web Search is the initial broad coverage-search provider.
 - Each external service is hidden behind an application-owned interface so it can be replaced without changing the workflow.
 - OpenRouter is the only LLM gateway.
 - The Codex CLI, Claude CLI, and direct OpenAI backends will be removed.
@@ -34,11 +34,17 @@ The system allocates scarce editor attention. It is not a notability oracle, an 
 
 - **AI pays attention; people exercise judgment.** Models assist with monitoring, primary-subject detection, identity matching, and evidence triage. Editors decide whether a person is notable, assess the sources, write the article, and participate in normal community review.
 - **The output is a shortlist, not a verdict.** A label such as `likely_notable` means “worth an editor's attention,” not “meets Wikipedia's notability policy.”
-- **Every recommendation is inspectable.** A surfaced person includes the independent sources, relevant evidence, and the reason the system considers the candidate newly interesting.
+- **Every recommendation is inspectable.** A surfaced person includes the
+  coverage leads, relevant evidence, and the reason the system considers the
+  candidate newly interesting. The application does not infer cross-source
+  independence from a numeric result count.
 - **Uncertainty remains visible.** Ambiguous identity, incomplete evidence, and model or provider failure cannot silently become a confident rejection.
 - **Sources express editorial interest.** Editors choose the feeds and source sets that define the topics, regions, and communities to monitor. Source selection is part of the equity mechanism, not merely ingestion configuration.
 - **Evidence accumulates over time.** A person is a durable entity rather than a row passing through a daily pipeline. Coverage from multiple days can combine into a stronger case and cause a candidate to resurface when materially new evidence arrives.
-- **Reliability outranks automation.** The workflow uses independent reliable sources, keeps deterministic control flow, records provenance, and never creates or edits Wikimedia content.
+- **Reliability outranks automation.** The workflow prioritizes deliberately
+  curated publishers, keeps deterministic control flow, records provenance,
+  exposes provisional evidence for human review, and never creates or edits
+  Wikimedia content.
 - **Success is attention saved.** A small, well-explained set of genuinely useful leads is better than a large volume of classifications.
 - **The method remains adaptable.** A technically curious editor can change source sets, policies, prompts, and models through configuration without modifying core workflow code.
 
@@ -76,7 +82,9 @@ The current implementation contains sound product ideas but expresses them throu
 
 Before the detailed rewrite design is finalized, the existing tests and implementation will be reviewed as evidence of legacy behavior. Existing tests are not automatically requirements: copying them wholesale would preserve obsolete interfaces and accidental complexity.
 
-This review has not started. It is recorded here as a future brainstorming and design activity.
+This review is underway. Approved decisions are indexed in the
+[legacy behavior inventory](legacy-behavior-inventory.md) and recorded in one
+file per capability.
 
 ### Review structure
 
@@ -109,7 +117,7 @@ Example structure:
 | --- | --- | --- | --- |
 | Duplicate feed entries are processed once | RSS ingestion tests | Preserve | pytest |
 | Model failure cannot become a confident rejection | Gate 3 and Gate 4b tests | Preserve | pytest |
-| Two independent domains are required | Gate 4b tests and prompt | Investigate | Promptfoo and pytest after approval |
+| Distinct domains are treated as independent evidence | Gate 4b tests and prompt | Delete | Output-language and duplicate-URL tests |
 | LLM JSON is recovered by searching for braces | LLM runner tests | Delete | Replaced by strict structured output |
 | Existing JSONL output prevents a stage from running | Stage collision tests | Delete | Replaced by SQLite idempotency |
 
@@ -124,7 +132,11 @@ Example structure:
 
 ### Outputs
 
-The activity produces `docs/architecture/legacy-behavior-inventory.md`, containing the complete traceability table and approved dispositions. The final design specification includes only preserved behavior and intentionally changed behavior expressed as acceptance criteria.
+The activity produces `docs/architecture/legacy-behavior-inventory.md` as an
+index plus a logically discrete file containing each capability's traceability
+table and approved dispositions. The final design specification includes only
+preserved behavior and intentionally changed behavior expressed as acceptance
+criteria.
 
 Implementation tests are written from those approved acceptance criteria rather than copied mechanically from the legacy suite. Temporary characterization tests may be used while investigating unclear behavior, but they are not automatically retained in the new test suite.
 
