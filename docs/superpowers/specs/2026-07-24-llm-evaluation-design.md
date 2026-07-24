@@ -249,8 +249,9 @@ change promotes one.
 Configuration maps each task to exactly one preferred OpenRouter model and its
 request parameters and token bound. The provider configuration supplies the
 single OpenRouter timeout profile and central retry policy shared by tasks.
-Startup validation checks strict structured-output support and permitted
-provider routing.
+Before a task's first paid generation in each run, the shared provider
+preflight checks strict structured-output support and permitted provider
+routing under the provider design's retry and deferral rules.
 
 OpenRouter may route the configured model among compatible serving providers
 under recorded capability and privacy requirements. It may not silently choose

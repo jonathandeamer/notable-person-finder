@@ -55,12 +55,15 @@ programme rather than questions to reopen routinely:
   profile.
 - MediaWiki supplies existing-biography checks and Brave supplies broad
   coverage search, both behind application-owned interfaces.
-- OpenRouter is the only LLM gateway. Codex CLI, Claude CLI, and direct OpenAI
-  backends will be removed.
+- OpenRouter is the only LLM gateway. One typed gateway keeps model assignment
+  configurable while eliminating subprocess parsing and duplicated schema,
+  retry, credential, and provenance behavior. Codex CLI, Claude CLI, and
+  direct OpenAI backends will be removed.
 - SQLite is the durable source of truth in a Python modular monolith with one
   installed CLI.
-- Task model assignments, request parameters, budgets, thresholds, concurrency, source profiles, and
-  digest size are configurable rather than architectural constants.
+- Task model assignments, request parameters, budgets, thresholds,
+  concurrency, source profiles, and digest size are configurable rather than
+  architectural constants.
 - The workflow optimizes for recall and produces an inspectable shortlist for
   human judgment.
 - The application never writes or edits Wikipedia content.
@@ -121,7 +124,7 @@ The review covers these capabilities:
 2. person detection and initial triage;
 3. Wikipedia identity matching;
 4. coverage discovery and source reliability;
-5. notability assessment and ranking;
+5. lead assessment and ranking;
 6. digest generation;
 7. failures, retries, budgets, and resumability.
 
@@ -132,6 +135,8 @@ The review covers these capabilities:
 Review all seven legacy capabilities and approve the disposition of each
 meaningful behavior. This establishes what the replacement must do without
 preserving the old pipeline structure by accident.
+
+**Completed:** [Legacy behavior inventory](../../architecture/legacy-behavior-inventory.md)
 
 ### 2. Product workflow and decision policy
 
@@ -163,12 +168,16 @@ Define the RSS, MediaWiki, Brave, and OpenRouter boundaries, including
 normalization, caching, rate limits, retries, access constraints, error
 translation, and contract fixtures.
 
+**Completed:** [Provider adapter contracts](2026-07-24-provider-adapters-design.md)
+
 ### 6. Operator experience and verification
 
 Define configuration and precedence, CLI commands, daily execution and
 single-machine locking, logs and run summaries, digest presentation, error
 reporting, pytest layers, the lightweight legacy comparison, and operational
 acceptance criteria.
+
+**Completed:** [Operator experience and verification](2026-07-24-operator-experience-verification-design.md)
 
 ### 7. Overarching system specification
 
@@ -212,6 +221,15 @@ The initial design excludes:
 
 Future possibilities may be noted only where they justify a clean interface in
 the initial implementation. They do not add behavior to the first release.
+
+## Replacement Boundary
+
+The prototype remains recoverable in Git and is the operational fallback until
+the rewrite passes its approved offline verification, manual live checks, and
+one-time legacy comparison. That comparison is the go/no-go review for
+replacing the prototype, not a permanent compatibility target. The rewrite
+starts with new state, so fallback means running the preserved prototype
+rather than downgrading or translating the new SQLite database.
 
 ## Transition to Implementation
 

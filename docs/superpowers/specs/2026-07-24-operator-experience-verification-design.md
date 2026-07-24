@@ -72,9 +72,9 @@ fails.
 
 `notable config validate` performs local parsing, schema, cross-field, path,
 URL, and secret-presence validation without making a network request or paid
-call. `notable run` performs the provider and configured-model preflight
-defined by the provider design after local validation and before paid LLM
-generation.
+call. During `notable run`, the first work that needs each configured model
+performs the provider preflight defined by the provider design after local
+validation and before that model's first paid generation.
 
 Each created run references the canonical, fully resolved, redacted
 configuration snapshot and its SHA-256 fingerprint. The snapshot records

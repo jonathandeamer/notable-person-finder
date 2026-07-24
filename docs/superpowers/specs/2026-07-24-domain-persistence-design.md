@@ -199,6 +199,18 @@ foreign keys. Future queries resolve the canonical person, and new evidence
 attaches there. Merge creation flattens prior redirects and rejects self-links
 and cycles so operational lookup never walks an unbounded chain.
 
+The merge transaction also restores canonical operational invariants. It
+supersedes active work for the merged-away person and schedules replacement
+work against the survivor when the combined input fingerprint changes. If both
+people have digest-queue entries, retain one survivor entry with the stronger
+tier, earliest pending time, latest material-change time, and combined
+eligibility reasons; record the other entry's removal as a merge transition.
+Immutable observations and their original current pointers remain historical,
+but the survivor never adopts an incompatible pointer merely because it is
+newer. Equivalent observations may be selected deterministically; conflicting
+or newly combined evidence schedules a fresh canonical observation or lead
+assessment. These changes commit atomically with the merge relation.
+
 ### Wikipedia identity
 
 MediaWiki pages are provider entities keyed by stable page ID, with canonical
@@ -224,9 +236,13 @@ URL, title, snippets and extra snippets, retrieval time, language/search
 parameters, and source-screening disposition.
 
 Repeated occurrences can reference one article, but their query and rank are
-never collapsed. A canonical article has one conservatively normalized unique
-URL and canonical publisher key derived under the active source policy. Feed
-items and search occurrences may both reference it.
+never collapsed. One application-owned `canonicalize_article_url` policy
+defines article identity for feed items, search occurrences, and observed
+redirect destinations alike. A canonical article has one conservatively
+normalized unique URL under that policy and a canonical publisher key derived
+under the active source policy. Original and redirected URLs remain as
+provenance aliases, allowing feed and search discovery to converge without
+using separate normalization functions.
 
 Publisher policy is authoritative versioned TOML. Each new screening or
 assessment copies the matched rule identifier, rule status, source-policy

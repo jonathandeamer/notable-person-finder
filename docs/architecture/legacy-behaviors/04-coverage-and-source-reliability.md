@@ -143,9 +143,9 @@ Retain rejected and inaccessible results for audit rather than physically
 dropping them.
 
 This capability does not emit `likely_notable`, `possibly_notable`, or
-`not_enough_evidence`. The notability-assessment capability applies
-configurable recommendation policy to this evidence set. Operational failures
-remain distinct from semantic uncertainty.
+`not_enough_evidence`. The lead-assessment capability applies configurable
+recommendation policy to this evidence set. Operational failures remain
+distinct from semantic uncertainty.
 
 Search caches use a finite configurable lifetime. Refresh after the interval
 or when materially new discovery evidence warrants it, merge newly found

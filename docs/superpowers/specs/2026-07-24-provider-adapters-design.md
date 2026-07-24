@@ -125,15 +125,17 @@ exceptions.
 ### Response limits
 
 Stream response bodies and stop when they exceed the applicable configurable
-limit:
+limit after content decoding:
 
 - 5 MiB for feeds and JSON APIs;
 - 10 MiB for article HTML.
 
-Do not download images, PDFs, video, or other non-text article assets. Record
-`unsupported_content` or `response_too_large` without pretending that the body
-was inspected. Existing feed excerpts or search snippets may still support a
-partial evidence view.
+Enforce an encoded transport bound as well, but never treat compression as a
+way around the decoded limit. This bounds gzip and similar expansion before a
+large decoded body can accumulate in memory. Do not download images, PDFs,
+video, or other non-text article assets. Record `unsupported_content` or
+`response_too_large` without pretending that the body was inspected. Existing
+feed excerpts or search snippets may still support a partial evidence view.
 
 ### Access boundaries and robots
 
@@ -251,11 +253,20 @@ The OpenRouter boundary has two operations:
   task input, JSON Schema, configured model and parameters, and provider-routing
   requirements.
 
-Every run inspects each distinct configured model once before paid generation,
-deduplicating models shared by tasks. Preflight verifies strict structured-
-output support and records current pricing/capability metadata. If fresh
-preflight cannot complete, the run fails before paid LLM calls rather than
-using stale capability or price data.
+Before the first paid generation for a configured model in a run, schedule one
+fresh inspection shared by every dependent task. Do not inspect an optional
+model that the run never needs. Preflight uses the central retry coordinator
+and records its attempts. It verifies strict structured-output support and
+records current pricing and capability metadata.
+
+An exhausted transient inspection defers only work that depends on that model;
+it does not prevent unrelated deterministic work from completing. An
+authentication, invalid-configuration, or unsupported-capability result fails
+dependent LLM work permanently for that input and contributes to the run state
+under the approved failure policy. No paid generation uses stale capability
+metadata. When a hard OpenRouter budget is enabled, it also requires fresh
+pricing sufficient to make the approved reservation; without a hard budget,
+missing price metadata alone does not block a capability-compatible call.
 
 A generation response retains raw model output, configured and resolved model,
 resolved serving provider when supplied, parameters, request ID, structured-
@@ -412,6 +423,7 @@ captured.
 - URL, timeout, redirect, content, response-size, concurrency, and pacing bounds
   are enforced.
 - Secrets and raw bodies do not appear in logs or configuration snapshots.
-- Fresh OpenRouter capability and pricing preflight occurs before paid calls.
+- Fresh OpenRouter capability preflight occurs before a model's paid calls;
+  fresh usable pricing is additionally required when a hard budget is enabled.
 - Version one neither fetches `robots.txt` nor circumvents direct access
   controls.
