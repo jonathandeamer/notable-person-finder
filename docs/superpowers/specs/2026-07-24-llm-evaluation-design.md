@@ -263,9 +263,13 @@ free-form fallback, or alternative-model retry.
 
 ## Promptfoo Dataset
 
-Start with 10–12 cases each for `detect_people`, `resolve_person_entity`,
-`match_wikipedia_identity`, and `assess_article`, plus 5–8 cases for
-`compose_lead_summary` and source reconnaissance: roughly 45–55 cases total.
+Build the initial dataset from a coverage matrix of approved behavior,
+important boundaries, and known failure modes rather than treating a case
+count as a quota. Aim for 10–12 cases each for `detect_people`,
+`resolve_person_entity`, `match_wikipedia_identity`, and `assess_article`,
+plus 5–8 cases for `compose_lead_summary`: roughly 45–55 cases total. Source
+reconnaissance boundary cases belong within `assess_article` rather than
+forming a sixth task suite.
 
 Fixtures are deliberately selected boundaries, local and stable, and contain
 exactly production context. They cover multiple people, passing mentions,
@@ -273,6 +277,12 @@ professional names, namesakes, sparse or conflicting identity context, missing
 Wikipedia event details, reviews, interviews, obituaries, promotion, partial
 views, unclassified sources, signals, and synthesis caveats. Each confirmed
 production error adds the smallest representative regression case.
+
+This initial suite is a prompt-regression and model-comparison aid, not a
+statistically representative estimate of recall or accuracy. Stop adding
+initial cases when the coverage matrix has representative examples for every
+material class; do not pad the suite to meet the approximate total. Thereafter
+grow it when real runs reveal a distinct failure mode.
 
 Version one has no stochastic repetitions, confidence intervals, holdout
 partition, NDCG, or LLM-as-judge.
