@@ -1,6 +1,6 @@
 # Redesign Programme Design
 
-**Status:** Approved
+**Status:** Completed
 **Date:** 2026-07-24
 **Branch:** `refactor/rearchitecture`
 
@@ -184,6 +184,8 @@ acceptance criteria.
 Reconcile the six approved designs into one component map and end-to-end data
 flow. Identify authoritative ownership and cross-cutting invariants, and link to
 the focused specifications instead of restating them.
+
+**Completed:** [Overarching system specification](2026-07-24-overarching-system-design.md)
 
 Each session depends on the approved outputs above it. If later work exposes a
 conflict, the earlier document will be amended explicitly rather than silently
