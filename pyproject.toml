@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "notable-person-finder"
+version = "0.1.0"
+description = "A personal batch tool for finding inspectable Wikipedia biography leads"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { file = "LICENSE" }
+dependencies = [
+  "platformdirs>=4.3,<5",
+  "portalocker>=3.1,<4",
+  "pydantic>=2.11,<3",
+  "python-dotenv>=1.1,<2",
+  "tzdata>=2025.2",
+]
+
+[project.scripts]
+notable = "notable_person_finder.cli.main:entrypoint"
+
+[dependency-groups]
+dev = ["pytest>=8.4,<9"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/notable_person_finder"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = ["live: explicitly invoked tests that contact external providers"]
