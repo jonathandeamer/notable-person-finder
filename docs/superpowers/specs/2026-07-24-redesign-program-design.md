@@ -1,6 +1,6 @@
 # Redesign Programme Design
 
-**Status:** Approved meta-design; awaiting review of the written specification
+**Status:** Approved
 **Date:** 2026-07-24
 **Branch:** `refactor/rearchitecture`
 
@@ -20,8 +20,9 @@ implementation.
 
 The design programme will produce:
 
-1. A legacy behavior inventory, grouped by product capability. Each behavior
-   will cite its legacy evidence and receive an approved disposition.
+1. A legacy behavior inventory index plus one focused inventory file per
+   product capability. Each behavior will cite its legacy evidence and receive
+   an approved disposition.
 2. Five focused design specifications covering the product workflow, domain
    and persistence, LLM behavior, provider contracts, and operator experience.
 3. A short overarching system specification that connects the focused designs,
@@ -80,8 +81,8 @@ Each focused design session follows the same sequence:
    trade-offs.
 4. Present two or three viable approaches for material design choices.
 5. Present the proposed design in small sections and obtain approval for each.
-6. Write and self-review the approved specification.
-7. Commit the document logically and ask for review of the committed version.
+6. Write and self-review the approved specification or inventory section.
+7. Commit the documents logically and ask for review of the committed version.
 
 No implementation or implementation planning begins during these sessions.
 All core design sessions will be completed before implementation starts because
@@ -90,8 +91,9 @@ and failure outcomes.
 
 ## Legacy Behavior Review
 
-The legacy review is the first dedicated session and produces
-`docs/architecture/legacy-behavior-inventory.md`.
+The legacy review is the first dedicated session. It produces the index
+`docs/architecture/legacy-behavior-inventory.md` and one file per capability
+under `docs/architecture/legacy-behaviors/`.
 
 The inventory is organized by observable behavior rather than by individual
 test. Each row may cite several tests, prompts, documents, or implementation
