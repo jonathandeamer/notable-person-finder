@@ -169,7 +169,7 @@ This approach is rejected for the initial rewrite. The workflow is bounded and p
 
 Build a modular monolith in Python with the following properties:
 
-- One installable package and one CLI entry point, tentatively `npf`.
+- One installable package and one CLI entry point, `notable`.
 - Ordinary Python orchestration with explicit stage transitions.
 - SQLite as the source of truth for runs, discovered items, people, evidence, decisions, attempts, and cached provider responses.
 - Pydantic models at configuration, provider, persistence, and LLM boundaries.
@@ -327,12 +327,12 @@ The project initially excludes repeated stochastic trials, confidence intervals,
 
 ## Remaining Design Work
 
-The legacy behavior inventory and
-[product workflow and decision policy](../superpowers/specs/2026-07-24-product-workflow-design.md)
+The legacy behavior inventory,
+[product workflow and decision policy](../superpowers/specs/2026-07-24-product-workflow-design.md),
+and
+[domain model, persistence, and continuation](../superpowers/specs/2026-07-24-domain-persistence-design.md)
 are complete. The remaining focused sessions will define:
 
-- package boundaries, domain model, SQLite schema, transactions, and
-  idempotency;
 - exact LLM task schemas, escalation policy, prompt versions, and Promptfoo
   datasets;
 - RSS, MediaWiki, Brave Web Search, article retrieval, and OpenRouter adapter

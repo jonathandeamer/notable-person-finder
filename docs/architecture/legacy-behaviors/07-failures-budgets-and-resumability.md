@@ -141,11 +141,13 @@ startup, an abandoned `running` record from a crashed process becomes
 `interrupted`, then the workflow queries durable state for unfinished work.
 The new run naturally continues pending items.
 
-Each item transition commits transactionally. Successfully completed external
+Each item transition commits transactionally. Successfully persisted external
 work is reused when the normalized input and relevant provider, policy,
-schema, prompt, and model versions match. A process crash therefore does not
-repeat paid work merely because it occurred in an earlier run. Changed inputs
-or versions create new observations rather than mutating history.
+schema, prompt, and model versions match. A crash after the remote provider
+accepts a request but before SQLite stores the result can still repeat paid
+work unless that provider supports a usable idempotency key; exactly-once
+execution across those systems is not promised. Changed inputs or versions
+create new observations rather than mutating history.
 
 One real operating-system file lock prevents concurrent local runs and is
 released automatically when the process exits or crashes. Do not use a stale
@@ -191,7 +193,7 @@ valid, and the next run records the interrupted predecessor.
 | A numeric Gate 1 event count acts as the budget. | **Delete.** Work bounds and optional OpenRouter USD cost cap are separate configurable controls. | Budget configuration tests |
 | Budget exhaustion drops remaining items. | **Delete.** Required work receives `not_evaluated_budget` and remains pending. | Multi-run budget tests |
 | Models and backends are embedded in runner flags. | **Delete.** OpenRouter-only logical task policies own configurable model routing; no CLI or direct-provider backend remains. | Configuration validation tests |
-| Retrying a crashed run repeats already completed paid work. | **Delete.** Reuse matching successful attempts through versioned idempotency identity. | Crash-boundary cost test |
+| Retrying a crashed run repeats already persisted paid work. | **Delete.** Reuse matching successful attempts through versioned idempotency identity; document the unavoidable post-provider/pre-persistence window. | Crash-boundary cost test |
 | Any failed run can leave the prior successful digest looking current. | **Delete.** Reporting exposes the latest attempt and explicit run state. | Failed-report test |
 | The application needs an overall elapsed-time kill switch. | **Delete for version one.** Existing finite bounds are sufficient; add one only if observed runs justify it. | Absence from initial configuration schema |
 | Database damage can be bypassed by starting fresh automatically. | **Delete.** Fail loudly and preserve the damaged database for manual recovery. | Storage-failure test |

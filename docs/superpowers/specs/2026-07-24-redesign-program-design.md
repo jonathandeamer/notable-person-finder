@@ -147,6 +147,8 @@ Define people, identities, source items, evidence, publisher domains,
 decisions, attempts, runs, caches, SQLite ownership, transactions, idempotency,
 retention, interruption, and continuation.
 
+**Completed:** [Domain model, persistence, and continuation](2026-07-24-domain-persistence-design.md)
+
 ### 4. LLM tasks and evaluation
 
 Define the bounded judgments that use models, their typed inputs and outputs,
