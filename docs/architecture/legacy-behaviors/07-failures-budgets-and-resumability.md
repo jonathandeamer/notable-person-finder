@@ -40,10 +40,9 @@ One bad feed, article, or model response is isolated to its work item. It does
 not fail the batch when other useful work can continue. A valid empty result is
 `complete`, not failed.
 
-Optional synthesis and stronger-model escalation are not required for run
-completeness. When budget or policy skips them, the existing semantic outcome
-and deterministic digest fallback remain valid. Only deferred required
-first-pass work makes the run partial.
+Optional synthesis is not required for run completeness. When budget or policy
+skips it, the existing semantic outcome and deterministic digest fallback
+remain valid. Only deferred required first-pass work makes the run partial.
 
 The CLI returns `0` for complete, `2` for partial, and `1` for failed. A lock
 conflict prevents a new usable run and returns `1`. An inaccessible or
@@ -82,8 +81,8 @@ Use one application-owned retry policy across provider adapters:
 - Do not retry authentication or configuration errors, ordinary HTTP 4xx,
   paywalls, robots denial, malformed source content, model refusals, or valid
   semantic uncertainty.
-- Invalid structured model output receives at most one fresh attempt before an
-  explicitly configured fallback or escalation.
+- Invalid structured model output receives at most one fresh attempt with the
+  same configured model before becoming an operational failure.
 - Adapter timeouts and maximum attempts are configurable with conservative
   defaults.
 - Every attempt is immutable and separately recorded; a success never
@@ -120,15 +119,14 @@ Budgeted work order is:
 
 1. required first-pass semantic judgments for pending items, oldest first
    within ordinary workflow order;
-2. boundary-critical optional escalations;
-3. optional shortlist synthesis; and
-4. non-critical retries or refinements.
+2. optional shortlist synthesis; and
+3. non-critical retries or refinements.
 
 Required work that cannot fit is recorded as `not_evaluated_budget` and remains
 pending for a later run. Budget exhaustion does not silently substitute a
 cheaper model, truncate required context, or invent a semantic outcome.
-Fallback models run only when explicitly configured. Skipped optional work is
-reported separately and does not make the run partial.
+There are no fallback models in version one. Skipped optional work is reported
+separately and does not make the run partial.
 
 Brave search uses the configurable query, result, page, and request bounds
 approved in capability 4. Version one does not add a general cross-provider
@@ -192,7 +190,7 @@ valid, and the next run records the interrupted predecessor.
 | One item failure can stop a stage or be merely printed as a warning. | **Change.** Isolate item failures, persist them, and derive explicit complete, partial, or failed run state. | Mixed-result run tests |
 | A numeric Gate 1 event count acts as the budget. | **Delete.** Work bounds and optional OpenRouter USD cost cap are separate configurable controls. | Budget configuration tests |
 | Budget exhaustion drops remaining items. | **Delete.** Required work receives `not_evaluated_budget` and remains pending. | Multi-run budget tests |
-| Models and backends are embedded in runner flags. | **Delete.** OpenRouter-only logical task policies own configurable model routing; no CLI or direct-provider backend remains. | Configuration validation tests |
+| Models and backends are embedded in runner flags. | **Delete.** Each OpenRouter-only logical task has one configured preferred model; no CLI or direct-provider backend remains. | Configuration validation tests |
 | Retrying a crashed run repeats already persisted paid work. | **Delete.** Reuse matching successful attempts through versioned idempotency identity; document the unavoidable post-provider/pre-persistence window. | Crash-boundary cost test |
 | Any failed run can leave the prior successful digest looking current. | **Delete.** Reporting exposes the latest attempt and explicit run state. | Failed-report test |
 | The application needs an overall elapsed-time kill switch. | **Delete for version one.** Existing finite bounds are sufficient; add one only if observed runs justify it. | Absence from initial configuration schema |

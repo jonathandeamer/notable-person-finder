@@ -59,7 +59,7 @@ programme rather than questions to reopen routinely:
   backends will be removed.
 - SQLite is the durable source of truth in a Python modular monolith with one
   installed CLI.
-- Models, routing, budgets, thresholds, concurrency, source profiles, and
+- Task model assignments, request parameters, budgets, thresholds, concurrency, source profiles, and
   digest size are configurable rather than architectural constants.
 - The workflow optimizes for recall and produces an inspectable shortlist for
   human judgment.
@@ -152,8 +152,10 @@ retention, interruption, and continuation.
 ### 4. LLM tasks and evaluation
 
 Define the bounded judgments that use models, their typed inputs and outputs,
-uncertainty and escalation behavior, configurable model routing and budgets,
+uncertainty behavior, configurable task model assignment and budgets,
 prompt versioning, and lean Promptfoo datasets.
+
+**Completed:** [LLM tasks and evaluation](2026-07-24-llm-evaluation-design.md)
 
 ### 5. Provider adapter contracts
 
@@ -189,7 +191,7 @@ The initial design is complete only when:
   approved and internally consistent;
 - the overarching specification describes one complete once-daily visual-arts
   workflow;
-- configuration covers models, routing, budgets, thresholds, concurrency,
+- configuration covers task models, request parameters, budgets, thresholds, concurrency,
   feeds, and digest size without hard-coding current guesses;
 - failure, uncertainty, interruption, and resumption paths are specified as
   fully as the successful path; and

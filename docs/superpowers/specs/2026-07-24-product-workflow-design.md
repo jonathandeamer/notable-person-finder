@@ -128,8 +128,7 @@ scheduler prioritizes:
 
 1. required first-pass work;
 2. older pending work within ordinary workflow order;
-3. boundary-critical optional escalation; and
-4. optional synthesis or refinement.
+3. optional synthesis or refinement.
 
 This prevents early candidates from consuming the model budget while later
 feed items receive no triage. It also prevents one slow record from holding a

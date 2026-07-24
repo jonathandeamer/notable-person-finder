@@ -91,8 +91,7 @@ interval, or after an earlier inconclusive search.
 ### `uncertain_identity`
 
 A plausible candidate page remains, but the supplied evidence cannot safely
-establish or reject identity. When configured and affordable, the workflow may
-escalate once to a stronger model. If uncertainty remains:
+establish or reject identity. Version one does not call a second model:
 
 1. coverage research continues with the identity warning attached;
 2. newly collected coverage may support one later identity reconsideration;
@@ -122,7 +121,7 @@ or uncertainty, as appropriate.
 | Search and page results are capped. | `srlimit`, `search_max_results`, and candidate selection | **Preserve and clarify.** Bounds are configurable and truncation is explicit. A negative result from an unsafe truncated set cannot become a no-match observation. | Boundary and truncation tests |
 | A matching page must repeat the discovery article's specific work or event. | Gate 3 prompt warns against this inference | **Delete.** Wikipedia lead extracts are selective. Require positive alignment of available identity facts, not repetition of every source detail. | Promptfoo cases with aligned identity and missing event detail |
 | The model may use outside knowledge to fill gaps. | Gate 3 prompt prohibits it | **Preserve the prohibition.** Compare only accumulated source context and supplied MediaWiki data. | Promptfoo grounding cases |
-| Genuine doubt favors `UNCERTAIN` over an unsupported `HAS_PAGE`. | Gate 3 prompt and tests | **Preserve and extend.** Escalate selectively, continue coverage, and surface unresolved identity rather than suppress the person. | Promptfoo ambiguity cases and workflow tests |
+| Genuine doubt favors `UNCERTAIN` over an unsupported `HAS_PAGE`. | Gate 3 prompt and tests | **Preserve and extend.** Continue coverage and surface unresolved identity rather than suppress the person; version one does not call a second model. | Promptfoo ambiguity cases and workflow tests |
 | Model or parsing failures fall back to semantic `UNCERTAIN` and continue. | Gate 3 runner fallback tests | **Change.** Technical failures receive typed operational outcomes. Whether independent coverage work continues is decided by workflow and failure policy, not by fabricating a semantic judgment. | Failure tests in capability 7 |
 | Known pages are cached by normalized subject name and regex-derived aliases. | Gate 2 and Gate 3 index update scripts | **Delete.** A bare normalized name is unsafe for namesakes. | Namesake persistence tests |
 | A confirmed mapping stores only a title in some paths and omits stable page identity. | Gate 3 index update | **Change.** Store an entity-scoped relation to MediaWiki page ID, canonical title, URL, decision basis, and provenance. | Persistence and referential-integrity tests |

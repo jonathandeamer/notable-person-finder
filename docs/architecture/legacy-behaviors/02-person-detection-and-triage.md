@@ -47,27 +47,25 @@ general product requirements.
 | Reader letters and family tributes receive special treatment. | Gate 0 personal-obituary and letters rules | **Delete.** The relevant Guardian feed is not in the pilot and no general special case is required. | No replacement test |
 | Awards, national political roles, and selected achievements force a strong pass. | Gate 1 hard auto-pass rules | **Change.** Record award, office, profile, obituary, and similar facts as reasons to research. They never assert notability before coverage is evaluated. | Promptfoo signal-extraction cases and schema tests |
 | Triage returns `STRONG_PASS`, `WEAK_PASS`, `FAIL`, or `SKIP_GLOBALLY_KNOWN`. | Gate 1 schema and smoke tests | **Change.** Use `research`, `do_not_research`, or semantic `uncertain`, with subject focus, signals, and rationale represented separately. Exact names belong to the LLM design. | Schema tests, workflow transition tests, and Promptfoo cases |
-| Semantic uncertainty is folded into weak pass, fail, or model confidence. | Gate 1 prompt and categorical confidence | **Change.** Escalate genuine ambiguity once when configured and affordable. If a usable identity remains and focus is plausible, continue research with uncertainty visible. Otherwise retain a capped needs-review item. Budget-deferred escalation remains pending. | Workflow pytest tests and Promptfoo ambiguity cases |
+| Semantic uncertainty is folded into weak pass, fail, or model confidence. | Gate 1 prompt and categorical confidence | **Change.** If a usable identity remains and focus is plausible, continue research with uncertainty visible. Otherwise retain a capped needs-review item. Version one does not call a second model. | Workflow pytest tests and Promptfoo ambiguity cases |
 | Provider failure, invalid output, and budget exhaustion are semantic uncertainty. | Runner error paths | **Change.** These are typed operational outcomes with separate retry and reporting behavior. | Failure and budget tests in capability 7 |
 | Model training knowledge can assert that a famous person already has a Wikipedia page. | `SKIP_GLOBALLY_KNOWN`; Gate 1 index update | **Delete.** Every candidate uses current MediaWiki evidence. Do not cache model guesses as page identities. | Workflow test ensuring famous fixtures reach MediaWiki |
-| A fixed confidence label and signal taxonomy are part of the product contract. | Gate 1 schema enums | **Change.** Preserve visible uncertainty, grounded rationale, and useful signals, but redesign the exact typed fields and escalation semantics in the LLM specification. | Schema and Promptfoo contract tests after design approval |
+| A fixed confidence label and signal taxonomy are part of the product contract. | Gate 1 schema enums | **Change.** Preserve visible uncertainty, grounded rationale, and useful signals under the task schema defined by the LLM specification. | Schema and Promptfoo contract tests |
 | Model output is structured and includes a short grounded rationale. | Gate 1 JSON schema and tests | **Preserve.** Strict local validation and complete attempt provenance replace permissive parsing. | Schema-validation and provenance tests |
 | Gate 1 production behavior includes random samples, keyword trial filters, batch event-ID recovery, and append-only last-write-wins output. | Gate 1 runner flags and retry tests | **Delete as production behavior.** Prompt experimentation belongs in Promptfoo; production uses durable work state, typed attempts, and explicit retries. | Promptfoo configuration tests and persistence tests defined later |
 
-## Provisional Uncertainty Flow
+## Uncertainty Flow
 
-The exact thresholds and model routing remain part of later workflow and LLM
-design, but the observable intent is approved:
+Task model assignment and thresholds are configuration. The approved behavior
+is:
 
-1. Genuine semantic ambiguity may receive one configured stronger-model
-   escalation when budget permits.
-2. A result with a usable person identity and plausible individual focus
+1. A result with a usable person identity and plausible individual focus
    continues to MediaWiki and coverage research with its uncertainty visible.
-3. A result without a stable person identity is retained in a small, capped
+2. A result without a stable person identity is retained in a small, capped
    needs-review section rather than entering the ranked candidate shortlist.
-4. An escalation prevented by budget remains explicitly pending for a later
-   run.
-5. Technical failures are never represented as semantic judgments.
+3. Valid semantic uncertainty does not trigger another production model in
+   version one.
+4. Technical failures are never represented as semantic judgments.
 
 ## Verification Boundary
 

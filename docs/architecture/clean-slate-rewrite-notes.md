@@ -25,7 +25,7 @@ The application will never create or edit Wikipedia articles.
   material improvement, Wikipedia identity, evidence strength, grounded
   attention signals, access quality, and recency. Roughly ten candidates is
   the initial operational preference, not a hard architectural limit.
-- Models, model routing, budgets, escalation thresholds, concurrency, and digest size are configuration values.
+- Task model assignments, request parameters, budgets, concurrency, and digest size are configuration values.
 - A budget such as GBP 1 per run may be supplied and enforced, but the architecture must not require that exact value or any budget to be configured.
 - People and their supporting evidence persist across daily runs. New coverage can make an older candidate newly worth surfacing.
 
@@ -196,11 +196,15 @@ Every LLM task has a named input model and output model. The output model produc
 
 OpenRouter provider routing must require support for the requested structured-output parameters. Models incapable of satisfying a task's schema are rejected before a run or treated as a configuration error.
 
-### Explicit model routing
+### Explicit task model assignment
 
-Configuration maps logical tasks to model policies rather than scattering model names through code. A policy can identify a primary model, optional fallback or escalation model, request parameters, maximum attempts, and per-task cost allowance.
+Configuration maps each logical task to one preferred model and its request
+parameters, maximum attempts, and per-task bounds rather than scattering model
+names through code. Several tasks may use the same model.
 
-The default operating strategy is cheap first-pass classification followed by selective escalation of ambiguous or high-value cases. The exact models remain configurable.
+Version one has no different-model fallback, cheap-first routing, or semantic
+escalation. Valid uncertainty remains visible. Production model changes are
+explicit configuration changes informed by Promptfoo.
 
 ### Bounded retries
 
@@ -212,9 +216,9 @@ Retry policy distinguishes:
 - model refusals;
 - valid semantic uncertainty.
 
-Only the first three are mechanically retried. Semantic uncertainty is a
-domain outcome that may trigger a configured escalation; it is not treated as
-a transport failure.
+Only the first three are mechanically retried, using the same configured
+model. Semantic uncertainty is a domain outcome, not a transport failure or a
+reason to call another model.
 
 ### Budget enforcement
 
@@ -223,8 +227,8 @@ workflow reserves a conservative maximum cost based on current stamped pricing
 and configured token bounds. After a call, the reservation is reconciled
 against reported usage and cost. When the allowance is exhausted, required
 work receives an explicit `not_evaluated_budget` outcome and remains pending;
-optional synthesis or escalation may be skipped without making the run
-partial. The workflow still produces a digest and an explicit run report.
+optional synthesis may be skipped without making the run partial. The workflow
+still produces a digest and an explicit run report.
 
 ### Provenance
 
@@ -330,11 +334,11 @@ The project initially excludes repeated stochastic trials, confidence intervals,
 The legacy behavior inventory,
 [product workflow and decision policy](../superpowers/specs/2026-07-24-product-workflow-design.md),
 and
-[domain model, persistence, and continuation](../superpowers/specs/2026-07-24-domain-persistence-design.md)
+[domain model, persistence, and continuation](../superpowers/specs/2026-07-24-domain-persistence-design.md),
+and
+[LLM tasks and evaluation](../superpowers/specs/2026-07-24-llm-evaluation-design.md)
 are complete. The remaining focused sessions will define:
 
-- exact LLM task schemas, escalation policy, prompt versions, and Promptfoo
-  datasets;
 - RSS, MediaWiki, Brave Web Search, article retrieval, and OpenRouter adapter
   contracts; and
 - configuration precedence, CLI experience, logs, audit views, test layers,

@@ -178,9 +178,8 @@ as requiring human source review. It cannot promote or demote publisher
 policy. Version one performs no separate crawl of publisher About or editorial
 policy pages.
 
-Boundary-critical uncertain article judgments may use the already approved
-single stronger-model escalation. That remains article assessment, not a
-candidate notability decision.
+Boundary-critical uncertain article judgments remain visibly uncertain in
+version one. They do not trigger another production model.
 
 ## Ranking
 
