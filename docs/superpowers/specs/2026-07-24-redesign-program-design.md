@@ -139,6 +139,8 @@ Define the candidate lifecycle, stage transitions, human-review outcomes,
 evidence thresholds, ranking, resurfacing, and the operational meaning of high
 recall.
 
+**Completed:** [Product workflow and decision policy](2026-07-24-product-workflow-design.md)
+
 ### 3. Domain model, persistence, and resumability
 
 Define people, identities, source items, evidence, publisher domains,

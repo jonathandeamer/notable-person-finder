@@ -327,10 +327,10 @@ The project initially excludes repeated stochastic trials, confidence intervals,
 
 ## Remaining Design Work
 
-The legacy behavior inventory is complete. The remaining focused sessions
-will turn it into:
+The legacy behavior inventory and
+[product workflow and decision policy](../superpowers/specs/2026-07-24-product-workflow-design.md)
+are complete. The remaining focused sessions will define:
 
-- the consolidated product workflow and decision policy;
 - package boundaries, domain model, SQLite schema, transactions, and
   idempotency;
 - exact LLM task schemas, escalation policy, prompt versions, and Promptfoo
