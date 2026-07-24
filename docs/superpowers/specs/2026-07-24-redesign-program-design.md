@@ -141,9 +141,9 @@ recall.
 
 ### 3. Domain model, persistence, and resumability
 
-Define people, identities, source items, evidence, evidence clusters,
+Define people, identities, source items, evidence, publisher domains,
 decisions, attempts, runs, caches, SQLite ownership, transactions, idempotency,
-retention, interruption, and resumption.
+retention, interruption, and continuation.
 
 ### 4. LLM tasks and evaluation
 

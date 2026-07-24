@@ -1,6 +1,6 @@
 # Legacy Behavior Inventory
 
-**Status:** In progress; six of seven capabilities approved
+**Status:** Complete; all seven capabilities approved
 **Date:** 2026-07-24
 **Branch:** `refactor/rearchitecture`
 
@@ -35,7 +35,7 @@ for the focused design sessions.
 | Coverage discovery and source reliability | Approved | [04-coverage-and-source-reliability.md](legacy-behaviors/04-coverage-and-source-reliability.md) |
 | Lead assessment and ranking | Approved | [05-assessment-and-ranking.md](legacy-behaviors/05-assessment-and-ranking.md) |
 | Digest generation | Approved | [06-digest-generation.md](legacy-behaviors/06-digest-generation.md) |
-| Failures, retries, budgets, and resumability | Not started | `07-failures-budgets-and-resumability.md` |
+| Failures, retries, budgets, and resumability | Approved | [07-failures-budgets-and-resumability.md](legacy-behaviors/07-failures-budgets-and-resumability.md) |
 
 ## Cross-Capability Rules
 

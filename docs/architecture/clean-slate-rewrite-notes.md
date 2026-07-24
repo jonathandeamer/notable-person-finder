@@ -210,13 +210,21 @@ Retry policy distinguishes:
 - rate limits;
 - structured-output validation failures;
 - model refusals;
-- valid low-confidence answers.
+- valid semantic uncertainty.
 
-Only the first three are mechanically retried. Low confidence is a domain outcome that may trigger a configured escalation; it is not treated as a transport failure.
+Only the first three are mechanically retried. Semantic uncertainty is a
+domain outcome that may trigger a configured escalation; it is not treated as
+a transport failure.
 
 ### Budget enforcement
 
-A run may have an optional budget. Before a call, the workflow estimates whether the configured request can fit within the remaining allowance. After a call, actual usage and cost are recorded. When the allowance is exhausted, remaining optional classifications receive an explicit `not_evaluated_budget` outcome; the workflow still produces a digest and a complete run report.
+A run may have an optional OpenRouter budget in USD. Before a call, the
+workflow reserves a conservative maximum cost based on current stamped pricing
+and configured token bounds. After a call, the reservation is reconciled
+against reported usage and cost. When the allowance is exhausted, required
+work receives an explicit `not_evaluated_budget` outcome and remains pending;
+optional synthesis or escalation may be skipped without making the run
+partial. The workflow still produces a digest and an explicit run report.
 
 ### Provenance
 
@@ -319,18 +327,18 @@ The project initially excludes repeated stochastic trials, confidence intervals,
 
 ## Remaining Design Work
 
-The detailed design still needs agreement on:
+The legacy behavior inventory is complete. The remaining focused sessions
+will turn it into:
 
-- the legacy behavior inventory and disposition decisions;
-- package and module boundaries;
-- the domain model and SQLite schema;
-- exact stage transitions and terminal outcomes;
-- confidence ranking and escalation semantics;
-- transaction and resumability boundaries;
-- configuration file shape and precedence;
-- error taxonomy and run status rules;
-- report and digest schemas;
-- test layers and provider contract fixtures.
+- the consolidated product workflow and decision policy;
+- package boundaries, domain model, SQLite schema, transactions, and
+  idempotency;
+- exact LLM task schemas, escalation policy, prompt versions, and Promptfoo
+  datasets;
+- RSS, MediaWiki, Brave Web Search, article retrieval, and OpenRouter adapter
+  contracts; and
+- configuration precedence, CLI experience, logs, audit views, test layers,
+  provider fixtures, and operational acceptance checks.
 
 After those sections are reviewed, this note will be superseded by a complete design specification and a task-by-task implementation plan.
 
