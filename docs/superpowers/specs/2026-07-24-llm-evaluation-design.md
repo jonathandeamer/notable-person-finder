@@ -247,8 +247,10 @@ change promotes one.
 ## Production Model Assignment and Validation
 
 Configuration maps each task to exactly one preferred OpenRouter model and its
-request parameters, token bound, timeout, and retry limit. Startup validation
-checks strict structured-output support and permitted provider routing.
+request parameters and token bound. The provider configuration supplies the
+single OpenRouter timeout profile and central retry policy shared by tasks.
+Startup validation checks strict structured-output support and permitted
+provider routing.
 
 OpenRouter may route the configured model among compatible serving providers
 under recorded capability and privacy requirements. It may not silently choose

@@ -100,6 +100,9 @@ generic extractor. Do not add publisher-specific scrapers or circumvent
 authentication, paywalls, robots controls, or anti-bot measures. Fall back to
 the Brave title and snippets when access or extraction is incomplete, and
 record whether the available view was full text, partial text, or snippets.
+Version one does not proactively request or interpret `robots.txt`; that
+possible future feature and direct access handling are defined in the provider
+adapter design.
 
 Content preparation is deterministic. Extract title, dek, byline, date,
 editorial labels, and main body; remove navigation, footers, cookie notices,

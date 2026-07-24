@@ -116,6 +116,8 @@ presented coverage leads.
 ## Access Boundaries
 
 - The application does not circumvent paywalls, authentication, robots controls, or anti-bot systems.
+- Version one does not proactively request or interpret `robots.txt`; this may
+  be added later as a separately designed provider feature.
 - Feed metadata and legally accessible excerpts may be used for discovery and triage.
 - A result records whether the model received a headline, feed excerpt, search snippet, accessible article text, or some combination.
 - The model cannot claim to have read content that was not supplied.
