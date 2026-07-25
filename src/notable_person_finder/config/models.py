@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
@@ -37,8 +38,19 @@ class PathsConfig(StrictModel):
 
 
 class SecretEnvConfig(StrictModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     openrouter_api_key: str = "OPENROUTER_API_KEY"
     brave_api_key: str = "BRAVE_API_KEY"
+
+    @field_validator("*")
+    @classmethod
+    def environment_variable_identifier(cls, value: str) -> str:
+        if re.fullmatch(r"[A-Z_][A-Z0-9_]*", value) is None:
+            raise ValueError(
+                "must be an uppercase environment-variable identifier"
+            )
+        return value
 
 
 class MainConfig(StrictModel):

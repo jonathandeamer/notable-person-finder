@@ -71,13 +71,18 @@ def apply_migrations(
     backup_dir: Path,
     migrations: Iterable[Migration] | None = None,
 ) -> MigrationResult:
+    if connection.in_transaction:
+        raise MigrationError(
+            "cannot apply migrations while the connection has an active transaction"
+        )
+
     available = (
         load_migrations() if migrations is None else _ordered_migrations(migrations)
     )
     available_by_version = {migration.version: migration for migration in available}
 
-    _ensure_migration_table(connection)
-    applied = _read_applied_migrations(connection)
+    migration_table_exists = _migration_table_exists(connection)
+    applied = _read_applied_migrations(connection) if migration_table_exists else ()
     _verify_applied_migrations(applied, available_by_version)
 
     applied_versions = {version for version, _, _ in applied}
@@ -94,6 +99,7 @@ def apply_migrations(
     for migration in pending:
         try:
             connection.execute("BEGIN")
+            _ensure_migration_table(connection)
             for statement in _split_statements(migration.sql):
                 connection.execute(statement)
             connection.execute(
@@ -145,21 +151,30 @@ def _ordered_migrations(migrations: Iterable[Migration]) -> tuple[Migration, ...
 
 
 def _ensure_migration_table(connection: sqlite3.Connection) -> None:
-    try:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS schema_migration (
-                version INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                checksum TEXT NOT NULL,
-                applied_at TEXT NOT NULL
-            )
-            """
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migration (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            checksum TEXT NOT NULL,
+            applied_at TEXT NOT NULL
         )
-        connection.commit()
+        """
+    )
+
+
+def _migration_table_exists(connection: sqlite3.Connection) -> bool:
+    try:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'schema_migration'
+            """
+        ).fetchone()
     except sqlite3.Error as error:
-        connection.rollback()
-        raise MigrationError(f"could not create schema_migration: {error}") from error
+        raise MigrationError(f"could not inspect database schema: {error}") from error
+    return row is not None
 
 
 def _read_applied_migrations(

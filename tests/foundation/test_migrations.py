@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from notable_person_finder.db import migrate as migrate_module
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.db.migrate import MigrationError, apply_migrations
 
@@ -68,5 +69,99 @@ def test_changed_applied_migration_checksum_fails(tmp_path: Path) -> None:
         connection.commit()
         with pytest.raises(MigrationError, match="checksum"):
             apply_migrations(connection, database, tmp_path / "backups")
+    finally:
+        connection.close()
+
+
+def test_backup_failure_leaves_existing_database_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "notable.sqlite3"
+    connection = connect_database(database)
+    try:
+        connection.execute("CREATE TABLE legacy_record (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO legacy_record VALUES ('preserve me')")
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        database_bytes = database.read_bytes()
+        wal_path = database.with_name(f"{database.name}-wal")
+        wal_bytes = wal_path.read_bytes()
+
+        def fail_backup(
+            connection: sqlite3.Connection,
+            database_path: Path,
+            backup_dir: Path,
+        ) -> Path:
+            raise MigrationError("injected backup failure")
+
+        monkeypatch.setattr(migrate_module, "_create_backup", fail_backup)
+
+        with pytest.raises(MigrationError, match="injected backup failure"):
+            apply_migrations(connection, database, tmp_path / "backups")
+
+        assert database.read_bytes() == database_bytes
+        assert wal_path.read_bytes() == wal_bytes
+        assert [
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            )
+        ] == ["legacy_record"]
+        assert [
+            row[0] for row in connection.execute("SELECT value FROM legacy_record")
+        ] == ["preserve me"]
+    finally:
+        connection.close()
+
+
+def test_pre_migration_backup_precedes_metadata_bootstrap(tmp_path: Path) -> None:
+    database = tmp_path / "notable.sqlite3"
+    connection = connect_database(database)
+    try:
+        connection.execute("CREATE TABLE legacy_record (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO legacy_record VALUES ('before migration')")
+        connection.commit()
+        result = apply_migrations(connection, database, tmp_path / "backups")
+    finally:
+        connection.close()
+
+    assert result.backup_path is not None
+    backup = sqlite3.connect(result.backup_path)
+    try:
+        tables = {
+            row[0]
+            for row in backup.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert "legacy_record" in tables
+        assert "schema_migration" not in tables
+        assert "configuration_snapshot" not in tables
+        assert backup.execute("SELECT value FROM legacy_record").fetchall() == [
+            ("before migration",)
+        ]
+    finally:
+        backup.close()
+
+
+def test_migrations_reject_caller_owned_transaction_without_committing_it(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "notable.sqlite3"
+    connection = connect_database(database)
+    try:
+        connection.execute("CREATE TABLE caller_work (value TEXT NOT NULL)")
+        connection.commit()
+        connection.execute("INSERT INTO caller_work VALUES ('uncommitted')")
+
+        with pytest.raises(MigrationError, match="active transaction"):
+            apply_migrations(connection, database, tmp_path / "backups")
+
+        assert connection.in_transaction
+        assert [
+            row[0] for row in connection.execute("SELECT value FROM caller_work")
+        ] == ["uncommitted"]
+        connection.rollback()
+        assert list(connection.execute("SELECT value FROM caller_work")) == []
     finally:
         connection.close()

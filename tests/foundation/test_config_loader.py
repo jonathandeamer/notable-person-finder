@@ -44,3 +44,23 @@ def test_missing_files_and_secrets_are_actionable(tmp_path: Path) -> None:
     assert "feeds.toml" in "\n".join(captured.value.errors)
     assert "TEST_OPENROUTER" in "\n".join(captured.value.errors)
     assert "TEST_BRAVE" in "\n".join(captured.value.errors)
+
+
+def test_literal_secret_selector_is_rejected_without_disclosure(tmp_path: Path) -> None:
+    config_file = write_graph(tmp_path)
+    literal_secret = "sk-or-v1.pasted-secret-value"
+    config_file.write_text(
+        config_file.read_text(encoding="utf-8").replace(
+            'openrouter_api_key = "TEST_OPENROUTER"',
+            f'openrouter_api_key = "{literal_secret}"',
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigLoadError) as captured:
+        load_config(config_file, environ={}, require_secrets=False)
+
+    diagnostic = str(captured.value)
+    assert "secrets.openrouter_api_key" in diagnostic
+    assert "environment-variable identifier" in diagnostic
+    assert literal_secret not in diagnostic
