@@ -8,6 +8,8 @@ from pathlib import Path
 from notable_person_finder.runs.lock import MutationLock
 from tests.foundation.helpers import write_graph
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
 
 def run_cli(config_file: Path, *arguments: str, env: dict[str, str] | None = None):
     command_env = os.environ.copy()
@@ -123,13 +125,14 @@ def test_checked_in_example_configuration_is_structurally_valid(
     config_root = tmp_path / "config"
     profile_root = config_root / "discovery_profiles"
     profile_root.mkdir(parents=True)
-    shutil.copyfile("config/notable.example.toml", config_root / "notable.toml")
+    examples = REPOSITORY_ROOT / "config"
+    shutil.copyfile(examples / "notable.example.toml", config_root / "notable.toml")
     shutil.copyfile(
-        "config/discovery-feeds.example.toml",
+        examples / "discovery-feeds.example.toml",
         config_root / "discovery-feeds.toml",
     )
     shutil.copyfile(
-        "config/discovery_profiles/art.example.toml",
+        examples / "discovery_profiles" / "art.example.toml",
         profile_root / "art.toml",
     )
     completed = run_cli(

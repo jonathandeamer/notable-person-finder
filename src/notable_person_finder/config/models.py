@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import re
 from pathlib import Path
 from typing import Annotated, Literal
@@ -24,12 +25,32 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+_NON_PUBLIC_SUFFIXES = (".localhost", ".local", ".internal", ".home.arpa")
+
+
+def _is_public_host(hostname: str) -> bool:
+    host = hostname.rstrip(".").lower()
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(_NON_PUBLIC_SUFFIXES):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        # A registered name; resolution is deliberately not attempted so that
+        # validation stays offline and deterministic.
+        return True
+    return address.is_global
+
+
 def validate_public_http_url(value: str) -> str:
     parsed = urlsplit(value)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("must be an absolute HTTP or HTTPS URL")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("URL must not contain embedded credentials")
+    if not _is_public_host(parsed.hostname):
+        raise ValueError("host must be publicly routable")
     return value
 
 
