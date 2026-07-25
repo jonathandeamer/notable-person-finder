@@ -4,6 +4,10 @@ import dataclasses
 import sqlite3
 from collections.abc import Collection
 
+from notable_person_finder.runs.budget import (
+    reconcile_in_transaction,
+    reserve_in_transaction,
+)
 from notable_person_finder.runs.models import (
     RunCounters,
     RunRecord,
@@ -12,6 +16,7 @@ from notable_person_finder.runs.models import (
     WorkItem,
     WorkState,
 )
+from notable_person_finder.runs.retry import AttemptRecord
 
 
 def store_snapshot(
@@ -478,4 +483,207 @@ def run_counters(
         optional_succeeded=tally.get((0, "succeeded"), 0),
         optional_skipped=tally.get((0, "superseded"), 0),
         operational_failures=operational_failures_for_run(connection, run_id=run_id),
+    )
+
+
+def next_attempt_ordinal(
+    connection: sqlite3.Connection, *, work_item_id: int
+) -> int:
+    row = connection.execute(
+        "SELECT COALESCE(MAX(ordinal), 0) + 1 AS ordinal FROM attempt WHERE work_item_id = ?",
+        (work_item_id,),
+    ).fetchone()
+    return int(row["ordinal"])
+
+
+def _insert_attempt(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    work_item_id: int,
+    provider: str,
+    operation: str,
+    ordinal: int,
+    request_fingerprint: str,
+    destination_host: str | None,
+    reserved_nano_usd: int,
+    now: str,
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO attempt (
+            run_id, work_item_id, provider, operation, ordinal,
+            started_at, request_fingerprint, destination_host, reserved_nano_usd
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id, work_item_id, provider, operation, ordinal, now,
+            request_fingerprint, destination_host, reserved_nano_usd,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def claim_and_start_attempt(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    work_item_id: int,
+    provider: str,
+    operation: str,
+    ordinal: int,
+    request_fingerprint: str,
+    destination_host: str | None,
+    reserved_nano_usd: int,
+    now: str,
+) -> int:
+    """Atomically claim work, reserve cost, and persist the first attempt."""
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        changed = connection.execute(
+            """
+            UPDATE work_item
+               SET state = 'running', claimed_by_run_id = ?, updated_at = ?
+             WHERE id = ?
+               AND (
+                       state = 'pending'
+                    OR (state = 'deferred' AND COALESCE(completed_by_run_id, -1) <> ?)
+               )
+            """,
+            (run_id, now, work_item_id, run_id),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError(f"work item {work_item_id} is not claimable by run-{run_id}")
+        reserve_in_transaction(
+            connection,
+            run_id=run_id,
+            nano_usd=reserved_nano_usd,
+        )
+        attempt_id = _insert_attempt(
+            connection,
+            run_id=run_id,
+            work_item_id=work_item_id,
+            provider=provider,
+            operation=operation,
+            ordinal=ordinal,
+            request_fingerprint=request_fingerprint,
+            destination_host=destination_host,
+            reserved_nano_usd=reserved_nano_usd,
+            now=now,
+        )
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+    return attempt_id
+
+
+def start_attempt(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    work_item_id: int,
+    provider: str,
+    operation: str,
+    ordinal: int,
+    request_fingerprint: str,
+    destination_host: str | None,
+    reserved_nano_usd: int,
+    now: str,
+) -> int:
+    """Atomically reserve and persist a retry for already-running work."""
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        reserve_in_transaction(
+            connection,
+            run_id=run_id,
+            nano_usd=reserved_nano_usd,
+        )
+        attempt_id = _insert_attempt(
+            connection,
+            run_id=run_id,
+            work_item_id=work_item_id,
+            provider=provider,
+            operation=operation,
+            ordinal=ordinal,
+            request_fingerprint=request_fingerprint,
+            destination_host=destination_host,
+            reserved_nano_usd=reserved_nano_usd,
+            now=now,
+        )
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+    return attempt_id
+
+
+def finish_attempt(
+    connection: sqlite3.Connection,
+    *,
+    attempt_id: int,
+    record: AttemptRecord,
+    response_bytes: int | None,
+    provider_request_id: str | None,
+    detail_json: str | None,
+    now: str,
+    actual_nano_usd: int | None = None,
+) -> None:
+    """Close one immutable attempt. Retries insert new rows; nothing is rewritten."""
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        attempt = connection.execute(
+            "SELECT run_id, reserved_nano_usd FROM attempt WHERE id = ? AND outcome IS NULL",
+            (attempt_id,),
+        ).fetchone()
+        if attempt is None:
+            raise RuntimeError(f"attempt {attempt_id} is already finished or does not exist")
+        reconcile_in_transaction(
+            connection,
+            run_id=int(attempt["run_id"]),
+            reserved_nano_usd=int(attempt["reserved_nano_usd"]),
+            actual_nano_usd=actual_nano_usd,
+        )
+        changed = connection.execute(
+            """
+            UPDATE attempt
+               SET outcome = ?, failure_category = ?, provider_status = ?,
+                   retry_after_ms = ?, latency_ms = ?, response_bytes = ?,
+                   provider_request_id = ?, detail_json = ?, actual_nano_usd = ?,
+                   finished_at = ?
+             WHERE id = ? AND outcome IS NULL
+            """,
+            (
+                record.outcome,
+                None if record.failure_category is None else str(record.failure_category),
+                record.status_code,
+                record.retry_after_ms,
+                record.latency_ms,
+                response_bytes,
+                provider_request_id,
+                detail_json,
+                actual_nano_usd,
+                now,
+                attempt_id,
+            ),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError(f"attempt {attempt_id} could not be finished")
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
+def attempts_for_run(
+    connection: sqlite3.Connection, *, run_id: int
+) -> tuple[sqlite3.Row, ...]:
+    return tuple(
+        connection.execute(
+            "SELECT * FROM attempt WHERE run_id = ? ORDER BY id", (run_id,)
+        )
     )
