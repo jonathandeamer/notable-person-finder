@@ -233,6 +233,24 @@ replacing the prototype, not a permanent compatibility target. The rewrite
 starts with new state, so fallback means running the preserved prototype
 rather than downgrading or translating the new SQLite database.
 
+## Integration and Cutover Policy
+
+`refactor/rearchitecture` is the integration branch for the rewrite. Focused
+implementation branches start from it and return to it after their own review
+and verification; they do not merge independently into `main`. Once a focused
+branch has been integrated, its worktree and local branch may be removed.
+
+Legacy removal is a product cutover step, not ordinary branch cleanup. The
+prototype runtime, tests, configuration, and entry points remain present until
+the replacement passes the approved offline verification, manual live checks,
+and one-time legacy comparison. Their removal is then made as an explicit,
+reviewed commit on the integration branch. That removal must not delete
+operator data or the historical design and behavior documentation.
+
+Only the complete, verified `refactor/rearchitecture` branch merges into
+`main`. Merged local worktrees and branches are cleaned up afterward; remote
+branch deletion requires explicit operator approval.
+
 ## Transition to Implementation
 
 After the legacy behavior inventory, five focused specifications, and
