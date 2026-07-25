@@ -101,6 +101,15 @@ class RetryCoordinator:
                     self._record_success_or_permanent(provider)
                     raise
                 if failure.category is FailureCategory.MALFORMED_RESPONSE:
+                    # Adjudicated: "at most one fresh attempt" for malformed
+                    # structured output is a ceiling, not a guarantee.
+                    # `max_attempts` remains the outer bound on total calls --
+                    # with max_attempts=1 a malformed response gets exactly
+                    # one attempt and stops, because the operator's
+                    # configured budget must bound the number of paid
+                    # generations. This branch never grants an attempt beyond
+                    # max_attempts; it only forecloses a second malformed
+                    # retry early when budget would otherwise allow one.
                     if malformed_retries >= 1:
                         self._record_success_or_permanent(provider)
                         raise
@@ -121,7 +130,15 @@ class RetryCoordinator:
             return result
 
         assert last_failure is not None
-        self._record_exhaustion(provider)
+        # The pause counter tracks transient exhaustion only. A malformed
+        # response is a real answer from the provider (it served us
+        # schema-nonconforming content, not unavailability), so it must not
+        # count toward pausing the provider even when it happens to be the
+        # failure that used up the last attempt slot.
+        if last_failure.category is FailureCategory.MALFORMED_RESPONSE:
+            self._record_success_or_permanent(provider)
+        else:
+            self._record_exhaustion(provider)
         raise RetryExhausted(last_failure, attempts=self._config.max_attempts)
 
     def _elapsed_ms(self, started: float) -> int:

@@ -250,6 +250,87 @@ def test_attempt_records_carry_status_and_latency() -> None:
     assert records[0].failure_category is FailureCategory.RATE_LIMIT
 
 
+def test_malformed_response_at_max_attempts_one_does_not_pause_the_provider() -> None:
+    calls: list[int] = []
+
+    def action(ordinal: int) -> str:
+        calls.append(ordinal)
+        raise ProviderFailure(
+            FailureCategory.MALFORMED_RESPONSE,
+            provider="openrouter",
+            operation="generate_structured",
+            retryable=True,
+        )
+
+    config = RetryConfig(
+        max_attempts=1,
+        jitter_ratio=0.0,
+        provider_pause_after_consecutive_exhaustions=1,
+    )
+    coordination = coordinator(config)
+    with pytest.raises(RetryExhausted):
+        coordination.call(
+            "openrouter", "generate_structured", action, on_attempt=lambda _: None
+        )
+    assert calls == [1]
+    assert not coordination.is_paused("openrouter")
+
+
+def test_malformed_response_on_final_budget_slot_does_not_pause_the_provider() -> None:
+    calls: list[int] = []
+
+    def action(ordinal: int) -> str:
+        calls.append(ordinal)
+        if ordinal < 3:
+            raise failure(FailureCategory.TRANSIENT_SERVER_ERROR)
+        raise ProviderFailure(
+            FailureCategory.MALFORMED_RESPONSE,
+            provider="brave",
+            operation="search_web",
+            retryable=True,
+        )
+
+    config = RetryConfig(
+        max_attempts=3,
+        initial_backoff_seconds=1.0,
+        max_backoff_seconds=30.0,
+        backoff_multiplier=2.0,
+        jitter_ratio=0.0,
+        provider_pause_after_consecutive_exhaustions=1,
+    )
+    clock = FakeClock()
+    coordination = coordinator(config, clock)
+    with pytest.raises(RetryExhausted) as raised:
+        coordination.call("brave", "search_web", action, on_attempt=lambda _: None)
+    assert calls == [1, 2, 3]
+    assert raised.value.last_failure.category is FailureCategory.MALFORMED_RESPONSE
+    assert not coordination.is_paused("brave")
+
+
+def test_starting_ordinal_with_a_retry_keeps_delays_keyed_to_retry_count() -> None:
+    records: list[AttemptRecord] = []
+    calls: list[int] = []
+
+    def action(ordinal: int) -> str:
+        calls.append(ordinal)
+        if ordinal == 10:
+            raise failure(FailureCategory.TRANSIENT_SERVER_ERROR)
+        return "page"
+
+    clock = FakeClock()
+    result = coordinator(clock=clock).call(
+        "brave",
+        "search_web",
+        action,
+        on_attempt=records.append,
+        starting_ordinal=10,
+    )
+    assert result == "page"
+    assert calls == [10, 11]
+    assert [r.ordinal for r in records] == [10, 11]
+    assert clock.slept == [1.0]
+
+
 def test_persisted_ordinals_can_continue_after_an_interrupted_attempt() -> None:
     records: list[AttemptRecord] = []
     calls: list[int] = []
