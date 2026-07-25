@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
@@ -74,6 +75,103 @@ class SecretEnvConfig(StrictModel):
         return value
 
 
+NANO_USD = 1_000_000_000
+_USD_PATTERN = re.compile(r"^\d{1,9}(\.\d{1,9})?$")
+
+DEFAULT_USER_AGENT_URL = "https://github.com/jonathandeamer/notable-person-finder"
+
+
+def usd_to_nano_usd(value: str) -> int:
+    """Convert a decimal USD string to exact integer nano-USD."""
+    if _USD_PATTERN.fullmatch(value) is None:
+        raise ValueError(
+            "must be a non-negative decimal USD amount with at most 9 decimal places"
+        )
+    try:
+        amount = Decimal(value)
+    except InvalidOperation as error:  # pragma: no cover - guarded by the pattern
+        raise ValueError("must be a decimal USD amount") from error
+    return int(amount * NANO_USD)
+
+
+class TransportConfig(StrictModel):
+    contact_url: str | None = None
+    user_agent_override: str | None = Field(default=None, min_length=1, max_length=200)
+    connect_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
+    read_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
+    llm_read_timeout_seconds: float = Field(default=300.0, gt=0, le=1800)
+    max_redirects: int = Field(default=5, ge=1, le=10)
+    max_api_response_bytes: int = Field(default=5 * 1024 * 1024, gt=0)
+    max_article_response_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
+
+    @field_validator("contact_url")
+    @classmethod
+    def public_contact_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return validate_public_http_url(value)
+
+    def resolved_user_agent(self, version: str) -> str:
+        if self.user_agent_override is not None:
+            return self.user_agent_override
+        contact = f"; {self.contact_url}" if self.contact_url else ""
+        return f"notable-person-finder/{version} (+{DEFAULT_USER_AGENT_URL}{contact})"
+
+
+class RetryConfig(StrictModel):
+    max_attempts: int = Field(default=3, ge=1, le=10)
+    initial_backoff_seconds: float = Field(default=1.0, gt=0, le=60)
+    max_backoff_seconds: float = Field(default=30.0, gt=0, le=300)
+    backoff_multiplier: float = Field(default=2.0, ge=1.0, le=10.0)
+    jitter_ratio: float = Field(default=0.25, ge=0.0, le=1.0)
+    provider_pause_after_consecutive_exhaustions: int = Field(default=3, ge=1, le=50)
+
+    @model_validator(mode="after")
+    def backoff_is_ordered(self) -> RetryConfig:
+        if self.max_backoff_seconds < self.initial_backoff_seconds:
+            raise ValueError(
+                "max_backoff_seconds must be at least initial_backoff_seconds"
+            )
+        return self
+
+
+class ConcurrencyConfig(StrictModel):
+    http_workers: int = Field(default=4, ge=1, le=32)
+    llm_workers: int = Field(default=2, ge=1, le=16)
+    per_origin: int = Field(default=2, ge=1, le=16)
+
+
+class PacingConfig(StrictModel):
+    mediawiki_min_interval_ms: int = Field(default=900, ge=0, le=60_000)
+    brave_min_interval_ms: int = Field(default=1100, ge=0, le=60_000)
+
+
+class BudgetConfig(StrictModel):
+    openrouter_usd_per_run: str | None = None
+
+    @field_validator("openrouter_usd_per_run")
+    @classmethod
+    def decimal_usd(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        usd_to_nano_usd(value)
+        return value
+
+    def openrouter_nano_usd_per_run(self) -> int | None:
+        if self.openrouter_usd_per_run is None:
+            return None
+        return usd_to_nano_usd(self.openrouter_usd_per_run)
+
+
+class DigestConfig(StrictModel):
+    write_latest_copy: bool = True
+
+
+class LoggingConfig(StrictModel):
+    max_bytes: int = Field(default=5 * 1024 * 1024, gt=0)
+    backup_count: int = Field(default=5, ge=0, le=100)
+
+
 class MainConfig(StrictModel):
     schema_version: Literal[1]
     timezone: str
@@ -81,6 +179,13 @@ class MainConfig(StrictModel):
     domain_profile_file: Path
     paths: PathsConfig = PathsConfig()
     secrets: SecretEnvConfig = SecretEnvConfig()
+    transport: TransportConfig = TransportConfig()
+    retry: RetryConfig = RetryConfig()
+    concurrency: ConcurrencyConfig = ConcurrencyConfig()
+    pacing: PacingConfig = PacingConfig()
+    budget: BudgetConfig = BudgetConfig()
+    digest: DigestConfig = DigestConfig()
+    logging: LoggingConfig = LoggingConfig()
 
     @field_validator("timezone")
     @classmethod
