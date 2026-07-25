@@ -73,7 +73,9 @@ confirm `git diff --check` and `git status --short` are clean as applicable.
 `refactor/rearchitecture` is the rewrite integration branch. Implement changes
 on a focused feature branch, preferably in an isolated worktree.
 
-For rewrite work:
+### New rewrite work
+
+New milestone, feature, or design work follows the full path:
 
 1. Implement and verify the active milestone on the feature branch.
 2. Obtain explicit user authorization before publishing external changes.
@@ -85,10 +87,35 @@ For rewrite work:
 6. Merge only after review approval and explicit user authorization.
 
 Do not directly merge a feature branch into `refactor/rearchitecture` as the
-normal completion path. Do not push, open or modify pull requests, merge, or
-target `main` without explicit user authorization. Only the complete, verified
-rewrite integration branch may merge into `main`, and only as a later explicit
-cutover decision.
+normal completion path.
+
+### Remediation of review findings
+
+Remediation is not new work. When a review produces findings against work that
+is already on the integration branch, the fixes do not need their own pull
+request or their own independent review — the review that produced them already
+supplied the independent judgement. Commit them on a focused branch and merge
+into `refactor/rearchitecture` with explicit user authorization.
+
+Treat work as remediation only when all of the following hold:
+
+- the findings come from a completed review of work already integrated;
+- every change traces to a specific finding, and no change adds feature
+  surface, a new interface, or a new dependency;
+- each behavioural fix carries a regression test that fails before the fix and
+  passes after it;
+- the active milestone's full verification gate passes.
+
+The classification is not the implementing agent's to stretch. If the work grows
+past the findings, it is no longer remediation: stop, open a pull request, and
+follow the full path. When in doubt, use the full path.
+
+### Always
+
+Do not push, open or modify pull requests, merge, or target `main` without
+explicit user authorization, on either path. Only the complete, verified rewrite
+integration branch may merge into `main`, and only as a later explicit cutover
+decision.
 
 ## Legacy Prototype
 

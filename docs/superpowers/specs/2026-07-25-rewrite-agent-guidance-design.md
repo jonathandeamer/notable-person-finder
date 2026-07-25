@@ -32,7 +32,8 @@ Rewrite implementation happens on feature branches. By default, pull requests
 target `refactor/rearchitecture`; merging to `main` is reserved for an explicit
 later cutover decision.
 
-Publishing and integration follow this sequence:
+New milestone, feature, and design work publishes and integrates through this
+sequence:
 
 1. Verify the feature branch with the milestone's approved rewrite checks.
 2. Ask for explicit user authorization before pushing.
@@ -43,8 +44,23 @@ Publishing and integration follow this sequence:
    required.
 6. Merge only with explicit user authorization after review approval.
 
+Remediation of review findings is a distinct, lighter path. Fixes for findings
+raised against already-integrated work carry no fresh review requirement,
+because the review that produced the findings is itself the independent
+judgement; requiring a second review of the remedy would be circular. Such
+fixes merge into `refactor/rearchitecture` from a focused branch with explicit
+user authorization and without a pull request.
+
+The lighter path is conditional, not discretionary. It applies only to changes
+that trace to specific findings against integrated work, add no feature
+surface, interface, or dependency, carry regression tests that fail before the
+fix and pass after, and leave the milestone's verification gate passing. An
+implementing agent must not widen the classification to cover adjacent
+improvements it happens to want; work that outgrows the findings returns to the
+full path.
+
 Agents must not push, merge, or target `main` merely because implementation and
-tests are complete.
+tests are complete, on either path.
 
 ## Legacy Prototype
 
