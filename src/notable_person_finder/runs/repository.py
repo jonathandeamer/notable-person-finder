@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Collection
 
 from notable_person_finder.runs.models import (
+    RunCounters,
     RunRecord,
     RunState,
     SweepResult,
+    WorkItem,
     WorkState,
 )
 
@@ -188,3 +191,285 @@ def load_run(connection: sqlite3.Connection, *, run_id: int) -> RunRecord:
 def latest_run(connection: sqlite3.Connection) -> RunRecord | None:
     row = connection.execute("SELECT * FROM run ORDER BY id DESC LIMIT 1").fetchone()
     return None if row is None else _to_record(row)
+
+
+def schedule_work(
+    connection: sqlite3.Connection,
+    *,
+    task_type: str,
+    subject_kind: str,
+    subject_id: int | None,
+    fingerprint: str,
+    required: bool,
+    priority: int,
+    eligible_at: str,
+    run_id: int | None,
+    now: str,
+) -> int:
+    """Create the work item, or return the identity of the existing active one.
+
+    Duplicate active scheduling is prevented by `work_item_active_identity`, so
+    a caller that rediscovers the same input is a no-op rather than an error.
+    """
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        existing = connection.execute(
+            """
+            SELECT id FROM work_item
+             WHERE task_type = ? AND fingerprint = ?
+               AND state IN ('pending', 'running', 'deferred')
+            """,
+            (task_type, fingerprint),
+        ).fetchone()
+        if existing is not None:
+            work_id = int(existing["id"])
+        else:
+            cursor = connection.execute(
+                """
+                INSERT INTO work_item (
+                    task_type, subject_kind, subject_id, fingerprint, required,
+                    priority, eligible_at, state, created_by_run_id,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                """,
+                (
+                    task_type,
+                    subject_kind,
+                    subject_id,
+                    fingerprint,
+                    1 if required else 0,
+                    priority,
+                    eligible_at,
+                    run_id,
+                    now,
+                    now,
+                ),
+            )
+            work_id = int(cursor.lastrowid)
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+    return work_id
+
+
+def supersede_work(
+    connection: sqlite3.Connection,
+    *,
+    task_type: str,
+    fingerprint: str,
+    now: str,
+    reason: str,
+) -> int:
+    """Retire active work whose material input has changed."""
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        changed = connection.execute(
+            """
+            UPDATE work_item
+               SET state = 'superseded', reason = ?, updated_at = ?
+             WHERE task_type = ? AND fingerprint = ?
+               AND state IN ('pending', 'deferred')
+            """,
+            (reason, now, task_type, fingerprint),
+        ).rowcount
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+    return changed
+
+
+def _work_item(row: sqlite3.Row, *, state: WorkState | None = None) -> WorkItem:
+    return WorkItem(
+        id=int(row["id"]),
+        task_type=row["task_type"],
+        subject_kind=row["subject_kind"],
+        subject_id=row["subject_id"],
+        fingerprint=row["fingerprint"],
+        required=bool(row["required"]),
+        priority=int(row["priority"]),
+        state=state or WorkState(row["state"]),
+    )
+
+
+def next_eligible(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    now: str,
+    task_types: Collection[str] | None = None,
+) -> WorkItem | None:
+    """Inspect the next eligible item without mutating it."""
+    if task_types is not None and not task_types:
+        return None
+    task_filter = ""
+    parameters: list[object] = [run_id, now]
+    if task_types is not None:
+        ordered = sorted(task_types)
+        task_filter = f" AND task_type IN ({','.join('?' for _ in ordered)})"
+        parameters.extend(ordered)
+    row = connection.execute(
+        f"""
+        SELECT * FROM work_item
+         WHERE (
+                   state = 'pending'
+                OR (state = 'deferred' AND COALESCE(completed_by_run_id, -1) <> ?)
+               )
+           AND eligible_at <= ?
+           {task_filter}
+         ORDER BY priority ASC, id ASC
+         LIMIT 1
+        """,
+        parameters,
+    ).fetchone()
+    return None if row is None else _work_item(row)
+
+
+def claim_next(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    now: str,
+    task_types: Collection[str] | None = None,
+) -> WorkItem | None:
+    """Claim deterministic work; external calls use claim_and_start_attempt."""
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        item = next_eligible(
+            connection, run_id=run_id, now=now, task_types=task_types
+        )
+        if item is None:
+            connection.rollback()
+            return None
+        changed = connection.execute(
+            """
+            UPDATE work_item
+               SET state = 'running', claimed_by_run_id = ?, updated_at = ?
+             WHERE id = ? AND state IN ('pending', 'deferred')
+            """,
+            (run_id, now, item.id),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError(f"work item {item.id} was no longer claimable")
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+    return WorkItem(
+        id=item.id,
+        task_type=item.task_type,
+        subject_kind=item.subject_kind,
+        subject_id=item.subject_id,
+        fingerprint=item.fingerprint,
+        required=item.required,
+        priority=item.priority,
+        state=WorkState.RUNNING,
+    )
+
+
+def complete_work(
+    connection: sqlite3.Connection,
+    *,
+    work_item_id: int,
+    run_id: int,
+    state: WorkState,
+    reason: str | None,
+    now: str,
+    eligible_at: str | None = None,
+) -> None:
+    """Record one item's terminal or deferred outcome; failures are isolated."""
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute(
+            """
+            UPDATE work_item
+               SET state = ?,
+                   reason = ?,
+                   completed_by_run_id = ?,
+                   claimed_by_run_id = NULL,
+                   eligible_at = COALESCE(?, eligible_at),
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (str(state), reason, run_id, eligible_at, now, work_item_id),
+        )
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
+def pending_required(
+    connection: sqlite3.Connection, *, now: str | None = None
+) -> int:
+    eligibility = "" if now is None else " AND eligible_at <= ?"
+    parameters = () if now is None else (now,)
+    return int(
+        connection.execute(
+            f"""
+            SELECT COUNT(*) AS n FROM work_item
+             WHERE required = 1 AND state IN ('pending', 'running'){eligibility}
+            """,
+            parameters,
+        ).fetchone()["n"]
+    )
+
+
+def deferred_required(connection: sqlite3.Connection) -> int:
+    return int(
+        connection.execute(
+            "SELECT COUNT(*) AS n FROM work_item WHERE required = 1 AND state = 'deferred'"
+        ).fetchone()["n"]
+    )
+
+
+def operational_failures_for_run(
+    connection: sqlite3.Connection, *, run_id: int
+) -> int:
+    return int(
+        connection.execute(
+            "SELECT COUNT(*) AS n FROM attempt WHERE run_id = ? AND outcome = 'failed'",
+            (run_id,),
+        ).fetchone()["n"]
+    )
+
+
+def run_counters(
+    connection: sqlite3.Connection, *, run_id: int, now: str
+) -> RunCounters:
+    tally = {
+        (row["required"], row["state"]): int(row["n"])
+        for row in connection.execute(
+            """
+            SELECT required, state, COUNT(*) AS n
+              FROM work_item
+             WHERE completed_by_run_id = ?
+             GROUP BY required, state
+            """,
+            (run_id,),
+        )
+    }
+    required_deferred = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM work_item
+             WHERE required = 1 AND state = 'deferred' AND eligible_at <= ?
+            """,
+            (now,),
+        ).fetchone()["n"]
+    )
+    return RunCounters(
+        required_succeeded=tally.get((1, "succeeded"), 0),
+        required_pending=pending_required(connection, now=now),
+        required_deferred=required_deferred,
+        required_failed_permanent=tally.get((1, "failed_permanent"), 0),
+        optional_succeeded=tally.get((0, "succeeded"), 0),
+        optional_skipped=tally.get((0, "superseded"), 0),
+        operational_failures=operational_failures_for_run(connection, run_id=run_id),
+    )
