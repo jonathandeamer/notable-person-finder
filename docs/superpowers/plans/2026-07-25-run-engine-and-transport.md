@@ -3264,6 +3264,15 @@ def new_run(connection: sqlite3.Connection, *, at: str = "2026-07-25T06:00:00Z")
     snapshot = repository.store_snapshot(
         connection, fingerprint="a" * 64, canonical_json="{}", now=at
     )
+    return repository.create_run(
+        connection,
+        snapshot_id=snapshot,
+        timezone="Europe/Paris",
+        window_start=WINDOW[0],
+        window_end=WINDOW[1],
+        budget_limit_nano_usd=None,
+        now=at,
+    )
 
 
 def add_pending_work(connection: sqlite3.Connection, *, run_id: int, fingerprint: str) -> int:
@@ -3281,15 +3290,6 @@ def add_pending_work(connection: sqlite3.Connection, *, run_id: int, fingerprint
     )
     connection.commit()
     return int(cursor.lastrowid)
-    return repository.create_run(
-        connection,
-        snapshot_id=snapshot,
-        timezone="Europe/Paris",
-        window_start=WINDOW[0],
-        window_end=WINDOW[1],
-        budget_limit_nano_usd=None,
-        now=at,
-    )
 
 
 def test_snapshot_is_stored_once_per_fingerprint(connection: sqlite3.Connection) -> None:
@@ -6092,7 +6092,10 @@ class RunEngine:
             self._connection, work_item_id=work_item.id
         )
 
+        last_outcome: TaskOutcome | None = None
+
         def action(ordinal: int) -> TaskOutcome:
+            nonlocal last_outcome
             # Persist the attempt before the call so a crash leaves evidence.
             start = (
                 repository.claim_and_start_attempt
@@ -6111,12 +6114,12 @@ class RunEngine:
                 reserved_nano_usd=handler.reserved_nano_usd,
                 now=self._now(),
             )
-            return handler.execute(work_item, ordinal)
-
-        pending_outcome: list[TaskOutcome] = []
+            last_outcome = handler.execute(work_item, ordinal)
+            return last_outcome
 
         def on_attempt(record: AttemptRecord) -> None:
-            outcome = pending_outcome[0] if record.outcome == "succeeded" and pending_outcome else None
+            # A failed attempt has no outcome to persist; only a success does.
+            outcome = last_outcome if record.outcome == "succeeded" else None
             if record.failure_category is not None:
                 key = str(record.failure_category)
                 failure_categories[key] = failure_categories.get(key, 0) + 1
@@ -6135,7 +6138,7 @@ class RunEngine:
             result = self._retry.call(
                 handler.provider,
                 handler.operation,
-                lambda ordinal: self._capture(action, ordinal, pending_outcome),
+                action,
                 on_attempt=on_attempt,
                 starting_ordinal=starting_ordinal,
             )
@@ -6188,17 +6191,6 @@ class RunEngine:
             reason=result.reason,
             now=self._now(),
         )
-
-    @staticmethod
-    def _capture(
-        action: Callable[[int], TaskOutcome],
-        ordinal: int,
-        sink: list[TaskOutcome],
-    ) -> TaskOutcome:
-        outcome = action(ordinal)
-        sink.clear()
-        sink.append(outcome)
-        return outcome
 ```
 
 The `BoundedScheduler` is held by the engine for milestones 3–6, which submit independent per-subject calls through it. Milestone 2's synthetic handlers execute sequentially; the scheduler's own bounded-concurrency contract is proven by Task 13.
@@ -6828,10 +6820,13 @@ from notable_person_finder.config.loader import ConfigLoadError, ResolvedConfig,
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.db.migrate import MigrationError, apply_migrations
 from notable_person_finder.obs.logging import configure_logging, log_event
-from notable_person_finder.providers.pacing import build_pacing_gate
 from notable_person_finder.providers.safety import SystemHostResolver
 from notable_person_finder.providers.transport import build_transport
-from notable_person_finder.reporting.digest import DigestWriteError, write_digest
+from notable_person_finder.reporting.digest import (
+    DigestRecord,
+    DigestWriteError,
+    write_digest,
+)
 from notable_person_finder.runs import repository
 from notable_person_finder.runs.clock import SystemClock, utc_timestamp
 from notable_person_finder.runs.engine import ReportArtifact, RunEngine
@@ -6951,17 +6946,17 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                 resolver=SystemHostResolver(),
                 clock=clock,
             )
-            pacing = build_pacing_gate(
-                loaded.main.pacing, loaded.main.concurrency, clock=clock
-            )
+            # The pacing gate is built by the first adapter milestone that has
+            # a provider to pace; nothing in this milestone makes requests.
             local_date = (
                 clock.now().astimezone(ZoneInfo(loaded.main.timezone)).date().isoformat()
             )
-            written_digest = []
+            written: DigestRecord | None = None
 
             def report_run(report) -> ReportArtifact:
+                nonlocal written
                 try:
-                    digest = write_digest(
+                    written = write_digest(
                         loaded.paths.digests,
                         report,
                         local_date=local_date,
@@ -6970,9 +6965,10 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                 except DigestWriteError:
                     log_event(logger, "run_reporting_failed", run_id=report.run_id)
                     raise
-                written_digest.append(digest)
                 return ReportArtifact(
-                    path=str(digest.path), sha256=digest.sha256, markdown=digest.markdown
+                    path=str(written.path),
+                    sha256=written.sha256,
+                    markdown=written.markdown,
                 )
 
             engine = RunEngine(
@@ -6994,9 +6990,8 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                 report = engine.execute({})
             finally:
                 transport.close()
-                del pacing
 
-            digest = written_digest[0]
+            assert written is not None
 
             log_event(
                 logger,
@@ -7007,9 +7002,9 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                 required_deferred=report.counters.required_deferred,
                 operational_failures=report.counters.operational_failures,
             )
-            sys.stdout.write(digest.markdown)
+            sys.stdout.write(written.markdown)
             if verbose:
-                print(f"digest: {digest.path}", file=sys.stderr)
+                print(f"digest: {written.path}", file=sys.stderr)
             return _EXIT_BY_STATE[report.state]
         finally:
             connection.close()
@@ -7326,11 +7321,26 @@ def test_abandoned_work_returns_to_pending_not_to_deferred(database: Path) -> No
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `uv run pytest tests/run_engine/test_crash_boundary.py -v`
-Expected: FAIL. `RunEngine._perform` currently lets `SimulatedCrash` propagate without leaving the attempt row in a recoverable state only if the attempt insert is not committed before the call; if these tests already pass, that is the correct behaviour and the plan's assertion is confirmed — record that in the commit message rather than weakening the test.
 
-- [ ] **Step 3: Confirm the engine commits the attempt before the call**
+**This task is a characterisation test, not red-green TDD.** Tasks 10–15 already
+built the behaviour these tests describe; this task proves it and writes it
+down. **Passing on the first run is the expected and correct result** — it
+confirms the claim in `docs/architecture/at-least-once-execution.md`. Record
+that in the commit message and move to Step 4.
 
-The attempt insert in `RunEngine._perform` uses `repository.start_attempt`, which commits its own transaction before `handler.execute` runs. If any test in Step 2 fails, the cause is a transaction still open across the handler call — fix `start_attempt` to commit, never the test.
+If a test *fails*, you have found a real defect in Task 12 or Task 15 — most
+likely a transaction still open across `handler.execute`, or an attempt row
+that was never committed before the call. Fix the production code in
+`repository.claim_and_start_attempt`, `repository.start_attempt`, or
+`RunEngine._perform`. Never weaken or delete an assertion to make this file
+pass.
+
+- [ ] **Step 3: Confirm the attempt is committed before the external call**
+
+Both `repository.claim_and_start_attempt` and `repository.start_attempt` commit
+their own transaction before `handler.execute` runs. Verify by inspection that
+neither holds an open transaction across the call, and that
+`RunEngine._perform` does not wrap them in an outer transaction.
 
 - [ ] **Step 4: Write the operator-facing note**
 
