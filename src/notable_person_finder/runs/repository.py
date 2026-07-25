@@ -291,6 +291,16 @@ def supersede_work(
     return changed
 
 
+# Shared by `next_eligible`, `claim_next`, and `claim_and_start_attempt` so the
+# three claim paths cannot silently diverge on what "claimable" means. Binds
+# two placeholders, in this order: run_id (for the same-run deferred check),
+# then now (for the eligibility check).
+_CLAIMABLE_PREDICATE = """(
+    state = 'pending'
+    OR (state = 'deferred' AND COALESCE(completed_by_run_id, -1) <> ?)
+) AND eligible_at <= ?"""
+
+
 def _work_item(row: sqlite3.Row) -> WorkItem:
     return WorkItem(
         id=int(row["id"]),
@@ -323,11 +333,7 @@ def next_eligible(
     row = connection.execute(
         f"""
         SELECT * FROM work_item
-         WHERE (
-                   state = 'pending'
-                OR (state = 'deferred' AND COALESCE(completed_by_run_id, -1) <> ?)
-               )
-           AND eligible_at <= ?
+         WHERE {_CLAIMABLE_PREDICATE}
            {task_filter}
          ORDER BY priority ASC, id ASC
          LIMIT 1
@@ -354,12 +360,12 @@ def claim_next(
             connection.rollback()
             return None
         changed = connection.execute(
-            """
+            f"""
             UPDATE work_item
                SET state = 'running', claimed_by_run_id = ?, updated_at = ?
-             WHERE id = ? AND state IN ('pending', 'deferred')
+             WHERE id = ? AND {_CLAIMABLE_PREDICATE}
             """,
-            (run_id, now, item.id),
+            (run_id, now, item.id, run_id, now),
         ).rowcount
         if changed != 1:
             raise RuntimeError(f"work item {item.id} was no longer claimable")
@@ -489,6 +495,13 @@ def run_counters(
 def next_attempt_ordinal(
     connection: sqlite3.Connection, *, work_item_id: int
 ) -> int:
+    """Advisory next ordinal for a work item.
+
+    Computed outside the transaction that will consume it, so it is a hint,
+    not a reservation: the `UNIQUE (work_item_id, ordinal)` index is the real
+    arbiter and turns a concurrent race into a rolled-back IntegrityError
+    rather than a silently overwritten attempt.
+    """
     row = connection.execute(
         "SELECT COALESCE(MAX(ordinal), 0) + 1 AS ordinal FROM attempt WHERE work_item_id = ?",
         (work_item_id,),
@@ -542,16 +555,12 @@ def claim_and_start_attempt(
     connection.execute("BEGIN IMMEDIATE")
     try:
         changed = connection.execute(
-            """
+            f"""
             UPDATE work_item
                SET state = 'running', claimed_by_run_id = ?, updated_at = ?
-             WHERE id = ?
-               AND (
-                       state = 'pending'
-                    OR (state = 'deferred' AND COALESCE(completed_by_run_id, -1) <> ?)
-               )
+             WHERE id = ? AND {_CLAIMABLE_PREDICATE}
             """,
-            (run_id, now, work_item_id, run_id),
+            (run_id, now, work_item_id, run_id, now),
         ).rowcount
         if changed != 1:
             raise RuntimeError(f"work item {work_item_id} is not claimable by run-{run_id}")
@@ -596,6 +605,14 @@ def start_attempt(
     """Atomically reserve and persist a retry for already-running work."""
     connection.execute("BEGIN IMMEDIATE")
     try:
+        owner = connection.execute(
+            "SELECT claimed_by_run_id FROM work_item WHERE id = ? AND state = 'running'",
+            (work_item_id,),
+        ).fetchone()
+        if owner is None or owner["claimed_by_run_id"] != run_id:
+            raise RuntimeError(
+                f"work item {work_item_id} is not a running attempt claimed by run-{run_id}"
+            )
         reserve_in_transaction(
             connection,
             run_id=run_id,
@@ -636,11 +653,16 @@ def finish_attempt(
     connection.execute("BEGIN IMMEDIATE")
     try:
         attempt = connection.execute(
-            "SELECT run_id, reserved_nano_usd FROM attempt WHERE id = ? AND outcome IS NULL",
+            "SELECT run_id, reserved_nano_usd, ordinal FROM attempt WHERE id = ? AND outcome IS NULL",
             (attempt_id,),
         ).fetchone()
         if attempt is None:
             raise RuntimeError(f"attempt {attempt_id} is already finished or does not exist")
+        if int(attempt["ordinal"]) != record.ordinal:
+            raise RuntimeError(
+                f"attempt {attempt_id} has ordinal {attempt['ordinal']}, "
+                f"but record is for ordinal {record.ordinal}"
+            )
         reconcile_in_transaction(
             connection,
             run_id=int(attempt["run_id"]),

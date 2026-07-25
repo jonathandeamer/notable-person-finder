@@ -9,7 +9,6 @@ from notable_person_finder.db.connection import connect_database
 from notable_person_finder.db.migrate import apply_migrations
 from notable_person_finder.providers.failures import FailureCategory
 from notable_person_finder.runs import repository
-from notable_person_finder.runs.models import WorkState
 from notable_person_finder.runs.retry import AttemptRecord
 
 NOW = "2026-07-25T06:00:00Z"
@@ -180,11 +179,13 @@ def test_every_attempt_is_attributed_to_its_run_and_work_item(
     assert row["work_item_id"] == work_id
 
 
-def test_attempt_detail_must_not_contain_a_raw_body(
+def test_detail_json_round_trips_through_finish_attempt(
     connection: sqlite3.Connection, context: tuple[int, int]
 ) -> None:
     # detail_json is reserved for immutable provider metadata; the transport
-    # never passes response content into it.
+    # never passes response content into it. This test confirms the column
+    # persists whatever it is given verbatim -- it does not itself enforce
+    # that callers keep raw bodies out.
     attempt_id = start(connection, context, 1)
     repository.finish_attempt(
         connection,
@@ -218,9 +219,13 @@ def test_next_ordinal_continues_after_an_interrupted_attempt(
     assert repository.next_attempt_ordinal(connection, work_item_id=context[1]) == 2
 
 
-def test_first_attempt_claims_and_reserves_in_one_transaction(
+def test_first_attempt_updates_work_item_and_budget_columns(
     connection: sqlite3.Connection, context: tuple[int, int]
 ) -> None:
+    # Happy-path column check only. This does NOT prove atomicity -- three
+    # separate autocommitted statements would pass it too. The atomicity
+    # proof is `test_refused_first_reservation_leaves_work_pending_and_no_attempt`
+    # below, which forces a mid-transaction failure and checks nothing stuck.
     run_id, work_id = context
     connection.execute(
         "UPDATE run SET budget_limit_nano_usd = 1000 WHERE id = ?", (run_id,)
@@ -273,3 +278,163 @@ def test_refused_first_reservation_leaves_work_pending_and_no_attempt(
         "SELECT state FROM work_item WHERE id = ?", (work_id,)
     ).fetchone()["state"] == "pending"
     assert connection.execute("SELECT COUNT(*) AS n FROM attempt").fetchone()["n"] == 0
+    assert connection.execute(
+        "SELECT budget_reserved_nano_usd FROM run WHERE id = ?", (run_id,)
+    ).fetchone()["budget_reserved_nano_usd"] == 0
+
+
+def test_reservation_is_rolled_back_when_the_attempt_insert_fails(
+    connection: sqlite3.Connection, context: tuple[int, int]
+) -> None:
+    """Proves the reserve-then-insert half of the atomicity guarantee.
+
+    Forces `_insert_attempt` to fail *after* `reserve_in_transaction` has
+    already run (a duplicate ordinal violates `UNIQUE(work_item_id, ordinal)`)
+    and asserts the reservation from that failed call did not stick.
+    """
+    run_id, work_id = context
+    connection.execute(
+        "UPDATE run SET budget_limit_nano_usd = 1000 WHERE id = ?", (run_id,)
+    )
+    connection.commit()
+    repository.claim_and_start_attempt(
+        connection,
+        run_id=run_id,
+        work_item_id=work_id,
+        provider="brave",
+        operation="search_web",
+        ordinal=1,
+        request_fingerprint="f" * 64,
+        destination_host=None,
+        reserved_nano_usd=100,
+        now=NOW,
+    )
+    reserved_before = connection.execute(
+        "SELECT budget_reserved_nano_usd FROM run WHERE id = ?", (run_id,)
+    ).fetchone()["budget_reserved_nano_usd"]
+    assert reserved_before == 100
+
+    with pytest.raises(sqlite3.IntegrityError):
+        repository.start_attempt(
+            connection,
+            run_id=run_id,
+            work_item_id=work_id,
+            provider="brave",
+            operation="search_web",
+            ordinal=1,  # duplicate ordinal -> UNIQUE(work_item_id, ordinal) violation
+            request_fingerprint="g" * 64,
+            destination_host=None,
+            reserved_nano_usd=200,
+            now=NOW,
+        )
+
+    reserved_after = connection.execute(
+        "SELECT budget_reserved_nano_usd FROM run WHERE id = ?", (run_id,)
+    ).fetchone()["budget_reserved_nano_usd"]
+    assert reserved_after == reserved_before
+
+
+def test_claim_and_start_attempt_refuses_a_work_item_still_in_backoff(
+    connection: sqlite3.Connection, context: tuple[int, int]
+) -> None:
+    """`claim_and_start_attempt` must honor eligible_at like `claim_next` does.
+
+    Parks the item in `deferred` with a future `eligible_at` (a retry
+    backoff window) and confirms the shared claim predicate refuses it at a
+    `now` that precedes that window, rather than authorizing a paid external
+    call early.
+    """
+    run_id, work_id = context
+    connection.execute(
+        "UPDATE work_item SET state = 'deferred', eligible_at = ? WHERE id = ?",
+        ("2026-07-25T09:00:00Z", work_id),
+    )
+    connection.commit()
+    with pytest.raises(RuntimeError):
+        repository.claim_and_start_attempt(
+            connection,
+            run_id=run_id,
+            work_item_id=work_id,
+            provider="brave",
+            operation="search_web",
+            ordinal=1,
+            request_fingerprint="h" * 64,
+            destination_host=None,
+            reserved_nano_usd=0,
+            now=NOW,  # 06:00, before the 09:00 backoff window ends
+        )
+    assert connection.execute(
+        "SELECT state FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()["state"] == "deferred"
+    assert connection.execute("SELECT COUNT(*) AS n FROM attempt").fetchone()["n"] == 0
+
+
+def test_start_attempt_refuses_a_work_item_owned_by_another_run(
+    connection: sqlite3.Connection, context: tuple[int, int]
+) -> None:
+    """A mis-wired caller must not bill and reserve against another run's item."""
+    run_id, work_id = context
+    other_run_id = repository.create_run(
+        connection,
+        snapshot_id=repository.store_snapshot(
+            connection, fingerprint="z" * 64, canonical_json="{}", now=NOW
+        ),
+        timezone="Europe/Paris",
+        window_start="2026-07-24T06:00:00Z",
+        window_end=NOW,
+        budget_limit_nano_usd=None,
+        now=NOW,
+    )
+    repository.claim_and_start_attempt(
+        connection,
+        run_id=run_id,
+        work_item_id=work_id,
+        provider="brave",
+        operation="search_web",
+        ordinal=1,
+        request_fingerprint="i" * 64,
+        destination_host=None,
+        reserved_nano_usd=0,
+        now=NOW,
+    )
+    with pytest.raises(RuntimeError):
+        repository.start_attempt(
+            connection,
+            run_id=other_run_id,
+            work_item_id=work_id,
+            provider="brave",
+            operation="search_web",
+            ordinal=2,
+            request_fingerprint="j" * 64,
+            destination_host=None,
+            reserved_nano_usd=0,
+            now=NOW,
+        )
+    assert connection.execute(
+        "SELECT budget_reserved_nano_usd FROM run WHERE id = ?", (other_run_id,)
+    ).fetchone()["budget_reserved_nano_usd"] == 0
+    assert connection.execute(
+        "SELECT COUNT(*) AS n FROM attempt WHERE ordinal = 2"
+    ).fetchone()["n"] == 0
+
+
+def test_finish_attempt_refuses_a_mismatched_ordinal(
+    connection: sqlite3.Connection, context: tuple[int, int]
+) -> None:
+    """Pairing the wrong AttemptRecord with an attempt_id must not silently write."""
+    attempt_id = start(connection, context, 1)
+    with pytest.raises(RuntimeError):
+        repository.finish_attempt(
+            connection,
+            attempt_id=attempt_id,
+            record=AttemptRecord(ordinal=2, outcome="succeeded", latency_ms=5),
+            response_bytes=None,
+            provider_request_id=None,
+            detail_json=None,
+            now=DONE,
+        )
+    row = connection.execute(
+        "SELECT outcome, finished_at FROM attempt WHERE id = ?", (attempt_id,)
+    ).fetchone()
+    assert row["outcome"] is None
+    assert row["finished_at"] is None
