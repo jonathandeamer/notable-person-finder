@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterator
 
 import pytest
 
@@ -61,6 +62,59 @@ def test_in_flight_work_never_exceeds_the_worker_limit() -> None:
     assert not consumer.is_alive()
     assert peak == 2
     assert len(completions) == 10
+
+
+def test_submission_stays_bounded_while_more_input_remains() -> None:
+    # `ThreadPoolExecutor(max_workers=N)` caps concurrent *execution* for
+    # free, even if every item were submitted eagerly up front -- that alone
+    # does not prove `run()` only pulls from `items` lazily, bounded by the
+    # cap. Count how many items the source iterable has yielded and check
+    # that count right after the very first completion is drained: an eager
+    # implementation (e.g. `{executor.submit(worker, i): i for i in
+    # list(items)}`) would already have pulled every item by then, so this
+    # discriminates a bound on submission, not just on concurrency.
+    pulled = 0
+    guard = threading.Lock()
+
+    def counting_items() -> Iterator[int]:
+        nonlocal pulled
+        for value in range(1_000):
+            with guard:
+                pulled += 1
+            yield value
+
+    with BoundedScheduler(max_workers=2) as scheduler:
+        completions = scheduler.run(counting_items(), lambda value: value)
+        next(completions)
+        with guard:
+            observed = pulled
+
+    assert observed <= 2
+
+
+def test_max_workers_below_one_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        BoundedScheduler(max_workers=0)
+
+
+def test_early_abandonment_still_shuts_the_pool_down() -> None:
+    # Breaking out of a `for` loop (or any other early exit) abandons the
+    # `run()` generator with futures still pending. The context manager's
+    # `__exit__` must still join every worker thread the pool created --
+    # otherwise a caller that stops iterating early leaks threads for the
+    # life of the process.
+    baseline = {thread.ident for thread in threading.enumerate()}
+
+    def worker(value: int) -> int:
+        return value
+
+    with BoundedScheduler(max_workers=3) as scheduler:
+        for completion in scheduler.run(range(20), worker):
+            assert completion.error is None
+            break
+
+    leaked = {thread.ident for thread in threading.enumerate()} - baseline
+    assert leaked == set()
 
 
 def test_a_worker_failure_is_returned_not_raised() -> None:
