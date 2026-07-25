@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -15,7 +16,7 @@ class _BackupInspectingConnection:
         self._connection = connection
         self.backup_pragmas: tuple[int, str, int, int] | None = None
 
-    def __getattr__(self, name: str) -> object:
+    def __getattr__(self, name: str) -> Any:
         return getattr(self._connection, name)
 
     def backup(self, destination: sqlite3.Connection) -> None:
@@ -50,7 +51,9 @@ def test_migration_backup_destination_uses_writable_configuration(
     database = tmp_path / "notable.sqlite3"
     connection = _BackupInspectingConnection(connect_database(database))
     try:
-        apply_migrations(connection, database, tmp_path / "backups")
+        apply_migrations(
+            cast(sqlite3.Connection, connection), database, tmp_path / "backups"
+        )
     finally:
         connection.close()
 

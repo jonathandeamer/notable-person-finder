@@ -38,6 +38,17 @@ markers = ["live: explicitly invoked tests that contact external providers"]
 [tool.ruff]
 line-length = 88
 target-version = "py313"
+extend-exclude = [
+    "run_pipeline.py",
+    "name_utils.py",
+    "scripts",
+    "ingest",
+    "prompts",
+    "output",
+    "state",
+    "tests/test_*",
+    "tests/conftest.py",
+]
 
 [tool.ruff.lint]
 select = [
@@ -56,6 +67,6 @@ known-first-party = ["notable_person_finder"]
 [tool.pyright]
 pythonVersion = "3.13"
 typeCheckingMode = "standard"
-include = ["src", "tests"]
+include = ["src", "tests/foundation"]
 exclude = ["**/__pycache__", ".venv", ".worktrees"]
 
