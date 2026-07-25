@@ -38,6 +38,11 @@ import or wrap prototype modules to shortcut rewrite work.
 
 - Python version: 3.13 or newer.
 - Install and synchronize dependencies with `uv sync --frozen`.
+- Configure repository git hooks: `git config core.hooksPath .githooks`.
+- Code quality and static analysis:
+  - `uv run ruff check .`
+  - `uv run ruff format .`
+  - `uv run pyright`
 - Run the focused rewrite tests and completion commands named by the active
   milestone plan.
 - For the completed application foundation, use
