@@ -64,8 +64,13 @@ def schedule(
 
 
 def test_scheduling_returns_a_new_work_item(connection: sqlite3.Connection, run_id: int) -> None:
-    work_id = schedule(connection, run_id)
-    assert work_id > 0
+    work_id = schedule(connection, run_id, priority=42, required=True)
+    row = connection.execute(
+        "SELECT state, priority, required FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["state"] == WorkState.PENDING
+    assert row["priority"] == 42
+    assert row["required"] == 1
 
 
 def test_rescheduling_identical_work_reuses_the_active_row(
@@ -83,7 +88,12 @@ def test_a_changed_fingerprint_supersedes_the_old_active_row(
 ) -> None:
     stale = schedule(connection, run_id, fingerprint="c" * 64)
     superseded = repository.supersede_work(
-        connection, task_type="detect_people", fingerprint="c" * 64, now=LATER, reason="input changed"
+        connection,
+        task_type="detect_people",
+        fingerprint="c" * 64,
+        run_id=run_id,
+        now=LATER,
+        reason="input changed",
     )
     assert superseded == 1
     fresh = schedule(connection, run_id, fingerprint="d" * 64)
@@ -255,4 +265,187 @@ def test_counters_separate_required_from_optional_work(
     counters = repository.run_counters(connection, run_id=run_id, now=NOW)
     assert counters.required_succeeded == 1
     assert counters.optional_succeeded == 1
-    assert repository.pending_required(connection, now=NOW) >= 1
+    assert repository.pending_required(connection, now=NOW) == 1
+
+
+def test_completing_a_non_running_item_raises(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
+    work_id = schedule(connection, run_id)
+    repository.claim_next(connection, run_id=run_id, now=NOW)
+    repository.complete_work(
+        connection,
+        work_item_id=work_id,
+        run_id=run_id,
+        state=WorkState.SUCCEEDED,
+        reason=None,
+        now=NOW,
+    )
+    with pytest.raises(RuntimeError):
+        repository.complete_work(
+            connection,
+            work_item_id=work_id,
+            run_id=run_id,
+            state=WorkState.SUCCEEDED,
+            reason=None,
+            now=LATER,
+        )
+    row = connection.execute(
+        "SELECT state, updated_at FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["state"] == WorkState.SUCCEEDED
+    assert row["updated_at"] == NOW
+
+
+def test_next_eligible_peeks_without_mutating(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
+    work_id = schedule(connection, run_id)
+    peeked = repository.next_eligible(connection, run_id=run_id, now=NOW)
+    assert peeked is not None
+    assert peeked.id == work_id
+    assert peeked.state is WorkState.PENDING
+    row = connection.execute(
+        "SELECT state, claimed_by_run_id FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["state"] == WorkState.PENDING
+    assert row["claimed_by_run_id"] is None
+
+
+def test_running_work_is_not_claimed_again(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
+    work_id = schedule(connection, run_id)
+    first = repository.claim_next(connection, run_id=run_id, now=NOW)
+    assert first is not None and first.id == work_id
+    second = repository.claim_next(connection, run_id=run_id, now=NOW)
+    assert second is None
+    row = connection.execute(
+        "SELECT state, claimed_by_run_id FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["state"] == WorkState.RUNNING
+    assert row["claimed_by_run_id"] == run_id
+
+
+def test_supersede_work_does_not_touch_a_running_item(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
+    work_id = schedule(connection, run_id, fingerprint="6" * 64)
+    repository.claim_next(connection, run_id=run_id, now=NOW)
+    changed = repository.supersede_work(
+        connection,
+        task_type="detect_people",
+        fingerprint="6" * 64,
+        run_id=run_id,
+        now=LATER,
+        reason="input changed",
+    )
+    assert changed == 0
+    row = connection.execute(
+        "SELECT state FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["state"] == WorkState.RUNNING
+
+
+def test_deferred_required_counts_only_required_deferred_items(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
+    required_item = schedule(connection, run_id, fingerprint="4" * 64, required=True)
+    optional_item = schedule(connection, run_id, fingerprint="5" * 64, required=False)
+    repository.claim_next(connection, run_id=run_id, now=NOW)
+    repository.claim_next(connection, run_id=run_id, now=NOW)
+    repository.complete_work(
+        connection,
+        work_item_id=required_item,
+        run_id=run_id,
+        state=WorkState.DEFERRED,
+        reason="exhausted transient failure",
+        now=NOW,
+    )
+    repository.complete_work(
+        connection,
+        work_item_id=optional_item,
+        run_id=run_id,
+        state=WorkState.DEFERRED,
+        reason="exhausted transient failure",
+        now=NOW,
+    )
+    assert repository.deferred_required(connection) == 1
+
+
+def test_operational_failures_for_run_counts_only_failed_attempts(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
+    work_id = schedule(connection, run_id)
+    repository.claim_next(connection, run_id=run_id, now=NOW)
+    connection.execute(
+        """
+        INSERT INTO attempt (run_id, work_item_id, provider, operation, ordinal,
+                             started_at, finished_at, outcome, failure_category,
+                             request_fingerprint)
+        VALUES (?, ?, 'brave', 'search_web', 1, ?, ?, 'failed', 'provider_error', ?)
+        """,
+        (run_id, work_id, NOW, NOW, "f" * 64),
+    )
+    connection.execute(
+        """
+        INSERT INTO attempt (run_id, work_item_id, provider, operation, ordinal,
+                             started_at, finished_at, outcome, request_fingerprint)
+        VALUES (?, ?, 'brave', 'search_web', 2, ?, ?, 'succeeded', ?)
+        """,
+        (run_id, work_id, NOW, NOW, "e" * 64),
+    )
+    connection.commit()
+    assert repository.operational_failures_for_run(connection, run_id=run_id) == 1
+
+
+def test_counters_cover_deferred_failed_permanent_skipped_and_operational_failures(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
+    deferred_item = schedule(connection, run_id, fingerprint="7" * 64, required=True)
+    failed_item = schedule(connection, run_id, fingerprint="8" * 64, required=True)
+    skipped_item = schedule(connection, run_id, fingerprint="a1" * 32, required=False)
+
+    repository.claim_next(connection, run_id=run_id, now=NOW)
+    repository.claim_next(connection, run_id=run_id, now=NOW)
+
+    repository.complete_work(
+        connection,
+        work_item_id=deferred_item,
+        run_id=run_id,
+        state=WorkState.DEFERRED,
+        reason="exhausted transient failure",
+        now=NOW,
+    )
+    repository.complete_work(
+        connection,
+        work_item_id=failed_item,
+        run_id=run_id,
+        state=WorkState.FAILED_PERMANENT,
+        reason="authentication",
+        now=NOW,
+    )
+    repository.supersede_work(
+        connection,
+        task_type="detect_people",
+        fingerprint="a1" * 32,
+        run_id=run_id,
+        now=NOW,
+        reason="input changed",
+    )
+    connection.execute(
+        """
+        INSERT INTO attempt (run_id, work_item_id, provider, operation, ordinal,
+                             started_at, finished_at, outcome, failure_category,
+                             request_fingerprint)
+        VALUES (?, ?, 'brave', 'search_web', 1, ?, ?, 'failed', 'provider_error', ?)
+        """,
+        (run_id, failed_item, NOW, NOW, "d" * 64),
+    )
+    connection.commit()
+
+    counters = repository.run_counters(connection, run_id=run_id, now=LATER)
+    assert counters.required_deferred == 1
+    assert counters.required_failed_permanent == 1
+    assert counters.optional_skipped == 1
+    assert counters.operational_failures == 1

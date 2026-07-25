@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 from collections.abc import Collection
 
@@ -260,6 +261,7 @@ def supersede_work(
     *,
     task_type: str,
     fingerprint: str,
+    run_id: int,
     now: str,
     reason: str,
 ) -> int:
@@ -269,11 +271,12 @@ def supersede_work(
         changed = connection.execute(
             """
             UPDATE work_item
-               SET state = 'superseded', reason = ?, updated_at = ?
+               SET state = 'superseded', reason = ?, completed_by_run_id = ?,
+                   updated_at = ?
              WHERE task_type = ? AND fingerprint = ?
                AND state IN ('pending', 'deferred')
             """,
-            (reason, now, task_type, fingerprint),
+            (reason, run_id, now, task_type, fingerprint),
         ).rowcount
     except BaseException:
         connection.rollback()
@@ -283,7 +286,7 @@ def supersede_work(
     return changed
 
 
-def _work_item(row: sqlite3.Row, *, state: WorkState | None = None) -> WorkItem:
+def _work_item(row: sqlite3.Row) -> WorkItem:
     return WorkItem(
         id=int(row["id"]),
         task_type=row["task_type"],
@@ -292,7 +295,7 @@ def _work_item(row: sqlite3.Row, *, state: WorkState | None = None) -> WorkItem:
         fingerprint=row["fingerprint"],
         required=bool(row["required"]),
         priority=int(row["priority"]),
-        state=state or WorkState(row["state"]),
+        state=WorkState(row["state"]),
     )
 
 
@@ -360,16 +363,7 @@ def claim_next(
         raise
     else:
         connection.commit()
-    return WorkItem(
-        id=item.id,
-        task_type=item.task_type,
-        subject_kind=item.subject_kind,
-        subject_id=item.subject_id,
-        fingerprint=item.fingerprint,
-        required=item.required,
-        priority=item.priority,
-        state=WorkState.RUNNING,
-    )
+    return dataclasses.replace(item, state=WorkState.RUNNING)
 
 
 def complete_work(
@@ -385,7 +379,7 @@ def complete_work(
     """Record one item's terminal or deferred outcome; failures are isolated."""
     connection.execute("BEGIN IMMEDIATE")
     try:
-        connection.execute(
+        changed = connection.execute(
             """
             UPDATE work_item
                SET state = ?,
@@ -394,10 +388,14 @@ def complete_work(
                    claimed_by_run_id = NULL,
                    eligible_at = COALESCE(?, eligible_at),
                    updated_at = ?
-             WHERE id = ?
+             WHERE id = ? AND state = 'running'
             """,
             (str(state), reason, run_id, eligible_at, now, work_item_id),
-        )
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError(
+                f"work item {work_item_id} is not completable by run-{run_id}"
+            )
     except BaseException:
         connection.rollback()
         raise
@@ -443,6 +441,14 @@ def operational_failures_for_run(
 def run_counters(
     connection: sqlite3.Connection, *, run_id: int, now: str
 ) -> RunCounters:
+    """Summarize one run's work for the digest.
+
+    Deliberately mixes scopes: `required_succeeded`, `required_failed_permanent`,
+    `optional_succeeded`, and `optional_skipped` are attributed to this run
+    (`completed_by_run_id = run_id`), while `required_pending` and
+    `required_deferred` are whole-queue counts that are not run-attributed,
+    since pending and eligible-deferred work is not "owned" by any one run.
+    """
     tally = {
         (row["required"], row["state"]): int(row["n"])
         for row in connection.execute(
