@@ -22,6 +22,11 @@ ENV/
 .env.*
 !.env.example
 
+# Local application configuration
+config/notable.toml
+config/discovery-feeds.toml
+config/discovery_profiles/art.toml
+
 # macOS
 .DS_Store
 

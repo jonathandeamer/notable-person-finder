@@ -1,0 +1,9 @@
+schema_version = 1
+key = "visual-arts-en"
+label = "English-language visual arts"
+language = "en"
+
+[attention_examples]
+significant_recognition = ["major art prize or honour"]
+institutional_recognition = ["work held in a permanent museum collection"]
+sustained_field_attention = ["substantial critical retrospective"]

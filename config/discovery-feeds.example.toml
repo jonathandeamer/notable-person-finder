@@ -1,0 +1,51 @@
+schema_version = 1
+
+[[feeds]]
+key = "the-art-newspaper"
+label = "The Art Newspaper"
+url = "https://www.theartnewspaper.com/rss.xml"
+
+[[feeds]]
+key = "artnews"
+label = "ARTnews"
+url = "https://www.artnews.com/feed/"
+
+[[feeds]]
+key = "artnet-news"
+label = "Artnet News"
+url = "https://news.artnet.com/feed"
+
+[[feeds]]
+key = "artforum"
+label = "Artforum"
+url = "https://www.artforum.com/feed/"
+
+[[feeds]]
+key = "nytimes-art-design"
+label = "The New York Times — Art & Design"
+url = "https://rss.nytimes.com/services/xml/rss/nyt/ArtandDesign.xml"
+
+[[feeds]]
+key = "guardian-art-design"
+label = "The Guardian — Art & Design"
+url = "https://www.theguardian.com/artanddesign/rss"
+
+[[feeds]]
+key = "artreview"
+label = "ArtReview"
+url = "https://artreview.com/rss.xml"
+
+[[feeds]]
+key = "telegraph-art"
+label = "The Telegraph — Art"
+url = "https://www.telegraph.co.uk/art/rss.xml"
+
+[[feeds]]
+key = "bbc-art"
+label = "BBC News — Art"
+url = "https://feeds.bbci.co.uk/news/topics/cjnwl8q4gjnt/rss.xml"
+
+[[feeds]]
+key = "hyperallergic"
+label = "Hyperallergic"
+url = "https://hyperallergic.com/feed/"

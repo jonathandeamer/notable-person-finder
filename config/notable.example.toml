@@ -1,0 +1,8 @@
+schema_version = 1
+timezone = "Europe/Paris"
+feeds_file = "discovery-feeds.toml"
+domain_profile_file = "discovery_profiles/art.toml"
+
+[secrets]
+openrouter_api_key = "OPENROUTER_API_KEY"
+brave_api_key = "BRAVE_API_KEY"

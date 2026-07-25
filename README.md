@@ -84,6 +84,25 @@ Edit `config/feeds.md` to add or remove RSS feeds before running.
 
 ---
 
+## Clean-slate CLI foundation
+
+The installable CLI starts from a copyable local configuration graph:
+
+```bash
+uv sync
+cp config/notable.example.toml config/notable.toml
+cp config/discovery-feeds.example.toml config/discovery-feeds.toml
+cp config/discovery_profiles/art.example.toml config/discovery_profiles/art.toml
+cp .env.example config/.env
+uv run notable --config config/notable.toml config validate
+uv run notable --config config/notable.toml paths
+uv run notable --config config/notable.toml db migrate
+```
+
+The prototype remains available but is not imported by the new package.
+
+---
+
 ## Usage
 
 ### Run the full pipeline

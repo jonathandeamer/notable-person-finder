@@ -113,3 +113,30 @@ def test_invalid_usage_returns_64() -> None:
 
     assert completed.returncode == 64
     assert "usage:" in completed.stderr
+
+
+def test_checked_in_example_configuration_is_structurally_valid(
+    tmp_path: Path,
+) -> None:
+    import shutil
+
+    config_root = tmp_path / "config"
+    profile_root = config_root / "discovery_profiles"
+    profile_root.mkdir(parents=True)
+    shutil.copyfile("config/notable.example.toml", config_root / "notable.toml")
+    shutil.copyfile(
+        "config/discovery-feeds.example.toml",
+        config_root / "discovery-feeds.toml",
+    )
+    shutil.copyfile(
+        "config/discovery_profiles/art.example.toml",
+        profile_root / "art.toml",
+    )
+    completed = run_cli(
+        config_root / "notable.toml",
+        "config",
+        "validate",
+        env={"OPENROUTER_API_KEY": "test", "BRAVE_API_KEY": "test"},
+    )
+
+    assert completed.returncode == 0, completed.stderr
