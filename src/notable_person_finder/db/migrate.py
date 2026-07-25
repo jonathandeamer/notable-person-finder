@@ -31,7 +31,16 @@ class MigrationResult:
 
 
 class MigrationError(Exception):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        applied_versions: tuple[int, ...] = (),
+        backup_path: Path | None = None,
+    ):
+        self.applied_versions = applied_versions
+        self.backup_path = backup_path
+        super().__init__(message)
 
 
 def load_migrations() -> tuple[Migration, ...]:
@@ -117,9 +126,18 @@ def apply_migrations(
             connection.commit()
         except (MigrationError, sqlite3.Error) as error:
             connection.rollback()
+            # Each migration commits separately, so the database is left at the
+            # last successful version rather than at its pre-run state.
+            progress = (
+                f"already applied: {', '.join(str(v) for v in newly_applied)}"
+                if newly_applied
+                else "no migrations were applied"
+            )
             raise MigrationError(
                 f"migration {migration.version} failed; "
-                f"backup: {backup_path}: {error}"
+                f"{progress}; backup: {backup_path}: {error}",
+                applied_versions=tuple(newly_applied),
+                backup_path=backup_path,
             ) from error
         newly_applied.append(migration.version)
 

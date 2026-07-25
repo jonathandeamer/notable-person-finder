@@ -123,8 +123,14 @@ def _read_toml(path: Path, errors: list[str]) -> dict[str, Any] | None:
         errors.append(f"{path}: file does not exist")
     except IsADirectoryError:
         errors.append(f"{path}: expected a TOML file, found a directory")
+    except NotADirectoryError:
+        errors.append(f"{path}: path component is not a directory")
     except PermissionError:
         errors.append(f"{path}: file is not readable")
+    except UnicodeDecodeError:
+        errors.append(f"{path}: file is not valid UTF-8")
+    except OSError as error:
+        errors.append(f"{path}: could not be read: {error.strerror or error}")
     except tomllib.TOMLDecodeError:
         errors.append(f"{path}: invalid TOML")
     return None
@@ -164,17 +170,14 @@ def _resolve_credentials(
     require_secrets: bool,
     errors: list[str],
 ) -> Credentials:
-    dotenv = {
-        name: value
-        for name, value in dotenv_values(main_path.parent / ".env").items()
-        if value is not None
-    }
-    merged_environment = {**dotenv, **(os.environ if environ is None else environ)}
+    dotenv = _present_values(dotenv_values(main_path.parent / ".env"))
+    process = _present_values(os.environ if environ is None else environ)
+    # The process environment wins, but only where it supplies a real value: an
+    # exported-but-blank variable must not shadow a usable .env entry.
+    merged_environment = {**dotenv, **process}
 
-    openrouter_api_key = _present_value(
-        merged_environment.get(main.secrets.openrouter_api_key)
-    )
-    brave_api_key = _present_value(merged_environment.get(main.secrets.brave_api_key))
+    openrouter_api_key = merged_environment.get(main.secrets.openrouter_api_key)
+    brave_api_key = merged_environment.get(main.secrets.brave_api_key)
     credentials = Credentials(
         openrouter_api_key=openrouter_api_key,
         brave_api_key=brave_api_key,
@@ -190,10 +193,20 @@ def _resolve_credentials(
     return credentials
 
 
+def _present_values(source: Mapping[str, str | None]) -> dict[str, str]:
+    present: dict[str, str] = {}
+    for name, value in source.items():
+        stripped = _present_value(value)
+        if stripped is not None:
+            present[name] = stripped
+    return present
+
+
 def _present_value(value: str | None) -> str | None:
-    if value is None or not value.strip():
+    if value is None:
         return None
-    return value
+    stripped = value.strip()
+    return stripped or None
 
 
 def _snapshot(
