@@ -53,11 +53,14 @@ confirm `git diff --check` and `git status --short` are clean as applicable.
 
 ## Foundation Invariants
 
+- The application never edits Wikipedia automatically. Every Wikipedia edit or
+  publication action requires explicit human review and approval.
 - Distribution: `notable-person-finder`; import package:
   `notable_person_finder`; executable: `notable`.
 - Configuration is strict and file-first. Environment variables supply secrets
   only, and secrets must never appear in snapshots, fingerprints, diagnostics,
-  terminal output, or tests.
+  terminal output, or tests. An adjacent `.env` may fill missing secret values,
+  but the process environment takes precedence.
 - SQLite migrations are forward-only, checksummed, transactional, and backed
   up before changing an existing database.
 - Mutating commands use the nonblocking, OS-managed lock scoped to one data
