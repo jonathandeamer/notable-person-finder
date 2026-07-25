@@ -14,17 +14,16 @@ import random
 import re
 import socket
 import time
+import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Callable
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
-import xml.etree.ElementTree as ET
-
 
 TRACKING_PARAM_EXACT = {
     "fbclid",
@@ -38,11 +37,11 @@ TRACKING_PARAM_PREFIXES = ("utm_",)
 
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def to_rfc3339(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def stable_json_dumps(value: object) -> str:
@@ -61,8 +60,7 @@ def event_id_for(
 ) -> str:
     bucket = (published_at_utc or "unknown-date")[:10]
     payload = (
-        f"{entry_url_canonical}|{entry_guid or ''}|"
-        f"{source_feed_url_original}|{bucket}"
+        f"{entry_url_canonical}|{entry_guid or ''}|{source_feed_url_original}|{bucket}"
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -146,7 +144,7 @@ def parse_datetime_to_rfc3339(date_text: str | None) -> tuple[str | None, bool]:
         dt = parsedate_to_datetime(date_text)
         if dt is not None:
             if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
+                dt = dt.replace(tzinfo=UTC)
             return to_rfc3339(dt), False
     except (TypeError, ValueError):
         pass
@@ -155,7 +153,7 @@ def parse_datetime_to_rfc3339(date_text: str | None) -> tuple[str | None, bool]:
     try:
         dt = datetime.fromisoformat(iso_candidate)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
         return to_rfc3339(dt), False
     except ValueError:
         return None, True
@@ -269,7 +267,9 @@ def parse_feed_bytes(content: bytes) -> tuple[str | None, list[ParsedEntry]]:
                     guid=_first_text(entry, ("id", "guid")),
                     summary=_first_text(entry, ("summary", "content", "description")),
                     author=_extract_author(entry),
-                    published_raw=_first_text(entry, ("published", "updated", "dc:date")),
+                    published_raw=_first_text(
+                        entry, ("published", "updated", "dc:date")
+                    ),
                 )
             )
         return feed_title, entries
@@ -561,7 +561,9 @@ def run_ingest(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="RSS ingest for notability pipeline")
-    parser.add_argument("--feeds", required=True, type=Path, help="Path to config/feeds.md")
+    parser.add_argument(
+        "--feeds", required=True, type=Path, help="Path to config/feeds.md"
+    )
     parser.add_argument("--state-dir", required=True, type=Path, help="State directory")
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--timeout-seconds", type=float, default=15.0)

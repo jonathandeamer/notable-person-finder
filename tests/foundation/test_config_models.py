@@ -1,4 +1,3 @@
-from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -40,7 +39,11 @@ def test_feeds_require_unique_keys_and_public_http_urls() -> None:
             {
                 "schema_version": 1,
                 "feeds": [
-                    {"key": "bad", "label": "Bad", "url": "https://u:p@example.com/feed"}
+                    {
+                        "key": "bad",
+                        "label": "Bad",
+                        "url": "https://u:p@example.com/feed",
+                    }
                 ],
             }
         )
@@ -61,6 +64,4 @@ def test_domain_profile_accepts_only_known_attention_signals() -> None:
     )
 
     assert profile.key == "visual-arts-en"
-    assert profile.attention_examples["significant_recognition"] == (
-        "major art prize",
-    )
+    assert profile.attention_examples["significant_recognition"] == ("major art prize",)

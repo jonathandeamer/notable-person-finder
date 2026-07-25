@@ -6,18 +6,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import random
 import re
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
-
 
 DEFAULT_USER_AGENT = (
     "WikiNotabilityFinder/0.1 "
@@ -130,11 +127,13 @@ for _nick, _formal in NICKNAME_MAP.items():
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Fetch MediaWiki candidates for Gate 2")
+    parser = argparse.ArgumentParser(
+        description="Fetch MediaWiki candidates for Gate 2"
+    )
     parser.add_argument(
         "--input",
         type=Path,
@@ -154,8 +153,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=10,
         help="Hard cap on number of search results to process per subject",
     )
-    parser.add_argument("--throttle-ms", type=int, default=900, help="Delay between MW calls")
-    parser.add_argument("--max-retries", type=int, default=4, help="Retry count for 429/5xx")
+    parser.add_argument(
+        "--throttle-ms", type=int, default=900, help="Delay between MW calls"
+    )
+    parser.add_argument(
+        "--max-retries", type=int, default=4, help="Retry count for 429/5xx"
+    )
     parser.add_argument(
         "--cache-dir",
         type=Path,
@@ -420,7 +423,9 @@ def mw_search(
         cont = data.get("continue") or {}
     while cont.get("sroffset"):
         params["sroffset"] = str(cont["sroffset"])
-        more = _fetch_json(_mw_url(params), user_agent, throttle_ms, max_retries, log_file)
+        more = _fetch_json(
+            _mw_url(params), user_agent, throttle_ms, max_retries, log_file
+        )
         all_items.extend(more.get("query", {}).get("search", []))
         cont = more.get("continue") or {}
     # rebuild response with merged results
@@ -462,7 +467,9 @@ def mw_page_details(
     cont = data.get("continue", {})
     while cont.get("clcontinue") and pages:
         params["clcontinue"] = cont["clcontinue"]
-        more = _fetch_json(_mw_url(params), user_agent, throttle_ms, max_retries, log_file)
+        more = _fetch_json(
+            _mw_url(params), user_agent, throttle_ms, max_retries, log_file
+        )
         more_pages = more.get("query", {}).get("pages", {})
         for page_id, page_obj in more_pages.items():
             if page_id in pages and "categories" in page_obj:
@@ -570,7 +577,9 @@ def build_candidate(
 ) -> dict:
     categories = []
     if page:
-        categories = [c.get("title") for c in page.get("categories", []) if c.get("title")]
+        categories = [
+            c.get("title") for c in page.get("categories", []) if c.get("title")
+        ]
     bio_score = biography_score(categories)
     return {
         "rank": rank,
@@ -578,7 +587,9 @@ def build_candidate(
         "pageid": page.get("pageid") if page else None,
         "fullurl": page.get("fullurl") if page else None,
         "snippet": search_item.get("snippet"),
-        "is_disambig": bool(page and page.get("pageprops", {}).get("disambiguation") is not None),
+        "is_disambig": bool(
+            page and page.get("pageprops", {}).get("disambiguation") is not None
+        ),
         "redirected_from": redirected_from,
         "description": page.get("description") if page else None,
         "extract": page.get("extract") if page else None,
@@ -626,7 +637,9 @@ def run(
         if not subject:
             parsed = row.get("parsed_output")
             if isinstance(parsed, dict):
-                subject = parsed.get("subject_name_full") or parsed.get("subject_name_as_written")
+                subject = parsed.get("subject_name_full") or parsed.get(
+                    "subject_name_as_written"
+                )
         if not subject:
             gate1_skip_counts["missing_subject"] += 1
             continue
@@ -664,7 +677,8 @@ def run(
                     "entry_title": row.get("entry_title"),
                     "summary": row.get("summary") or _gi.get("summary"),
                     "source": row.get("source") or _gi.get("source"),
-                    "publication_date": row.get("publication_date") or _gi.get("publication_date"),
+                    "publication_date": row.get("publication_date")
+                    or _gi.get("publication_date"),
                 },
                 "query": {
                     "original": subject,
@@ -712,7 +726,9 @@ def run(
             except Exception as exc:  # noqa: BLE001
                 record["errors"].append(f"search_error:{exc}")
                 error_counts["search_error"] += 1
-                out_f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+                out_f.write(
+                    json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+                )
                 out_f.flush()
                 if progress_every and idx % progress_every == 0:
                     print(f"progress: {idx}/{total_work}")

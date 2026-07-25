@@ -7,24 +7,25 @@ import argparse
 import json
 import sys
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from name_utils import normalize_name, sort_by_priority_recency
 
-
 BIO_SCORE_THRESHOLD = 3
 SIMILARITY_DISTANCE = 2
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Deterministic Gate 2: has-page filter")
+    parser = argparse.ArgumentParser(
+        description="Deterministic Gate 2: has-page filter"
+    )
     parser.add_argument(
         "--input",
         type=Path,
@@ -90,7 +91,10 @@ def read_jsonl(path: Path) -> list[dict]:
             try:
                 obj = json.loads(raw)
             except json.JSONDecodeError:
-                print(f"warning: invalid JSON at line {line_no}; skipping", file=sys.stderr)
+                print(
+                    f"warning: invalid JSON at line {line_no}; skipping",
+                    file=sys.stderr,
+                )
                 continue
             if isinstance(obj, dict):
                 rows.append(obj)
@@ -102,7 +106,6 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
-
 
 
 def _check_output_paths(pass_output: Path, skip_output: Path, overwrite: bool) -> None:
@@ -146,6 +149,7 @@ def is_biography_candidate(candidate: dict) -> bool:
 
 def normalized_candidate_title(candidate: dict) -> str:
     return normalize_name(candidate.get("title"))
+
 
 def normalized_redirect_title(candidate: dict) -> str:
     return normalize_name(candidate.get("redirected_from"))
@@ -266,8 +270,14 @@ def run_gate2(
             continue
 
         match = pick_best_match(exact_matches)
-        match_type = match_type_by_id.get(match.get("pageid"), "title") if match else None
-        has_similar = has_similar_biography(subject_norm, bio_candidates, match) if match else False
+        match_type = (
+            match_type_by_id.get(match.get("pageid"), "title") if match else None
+        )
+        has_similar = (
+            has_similar_biography(subject_norm, bio_candidates, match)
+            if match
+            else False
+        )
 
         if has_similar:
             signal = "EXACT_MATCH_AMBIGUOUS"
@@ -283,9 +293,13 @@ def run_gate2(
         row_out["det_gate2_signal"] = signal
         row_out["det_gate2_best_match_title"] = match.get("title") if match else None
         row_out["det_gate2_best_match_pageid"] = match.get("pageid") if match else None
-        row_out["det_gate2_best_match_fullurl"] = match.get("fullurl") if match else None
+        row_out["det_gate2_best_match_fullurl"] = (
+            match.get("fullurl") if match else None
+        )
         row_out["det_gate2_best_match_type"] = match_type
-        row_out["det_gate2_best_match_score"] = match.get("biography_score") if match else None
+        row_out["det_gate2_best_match_score"] = (
+            match.get("biography_score") if match else None
+        )
         row_out["det_gate2_has_similar_bio"] = has_similar
         row_out["det_gate2_bio_candidates_count"] = len(bio_candidates)
         pass_rows.append(row_out)

@@ -12,7 +12,6 @@ from ingest.rss_ingest import (
     run_ingest,
 )
 
-
 RSS_FIXTURE = b"""<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
   <channel>

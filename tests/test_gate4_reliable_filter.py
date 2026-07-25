@@ -107,7 +107,12 @@ class TestReliableFilter(unittest.TestCase):
             "event_id": event_id,
             "subject_name": "Test Person",
             "gate3_status": "MISSING",
-            "source_context": {"entry_title": None, "summary": None, "source": None, "publication_date": None},
+            "source_context": {
+                "entry_title": None,
+                "summary": None,
+                "source": None,
+                "publication_date": None,
+            },
             "brave_queries": ['"Test Person"'],
             "brave_results": results,
             "brave_result_count": len(results),
@@ -119,9 +124,33 @@ class TestReliableFilter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             results = [
-                {"rank": 1, "title": "NYT story", "url": "https://www.nytimes.com/story", "description": None, "age": None, "page_age": None, "source_domain": "nytimes.com"},
-                {"rank": 2, "title": "Random blog", "url": "https://randomnewsblog.com/story", "description": None, "age": None, "page_age": None, "source_domain": "randomnewsblog.com"},
-                {"rank": 3, "title": "BBC story", "url": "https://www.bbc.co.uk/news/123", "description": None, "age": None, "page_age": None, "source_domain": "bbc.co.uk"},
+                {
+                    "rank": 1,
+                    "title": "NYT story",
+                    "url": "https://www.nytimes.com/story",
+                    "description": None,
+                    "age": None,
+                    "page_age": None,
+                    "source_domain": "nytimes.com",
+                },
+                {
+                    "rank": 2,
+                    "title": "Random blog",
+                    "url": "https://randomnewsblog.com/story",
+                    "description": None,
+                    "age": None,
+                    "page_age": None,
+                    "source_domain": "randomnewsblog.com",
+                },
+                {
+                    "rank": 3,
+                    "title": "BBC story",
+                    "url": "https://www.bbc.co.uk/news/123",
+                    "description": None,
+                    "age": None,
+                    "page_age": None,
+                    "source_domain": "bbc.co.uk",
+                },
             ]
             input_path = self._make_input(tmp, [self._make_row(results)])
             output_path = tmp / "out.jsonl"
@@ -133,7 +162,10 @@ class TestReliableFilter(unittest.TestCase):
                 progress_every=0,
             )
             self.assertEqual(rc, 0)
-            rows = [json.loads(l) for l in output_path.read_text(encoding="utf-8").splitlines()]
+            rows = [
+                json.loads(l)
+                for l in output_path.read_text(encoding="utf-8").splitlines()
+            ]
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["brave_result_count"], 2)
             self.assertEqual(rows[0]["brave_result_count_unfiltered"], 3)
@@ -146,28 +178,70 @@ class TestReliableFilter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             results = [
-                {"rank": 1, "title": "Unreliable", "url": "https://blog.example.com/1", "description": None, "age": None, "page_age": None, "source_domain": "blog.example.com"},
-                {"rank": 2, "title": "Reuters", "url": "https://www.reuters.com/story", "description": None, "age": None, "page_age": None, "source_domain": "reuters.com"},
+                {
+                    "rank": 1,
+                    "title": "Unreliable",
+                    "url": "https://blog.example.com/1",
+                    "description": None,
+                    "age": None,
+                    "page_age": None,
+                    "source_domain": "blog.example.com",
+                },
+                {
+                    "rank": 2,
+                    "title": "Reuters",
+                    "url": "https://www.reuters.com/story",
+                    "description": None,
+                    "age": None,
+                    "page_age": None,
+                    "source_domain": "reuters.com",
+                },
             ]
             input_path = self._make_input(tmp, [self._make_row(results)])
             output_path = tmp / "out.jsonl"
 
-            self.rf.run(input_path=input_path, output_path=output_path, overwrite=False, progress_every=0)
-            rows = [json.loads(l) for l in output_path.read_text(encoding="utf-8").splitlines()]
+            self.rf.run(
+                input_path=input_path,
+                output_path=output_path,
+                overwrite=False,
+                progress_every=0,
+            )
+            rows = [
+                json.loads(l)
+                for l in output_path.read_text(encoding="utf-8").splitlines()
+            ]
             self.assertEqual(rows[0]["brave_results"][0]["rank"], 1)
-            self.assertEqual(rows[0]["brave_results"][0]["source_domain"], "reuters.com")
+            self.assertEqual(
+                rows[0]["brave_results"][0]["source_domain"], "reuters.com"
+            )
 
     def test_run_all_filtered_out(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             results = [
-                {"rank": 1, "title": "Spam", "url": "https://spam.example.com/1", "description": None, "age": None, "page_age": None, "source_domain": "spam.example.com"},
+                {
+                    "rank": 1,
+                    "title": "Spam",
+                    "url": "https://spam.example.com/1",
+                    "description": None,
+                    "age": None,
+                    "page_age": None,
+                    "source_domain": "spam.example.com",
+                },
             ]
             input_path = self._make_input(tmp, [self._make_row(results)])
             output_path = tmp / "out.jsonl"
 
-            self.rf.run(input_path=input_path, output_path=output_path, overwrite=False, progress_every=0)
-            rows = [json.loads(l) for l in output_path.read_text(encoding="utf-8").splitlines()]
+            self.rf.run(
+                input_path=input_path,
+                output_path=output_path,
+                overwrite=False,
+                progress_every=0,
+            )
+            rows = [
+                json.loads(l)
+                for l in output_path.read_text(encoding="utf-8").splitlines()
+            ]
             self.assertEqual(rows[0]["brave_result_count"], 0)
             self.assertEqual(rows[0]["brave_result_count_unfiltered"], 1)
             self.assertEqual(rows[0]["brave_results"], [])
@@ -196,9 +270,19 @@ class TestReliableFilter(unittest.TestCase):
             input_path = self._make_input(tmp, [row])
             output_path = tmp / "out.jsonl"
 
-            self.rf.run(input_path=input_path, output_path=output_path, overwrite=False, progress_every=0)
-            rows = [json.loads(l) for l in output_path.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual(rows[0]["brave_queries"], ['"Test Person"', '"Test Person" obituary'])
+            self.rf.run(
+                input_path=input_path,
+                output_path=output_path,
+                overwrite=False,
+                progress_every=0,
+            )
+            rows = [
+                json.loads(l)
+                for l in output_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                rows[0]["brave_queries"], ['"Test Person"', '"Test Person" obituary']
+            )
             self.assertEqual(rows[0]["fetched_at_utc"], "2026-02-21T12:00:00Z")
             self.assertEqual(rows[0]["subject_name"], "Test Person")
 

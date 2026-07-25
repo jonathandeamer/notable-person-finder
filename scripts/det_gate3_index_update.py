@@ -16,18 +16,19 @@ import argparse
 import json
 import sys
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 sys.path.append(str(Path(__file__).resolve().parent))
 
-from name_utils import normalize_name
 from det_gate0_prefilter import extract_candidate_name
+
+from name_utils import normalize_name
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -97,7 +98,10 @@ def read_jsonl(path: Path) -> list[dict]:
             try:
                 obj = json.loads(raw)
             except json.JSONDecodeError:
-                print(f"warning: invalid JSON at line {line_no}; skipping", file=sys.stderr)
+                print(
+                    f"warning: invalid JSON at line {line_no}; skipping",
+                    file=sys.stderr,
+                )
                 continue
             if isinstance(obj, dict):
                 rows.append(obj)
@@ -106,7 +110,9 @@ def read_jsonl(path: Path) -> list[dict]:
 
 def extract_matched_title(row: dict) -> str | None:
     """Extract matched_title from parsed_output or top-level fields."""
-    parsed = row.get("parsed_output") if isinstance(row.get("parsed_output"), dict) else {}
+    parsed = (
+        row.get("parsed_output") if isinstance(row.get("parsed_output"), dict) else {}
+    )
     title = parsed.get("matched_title")
     if isinstance(title, str):
         return title
@@ -169,14 +175,24 @@ def run_update(
         # different regex name (e.g. "Nick" vs LLM full name "Nicholas Smith") will
         # still hit the index at Gate 0, avoiding redundant Gate 1+3 LLM calls.
         src_ctx = row.get("source_context") or {}
-        event_text = f"{src_ctx.get('entry_title') or ''} {src_ctx.get('summary') or ''}".strip()
+        event_text = (
+            f"{src_ctx.get('entry_title') or ''} {src_ctx.get('summary') or ''}".strip()
+        )
         alias_name = extract_candidate_name(event_text)
         if alias_name:
             alias_key = normalize_name(alias_name)
             if alias_key and alias_key != normalized:
                 existing_alias = entries.get(alias_key)
-                alias_added_at = existing_alias.get("added_at_utc") if isinstance(existing_alias, dict) else now
-                entries[alias_key] = {**entry, "normalized_name": alias_key, "added_at_utc": alias_added_at}
+                alias_added_at = (
+                    existing_alias.get("added_at_utc")
+                    if isinstance(existing_alias, dict)
+                    else now
+                )
+                entries[alias_key] = {
+                    **entry,
+                    "normalized_name": alias_key,
+                    "added_at_utc": alias_added_at,
+                }
                 counts["alias_written"] += 1
 
     index["updated_at_utc"] = now

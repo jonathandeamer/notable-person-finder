@@ -11,13 +11,12 @@ import random
 import re
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
-
 
 BRAVE_NEWS_API = "https://api.search.brave.com/res/v1/news/search"
 _QUERY_STOPWORDS = {
@@ -54,7 +53,7 @@ _OBIT_SIGNALS = (
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

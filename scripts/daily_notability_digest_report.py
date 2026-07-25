@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Refresh the daily notability digest and print a concise summary."""
+
 from __future__ import annotations
 
 import argparse
 import json
 import subprocess
 import sys
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 SCRIPT_PATH = Path(__file__).resolve()
 DEFAULT_PROJECT_ROOT = SCRIPT_PATH.parent.parent
@@ -85,7 +86,9 @@ def normalize_urls(value: Iterable[str] | str | None) -> set[str]:
     return set(value)
 
 
-def gather_person_urls(events: list[dict], summary: dict) -> tuple[list[str], list[str]]:
+def gather_person_urls(
+    events: list[dict], summary: dict
+) -> tuple[list[str], list[str]]:
     rss_urls: set[str] = set()
     brave_urls: set[str] = set()
     for event in events:
@@ -98,8 +101,10 @@ def gather_person_urls(events: list[dict], summary: dict) -> tuple[list[str], li
 def select_latest_run(runs: list[dict]) -> dict | None:
     if not runs:
         return None
+
     def sort_key(run: dict) -> str:
         return run.get("generated_at") or run.get("finished_at") or ""
+
     return max(runs, key=sort_key)
 
 
@@ -157,7 +162,9 @@ def main() -> int:
     for line in format_section("Likely notable", data.get("likely_notable_people", [])):
         print(line)
     print()
-    for line in format_section("Possibly notable", data.get("possibly_notable_people", [])):
+    for line in format_section(
+        "Possibly notable", data.get("possibly_notable_people", [])
+    ):
         print(line)
     return 0
 

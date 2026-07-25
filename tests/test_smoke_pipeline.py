@@ -29,6 +29,7 @@ MOCK_BIN = PROJECT_ROOT / "tests" / "mock_bin"
 # Cache-key helpers (must mirror the real scripts exactly)
 # ---------------------------------------------------------------------------
 
+
 def _sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
@@ -97,6 +98,7 @@ FIXTURE_EVENTS = [
 # File I/O helpers
 # ---------------------------------------------------------------------------
 
+
 def _write_jsonl(path: Path, records: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -129,6 +131,7 @@ def _write_cache(cache_dir: Path, key: str, payload: dict) -> None:
 # MW cache setup
 # ---------------------------------------------------------------------------
 
+
 def _setup_mw_cache(cache_dir: Path) -> None:
     """Pre-populate MW cache so det_mw_candidates.py never makes network calls."""
 
@@ -148,26 +151,36 @@ def _setup_mw_cache(cache_dir: Path) -> None:
 
     # James Worthington: first variant returns a match, others are empty.
     # det_mw_candidates expands "James" → ["Jim", "Jimmy"] via FORMAL_TO_NICKNAMES.
-    search("James Worthington", [
-        {"title": "James Worthington", "pageid": 9001, "snippet": "British academic"},
-    ])
+    search(
+        "James Worthington",
+        [
+            {
+                "title": "James Worthington",
+                "pageid": 9001,
+                "snippet": "British academic",
+            },
+        ],
+    )
     search("Jim Worthington", [])
     search("Jimmy Worthington", [])
 
-    page("James Worthington", {
-        "pageid": 9001,
-        "ns": 0,
-        "title": "James Worthington",
-        "fullurl": "https://en.wikipedia.org/wiki/James_Worthington",
-        "description": "British academic and professor",
-        "extract": "James Worthington is a British academic and professor of economics.",
-        "categories": [
-            {"ns": 14, "title": "Category:1970 births"},
-            {"ns": 14, "title": "Category:Living people"},
-            {"ns": 14, "title": "Category:Oxford academics"},
-        ],
-        "pageprops": {},
-    })
+    page(
+        "James Worthington",
+        {
+            "pageid": 9001,
+            "ns": 0,
+            "title": "James Worthington",
+            "fullurl": "https://en.wikipedia.org/wiki/James_Worthington",
+            "description": "British academic and professor",
+            "extract": "James Worthington is a British academic and professor of economics.",
+            "categories": [
+                {"ns": 14, "title": "Category:1970 births"},
+                {"ns": 14, "title": "Category:Living people"},
+                {"ns": 14, "title": "Category:Oxford academics"},
+            ],
+            "pageprops": {},
+        },
+    )
 
     # Clara Osei-Mensah: no Wikipedia match.
     search("Clara Osei-Mensah", [])
@@ -182,6 +195,7 @@ def _setup_mw_cache(cache_dir: Path) -> None:
 # Brave cache setup
 # ---------------------------------------------------------------------------
 
+
 def _setup_brave_cache(cache_dir: Path) -> None:
     """Pre-populate Brave cache so det_brave_coverage.py never calls the API."""
 
@@ -191,62 +205,71 @@ def _setup_brave_cache(cache_dir: Path) -> None:
     # Clara Osei-Mensah: 2 results from reliable domains + 1 unreliable.
     # build_queries wraps the subject name in quotes: '"Clara Osei-Mensah"'
     clara_q = '"Clara Osei-Mensah"'
-    brave(clara_q, 0, [
-        {
-            "title": "Clara Osei-Mensah wins science prize",
-            "url": "https://www.bbc.com/news/science-clara-osei-mensah",
-            "description": "Osei-Mensah awarded the annual prize for her research.",
-            "age": "1 hour ago",
-            "page_age": None,
-        },
-        {
-            "title": "Ghanaian-British scientist honoured at ceremony",
-            "url": "https://www.theguardian.com/science/2025/jan/01/clara-osei-mensah",
-            "description": "Guardian report on the award ceremony in London.",
-            "age": "2 hours ago",
-            "page_age": None,
-        },
-        {
-            "title": "Science awards 2025 annual ceremony",
-            "url": "https://example-science-news.example.com/awards-2025",
-            "description": "Annual science awards ceremony held in London.",
-            "age": "1 day ago",
-            "page_age": None,
-        },
-    ])
+    brave(
+        clara_q,
+        0,
+        [
+            {
+                "title": "Clara Osei-Mensah wins science prize",
+                "url": "https://www.bbc.com/news/science-clara-osei-mensah",
+                "description": "Osei-Mensah awarded the annual prize for her research.",
+                "age": "1 hour ago",
+                "page_age": None,
+            },
+            {
+                "title": "Ghanaian-British scientist honoured at ceremony",
+                "url": "https://www.theguardian.com/science/2025/jan/01/clara-osei-mensah",
+                "description": "Guardian report on the award ceremony in London.",
+                "age": "2 hours ago",
+                "page_age": None,
+            },
+            {
+                "title": "Science awards 2025 annual ceremony",
+                "url": "https://example-science-news.example.com/awards-2025",
+                "description": "Annual science awards ceremony held in London.",
+                "age": "1 day ago",
+                "page_age": None,
+            },
+        ],
+    )
     brave(clara_q, 1, [])  # Second page: empty
 
     # Bob Fielding: all results from unreliable domains → gate4_filter keeps none.
     bob_q = '"Bob Fielding"'
-    brave(bob_q, 0, [
-        {
-            "title": "Council by-election results",
-            "url": "https://localcouncil.example.com/results",
-            "description": "By-election results for district council.",
-            "age": "1 day ago",
-            "page_age": None,
-        },
-        {
-            "title": "Fielding announces retirement from council",
-            "url": "https://townsnews.example.com/bob-fielding-retires",
-            "description": "Local councillor retires after losing by-election.",
-            "age": "2 days ago",
-            "page_age": None,
-        },
-        {
-            "title": "New council member takes seat",
-            "url": "https://districtgazette.example.com/council-update",
-            "description": "District council seat filled after by-election.",
-            "age": "3 days ago",
-            "page_age": None,
-        },
-    ])
+    brave(
+        bob_q,
+        0,
+        [
+            {
+                "title": "Council by-election results",
+                "url": "https://localcouncil.example.com/results",
+                "description": "By-election results for district council.",
+                "age": "1 day ago",
+                "page_age": None,
+            },
+            {
+                "title": "Fielding announces retirement from council",
+                "url": "https://townsnews.example.com/bob-fielding-retires",
+                "description": "Local councillor retires after losing by-election.",
+                "age": "2 days ago",
+                "page_age": None,
+            },
+            {
+                "title": "New council member takes seat",
+                "url": "https://districtgazette.example.com/council-update",
+                "description": "District council seat filled after by-election.",
+                "age": "3 days ago",
+                "page_age": None,
+            },
+        ],
+    )
     brave(bob_q, 1, [])  # Second page: empty
 
 
 # ---------------------------------------------------------------------------
 # Base test class
 # ---------------------------------------------------------------------------
+
 
 class SmokeTestBase(unittest.TestCase):
     """Sets up an isolated temp state directory and tears it down after each test."""
@@ -288,16 +311,26 @@ class SmokeTestBase(unittest.TestCase):
         cmd = [
             sys.executable,
             str(PROJECT_ROOT / "run_pipeline.py"),
-            "--from-gate", "gate1",
-            "--backend-gate1", "claude-cli",
-            "--backend-gate3", "claude-cli",
-            "--backend-gate4b", "claude-cli",
-            "--model-gate1", "smoke-mock",
-            "--model-gate3", "smoke-mock",
-            "--model-gate4b", "smoke-mock",
-            "--state-dir", str(self.state),
-            "--output-dir", str(self.output),
-            "--gate1-budget", "10",
+            "--from-gate",
+            "gate1",
+            "--backend-gate1",
+            "claude-cli",
+            "--backend-gate3",
+            "claude-cli",
+            "--backend-gate4b",
+            "claude-cli",
+            "--model-gate1",
+            "smoke-mock",
+            "--model-gate3",
+            "smoke-mock",
+            "--model-gate4b",
+            "smoke-mock",
+            "--state-dir",
+            str(self.state),
+            "--output-dir",
+            str(self.output),
+            "--gate1-budget",
+            "10",
         ]
         if extra_args:
             cmd.extend(extra_args)
@@ -315,6 +348,7 @@ class SmokeTestBase(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Happy-path smoke test
 # ---------------------------------------------------------------------------
+
 
 class TestSmokePipelineHappyPath(SmokeTestBase):
     """Full pipeline run with the happy_path mock scenario."""
@@ -348,16 +382,26 @@ class TestSmokePipelineHappyPath(SmokeTestBase):
             [
                 sys.executable,
                 str(PROJECT_ROOT / "run_pipeline.py"),
-                "--from-gate", "gate1",
-                "--backend-gate1", "claude-cli",
-                "--backend-gate3", "claude-cli",
-                "--backend-gate4b", "claude-cli",
-                "--model-gate1", "smoke-mock",
-                "--model-gate3", "smoke-mock",
-                "--model-gate4b", "smoke-mock",
-                "--state-dir", str(cls.state),
-                "--output-dir", str(cls.output),
-                "--gate1-budget", "10",
+                "--from-gate",
+                "gate1",
+                "--backend-gate1",
+                "claude-cli",
+                "--backend-gate3",
+                "claude-cli",
+                "--backend-gate4b",
+                "claude-cli",
+                "--model-gate1",
+                "smoke-mock",
+                "--model-gate3",
+                "smoke-mock",
+                "--model-gate4b",
+                "smoke-mock",
+                "--state-dir",
+                str(cls.state),
+                "--output-dir",
+                str(cls.output),
+                "--gate1-budget",
+                "10",
             ],
             capture_output=True,
             text=True,
@@ -386,7 +430,8 @@ class TestSmokePipelineHappyPath(SmokeTestBase):
 
     def test_pipeline_exits_zero(self) -> None:
         self.assertEqual(
-            self.proc.returncode, 0,
+            self.proc.returncode,
+            0,
             msg=f"Pipeline exited {self.proc.returncode}" + self._dump_on_failure(),
         )
 
@@ -427,7 +472,9 @@ class TestSmokePipelineHappyPath(SmokeTestBase):
         )
         self.assertIsNotNone(worthington)
         candidates = (worthington.get("mw_search") or {}).get("results") or []
-        self.assertGreater(len(candidates), 0, msg="James Worthington should have MW candidates")
+        self.assertGreater(
+            len(candidates), 0, msg="James Worthington should have MW candidates"
+        )
 
     def test_gate2_passes_all_candidates(self) -> None:
         # gate2 always passes everything — wiki_candidates_pass == wiki_candidates
@@ -476,7 +523,8 @@ class TestSmokePipelineHappyPath(SmokeTestBase):
         )
         self.assertIsNotNone(clara)
         self.assertGreaterEqual(
-            clara.get("brave_result_count", 0), 2,
+            clara.get("brave_result_count", 0),
+            2,
             msg="Clara should have ≥2 reliable-domain results",
         )
 
@@ -503,7 +551,9 @@ class TestSmokePipelineHappyPath(SmokeTestBase):
     def test_output_summary_written(self) -> None:
         runs_dir = self.output / "runs"
         summaries = list(runs_dir.glob("*_summary.json"))
-        self.assertEqual(len(summaries), 1, msg=f"Expected one summary file in {runs_dir}")
+        self.assertEqual(
+            len(summaries), 1, msg=f"Expected one summary file in {runs_dir}"
+        )
         data = json.loads(summaries[0].read_text(encoding="utf-8"))
         likely = [e["subject_name"] for e in data.get("likely_notable", [])]
         self.assertTrue(
@@ -525,6 +575,7 @@ class TestSmokePipelineHappyPath(SmokeTestBase):
 # Gate1 malformed: retry mechanism
 # ---------------------------------------------------------------------------
 
+
 class TestSmokePipelineGate1Malformed(SmokeTestBase):
     """gate1_malformed scenario: gate1 returns garbage JSON; retry is triggered."""
 
@@ -535,14 +586,16 @@ class TestSmokePipelineGate1Malformed(SmokeTestBase):
         # Initial pass: 5 records (all json_parse_ok=False)
         # Retry pass (--retry-parse-failures): up to 5 more records
         self.assertGreaterEqual(
-            len(gate1_records), 5,
+            len(gate1_records),
+            5,
             msg=f"Expected ≥5 gate1 records; got {len(gate1_records)}\n"
-                f"STDOUT: {proc.stdout[-2000:]}\nSTDERR: {proc.stderr[-1000:]}",
+            f"STDOUT: {proc.stdout[-2000:]}\nSTDERR: {proc.stderr[-1000:]}",
         )
 
         malformed = [r for r in gate1_records if not r.get("json_parse_ok")]
         self.assertGreater(
-            len(malformed), 0,
+            len(malformed),
+            0,
             msg="Expected at least one record with json_parse_ok=False",
         )
 
@@ -558,13 +611,15 @@ class TestSmokePipelineGate1Malformed(SmokeTestBase):
 # Clara + Bob always short-circuit to MISSING since they have no candidates.
 # ---------------------------------------------------------------------------
 
+
 class TestSmokePipelineGate3AllHasPage(SmokeTestBase):
     """gate3_all_has_page: mock returns HAS_PAGE for any subject with candidates."""
 
     def test_pipeline_succeeds(self) -> None:
         proc = self._run_pipeline(scenario="gate3_all_has_page")
         self.assertEqual(
-            proc.returncode, 0,
+            proc.returncode,
+            0,
             msg=(
                 f"Pipeline should succeed; got RC={proc.returncode}\n"
                 f"STDOUT: {proc.stdout[-2000:]}\nSTDERR: {proc.stderr[-1000:]}"
@@ -596,13 +651,15 @@ class TestSmokePipelineGate3AllHasPage(SmokeTestBase):
 # Dry-run: pipeline prints commands but writes nothing
 # ---------------------------------------------------------------------------
 
+
 class TestSmokePipelineDryRun(SmokeTestBase):
     """--dry-run flag should exit 0 without writing any state files."""
 
     def test_dry_run_exits_zero(self) -> None:
         proc = self._run_pipeline(extra_args=["--dry-run"])
         self.assertEqual(
-            proc.returncode, 0,
+            proc.returncode,
+            0,
             msg=f"Dry run should exit 0\nSTDOUT: {proc.stdout[-1000:]}\nSTDERR: {proc.stderr[-500:]}",
         )
 

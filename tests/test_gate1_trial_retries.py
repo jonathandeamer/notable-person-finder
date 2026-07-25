@@ -17,7 +17,9 @@ class TestGate1TrialRetries(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         root = Path(__file__).resolve().parents[1]
-        cls.gate1 = load_module("llm_gate1_runner", root / "scripts" / "llm_gate1_runner.py")
+        cls.gate1 = load_module(
+            "llm_gate1_runner", root / "scripts" / "llm_gate1_runner.py"
+        )
 
     def test_codex_retry_succeeds_after_failure(self) -> None:
         calls = {"count": 0}
@@ -69,13 +71,20 @@ class TestGate1TrialRetries(unittest.TestCase):
             calls["count"] += 1
             if calls["count"] < 2:
                 raise RuntimeError("claude cli failed (code 1): transient")
-            return "ok output", {"backend": "claude-cli", "returncode": 0, "stderr_excerpt": ""}
+            return "ok output", {
+                "backend": "claude-cli",
+                "returncode": 0,
+                "stderr_excerpt": "",
+            }
 
         orig = self.gate1.call_claude_cli
         try:
             self.gate1.call_claude_cli = fake_call
             out, meta = self.gate1.call_claude_cli_with_retries(
-                prompt_text="x", model="m", cwd=Path("/tmp"), max_attempts=3,
+                prompt_text="x",
+                model="m",
+                cwd=Path("/tmp"),
+                max_attempts=3,
             )
             self.assertEqual(out, "ok output")
             self.assertEqual(calls["count"], 2)
@@ -91,14 +100,19 @@ class TestGate1TrialRetries(unittest.TestCase):
             self.gate1.call_claude_cli = fake_call
             with self.assertRaises(RuntimeError):
                 self.gate1.call_claude_cli_with_retries(
-                    prompt_text="x", model="m", cwd=Path("/tmp"), max_attempts=2,
+                    prompt_text="x",
+                    model="m",
+                    cwd=Path("/tmp"),
+                    max_attempts=2,
                 )
         finally:
             self.gate1.call_claude_cli = orig
 
     def test_gate1_schema_includes_skip_globally_known(self) -> None:
         schema = self.gate1.gate1_output_schema()
-        self.assertIn("SKIP_GLOBALLY_KNOWN", schema["properties"]["gate1_decision"]["enum"])
+        self.assertIn(
+            "SKIP_GLOBALLY_KNOWN", schema["properties"]["gate1_decision"]["enum"]
+        )
 
     def test_gate1_schema_includes_globally_famous_signal(self) -> None:
         schema = self.gate1.gate1_output_schema()
@@ -106,8 +120,20 @@ class TestGate1TrialRetries(unittest.TestCase):
 
     def test_event_id_missing_in_batch_output_flag(self) -> None:
         batch_events = [
-            {"event_id": "a1", "entry_title": "Title A", "summary": "", "source": "S", "publication_date": "2026-02-01"},
-            {"event_id": "b2", "entry_title": "Title B", "summary": "", "source": "S", "publication_date": "2026-02-01"},
+            {
+                "event_id": "a1",
+                "entry_title": "Title A",
+                "summary": "",
+                "source": "S",
+                "publication_date": "2026-02-01",
+            },
+            {
+                "event_id": "b2",
+                "entry_title": "Title B",
+                "summary": "",
+                "source": "S",
+                "publication_date": "2026-02-01",
+            },
         ]
 
         parsed_output = {
@@ -139,7 +165,9 @@ class TestGate1TrialRetries(unittest.TestCase):
             for event in events:
                 item_output = batch_result_by_event_id.get(event.get("event_id"))
                 item_parse_ok = bool(item_output)
-                item_parse_error = None if item_parse_ok else "event_id_missing_in_batch_output"
+                item_parse_error = (
+                    None if item_parse_ok else "event_id_missing_in_batch_output"
+                )
                 results.append((event["event_id"], item_parse_ok, item_parse_error))
             return results
 
@@ -150,9 +178,21 @@ class TestGate1TrialRetries(unittest.TestCase):
     def test_sort_by_priority_lower_first(self) -> None:
         """Priority sort should process lower numbers first."""
         events = [
-            {"event_id": "1", "feed_priority": 3, "published_at_utc": "2026-02-20T12:00:00Z"},
-            {"event_id": "2", "feed_priority": 1, "published_at_utc": "2026-02-19T12:00:00Z"},
-            {"event_id": "3", "feed_priority": 2, "published_at_utc": "2026-02-21T12:00:00Z"},
+            {
+                "event_id": "1",
+                "feed_priority": 3,
+                "published_at_utc": "2026-02-20T12:00:00Z",
+            },
+            {
+                "event_id": "2",
+                "feed_priority": 1,
+                "published_at_utc": "2026-02-19T12:00:00Z",
+            },
+            {
+                "event_id": "3",
+                "feed_priority": 2,
+                "published_at_utc": "2026-02-21T12:00:00Z",
+            },
         ]
 
         # Apply the same sorting logic as in gate1_runner
@@ -163,7 +203,11 @@ class TestGate1TrialRetries(unittest.TestCase):
         )
         _PRIORITY_MAX = float("inf")
         unprocessed.sort(
-            key=lambda e: e.get("feed_priority") if e.get("feed_priority") is not None else _PRIORITY_MAX,
+            key=lambda e: (
+                e.get("feed_priority")
+                if e.get("feed_priority") is not None
+                else _PRIORITY_MAX
+            ),
         )
 
         # Verify order: priority 1, 2, 3
@@ -192,12 +236,14 @@ class TestGate1TrialRetries(unittest.TestCase):
     def test_safe_json_parse_missing_decision_field(self) -> None:
         """Valid JSON dict that omits gate1_decision → parses OK, but decision is None on extraction."""
         # Simulates a model returning valid JSON that partially matches the schema.
-        incomplete = json.dumps({
-            "person_detected": True,
-            "subject_name_as_written": "Alice Smith",
-            "subject_name_full": "Alice Smith",
-            # gate1_decision is intentionally absent
-        })
+        incomplete = json.dumps(
+            {
+                "person_detected": True,
+                "subject_name_as_written": "Alice Smith",
+                "subject_name_full": "Alice Smith",
+                # gate1_decision is intentionally absent
+            }
+        )
         ok, parsed, err = self.gate1.safe_json_parse(incomplete)
         self.assertTrue(ok)
         self.assertIsInstance(parsed, dict)
@@ -208,12 +254,14 @@ class TestGate1TrialRetries(unittest.TestCase):
 
     def test_safe_json_parse_extra_fields_ok(self) -> None:
         """Unexpected extra fields in the JSON are silently accepted by the parser."""
-        full = json.dumps({
-            "person_detected": True,
-            "gate1_decision": "STRONG_PASS",
-            "unexpected_extra_field": "some_value",
-            "another_unknown": 42,
-        })
+        full = json.dumps(
+            {
+                "person_detected": True,
+                "gate1_decision": "STRONG_PASS",
+                "unexpected_extra_field": "some_value",
+                "another_unknown": 42,
+            }
+        )
         ok, parsed, err = self.gate1.safe_json_parse(full)
         self.assertTrue(ok)
         self.assertIsInstance(parsed, dict)
@@ -223,9 +271,21 @@ class TestGate1TrialRetries(unittest.TestCase):
     def test_sort_by_priority_none_last(self) -> None:
         """Events with feed_priority=None should sort after numbered priorities."""
         events = [
-            {"event_id": "1", "feed_priority": 1, "published_at_utc": "2026-02-20T12:00:00Z"},
-            {"event_id": "2", "feed_priority": None, "published_at_utc": "2026-02-21T12:00:00Z"},
-            {"event_id": "3", "feed_priority": 2, "published_at_utc": "2026-02-19T12:00:00Z"},
+            {
+                "event_id": "1",
+                "feed_priority": 1,
+                "published_at_utc": "2026-02-20T12:00:00Z",
+            },
+            {
+                "event_id": "2",
+                "feed_priority": None,
+                "published_at_utc": "2026-02-21T12:00:00Z",
+            },
+            {
+                "event_id": "3",
+                "feed_priority": 2,
+                "published_at_utc": "2026-02-19T12:00:00Z",
+            },
         ]
 
         # Apply the same sorting logic as in gate1_runner
@@ -236,7 +296,11 @@ class TestGate1TrialRetries(unittest.TestCase):
         )
         _PRIORITY_MAX = float("inf")
         unprocessed.sort(
-            key=lambda e: e.get("feed_priority") if e.get("feed_priority") is not None else _PRIORITY_MAX,
+            key=lambda e: (
+                e.get("feed_priority")
+                if e.get("feed_priority") is not None
+                else _PRIORITY_MAX
+            ),
         )
 
         # Verify order: priority 1, 2, then None (represented as inf)

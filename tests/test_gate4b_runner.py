@@ -18,7 +18,9 @@ def load_module(module_name: str, path: Path):
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _make_result(rank: int, domain: str = "reuters.com", title: str = "Subject does things") -> dict:
+def _make_result(
+    rank: int, domain: str = "reuters.com", title: str = "Subject does things"
+) -> dict:
     return {
         "rank": rank,
         "title": title,
@@ -126,7 +128,9 @@ class TestGate4bRunner(unittest.TestCase):
                 records = [_make_input_record(brave_results=[_make_result(1)])]
                 input_path = _write_input(tmp, records)
                 output_path = tmp / "out.jsonl"
-                args = _make_args(input_path, output_path, self.prompt_path, min_reliable_results=2)
+                args = _make_args(
+                    input_path, output_path, self.prompt_path, min_reliable_results=2
+                )
                 rc = self.mod.run(args)
                 self.assertEqual(rc, 0)
                 rows = _read_output(output_path)
@@ -147,12 +151,24 @@ class TestGate4bRunner(unittest.TestCase):
     # test 2: LLM returns about_subject=true for both → LIKELY_NOTABLE
     # ------------------------------------------------------------------
     def test_notable_two_confirmed(self) -> None:
-        llm_response = json.dumps({
-            "results": [
-                {"rank": 1, "about_subject": True, "confidence": 0.9, "reasoning": "Article is about the subject."},
-                {"rank": 2, "about_subject": True, "confidence": 0.85, "reasoning": "Confirmed primary subject."},
-            ]
-        })
+        llm_response = json.dumps(
+            {
+                "results": [
+                    {
+                        "rank": 1,
+                        "about_subject": True,
+                        "confidence": 0.9,
+                        "reasoning": "Article is about the subject.",
+                    },
+                    {
+                        "rank": 2,
+                        "about_subject": True,
+                        "confidence": 0.85,
+                        "reasoning": "Confirmed primary subject.",
+                    },
+                ]
+            }
+        )
 
         def fake_llm(*_args, **_kwargs):
             return llm_response, {"backend": "claude-cli"}
@@ -162,7 +178,11 @@ class TestGate4bRunner(unittest.TestCase):
             self.mod.call_claude_cli = fake_llm
             with tempfile.TemporaryDirectory() as td:
                 tmp = Path(td)
-                records = [_make_input_record(brave_results=[_make_result(1), _make_result(2, "apnews.com")])]
+                records = [
+                    _make_input_record(
+                        brave_results=[_make_result(1), _make_result(2, "apnews.com")]
+                    )
+                ]
                 input_path = _write_input(tmp, records)
                 output_path = tmp / "out.jsonl"
                 args = _make_args(input_path, output_path, self.prompt_path)
@@ -188,12 +208,24 @@ class TestGate4bRunner(unittest.TestCase):
     # test 3: LLM returns about_subject=false for all → NOT_NOTABLE
     # ------------------------------------------------------------------
     def test_not_notable_none_confirmed(self) -> None:
-        llm_response = json.dumps({
-            "results": [
-                {"rank": 1, "about_subject": False, "confidence": 0.8, "reasoning": "About a different person."},
-                {"rank": 2, "about_subject": False, "confidence": 0.75, "reasoning": "Passing mention only."},
-            ]
-        })
+        llm_response = json.dumps(
+            {
+                "results": [
+                    {
+                        "rank": 1,
+                        "about_subject": False,
+                        "confidence": 0.8,
+                        "reasoning": "About a different person.",
+                    },
+                    {
+                        "rank": 2,
+                        "about_subject": False,
+                        "confidence": 0.75,
+                        "reasoning": "Passing mention only.",
+                    },
+                ]
+            }
+        )
 
         def fake_llm(*_args, **_kwargs):
             return llm_response, {"backend": "claude-cli"}
@@ -203,7 +235,11 @@ class TestGate4bRunner(unittest.TestCase):
             self.mod.call_claude_cli = fake_llm
             with tempfile.TemporaryDirectory() as td:
                 tmp = Path(td)
-                records = [_make_input_record(brave_results=[_make_result(1), _make_result(2, "apnews.com")])]
+                records = [
+                    _make_input_record(
+                        brave_results=[_make_result(1), _make_result(2, "apnews.com")]
+                    )
+                ]
                 input_path = _write_input(tmp, records)
                 output_path = tmp / "out.jsonl"
                 args = _make_args(input_path, output_path, self.prompt_path)
@@ -220,12 +256,24 @@ class TestGate4bRunner(unittest.TestCase):
     # test 4: 1 of 2 confirmed → UNCERTAIN
     # ------------------------------------------------------------------
     def test_uncertain_one_confirmed(self) -> None:
-        llm_response = json.dumps({
-            "results": [
-                {"rank": 1, "about_subject": True, "confidence": 0.8, "reasoning": "Clearly about the subject."},
-                {"rank": 2, "about_subject": False, "confidence": 0.7, "reasoning": "Different person with same name."},
-            ]
-        })
+        llm_response = json.dumps(
+            {
+                "results": [
+                    {
+                        "rank": 1,
+                        "about_subject": True,
+                        "confidence": 0.8,
+                        "reasoning": "Clearly about the subject.",
+                    },
+                    {
+                        "rank": 2,
+                        "about_subject": False,
+                        "confidence": 0.7,
+                        "reasoning": "Different person with same name.",
+                    },
+                ]
+            }
+        )
 
         def fake_llm(*_args, **_kwargs):
             return llm_response, {"backend": "claude-cli"}
@@ -235,7 +283,11 @@ class TestGate4bRunner(unittest.TestCase):
             self.mod.call_claude_cli = fake_llm
             with tempfile.TemporaryDirectory() as td:
                 tmp = Path(td)
-                records = [_make_input_record(brave_results=[_make_result(1), _make_result(2, "apnews.com")])]
+                records = [
+                    _make_input_record(
+                        brave_results=[_make_result(1), _make_result(2, "apnews.com")]
+                    )
+                ]
                 input_path = _write_input(tmp, records)
                 output_path = tmp / "out.jsonl"
                 args = _make_args(input_path, output_path, self.prompt_path)
@@ -268,16 +320,22 @@ class TestGate4bRunner(unittest.TestCase):
                 # One independent result
                 results = [
                     _make_result(1, domain="bbc.com", title=entry_title),
-                    _make_result(2, domain="reuters.com", title="Test Person does something else"),
+                    _make_result(
+                        2, domain="reuters.com", title="Test Person does something else"
+                    ),
                 ]
-                records = [_make_input_record(
-                    brave_results=results,
-                    entry_title=entry_title,
-                )]
+                records = [
+                    _make_input_record(
+                        brave_results=results,
+                        entry_title=entry_title,
+                    )
+                ]
                 input_path = _write_input(tmp, records)
                 output_path = tmp / "out.jsonl"
                 # With 1 result excluded, only 1 remains → below threshold of 2
-                args = _make_args(input_path, output_path, self.prompt_path, min_reliable_results=2)
+                args = _make_args(
+                    input_path, output_path, self.prompt_path, min_reliable_results=2
+                )
                 self.mod.run(args)
                 rows = _read_output(output_path)
                 self.assertEqual(rows[0]["gate4b_status"], "SKIPPED")
@@ -300,10 +358,16 @@ class TestGate4bRunner(unittest.TestCase):
             self.mod.call_claude_cli = fake_llm
             with tempfile.TemporaryDirectory() as td:
                 tmp = Path(td)
-                records = [_make_input_record(brave_results=[_make_result(1), _make_result(2, "apnews.com")])]
+                records = [
+                    _make_input_record(
+                        brave_results=[_make_result(1), _make_result(2, "apnews.com")]
+                    )
+                ]
                 input_path = _write_input(tmp, records)
                 output_path = tmp / "out.jsonl"
-                args = _make_args(input_path, output_path, self.prompt_path, max_attempts=1)
+                args = _make_args(
+                    input_path, output_path, self.prompt_path, max_attempts=1
+                )
                 self.mod.run(args)
                 rows = _read_output(output_path)
                 self.assertEqual(len(rows), 1)
@@ -329,7 +393,11 @@ class TestGate4bRunner(unittest.TestCase):
             self.mod.call_claude_cli = fake_llm
             with tempfile.TemporaryDirectory() as td:
                 tmp = Path(td)
-                records = [_make_input_record(brave_results=[_make_result(1), _make_result(2, "apnews.com")])]
+                records = [
+                    _make_input_record(
+                        brave_results=[_make_result(1), _make_result(2, "apnews.com")]
+                    )
+                ]
                 input_path = _write_input(tmp, records)
                 output_path = tmp / "out.jsonl"
                 args = _make_args(input_path, output_path, self.prompt_path)
@@ -346,12 +414,24 @@ class TestGate4bRunner(unittest.TestCase):
             self.mod.call_claude_cli = orig
 
     def test_distinct_domains_required_for_likely_notable(self) -> None:
-        llm_response = json.dumps({
-            "results": [
-                {"rank": 1, "about_subject": True, "confidence": 0.9, "reasoning": "About subject."},
-                {"rank": 2, "about_subject": True, "confidence": 0.88, "reasoning": "About subject too."},
-            ]
-        })
+        llm_response = json.dumps(
+            {
+                "results": [
+                    {
+                        "rank": 1,
+                        "about_subject": True,
+                        "confidence": 0.9,
+                        "reasoning": "About subject.",
+                    },
+                    {
+                        "rank": 2,
+                        "about_subject": True,
+                        "confidence": 0.88,
+                        "reasoning": "About subject too.",
+                    },
+                ]
+            }
+        )
 
         def fake_llm(*_args, **_kwargs):
             return llm_response, {"backend": "claude-cli"}
@@ -362,7 +442,14 @@ class TestGate4bRunner(unittest.TestCase):
             with tempfile.TemporaryDirectory() as td:
                 tmp = Path(td)
                 # Two URLs, same domain => one distinct domain.
-                records = [_make_input_record(brave_results=[_make_result(1, "bbc.com"), _make_result(2, "bbc.com")])]
+                records = [
+                    _make_input_record(
+                        brave_results=[
+                            _make_result(1, "bbc.com"),
+                            _make_result(2, "bbc.com"),
+                        ]
+                    )
+                ]
                 input_path = _write_input(tmp, records)
                 output_path = tmp / "out.jsonl"
                 args = _make_args(input_path, output_path, self.prompt_path)
@@ -377,17 +464,37 @@ class TestGate4bRunner(unittest.TestCase):
 
     def test_second_pass_promotes_when_combined_domains_reach_two(self) -> None:
         call_count = {"n": 0}
-        first_pass_response = json.dumps({
-            "results": [
-                {"rank": 1, "about_subject": True, "confidence": 0.9, "reasoning": "About subject."},
-                {"rank": 2, "about_subject": False, "confidence": 0.6, "reasoning": "Different subject."},
-            ]
-        })
-        second_pass_response = json.dumps({
-            "results": [
-                {"rank": 2, "about_subject": True, "is_reliable_source": True, "confidence": 0.9, "reasoning": "About subject and reliable."},
-            ]
-        })
+        first_pass_response = json.dumps(
+            {
+                "results": [
+                    {
+                        "rank": 1,
+                        "about_subject": True,
+                        "confidence": 0.9,
+                        "reasoning": "About subject.",
+                    },
+                    {
+                        "rank": 2,
+                        "about_subject": False,
+                        "confidence": 0.6,
+                        "reasoning": "Different subject.",
+                    },
+                ]
+            }
+        )
+        second_pass_response = json.dumps(
+            {
+                "results": [
+                    {
+                        "rank": 2,
+                        "about_subject": True,
+                        "is_reliable_source": True,
+                        "confidence": 0.9,
+                        "reasoning": "About subject and reliable.",
+                    },
+                ]
+            }
+        )
 
         def fake_llm(*_args, **_kwargs):
             call_count["n"] += 1
@@ -400,26 +507,46 @@ class TestGate4bRunner(unittest.TestCase):
             self.mod.call_claude_cli = fake_llm
             with tempfile.TemporaryDirectory() as td:
                 tmp = Path(td)
-                brave_results = [_make_result(1, "reuters.com"), _make_result(2, "apnews.com")]
-                brave_record = _make_input_record(brave_results=brave_results, event_id="event-abc")
+                brave_results = [
+                    _make_result(1, "reuters.com"),
+                    _make_result(2, "apnews.com"),
+                ]
+                brave_record = _make_input_record(
+                    brave_results=brave_results, event_id="event-abc"
+                )
                 brave_path = tmp / "brave_coverage.jsonl"
                 brave_path.write_text(json.dumps(brave_record) + "\n", encoding="utf-8")
                 unlisted_prompt_path = tmp / "gate4b_unlisted.md"
-                unlisted_prompt_path.write_text("Unlisted prompt body.", encoding="utf-8")
+                unlisted_prompt_path.write_text(
+                    "Unlisted prompt body.", encoding="utf-8"
+                )
 
-                records = [_make_input_record(brave_results=[_make_result(1, "reuters.com"), _make_result(2, "bbc.com")])]
+                records = [
+                    _make_input_record(
+                        brave_results=[
+                            _make_result(1, "reuters.com"),
+                            _make_result(2, "bbc.com"),
+                        ]
+                    )
+                ]
                 input_path = _write_input(tmp, records)
                 output_path = tmp / "out.jsonl"
                 args = _make_args(
-                    input_path, output_path, self.prompt_path,
-                    brave_input=brave_path, unlisted_prompt=unlisted_prompt_path,
+                    input_path,
+                    output_path,
+                    self.prompt_path,
+                    brave_input=brave_path,
+                    unlisted_prompt=unlisted_prompt_path,
                 )
                 self.mod.run(args)
                 rows = _read_output(output_path)
                 self.assertEqual(rows[0]["confirmed_count"], 1)
                 self.assertEqual(rows[0]["second_pass_confirmed_count"], 1)
                 self.assertEqual(rows[0]["gate4b_status"], "POSSIBLY_NOTABLE")
-                self.assertEqual(set(rows[0]["all_reliable_brave_domains"]), {"reuters.com", "apnews.com"})
+                self.assertEqual(
+                    set(rows[0]["all_reliable_brave_domains"]),
+                    {"reuters.com", "apnews.com"},
+                )
         finally:
             self.mod.call_claude_cli = orig
 
@@ -438,12 +565,16 @@ class TestGate4bRunner(unittest.TestCase):
                 output_path = tmp / "out.jsonl"
                 # Pre-populate with stale content (2 fake rows)
                 old_row = json.dumps({"gate4b_status": "STALE", "subject_name": "Old"})
-                output_path.write_text(old_row + "\n" + old_row + "\n", encoding="utf-8")
+                output_path.write_text(
+                    old_row + "\n" + old_row + "\n", encoding="utf-8"
+                )
 
                 # Run with 1 subject below threshold → writes 1 SKIPPED row
                 records = [_make_input_record(brave_results=[_make_result(1)])]
                 input_path = _write_input(tmp, records)
-                args = _make_args(input_path, output_path, self.prompt_path, fresh_output=True)
+                args = _make_args(
+                    input_path, output_path, self.prompt_path, fresh_output=True
+                )
                 self.mod.run(args)
 
                 rows = _read_output(output_path)
@@ -459,7 +590,9 @@ class TestGate4bRunner(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_is_original_source_title_match(self) -> None:
-        result = _make_result(1, title="Test Person wins award at major championship event in Rome")
+        result = _make_result(
+            1, title="Test Person wins award at major championship event in Rome"
+        )
         ctx = {
             "entry_title": "Test Person wins award at major championship event in Rome",
             "source": None,
@@ -492,8 +625,18 @@ class TestGate4bRunner(unittest.TestCase):
         schema = self.mod.gate4b_output_schema()
         valid = {
             "results": [
-                {"rank": 1, "about_subject": True, "confidence": 0.9, "reasoning": "Clearly about subject."},
-                {"rank": 2, "about_subject": False, "confidence": 0.3, "reasoning": "Different person."},
+                {
+                    "rank": 1,
+                    "about_subject": True,
+                    "confidence": 0.9,
+                    "reasoning": "Clearly about subject.",
+                },
+                {
+                    "rank": 2,
+                    "about_subject": False,
+                    "confidence": 0.3,
+                    "reasoning": "Different person.",
+                },
             ]
         }
         jsonschema.validate(valid, schema)
@@ -511,7 +654,11 @@ class TestGate4bRunner(unittest.TestCase):
         schema = self.mod.gate4b_output_schema()
         invalid = {
             "results": [
-                {"rank": 1, "about_subject": True, "confidence": 0.9}  # missing "reasoning"
+                {
+                    "rank": 1,
+                    "about_subject": True,
+                    "confidence": 0.9,
+                }  # missing "reasoning"
             ]
         }
         with self.assertRaises(jsonschema.ValidationError):
@@ -542,7 +689,12 @@ class TestGate4bRunner(unittest.TestCase):
 
     def test_format_gate4b_prompt_numbered_by_rank(self) -> None:
         prompt_body = "Gate 4b."
-        ctx = {"entry_title": "T", "summary": "S", "source": "P", "publication_date": "2026-01-01"}
+        ctx = {
+            "entry_title": "T",
+            "summary": "S",
+            "source": "P",
+            "publication_date": "2026-01-01",
+        }
         results = [_make_result(1), _make_result(3, "apnews.com")]
         out = self.mod.format_gate4b_prompt(
             prompt_body=prompt_body,
@@ -558,12 +710,24 @@ class TestGate4bRunner(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_second_pass_not_run_when_no_brave_input(self) -> None:
         llm_calls = {"count": 0}
-        llm_response = json.dumps({
-            "results": [
-                {"rank": 1, "about_subject": True, "confidence": 0.9, "reasoning": "About subject."},
-                {"rank": 2, "about_subject": True, "confidence": 0.85, "reasoning": "Confirmed."},
-            ]
-        })
+        llm_response = json.dumps(
+            {
+                "results": [
+                    {
+                        "rank": 1,
+                        "about_subject": True,
+                        "confidence": 0.9,
+                        "reasoning": "About subject.",
+                    },
+                    {
+                        "rank": 2,
+                        "about_subject": True,
+                        "confidence": 0.85,
+                        "reasoning": "Confirmed.",
+                    },
+                ]
+            }
+        )
 
         def fake_llm(*_args, **_kwargs):
             llm_calls["count"] += 1
@@ -574,10 +738,16 @@ class TestGate4bRunner(unittest.TestCase):
             self.mod.call_claude_cli = fake_llm
             with tempfile.TemporaryDirectory() as td:
                 tmp = Path(td)
-                records = [_make_input_record(brave_results=[_make_result(1), _make_result(2, "apnews.com")])]
+                records = [
+                    _make_input_record(
+                        brave_results=[_make_result(1), _make_result(2, "apnews.com")]
+                    )
+                ]
                 input_path = _write_input(tmp, records)
                 output_path = tmp / "out.jsonl"
-                args = _make_args(input_path, output_path, self.prompt_path, brave_input=None)
+                args = _make_args(
+                    input_path, output_path, self.prompt_path, brave_input=None
+                )
                 rc = self.mod.run(args)
                 self.assertEqual(rc, 0)
                 rows = _read_output(output_path)
@@ -597,12 +767,24 @@ class TestGate4bRunner(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_second_pass_skipped_for_likely_notable(self) -> None:
         llm_calls = {"count": 0}
-        llm_response = json.dumps({
-            "results": [
-                {"rank": 1, "about_subject": True, "confidence": 0.9, "reasoning": "About subject."},
-                {"rank": 2, "about_subject": True, "confidence": 0.85, "reasoning": "Confirmed."},
-            ]
-        })
+        llm_response = json.dumps(
+            {
+                "results": [
+                    {
+                        "rank": 1,
+                        "about_subject": True,
+                        "confidence": 0.9,
+                        "reasoning": "About subject.",
+                    },
+                    {
+                        "rank": 2,
+                        "about_subject": True,
+                        "confidence": 0.85,
+                        "reasoning": "Confirmed.",
+                    },
+                ]
+            }
+        )
 
         def fake_llm(*_args, **_kwargs):
             llm_calls["count"] += 1
@@ -613,19 +795,34 @@ class TestGate4bRunner(unittest.TestCase):
             self.mod.call_claude_cli = fake_llm
             with tempfile.TemporaryDirectory() as td:
                 tmp = Path(td)
-                brave_results = [_make_result(1), _make_result(2, "apnews.com"), _make_result(3, "bbc.com")]
-                brave_record = _make_input_record(brave_results=brave_results, event_id="event-abc")
+                brave_results = [
+                    _make_result(1),
+                    _make_result(2, "apnews.com"),
+                    _make_result(3, "bbc.com"),
+                ]
+                brave_record = _make_input_record(
+                    brave_results=brave_results, event_id="event-abc"
+                )
                 brave_path = tmp / "brave_coverage.jsonl"
                 brave_path.write_text(json.dumps(brave_record) + "\n", encoding="utf-8")
                 unlisted_prompt_path = tmp / "gate4b_unlisted.md"
-                unlisted_prompt_path.write_text("Unlisted prompt body.", encoding="utf-8")
+                unlisted_prompt_path.write_text(
+                    "Unlisted prompt body.", encoding="utf-8"
+                )
 
-                records = [_make_input_record(brave_results=[_make_result(1), _make_result(2, "apnews.com")])]
+                records = [
+                    _make_input_record(
+                        brave_results=[_make_result(1), _make_result(2, "apnews.com")]
+                    )
+                ]
                 input_path = _write_input(tmp, records)
                 output_path = tmp / "out.jsonl"
                 args = _make_args(
-                    input_path, output_path, self.prompt_path,
-                    brave_input=brave_path, unlisted_prompt=unlisted_prompt_path,
+                    input_path,
+                    output_path,
+                    self.prompt_path,
+                    brave_input=brave_path,
+                    unlisted_prompt=unlisted_prompt_path,
                 )
                 rc = self.mod.run(args)
                 self.assertEqual(rc, 0)
@@ -642,19 +839,51 @@ class TestGate4bRunner(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_second_pass_produces_possibly_notable(self) -> None:
         call_count = {"n": 0}
-        first_pass_response = json.dumps({
-            "results": [
-                {"rank": 1, "about_subject": False, "confidence": 0.8, "reasoning": "Different person."},
-                {"rank": 2, "about_subject": False, "confidence": 0.7, "reasoning": "Passing mention."},
-            ]
-        })
-        second_pass_response = json.dumps({
-            "results": [
-                {"rank": 1, "about_subject": True, "is_reliable_source": True, "confidence": 0.9, "reasoning": "On subject, reliable."},
-                {"rank": 2, "about_subject": True, "is_reliable_source": True, "confidence": 0.85, "reasoning": "On subject, reliable."},
-                {"rank": 3, "about_subject": True, "is_reliable_source": True, "confidence": 0.8, "reasoning": "On subject, reliable."},
-            ]
-        })
+        first_pass_response = json.dumps(
+            {
+                "results": [
+                    {
+                        "rank": 1,
+                        "about_subject": False,
+                        "confidence": 0.8,
+                        "reasoning": "Different person.",
+                    },
+                    {
+                        "rank": 2,
+                        "about_subject": False,
+                        "confidence": 0.7,
+                        "reasoning": "Passing mention.",
+                    },
+                ]
+            }
+        )
+        second_pass_response = json.dumps(
+            {
+                "results": [
+                    {
+                        "rank": 1,
+                        "about_subject": True,
+                        "is_reliable_source": True,
+                        "confidence": 0.9,
+                        "reasoning": "On subject, reliable.",
+                    },
+                    {
+                        "rank": 2,
+                        "about_subject": True,
+                        "is_reliable_source": True,
+                        "confidence": 0.85,
+                        "reasoning": "On subject, reliable.",
+                    },
+                    {
+                        "rank": 3,
+                        "about_subject": True,
+                        "is_reliable_source": True,
+                        "confidence": 0.8,
+                        "reasoning": "On subject, reliable.",
+                    },
+                ]
+            }
+        )
 
         def fake_llm(*_args, **_kwargs):
             call_count["n"] += 1
@@ -667,19 +896,34 @@ class TestGate4bRunner(unittest.TestCase):
             self.mod.call_claude_cli = fake_llm
             with tempfile.TemporaryDirectory() as td:
                 tmp = Path(td)
-                brave_results = [_make_result(1), _make_result(2, "apnews.com"), _make_result(3, "bbc.com")]
-                brave_record = _make_input_record(brave_results=brave_results, event_id="event-abc")
+                brave_results = [
+                    _make_result(1),
+                    _make_result(2, "apnews.com"),
+                    _make_result(3, "bbc.com"),
+                ]
+                brave_record = _make_input_record(
+                    brave_results=brave_results, event_id="event-abc"
+                )
                 brave_path = tmp / "brave_coverage.jsonl"
                 brave_path.write_text(json.dumps(brave_record) + "\n", encoding="utf-8")
                 unlisted_prompt_path = tmp / "gate4b_unlisted.md"
-                unlisted_prompt_path.write_text("Unlisted prompt body.", encoding="utf-8")
+                unlisted_prompt_path.write_text(
+                    "Unlisted prompt body.", encoding="utf-8"
+                )
 
-                records = [_make_input_record(brave_results=[_make_result(1), _make_result(2, "apnews.com")])]
+                records = [
+                    _make_input_record(
+                        brave_results=[_make_result(1), _make_result(2, "apnews.com")]
+                    )
+                ]
                 input_path = _write_input(tmp, records)
                 output_path = tmp / "out.jsonl"
                 args = _make_args(
-                    input_path, output_path, self.prompt_path,
-                    brave_input=brave_path, unlisted_prompt=unlisted_prompt_path,
+                    input_path,
+                    output_path,
+                    self.prompt_path,
+                    brave_input=brave_path,
+                    unlisted_prompt=unlisted_prompt_path,
                 )
                 rc = self.mod.run(args)
                 self.assertEqual(rc, 0)
@@ -695,18 +939,44 @@ class TestGate4bRunner(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_second_pass_requires_both_flags_true(self) -> None:
         call_count = {"n": 0}
-        first_pass_response = json.dumps({
-            "results": [
-                {"rank": 1, "about_subject": False, "confidence": 0.8, "reasoning": "Different person."},
-                {"rank": 2, "about_subject": False, "confidence": 0.7, "reasoning": "Passing mention."},
-            ]
-        })
-        second_pass_response = json.dumps({
-            "results": [
-                {"rank": 1, "about_subject": True, "is_reliable_source": True, "confidence": 0.9, "reasoning": "On subject, reliable."},
-                {"rank": 2, "about_subject": True, "is_reliable_source": False, "confidence": 0.5, "reasoning": "On subject but PR wire."},
-            ]
-        })
+        first_pass_response = json.dumps(
+            {
+                "results": [
+                    {
+                        "rank": 1,
+                        "about_subject": False,
+                        "confidence": 0.8,
+                        "reasoning": "Different person.",
+                    },
+                    {
+                        "rank": 2,
+                        "about_subject": False,
+                        "confidence": 0.7,
+                        "reasoning": "Passing mention.",
+                    },
+                ]
+            }
+        )
+        second_pass_response = json.dumps(
+            {
+                "results": [
+                    {
+                        "rank": 1,
+                        "about_subject": True,
+                        "is_reliable_source": True,
+                        "confidence": 0.9,
+                        "reasoning": "On subject, reliable.",
+                    },
+                    {
+                        "rank": 2,
+                        "about_subject": True,
+                        "is_reliable_source": False,
+                        "confidence": 0.5,
+                        "reasoning": "On subject but PR wire.",
+                    },
+                ]
+            }
+        )
 
         def fake_llm(*_args, **_kwargs):
             call_count["n"] += 1
@@ -720,18 +990,29 @@ class TestGate4bRunner(unittest.TestCase):
             with tempfile.TemporaryDirectory() as td:
                 tmp = Path(td)
                 brave_results = [_make_result(1), _make_result(2, "prnewswire.com")]
-                brave_record = _make_input_record(brave_results=brave_results, event_id="event-abc")
+                brave_record = _make_input_record(
+                    brave_results=brave_results, event_id="event-abc"
+                )
                 brave_path = tmp / "brave_coverage.jsonl"
                 brave_path.write_text(json.dumps(brave_record) + "\n", encoding="utf-8")
                 unlisted_prompt_path = tmp / "gate4b_unlisted.md"
-                unlisted_prompt_path.write_text("Unlisted prompt body.", encoding="utf-8")
+                unlisted_prompt_path.write_text(
+                    "Unlisted prompt body.", encoding="utf-8"
+                )
 
-                records = [_make_input_record(brave_results=[_make_result(1), _make_result(2, "apnews.com")])]
+                records = [
+                    _make_input_record(
+                        brave_results=[_make_result(1), _make_result(2, "apnews.com")]
+                    )
+                ]
                 input_path = _write_input(tmp, records)
                 output_path = tmp / "out.jsonl"
                 args = _make_args(
-                    input_path, output_path, self.prompt_path,
-                    brave_input=brave_path, unlisted_prompt=unlisted_prompt_path,
+                    input_path,
+                    output_path,
+                    self.prompt_path,
+                    brave_input=brave_path,
+                    unlisted_prompt=unlisted_prompt_path,
                 )
                 self.mod.run(args)
                 rows = _read_output(output_path)
@@ -746,18 +1027,44 @@ class TestGate4bRunner(unittest.TestCase):
     def test_second_pass_excludes_original_source(self) -> None:
         call_count = {"n": 0}
         entry_title = "Test Person wins award at major event"
-        first_pass_response = json.dumps({
-            "results": [
-                {"rank": 1, "about_subject": False, "confidence": 0.6, "reasoning": "Not subject."},
-                {"rank": 2, "about_subject": False, "confidence": 0.6, "reasoning": "Not subject."},
-            ]
-        })
-        second_pass_response = json.dumps({
-            "results": [
-                {"rank": 2, "about_subject": True, "is_reliable_source": True, "confidence": 0.8, "reasoning": "About subject."},
-                {"rank": 3, "about_subject": False, "is_reliable_source": True, "confidence": 0.5, "reasoning": "Not about subject."},
-            ]
-        })
+        first_pass_response = json.dumps(
+            {
+                "results": [
+                    {
+                        "rank": 1,
+                        "about_subject": False,
+                        "confidence": 0.6,
+                        "reasoning": "Not subject.",
+                    },
+                    {
+                        "rank": 2,
+                        "about_subject": False,
+                        "confidence": 0.6,
+                        "reasoning": "Not subject.",
+                    },
+                ]
+            }
+        )
+        second_pass_response = json.dumps(
+            {
+                "results": [
+                    {
+                        "rank": 2,
+                        "about_subject": True,
+                        "is_reliable_source": True,
+                        "confidence": 0.8,
+                        "reasoning": "About subject.",
+                    },
+                    {
+                        "rank": 3,
+                        "about_subject": False,
+                        "is_reliable_source": True,
+                        "confidence": 0.5,
+                        "reasoning": "Not about subject.",
+                    },
+                ]
+            }
+        )
         sent_candidates = {"results": None}
 
         original_format = self.mod.format_gate4b_unlisted_prompt
@@ -785,21 +1092,35 @@ class TestGate4bRunner(unittest.TestCase):
                     _make_result(2, domain="apnews.com"),
                     _make_result(3, domain="reuters.com"),
                 ]
-                brave_record = _make_input_record(brave_results=brave_results, entry_title=entry_title, event_id="event-abc")
+                brave_record = _make_input_record(
+                    brave_results=brave_results,
+                    entry_title=entry_title,
+                    event_id="event-abc",
+                )
                 brave_path = tmp / "brave_coverage.jsonl"
                 brave_path.write_text(json.dumps(brave_record) + "\n", encoding="utf-8")
                 unlisted_prompt_path = tmp / "gate4b_unlisted.md"
-                unlisted_prompt_path.write_text("Unlisted prompt body.", encoding="utf-8")
+                unlisted_prompt_path.write_text(
+                    "Unlisted prompt body.", encoding="utf-8"
+                )
 
-                records = [_make_input_record(
-                    brave_results=[_make_result(1, domain="apnews.com"), _make_result(2, domain="reuters.com")],
-                    entry_title=entry_title,
-                )]
+                records = [
+                    _make_input_record(
+                        brave_results=[
+                            _make_result(1, domain="apnews.com"),
+                            _make_result(2, domain="reuters.com"),
+                        ],
+                        entry_title=entry_title,
+                    )
+                ]
                 input_path = _write_input(tmp, records)
                 output_path = tmp / "out.jsonl"
                 args = _make_args(
-                    input_path, output_path, self.prompt_path,
-                    brave_input=brave_path, unlisted_prompt=unlisted_prompt_path,
+                    input_path,
+                    output_path,
+                    self.prompt_path,
+                    brave_input=brave_path,
+                    unlisted_prompt=unlisted_prompt_path,
                 )
                 self.mod.run(args)
                 # Original source (bbc.com with title match) excluded → only 2 candidates sent
@@ -817,12 +1138,24 @@ class TestGate4bRunner(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_second_pass_llm_error_recorded(self) -> None:
         call_count = {"n": 0}
-        first_pass_response = json.dumps({
-            "results": [
-                {"rank": 1, "about_subject": True, "confidence": 0.8, "reasoning": "About subject."},
-                {"rank": 2, "about_subject": False, "confidence": 0.6, "reasoning": "Not subject."},
-            ]
-        })
+        first_pass_response = json.dumps(
+            {
+                "results": [
+                    {
+                        "rank": 1,
+                        "about_subject": True,
+                        "confidence": 0.8,
+                        "reasoning": "About subject.",
+                    },
+                    {
+                        "rank": 2,
+                        "about_subject": False,
+                        "confidence": 0.6,
+                        "reasoning": "Not subject.",
+                    },
+                ]
+            }
+        )
 
         def fake_llm(*_args, **_kwargs):
             call_count["n"] += 1
@@ -835,19 +1168,34 @@ class TestGate4bRunner(unittest.TestCase):
             self.mod.call_claude_cli = fake_llm
             with tempfile.TemporaryDirectory() as td:
                 tmp = Path(td)
-                brave_results = [_make_result(1), _make_result(2, "apnews.com"), _make_result(3, "bbc.com")]
-                brave_record = _make_input_record(brave_results=brave_results, event_id="event-abc")
+                brave_results = [
+                    _make_result(1),
+                    _make_result(2, "apnews.com"),
+                    _make_result(3, "bbc.com"),
+                ]
+                brave_record = _make_input_record(
+                    brave_results=brave_results, event_id="event-abc"
+                )
                 brave_path = tmp / "brave_coverage.jsonl"
                 brave_path.write_text(json.dumps(brave_record) + "\n", encoding="utf-8")
                 unlisted_prompt_path = tmp / "gate4b_unlisted.md"
-                unlisted_prompt_path.write_text("Unlisted prompt body.", encoding="utf-8")
+                unlisted_prompt_path.write_text(
+                    "Unlisted prompt body.", encoding="utf-8"
+                )
 
-                records = [_make_input_record(brave_results=[_make_result(1), _make_result(2, "apnews.com")])]
+                records = [
+                    _make_input_record(
+                        brave_results=[_make_result(1), _make_result(2, "apnews.com")]
+                    )
+                ]
                 input_path = _write_input(tmp, records)
                 output_path = tmp / "out.jsonl"
                 args = _make_args(
-                    input_path, output_path, self.prompt_path,
-                    brave_input=brave_path, unlisted_prompt=unlisted_prompt_path,
+                    input_path,
+                    output_path,
+                    self.prompt_path,
+                    brave_input=brave_path,
+                    unlisted_prompt=unlisted_prompt_path,
                 )
                 self.mod.run(args)
                 rows = _read_output(output_path)
@@ -862,12 +1210,24 @@ class TestGate4bRunner(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_second_pass_invalid_json(self) -> None:
         call_count = {"n": 0}
-        first_pass_response = json.dumps({
-            "results": [
-                {"rank": 1, "about_subject": False, "confidence": 0.6, "reasoning": "Not subject."},
-                {"rank": 2, "about_subject": False, "confidence": 0.6, "reasoning": "Not subject."},
-            ]
-        })
+        first_pass_response = json.dumps(
+            {
+                "results": [
+                    {
+                        "rank": 1,
+                        "about_subject": False,
+                        "confidence": 0.6,
+                        "reasoning": "Not subject.",
+                    },
+                    {
+                        "rank": 2,
+                        "about_subject": False,
+                        "confidence": 0.6,
+                        "reasoning": "Not subject.",
+                    },
+                ]
+            }
+        )
 
         def fake_llm(*_args, **_kwargs):
             call_count["n"] += 1
@@ -880,19 +1240,34 @@ class TestGate4bRunner(unittest.TestCase):
             self.mod.call_claude_cli = fake_llm
             with tempfile.TemporaryDirectory() as td:
                 tmp = Path(td)
-                brave_results = [_make_result(1), _make_result(2, "apnews.com"), _make_result(3, "bbc.com")]
-                brave_record = _make_input_record(brave_results=brave_results, event_id="event-abc")
+                brave_results = [
+                    _make_result(1),
+                    _make_result(2, "apnews.com"),
+                    _make_result(3, "bbc.com"),
+                ]
+                brave_record = _make_input_record(
+                    brave_results=brave_results, event_id="event-abc"
+                )
                 brave_path = tmp / "brave_coverage.jsonl"
                 brave_path.write_text(json.dumps(brave_record) + "\n", encoding="utf-8")
                 unlisted_prompt_path = tmp / "gate4b_unlisted.md"
-                unlisted_prompt_path.write_text("Unlisted prompt body.", encoding="utf-8")
+                unlisted_prompt_path.write_text(
+                    "Unlisted prompt body.", encoding="utf-8"
+                )
 
-                records = [_make_input_record(brave_results=[_make_result(1), _make_result(2, "apnews.com")])]
+                records = [
+                    _make_input_record(
+                        brave_results=[_make_result(1), _make_result(2, "apnews.com")]
+                    )
+                ]
                 input_path = _write_input(tmp, records)
                 output_path = tmp / "out.jsonl"
                 args = _make_args(
-                    input_path, output_path, self.prompt_path,
-                    brave_input=brave_path, unlisted_prompt=unlisted_prompt_path,
+                    input_path,
+                    output_path,
+                    self.prompt_path,
+                    brave_input=brave_path,
+                    unlisted_prompt=unlisted_prompt_path,
                 )
                 self.mod.run(args)
                 rows = _read_output(output_path)
@@ -907,12 +1282,24 @@ class TestGate4bRunner(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_second_pass_no_brave_record_for_event(self) -> None:
         call_count = {"n": 0}
-        first_pass_response = json.dumps({
-            "results": [
-                {"rank": 1, "about_subject": False, "confidence": 0.6, "reasoning": "Not subject."},
-                {"rank": 2, "about_subject": False, "confidence": 0.6, "reasoning": "Not subject."},
-            ]
-        })
+        first_pass_response = json.dumps(
+            {
+                "results": [
+                    {
+                        "rank": 1,
+                        "about_subject": False,
+                        "confidence": 0.6,
+                        "reasoning": "Not subject.",
+                    },
+                    {
+                        "rank": 2,
+                        "about_subject": False,
+                        "confidence": 0.6,
+                        "reasoning": "Not subject.",
+                    },
+                ]
+            }
+        )
 
         def fake_llm(*_args, **_kwargs):
             call_count["n"] += 1
@@ -924,18 +1311,30 @@ class TestGate4bRunner(unittest.TestCase):
             with tempfile.TemporaryDirectory() as td:
                 tmp = Path(td)
                 # brave record has a DIFFERENT event_id
-                brave_record = _make_input_record(brave_results=[_make_result(1)], event_id="different-event")
+                brave_record = _make_input_record(
+                    brave_results=[_make_result(1)], event_id="different-event"
+                )
                 brave_path = tmp / "brave_coverage.jsonl"
                 brave_path.write_text(json.dumps(brave_record) + "\n", encoding="utf-8")
                 unlisted_prompt_path = tmp / "gate4b_unlisted.md"
-                unlisted_prompt_path.write_text("Unlisted prompt body.", encoding="utf-8")
+                unlisted_prompt_path.write_text(
+                    "Unlisted prompt body.", encoding="utf-8"
+                )
 
-                records = [_make_input_record(brave_results=[_make_result(1), _make_result(2, "apnews.com")], event_id="event-abc")]
+                records = [
+                    _make_input_record(
+                        brave_results=[_make_result(1), _make_result(2, "apnews.com")],
+                        event_id="event-abc",
+                    )
+                ]
                 input_path = _write_input(tmp, records)
                 output_path = tmp / "out.jsonl"
                 args = _make_args(
-                    input_path, output_path, self.prompt_path,
-                    brave_input=brave_path, unlisted_prompt=unlisted_prompt_path,
+                    input_path,
+                    output_path,
+                    self.prompt_path,
+                    brave_input=brave_path,
+                    unlisted_prompt=unlisted_prompt_path,
                 )
                 self.mod.run(args)
                 rows = _read_output(output_path)
@@ -995,7 +1394,9 @@ class TestGate4bRunner(unittest.TestCase):
             "source": "BBC News",
             "publication_date": "2026-01-01",
         }
-        results = [_make_result(1, domain="somesite.com", title="Jane Smith wins award")]
+        results = [
+            _make_result(1, domain="somesite.com", title="Jane Smith wins award")
+        ]
         out = self.mod.format_gate4b_unlisted_prompt(
             prompt_body=prompt_body,
             subject="Jane Smith",

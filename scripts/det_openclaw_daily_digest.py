@@ -18,11 +18,11 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from glob import glob
 from pathlib import Path
-from urllib.parse import urlparse
 from typing import Any
+from urllib.parse import urlparse
 
 SCRIPT_PATH = Path(__file__).resolve()
 PROJECT_ROOT = SCRIPT_PATH.parent.parent
@@ -41,12 +41,12 @@ def parse_iso8601(value: str | None) -> datetime | None:
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def iso_utc(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def load_json(path: Path) -> dict[str, Any] | None:
@@ -209,7 +209,11 @@ def collect_people(
             ]
         event_domains = dedup_preserve_order(event_domains)
 
-        source_context = rec.get("source_context") if isinstance(rec.get("source_context"), dict) else {}
+        source_context = (
+            rec.get("source_context")
+            if isinstance(rec.get("source_context"), dict)
+            else {}
+        )
         event_obj = {
             "event_id": event_id,
             "run_id": run_id,
@@ -261,10 +265,14 @@ def collect_people(
     people = list(grouped.values())
     for person in people:
         person["run_ids"].sort()
-        person["events"].sort(key=lambda e: (e.get("trial_at_utc") or "", e.get("event_id") or ""))
+        person["events"].sort(
+            key=lambda e: (e.get("trial_at_utc") or "", e.get("event_id") or "")
+        )
         person["event_count"] = len(person["events"])
         person["reliable_brave_url_count"] = len(person["all_reliable_brave_urls"])
-        person["reliable_brave_domain_count"] = len(person["all_reliable_brave_domains"])
+        person["reliable_brave_domain_count"] = len(
+            person["all_reliable_brave_domains"]
+        )
 
     people.sort(key=lambda p: p.get("subject_name", "").casefold())
     return people
@@ -350,7 +358,7 @@ def main() -> int:
     args = build_arg_parser().parse_args()
     project_root = args.project_root.resolve()
 
-    now_dt = parse_iso8601(args.now_utc) if args.now_utc else datetime.now(timezone.utc)
+    now_dt = parse_iso8601(args.now_utc) if args.now_utc else datetime.now(UTC)
     if now_dt is None:
         print("error: invalid --now-utc value")
         return 1
@@ -477,7 +485,9 @@ def main() -> int:
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    output_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
 
     print(f"Wrote OpenClaw digest: {output_path}")
     if args.stdout:

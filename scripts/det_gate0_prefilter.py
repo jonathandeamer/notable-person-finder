@@ -116,6 +116,7 @@ def extract_candidate_name(text: str) -> str | None:
         return match.group(0)
     return None
 
+
 def classify_event(event: dict) -> dict:
     entry_title = event.get("entry_title") or ""
     summary = event.get("summary") or ""
@@ -207,7 +208,10 @@ def load_events(path: Path) -> tuple[list[dict], int]:
                 event = json.loads(raw)
             except json.JSONDecodeError:
                 invalid_lines += 1
-                print(f"warning: invalid JSON at line {line_no}; skipping", file=sys.stderr)
+                print(
+                    f"warning: invalid JSON at line {line_no}; skipping",
+                    file=sys.stderr,
+                )
                 continue
             if not isinstance(event, dict):
                 invalid_lines += 1
@@ -250,6 +254,7 @@ def load_known_pages(path: Path) -> dict[str, dict]:
     if not isinstance(entries, dict):
         return {}
     return entries
+
 
 def run_prefilter(
     events_path: Path,

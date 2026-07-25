@@ -18,7 +18,9 @@ class TestMwCandidates(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         root = Path(__file__).resolve().parents[1]
-        cls.mw = load_module("det_mw_candidates", root / "scripts" / "det_mw_candidates.py")
+        cls.mw = load_module(
+            "det_mw_candidates", root / "scripts" / "det_mw_candidates.py"
+        )
 
     def test_query_variants(self) -> None:
         variants = self.mw.query_variants("Dr Ada Lovelace")
@@ -127,7 +129,10 @@ class TestMwCandidates(unittest.TestCase):
                 self.mw.mw_search = orig_search
                 self.mw.mw_page_details = orig_page
 
-            rows = [json.loads(x) for x in output_path.read_text(encoding="utf-8").splitlines()]
+            rows = [
+                json.loads(x)
+                for x in output_path.read_text(encoding="utf-8").splitlines()
+            ]
             self.assertEqual(len(rows), 1)
             self.assertEqual(len(rows[0]["mw_search"]["results"]), 3)
             self.assertEqual(calls["count"], 3)
@@ -205,10 +210,15 @@ class TestMwCandidates(unittest.TestCase):
                 self.mw.mw_search = orig_search
                 self.mw.mw_page_details = orig_page
 
-            rows = [json.loads(x) for x in output_path.read_text(encoding="utf-8").splitlines()]
+            rows = [
+                json.loads(x)
+                for x in output_path.read_text(encoding="utf-8").splitlines()
+            ]
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["event_id"], "1")
-            self.assertEqual(rows[0]["mw_search"]["results"][0]["title"], "Ada Lovelace")
+            self.assertEqual(
+                rows[0]["mw_search"]["results"][0]["title"], "Ada Lovelace"
+            )
 
     def test_subject_from_parsed_output(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -237,7 +247,13 @@ class TestMwCandidates(unittest.TestCase):
             )
 
             def fake_search(*_args, **_kwargs):
-                return {"query": {"search": [{"title": "Ada Lovelace", "snippet": "Mathematician"}]}}
+                return {
+                    "query": {
+                        "search": [
+                            {"title": "Ada Lovelace", "snippet": "Mathematician"}
+                        ]
+                    }
+                }
 
             def fake_page(*_args, **_kwargs):
                 return {
@@ -279,7 +295,10 @@ class TestMwCandidates(unittest.TestCase):
                 self.mw.mw_search = orig_search
                 self.mw.mw_page_details = orig_page
 
-            rows = [json.loads(x) for x in output_path.read_text(encoding="utf-8").splitlines()]
+            rows = [
+                json.loads(x)
+                for x in output_path.read_text(encoding="utf-8").splitlines()
+            ]
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["subject_name"], "Ada Lovelace")
 
@@ -309,7 +328,13 @@ class TestMwCandidates(unittest.TestCase):
                     f.write(json.dumps(row) + "\n")
 
             def fake_search(*_args, **_kwargs):
-                return {"query": {"search": [{"title": "Ada Lovelace", "snippet": "Mathematician"}]}}
+                return {
+                    "query": {
+                        "search": [
+                            {"title": "Ada Lovelace", "snippet": "Mathematician"}
+                        ]
+                    }
+                }
 
             def fake_page(*_args, **_kwargs):
                 return {
@@ -351,11 +376,13 @@ class TestMwCandidates(unittest.TestCase):
                 self.mw.mw_search = orig_search
                 self.mw.mw_page_details = orig_page
 
-            rows = [json.loads(x) for x in output_path.read_text(encoding="utf-8").splitlines()]
+            rows = [
+                json.loads(x)
+                for x in output_path.read_text(encoding="utf-8").splitlines()
+            ]
             # Current semantics: first record for an event_id wins, so the later duplicate
             # (even if valid) is skipped.
             self.assertEqual(len(rows), 0)
-
 
     # --- nickname expansion tests ---
 
@@ -389,7 +416,9 @@ class TestMwCandidates(unittest.TestCase):
     def test_query_variants_no_duplicate(self) -> None:
         for name in ("Nick White", "Nicholas White", "Dr Bill Smith", "Bob Jones"):
             variants = self.mw.query_variants(name)
-            self.assertEqual(len(variants), len(set(variants)), f"duplicate in {name}: {variants}")
+            self.assertEqual(
+                len(variants), len(set(variants)), f"duplicate in {name}: {variants}"
+            )
 
     def test_source_context_from_gate_input(self) -> None:
         """source_context fields fall back to gate_input when not top-level (Gate 1 output format)."""
@@ -421,7 +450,11 @@ class TestMwCandidates(unittest.TestCase):
             )
 
             def fake_search(*_args, **_kwargs):
-                return {"query": {"search": [{"title": "Fred Smith", "snippet": "Musician"}]}}
+                return {
+                    "query": {
+                        "search": [{"title": "Fred Smith", "snippet": "Musician"}]
+                    }
+                }
 
             def fake_page(*_args, **_kwargs):
                 return {
@@ -463,10 +496,15 @@ class TestMwCandidates(unittest.TestCase):
                 self.mw.mw_search = orig_search
                 self.mw.mw_page_details = orig_page
 
-            rows = [json.loads(x) for x in output_path.read_text(encoding="utf-8").splitlines()]
+            rows = [
+                json.loads(x)
+                for x in output_path.read_text(encoding="utf-8").splitlines()
+            ]
             self.assertEqual(len(rows), 1)
             ctx = rows[0]["source_context"]
-            self.assertEqual(ctx["summary"], "Bass player who provided subtle but potent rhythm.")
+            self.assertEqual(
+                ctx["summary"], "Bass player who provided subtle but potent rhythm."
+            )
             self.assertEqual(ctx["source"], "Obituaries | The Guardian")
             self.assertEqual(ctx["publication_date"], "2026-02-19T17:23:48Z")
 

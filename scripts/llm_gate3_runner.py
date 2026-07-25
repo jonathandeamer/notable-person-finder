@@ -22,7 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -31,7 +31,7 @@ from name_utils import sort_by_priority_recency
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def safe_json_parse(text: str) -> tuple[bool, object | None, str | None]:
@@ -147,6 +147,7 @@ def format_gate3_prompt(
 def call_claude_cli(prompt_text: str, model: str, cwd: Path) -> tuple[str, dict]:
     """Call the claude CLI with prompt via stdin."""
     import os
+
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
     cmd = ["claude", "--model", model, "-p", "-"]
     proc = subprocess.run(
@@ -304,7 +305,8 @@ def build_source_context(record: dict) -> dict:
         "entry_title": record.get("entry_title"),
         "summary": record.get("summary"),
         "source": record.get("source_feed_title") or record.get("source"),
-        "publication_date": record.get("published_at_utc") or record.get("publication_date"),
+        "publication_date": record.get("published_at_utc")
+        or record.get("publication_date"),
     }
 
 
@@ -437,7 +439,8 @@ def main() -> int:
             if isinstance(eid, str):
                 last_by_id[eid] = r
         failed_ids = {
-            eid for eid, r in last_by_id.items()
+            eid
+            for eid, r in last_by_id.items()
             if not r.get("json_parse_ok") or r.get("llm_error")
         }
         if not failed_ids:
@@ -496,10 +499,19 @@ def main() -> int:
                     "json_parse_ok": True,
                     "json_parse_error": None,
                     "gate3_status": "MISSING",
-                    "parsed_output": {"status": "MISSING", "matched_title": None, "confidence": 1.0, "evidence": ["No MediaWiki search results returned for subject."]},
+                    "parsed_output": {
+                        "status": "MISSING",
+                        "matched_title": None,
+                        "confidence": 1.0,
+                        "evidence": [
+                            "No MediaWiki search results returned for subject."
+                        ],
+                    },
                     "raw_output": "",
                 }
-                out_f.write(json.dumps(result_record, ensure_ascii=False, sort_keys=True) + "\n")
+                out_f.write(
+                    json.dumps(result_record, ensure_ascii=False, sort_keys=True) + "\n"
+                )
                 out_f.flush()
                 valid_json_count += 1
                 print(f"[{idx}/{sample_size}] MISSING (no candidates) - {subject_name}")
@@ -569,7 +581,9 @@ def main() -> int:
                 "parsed_output": parsed_output,
                 "raw_output": (raw_output or "")[: args.max_output_chars],
             }
-            out_f.write(json.dumps(result_record, ensure_ascii=False, sort_keys=True) + "\n")
+            out_f.write(
+                json.dumps(result_record, ensure_ascii=False, sort_keys=True) + "\n"
+            )
             out_f.flush()
 
             status_label = gate3_status or ("ERROR" if error else "INVALID_JSON")
