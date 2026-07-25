@@ -18,6 +18,7 @@
 - Timestamps are UTC ISO-8601 text ending in `Z`. Durations are integer milliseconds.
 - Every connection already sets foreign keys, WAL, `synchronous=FULL`, and a busy timeout via `connect_database`; do not open `sqlite3.connect` directly in application code.
 - No SQLite transaction may be open across a network call. Worker threads never touch a `sqlite3.Connection`.
+- The first external attempt is created in the same transaction that claims its work item and reserves its budget. Each retry continues the persisted work-item ordinal and reserves its own maximum cost before the call.
 - Only the central `RetryCoordinator` starts a repeat request. HTTPX automatic retries stay disabled.
 - Raw `httpx` types never cross the `providers/` boundary. Domain and CLI code sees `HttpResponse` and `ProviderFailure` only.
 - Secrets never appear in logs, snapshots, digests, exception messages, terminal output, or tests.
@@ -702,6 +703,26 @@ def test_failed_attempt_requires_a_failure_category(connection: sqlite3.Connecti
     )
 
 
+def test_finished_attempt_requires_an_outcome(connection: sqlite3.Connection) -> None:
+    run_id = start_run(connection)
+    work_id = add_work(connection, state="running", fingerprint="2" * 64)
+    cursor = connection.execute(
+        """
+        INSERT INTO attempt (
+            run_id, work_item_id, provider, operation, ordinal,
+            started_at, request_fingerprint
+        )
+        VALUES (?, ?, 'brave', 'search_web', 1, '2026-07-25T06:00:00Z', ?)
+        """,
+        (run_id, work_id, "3" * 64),
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "UPDATE attempt SET finished_at = '2026-07-25T06:00:01Z' WHERE id = ?",
+            (int(cursor.lastrowid),),
+        )
+
+
 def test_money_columns_reject_negative_values(connection: sqlite3.Connection) -> None:
     run_id = start_run(connection)
     with pytest.raises(sqlite3.IntegrityError):
@@ -835,7 +856,13 @@ CREATE TABLE attempt (
     provider_request_id TEXT,
     detail_json TEXT,
     UNIQUE (work_item_id, ordinal),
-    CHECK (failure_category IS NULL OR outcome = 'failed')
+    CHECK ((outcome IS NULL) = (finished_at IS NULL)),
+    CHECK (
+        CASE
+            WHEN outcome = 'failed' THEN failure_category IS NOT NULL
+            ELSE failure_category IS NULL
+        END
+    )
 );
 
 CREATE INDEX attempt_by_run ON attempt(run_id, id);
@@ -1236,7 +1263,7 @@ git commit -m "feat(runs): add injectable clock for deterministic pacing and tim
 
 ## Task 5: URL, DNS, and Redirect Safety
 
-The foundation's `validate_public_http_url` is syntactic and deliberately does not resolve hostnames, because configuration validation must stay offline. Request-time safety is different: it must resolve the destination and reject non-public addresses **before the initial request and before following every redirect**, which is what closes the DNS-rebinding gap.
+The foundation's `validate_public_http_url` is syntactic and deliberately does not resolve hostnames, because configuration validation must stay offline. Request-time safety is different: it resolves the destination and rejects non-public addresses **before the initial request and before following every redirect**. This is the approved proportionate preflight for a personal single-machine tool. Because HTTPX performs its own resolution when connecting, this check reduces exposure but does not pin the connection to the inspected address and must not be described as complete DNS-rebinding protection.
 
 **Files:**
 - Create: `src/notable_person_finder/providers/safety.py`
@@ -1439,9 +1466,9 @@ git commit -m "feat(providers): reject unsafe URLs and redirect destinations"
 
 ## Task 6: Shared HTTP Transport
 
-One run-scoped transport owns connection reuse, the two timeout profiles, the user agent, manual redirect following, streamed response bounds, and translation of every HTTPX error into `ProviderFailure`.
+One run-scoped transport owns connection reuse, the two timeout profiles, the user agent, manual redirect following, streamed response bounds, and translation of HTTPX and URL-safety errors into `ProviderFailure`.
 
-Redirects are followed **manually** (`follow_redirects=False`) because each hop must pass `assert_safe_url` before it is requested. Bodies are streamed and abandoned the moment either the encoded or the decoded bound is exceeded, so a compressed bomb cannot expand in memory.
+Redirects are followed **manually** (`follow_redirects=False`) because each hop must pass `assert_safe_url` before it is requested. Bodies use `iter_raw()` plus a bounded incremental gzip/deflate decoder. Both encoded input and decoded output are capped while streaming, so decompression never materializes an unbounded decoded chunk before the limit check.
 
 **Files:**
 - Modify: `pyproject.toml`
@@ -1476,7 +1503,7 @@ import pytest
 
 from notable_person_finder.config.models import TransportConfig
 from notable_person_finder.providers.failures import FailureCategory, ProviderFailure
-from notable_person_finder.providers.safety import StaticHostResolver, UnsafeUrl
+from notable_person_finder.providers.safety import StaticHostResolver
 from notable_person_finder.providers.transport import (
     HttpTransport,
     ResponseLimit,
@@ -1545,10 +1572,15 @@ def test_adapter_headers_are_merged_without_replacing_the_user_agent() -> None:
             "https://example.com/a",
             provider="brave",
             operation="search_web",
-            headers={"X-Subscription-Token": "secret"},
+            headers={
+                "X-Subscription-Token": "secret",
+                "User-Agent": "untrusted-override",
+                "Accept-Encoding": "br",
+            },
         )
     assert seen["x-subscription-token"] == "secret"
     assert seen["user-agent"].startswith("notable-person-finder/")
+    assert seen["accept-encoding"] == "gzip, deflate"
 
 
 def test_redirects_are_followed_and_the_chain_is_recorded() -> None:
@@ -1572,10 +1604,12 @@ def test_redirect_to_a_private_address_is_refused() -> None:
         return httpx.Response(302, headers={"location": "https://internal.example/secrets"})
 
     with transport_for(handler) as transport:
-        with pytest.raises(UnsafeUrl):
+        with pytest.raises(ProviderFailure) as raised:
             transport.request(
                 "GET", "https://example.com/a", provider="feeds", operation="fetch_feed"
             )
+    assert raised.value.category is FailureCategory.CONFIGURATION
+    assert "internal.example" not in str(raised.value)
 
 
 def test_redirect_limit_is_enforced() -> None:
@@ -1748,7 +1782,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from types import TracebackType
-from typing import Literal
+from typing import Any, Literal
+import zlib
 
 import httpx
 
@@ -1758,7 +1793,7 @@ from notable_person_finder.providers.failures import (
     ProviderFailure,
     parse_retry_after,
 )
-from notable_person_finder.providers.safety import HostResolver, assert_safe_url
+from notable_person_finder.providers.safety import HostResolver, UnsafeUrl, assert_safe_url
 from notable_person_finder.runs.clock import Clock
 
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -1806,6 +1841,45 @@ class HttpResponse:
     content: bytes
     encoded_bytes: int
     decoded_bytes: int
+
+
+def _decoder(content_encoding: str) -> Any | None:
+    encoding = content_encoding.strip().lower()
+    if encoding in {"", "identity"}:
+        return None
+    if encoding == "gzip":
+        return zlib.decompressobj(16 + zlib.MAX_WBITS)
+    if encoding == "deflate":
+        return zlib.decompressobj()
+    raise ValueError("unsupported content encoding")
+
+
+def _bounded_body(response: httpx.Response, *, byte_limit: int) -> tuple[bytes, int]:
+    """Read encoded bytes and incrementally cap decoded output."""
+    try:
+        decoder = _decoder(response.headers.get("content-encoding", ""))
+    except ValueError as error:
+        raise httpx.DecodingError(str(error), request=response.request) from error
+
+    encoded_bytes = 0
+    decoded = bytearray()
+    for chunk in response.iter_raw():
+        encoded_bytes += len(chunk)
+        if encoded_bytes > byte_limit:
+            raise OverflowError("encoded")
+        if decoder is None:
+            piece = chunk
+        else:
+            piece = decoder.decompress(chunk, byte_limit - len(decoded) + 1)
+        decoded.extend(piece)
+        if len(decoded) > byte_limit:
+            raise OverflowError("decoded")
+
+    if decoder is not None:
+        decoded.extend(decoder.flush(byte_limit - len(decoded) + 1))
+        if len(decoded) > byte_limit:
+            raise OverflowError("decoded")
+    return bytes(decoded), encoded_bytes
 
 
 class HttpTransport:
@@ -1877,7 +1951,15 @@ class HttpTransport:
         byte_limit = self._byte_limit(limit)
 
         for _ in range(self._config.max_redirects + 1):
-            host = assert_safe_url(current_url, resolver=self._resolver)
+            try:
+                host = assert_safe_url(current_url, resolver=self._resolver)
+            except UnsafeUrl as error:
+                raise ProviderFailure(
+                    FailureCategory.CONFIGURATION,
+                    provider=provider,
+                    operation=operation,
+                    detail="unsafe request destination",
+                ) from error
             response = self._send(
                 method,
                 current_url,
@@ -1921,9 +2003,17 @@ class HttpTransport:
         requested_url: str,
         redirect_chain: tuple[str, ...],
     ) -> HttpResponse | str | None:
-        merged = {"user-agent": self._user_agent}
+        merged = {
+            "user-agent": self._user_agent,
+            # Only encodings handled by the bounded incremental decoder.
+            "accept-encoding": "gzip, deflate",
+        }
         if headers:
-            merged.update({name.lower(): value for name, value in headers.items()})
+            for name, value in headers.items():
+                lowered = name.lower()
+                if lowered in {"user-agent", "accept-encoding"}:
+                    continue
+                merged[lowered] = value
 
         request = self._client.build_request(
             method,
@@ -1952,23 +2042,15 @@ class HttpTransport:
             if response.status_code >= 400:
                 raise self._status_failure(response, provider=provider, operation=operation)
 
-            decoded = bytearray()
-            for chunk in response.iter_bytes():
-                decoded.extend(chunk)
-                if len(decoded) > byte_limit:
-                    raise ProviderFailure(
-                        FailureCategory.RESPONSE_TOO_LARGE,
-                        provider=provider,
-                        operation=operation,
-                        detail=f"decoded body exceeded {byte_limit} bytes",
-                    )
-                if response.num_bytes_downloaded > byte_limit:
-                    raise ProviderFailure(
-                        FailureCategory.RESPONSE_TOO_LARGE,
-                        provider=provider,
-                        operation=operation,
-                        detail=f"encoded body exceeded {byte_limit} bytes",
-                    )
+            try:
+                content, encoded_bytes = _bounded_body(response, byte_limit=byte_limit)
+            except OverflowError as error:
+                raise ProviderFailure(
+                    FailureCategory.RESPONSE_TOO_LARGE,
+                    provider=provider,
+                    operation=operation,
+                    detail=f"{error.args[0]} body exceeded {byte_limit} bytes",
+                ) from error
 
             return HttpResponse(
                 requested_url=requested_url,
@@ -1981,9 +2063,9 @@ class HttpTransport:
                     for name, value in response.headers.items()
                     if name.lower() not in {"authorization", "set-cookie", "cookie"}
                 },
-                content=bytes(decoded),
-                encoded_bytes=response.num_bytes_downloaded,
-                decoded_bytes=len(decoded),
+                content=content,
+                encoded_bytes=encoded_bytes,
+                decoded_bytes=len(content),
             )
         except ProviderFailure:
             raise
@@ -2308,7 +2390,7 @@ Every physical call gets its own ordinal, and the coordinator reports each one t
 
 **Interfaces:**
 - Consumes: `RetryConfig`, `Clock`, `FailureCategory`, `ProviderFailure`, `ProviderPaused`.
-- Produces: `AttemptRecord` frozen dataclass (`ordinal`, `outcome`, `failure_category`, `status_code`, `retry_after_ms`, `latency_ms`, `detail`); `RetryExhausted` exception carrying `last_failure` and `attempts`; `RetryCoordinator` with `call(provider, operation, action, *, on_attempt) -> T`, `is_paused(provider) -> bool`, and `paused_providers() -> frozenset[str]`.
+- Produces: `AttemptRecord` frozen dataclass (`ordinal`, `outcome`, `failure_category`, `status_code`, `retry_after_ms`, `latency_ms`, `detail`); `RetryExhausted` exception carrying `last_failure` and `attempts`; `RetryCoordinator` with `call(provider, operation, action, *, on_attempt, starting_ordinal=1) -> T`, `is_paused(provider) -> bool`, and `paused_providers() -> frozenset[str]`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2441,7 +2523,7 @@ def test_malformed_output_marked_retryable_gets_exactly_one_more_attempt() -> No
             FailureCategory.MALFORMED_RESPONSE,
             provider="openrouter",
             operation="generate_structured",
-            retryable=ordinal == 1,
+            retryable=True,
         )
 
     with pytest.raises(ProviderFailure):
@@ -2565,6 +2647,21 @@ def test_attempt_records_carry_status_and_latency() -> None:
     assert records[0].retry_after_ms == 1000
     assert records[0].latency_ms == 250
     assert records[0].failure_category is FailureCategory.RATE_LIMIT
+
+
+def test_persisted_ordinals_can_continue_after_an_interrupted_attempt() -> None:
+    records: list[AttemptRecord] = []
+    calls: list[int] = []
+    result = coordinator().call(
+        "brave",
+        "search_web",
+        lambda ordinal: calls.append(ordinal) or "page",
+        on_attempt=records.append,
+        starting_ordinal=4,
+    )
+    assert result == "page"
+    assert calls == [4]
+    assert records[0].ordinal == 4
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -2648,14 +2745,19 @@ class RetryCoordinator:
         action: Callable[[int], T],
         *,
         on_attempt: Callable[[AttemptRecord], None],
+        starting_ordinal: int = 1,
     ) -> T:
+        if starting_ordinal < 1:
+            raise ValueError("starting_ordinal must be at least 1")
         if self.is_paused(provider):
             with self._guard:
                 exhaustions = self._consecutive_exhaustions.get(provider, 0)
             raise ProviderPaused(provider, consecutive_exhaustions=exhaustions)
 
         last_failure: ProviderFailure | None = None
-        for ordinal in range(1, self._config.max_attempts + 1):
+        malformed_retries = 0
+        for attempt_index in range(self._config.max_attempts):
+            ordinal = starting_ordinal + attempt_index
             started = self._clock.monotonic()
             try:
                 result = action(ordinal)
@@ -2674,9 +2776,14 @@ class RetryCoordinator:
                 if not failure.retryable:
                     self._record_success_or_permanent(provider)
                     raise
+                if failure.category is FailureCategory.MALFORMED_RESPONSE:
+                    if malformed_retries >= 1:
+                        self._record_success_or_permanent(provider)
+                        raise
+                    malformed_retries += 1
                 last_failure = failure
-                if ordinal < self._config.max_attempts:
-                    self._clock.sleep(self._delay(ordinal, failure))
+                if attempt_index + 1 < self._config.max_attempts:
+                    self._clock.sleep(self._delay(attempt_index + 1, failure))
                 continue
 
             on_attempt(
@@ -2738,7 +2845,7 @@ git commit -m "feat(runs): add central retry coordinator with provider pausing"
 
 ## Task 9: Budget Reservation and Reconciliation
 
-The budget is optional and expressed as a decimal USD per-run cap. Reservation and reconciliation happen inside the same brief transaction that claims work and creates the attempt, using `BEGIN IMMEDIATE` so two concurrently scheduled external calls cannot reserve the same remaining allowance.
+The budget is optional and expressed as a decimal USD per-run cap. Reservation and reconciliation expose transaction-scoped primitives. Task 12 uses them inside the brief transactions that claim work and create the attempt, or finish the attempt and store its cost. The public wrappers in this task exist for focused tests and use `BEGIN IMMEDIATE`, so two concurrently scheduled external calls cannot reserve the same remaining allowance.
 
 The run row holds one outstanding-plus-settled `budget_reserved_nano_usd` figure. Reserving adds; reconciling subtracts the reservation and adds the reported actual cost.
 
@@ -2748,7 +2855,7 @@ The run row holds one outstanding-plus-settled `budget_reserved_nano_usd` figure
 
 **Interfaces:**
 - Consumes: `sqlite3.Connection`; `FailureCategory`, `ProviderFailure`.
-- Produces: `BudgetExhausted` exception; `reserve(connection, *, run_id, nano_usd) -> None`; `reconcile(connection, *, run_id, attempt_id, reserved_nano_usd, actual_nano_usd) -> None`; `remaining(connection, *, run_id) -> int | None`.
+- Produces: `BudgetExhausted` exception; transaction primitives `reserve_in_transaction(connection, *, run_id, nano_usd) -> None` and `reconcile_in_transaction(connection, *, run_id, reserved_nano_usd, actual_nano_usd) -> None`; focused wrappers `reserve(...)` and `reconcile(...)`; `remaining(connection, *, run_id) -> int | None`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3005,29 +3112,38 @@ def reserve(connection: sqlite3.Connection, *, run_id: int, nano_usd: int) -> No
 
     connection.execute("BEGIN IMMEDIATE")
     try:
-        row = connection.execute(
-            "SELECT budget_limit_nano_usd, budget_reserved_nano_usd FROM run WHERE id = ?",
-            (run_id,),
-        ).fetchone()
-        if row is None:
-            raise LookupError(f"run {run_id} does not exist")
-
-        limit = row["budget_limit_nano_usd"]
-        reserved = row["budget_reserved_nano_usd"]
-        if limit is not None and reserved + nano_usd > limit:
-            raise BudgetExhausted(
-                requested_nano_usd=nano_usd, remaining_nano_usd=limit - reserved
-            )
-
-        connection.execute(
-            "UPDATE run SET budget_reserved_nano_usd = ? WHERE id = ?",
-            (reserved + nano_usd, run_id),
-        )
+        reserve_in_transaction(connection, run_id=run_id, nano_usd=nano_usd)
     except BaseException:
         connection.rollback()
         raise
     else:
         connection.commit()
+
+
+def reserve_in_transaction(
+    connection: sqlite3.Connection, *, run_id: int, nano_usd: int
+) -> None:
+    """Reserve within the caller's existing write transaction."""
+    if nano_usd < 0:
+        raise ValueError("a budget reservation must not be negative")
+    if not connection.in_transaction:
+        raise RuntimeError("reserve_in_transaction requires an active transaction")
+    row = connection.execute(
+        "SELECT budget_limit_nano_usd, budget_reserved_nano_usd FROM run WHERE id = ?",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"run {run_id} does not exist")
+    limit = row["budget_limit_nano_usd"]
+    reserved = row["budget_reserved_nano_usd"]
+    if limit is not None and reserved + nano_usd > limit:
+        raise BudgetExhausted(
+            requested_nano_usd=nano_usd, remaining_nano_usd=limit - reserved
+        )
+    connection.execute(
+        "UPDATE run SET budget_reserved_nano_usd = ? WHERE id = ?",
+        (reserved + nano_usd, run_id),
+    )
 
 
 def reconcile(
@@ -3045,17 +3161,12 @@ def reconcile(
     """
     connection.execute("BEGIN IMMEDIATE")
     try:
-        if actual_nano_usd is not None:
-            connection.execute(
-                """
-                UPDATE run
-                   SET budget_reserved_nano_usd =
-                           MAX(budget_reserved_nano_usd - ? + ?, 0),
-                       budget_actual_nano_usd = budget_actual_nano_usd + ?
-                 WHERE id = ?
-                """,
-                (reserved_nano_usd, actual_nano_usd, actual_nano_usd, run_id),
-            )
+        reconcile_in_transaction(
+            connection,
+            run_id=run_id,
+            reserved_nano_usd=reserved_nano_usd,
+            actual_nano_usd=actual_nano_usd,
+        )
         connection.execute(
             "UPDATE attempt SET actual_nano_usd = ? WHERE id = ?",
             (actual_nano_usd, attempt_id),
@@ -3065,6 +3176,30 @@ def reconcile(
         raise
     else:
         connection.commit()
+
+
+def reconcile_in_transaction(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    reserved_nano_usd: int,
+    actual_nano_usd: int | None,
+) -> None:
+    """Replace a reservation inside the caller's finishing transaction."""
+    if not connection.in_transaction:
+        raise RuntimeError("reconcile_in_transaction requires an active transaction")
+    if actual_nano_usd is None:
+        return
+    connection.execute(
+        """
+        UPDATE run
+           SET budget_reserved_nano_usd =
+                   MAX(budget_reserved_nano_usd - ? + ?, 0),
+               budget_actual_nano_usd = budget_actual_nano_usd + ?
+         WHERE id = ?
+        """,
+        (reserved_nano_usd, actual_nano_usd, actual_nano_usd, run_id),
+    )
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -3129,6 +3264,23 @@ def new_run(connection: sqlite3.Connection, *, at: str = "2026-07-25T06:00:00Z")
     snapshot = repository.store_snapshot(
         connection, fingerprint="a" * 64, canonical_json="{}", now=at
     )
+
+
+def add_pending_work(connection: sqlite3.Connection, *, run_id: int, fingerprint: str) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO work_item (
+            task_type, subject_kind, subject_id, fingerprint, required,
+            priority, eligible_at, state, created_by_run_id, created_at, updated_at
+        )
+        VALUES ('detect_people', 'source_item', 1, ?, 1, 100,
+                '2026-07-25T06:00:00Z', 'pending', ?,
+                '2026-07-25T06:00:00Z', '2026-07-25T06:00:00Z')
+        """,
+        (fingerprint, run_id),
+    )
+    connection.commit()
+    return int(cursor.lastrowid)
     return repository.create_run(
         connection,
         snapshot_id=snapshot,
@@ -3206,18 +3358,7 @@ def test_sweep_marks_an_abandoned_run_interrupted(connection: sqlite3.Connection
 
 def test_sweep_returns_abandoned_running_work_to_pending(connection: sqlite3.Connection) -> None:
     abandoned = new_run(connection)
-    work_id = repository.schedule_work(
-        connection,
-        task_type="detect_people",
-        subject_kind="source_item",
-        subject_id=1,
-        fingerprint="d" * 64,
-        required=True,
-        priority=100,
-        eligible_at="2026-07-25T06:00:00Z",
-        run_id=abandoned,
-        now="2026-07-25T06:00:00Z",
-    )
+    work_id = add_pending_work(connection, run_id=abandoned, fingerprint="d" * 64)
     connection.execute(
         "UPDATE work_item SET state = 'running', claimed_by_run_id = ? WHERE id = ?",
         (abandoned, work_id),
@@ -3235,18 +3376,7 @@ def test_sweep_returns_abandoned_running_work_to_pending(connection: sqlite3.Con
 
 def test_sweep_marks_in_flight_attempts_interrupted(connection: sqlite3.Connection) -> None:
     abandoned = new_run(connection)
-    work_id = repository.schedule_work(
-        connection,
-        task_type="detect_people",
-        subject_kind="source_item",
-        subject_id=1,
-        fingerprint="e" * 64,
-        required=True,
-        priority=100,
-        eligible_at="2026-07-25T06:00:00Z",
-        run_id=abandoned,
-        now="2026-07-25T06:00:00Z",
-    )
+    work_id = add_pending_work(connection, run_id=abandoned, fingerprint="e" * 64)
     connection.execute(
         """
         INSERT INTO attempt (run_id, work_item_id, provider, operation, ordinal,
@@ -3288,6 +3418,29 @@ def test_latest_run_returns_the_most_recent(connection: sqlite3.Connection) -> N
 
 def test_latest_run_is_none_on_an_empty_database(connection: sqlite3.Connection) -> None:
     assert repository.latest_run(connection) is None
+
+
+def test_a_run_cannot_be_finished_twice(connection: sqlite3.Connection) -> None:
+    run_id = new_run(connection)
+    repository.finish_run(
+        connection,
+        run_id=run_id,
+        state=RunState.COMPLETE,
+        reason=None,
+        digest_path=None,
+        digest_sha256=None,
+        now="2026-07-25T06:30:00Z",
+    )
+    with pytest.raises(RuntimeError, match="already terminal"):
+        repository.finish_run(
+            connection,
+            run_id=run_id,
+            state=RunState.FAILED,
+            reason="late reporting failure",
+            digest_path=None,
+            digest_sha256=None,
+            now="2026-07-25T06:31:00Z",
+        )
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -3484,14 +3637,16 @@ def finish_run(
 ) -> None:
     connection.execute("BEGIN IMMEDIATE")
     try:
-        connection.execute(
+        changed = connection.execute(
             """
             UPDATE run
                SET state = ?, finished_at = ?, digest_path = ?, digest_sha256 = ?
              WHERE id = ? AND state = 'running'
             """,
             (str(state), now, digest_path, digest_sha256, run_id),
-        )
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError(f"run-{run_id} is already terminal or does not exist")
         _insert_transition(connection, run_id=run_id, state=state, reason=reason, now=now)
     except BaseException:
         connection.rollback()
@@ -3584,10 +3739,10 @@ def latest_run(connection: sqlite3.Connection) -> RunRecord | None:
 
 The `WorkState` import is used by Task 11; leave it in place.
 
-- [ ] **Step 5: Run the tests to verify they fail on the work-item helper only**
+- [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/run_engine/test_repository.py -v`
-Expected: the run lifecycle tests PASS; the two sweep tests that call `repository.schedule_work` FAIL with `AttributeError: module ... has no attribute 'schedule_work'`. Task 11 adds it.
+Expected: PASS. Task 10 uses direct SQL fixtures for work rows so this commit remains green; Task 11 adds the public scheduling interface.
 
 - [ ] **Step 6: Commit**
 
@@ -3602,7 +3757,7 @@ git commit -m "feat(runs): add run lifecycle records and interrupted-run sweep"
 
 Work is scheduled with a fingerprint that identifies its material inputs. The partial unique index makes duplicate active scheduling impossible, so `schedule_work` returns the existing row's identity instead of raising. A changed input supersedes the obsolete active row and schedules a new one.
 
-Claiming is a brief `BEGIN IMMEDIATE` transaction: select the highest-priority eligible row, mark it `running`, commit. No transaction is held while the external call runs.
+Queue inspection can be restricted to task types for which the current engine has handlers, so unknown future work remains pending without being reclaimed in a loop. `claim_next` provides a focused queue primitive for deterministic work and tests. External work uses Task 12's `claim_and_start_attempt`, which performs the claim, budget reservation, and attempt insert in one transaction. Deferred work is eligible only when it was completed by an earlier run.
 
 **Files:**
 - Modify: `src/notable_person_finder/runs/repository.py`
@@ -3610,7 +3765,7 @@ Claiming is a brief `BEGIN IMMEDIATE` transaction: select the highest-priority e
 
 **Interfaces:**
 - Consumes: `WorkItem`, `WorkState`, `RunCounters`.
-- Produces: `schedule_work(...) -> int`, `supersede_work(connection, *, task_type, fingerprint, now, reason) -> int`, `claim_next(connection, *, run_id, now) -> WorkItem | None`, `complete_work(connection, *, work_item_id, run_id, state, reason, now, eligible_at=None) -> None`, `counters(connection) -> RunCounters`, `pending_required(connection) -> int`.
+- Produces: `schedule_work(connection, *, task_type, subject_kind, subject_id, fingerprint, required, priority, eligible_at, run_id, now) -> int`; `supersede_work(connection, *, task_type, fingerprint, now, reason) -> int`; `next_eligible(connection, *, run_id, now, task_types=None) -> WorkItem | None`; `claim_next(connection, *, run_id, now, task_types=None) -> WorkItem | None`; `complete_work(connection, *, work_item_id, run_id, state, reason, now, eligible_at=None) -> None`; `run_counters(connection, *, run_id, now) -> RunCounters`; `pending_required(connection, *, now=None) -> int`; `deferred_required(connection) -> int`; and `operational_failures_for_run(connection, *, run_id) -> int`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3794,6 +3949,18 @@ def test_deferred_work_becomes_eligible_in_the_next_run(
     assert claimed is not None and claimed.id == work_id
 
 
+def test_claiming_can_be_restricted_to_registered_task_types(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
+    unknown = schedule(connection, run_id, fingerprint="9" * 64, task_type="future_task")
+    assert repository.claim_next(
+        connection, run_id=run_id, now=NOW, task_types={"detect_people"}
+    ) is None
+    assert connection.execute(
+        "SELECT state FROM work_item WHERE id = ?", (unknown,)
+    ).fetchone()["state"] == WorkState.PENDING
+
+
 def test_permanently_failed_work_is_never_reclaimed(
     connection: sqlite3.Connection, run_id: int
 ) -> None:
@@ -3859,10 +4026,10 @@ def test_counters_separate_required_from_optional_work(
         now=NOW,
     )
 
-    counters = repository.counters(connection)
+    counters = repository.run_counters(connection, run_id=run_id, now=NOW)
     assert counters.required_succeeded == 1
     assert counters.optional_succeeded == 1
-    assert repository.pending_required(connection) >= 1
+    assert repository.pending_required(connection, now=NOW) >= 1
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -3872,7 +4039,7 @@ Expected: FAIL with `AttributeError: module 'notable_person_finder.runs.reposito
 
 - [ ] **Step 3: Add the work-item functions**
 
-Append to `src/notable_person_finder/runs/repository.py`, and add `RunCounters` and `WorkItem` to the existing `notable_person_finder.runs.models` import:
+Append to `src/notable_person_finder/runs/repository.py`, add `from collections.abc import Collection`, and add `RunCounters` and `WorkItem` to the existing `notable_person_finder.runs.models` import:
 
 ```python
 def schedule_work(
@@ -3965,37 +4132,7 @@ def supersede_work(
     return changed
 
 
-def claim_next(
-    connection: sqlite3.Connection, *, run_id: int, now: str
-) -> WorkItem | None:
-    """Claim the highest-priority eligible item in one brief transaction."""
-    connection.execute("BEGIN IMMEDIATE")
-    try:
-        row = connection.execute(
-            """
-            SELECT * FROM work_item
-             WHERE state = 'pending' AND eligible_at <= ?
-             ORDER BY priority ASC, id ASC
-             LIMIT 1
-            """,
-            (now,),
-        ).fetchone()
-        if row is None:
-            connection.rollback()
-            return None
-        connection.execute(
-            """
-            UPDATE work_item
-               SET state = 'running', claimed_by_run_id = ?, updated_at = ?
-             WHERE id = ?
-            """,
-            (run_id, now, int(row["id"])),
-        )
-    except BaseException:
-        connection.rollback()
-        raise
-    else:
-        connection.commit()
+def _work_item(row: sqlite3.Row, *, state: WorkState | None = None) -> WorkItem:
     return WorkItem(
         id=int(row["id"]),
         task_type=row["task_type"],
@@ -4004,6 +4141,82 @@ def claim_next(
         fingerprint=row["fingerprint"],
         required=bool(row["required"]),
         priority=int(row["priority"]),
+        state=state or WorkState(row["state"]),
+    )
+
+
+def next_eligible(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    now: str,
+    task_types: Collection[str] | None = None,
+) -> WorkItem | None:
+    """Inspect the next eligible item without mutating it."""
+    if task_types is not None and not task_types:
+        return None
+    task_filter = ""
+    parameters: list[object] = [run_id, now]
+    if task_types is not None:
+        ordered = sorted(task_types)
+        task_filter = f" AND task_type IN ({','.join('?' for _ in ordered)})"
+        parameters.extend(ordered)
+    row = connection.execute(
+        f"""
+        SELECT * FROM work_item
+         WHERE (
+                   state = 'pending'
+                OR (state = 'deferred' AND COALESCE(completed_by_run_id, -1) <> ?)
+               )
+           AND eligible_at <= ?
+           {task_filter}
+         ORDER BY priority ASC, id ASC
+         LIMIT 1
+        """,
+        parameters,
+    ).fetchone()
+    return None if row is None else _work_item(row)
+
+
+def claim_next(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    now: str,
+    task_types: Collection[str] | None = None,
+) -> WorkItem | None:
+    """Claim deterministic work; external calls use claim_and_start_attempt."""
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        item = next_eligible(
+            connection, run_id=run_id, now=now, task_types=task_types
+        )
+        if item is None:
+            connection.rollback()
+            return None
+        changed = connection.execute(
+            """
+            UPDATE work_item
+               SET state = 'running', claimed_by_run_id = ?, updated_at = ?
+             WHERE id = ? AND state IN ('pending', 'deferred')
+            """,
+            (run_id, now, item.id),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError(f"work item {item.id} was no longer claimable")
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+    return WorkItem(
+        id=item.id,
+        task_type=item.task_type,
+        subject_kind=item.subject_kind,
+        subject_id=item.subject_id,
+        fingerprint=item.fingerprint,
+        required=item.required,
+        priority=item.priority,
         state=WorkState.RUNNING,
     )
 
@@ -4041,37 +4254,73 @@ def complete_work(
         connection.commit()
 
 
-def counters(connection: sqlite3.Connection) -> RunCounters:
+def pending_required(
+    connection: sqlite3.Connection, *, now: str | None = None
+) -> int:
+    eligibility = "" if now is None else " AND eligible_at <= ?"
+    parameters = () if now is None else (now,)
+    return int(
+        connection.execute(
+            f"""
+            SELECT COUNT(*) AS n FROM work_item
+             WHERE required = 1 AND state IN ('pending', 'running'){eligibility}
+            """,
+            parameters,
+        ).fetchone()["n"]
+    )
+
+
+def deferred_required(connection: sqlite3.Connection) -> int:
+    return int(
+        connection.execute(
+            "SELECT COUNT(*) AS n FROM work_item WHERE required = 1 AND state = 'deferred'"
+        ).fetchone()["n"]
+    )
+
+
+def operational_failures_for_run(
+    connection: sqlite3.Connection, *, run_id: int
+) -> int:
+    return int(
+        connection.execute(
+            "SELECT COUNT(*) AS n FROM attempt WHERE run_id = ? AND outcome = 'failed'",
+            (run_id,),
+        ).fetchone()["n"]
+    )
+
+
+def run_counters(
+    connection: sqlite3.Connection, *, run_id: int, now: str
+) -> RunCounters:
     tally = {
         (row["required"], row["state"]): int(row["n"])
         for row in connection.execute(
-            "SELECT required, state, COUNT(*) AS n FROM work_item GROUP BY required, state"
+            """
+            SELECT required, state, COUNT(*) AS n
+              FROM work_item
+             WHERE completed_by_run_id = ?
+             GROUP BY required, state
+            """,
+            (run_id,),
         )
     }
-    operational_failures = int(
+    required_deferred = int(
         connection.execute(
-            "SELECT COUNT(*) AS n FROM attempt WHERE outcome = 'failed'"
+            """
+            SELECT COUNT(*) AS n FROM work_item
+             WHERE required = 1 AND state = 'deferred' AND eligible_at <= ?
+            """,
+            (now,),
         ).fetchone()["n"]
     )
     return RunCounters(
         required_succeeded=tally.get((1, "succeeded"), 0),
-        required_pending=tally.get((1, "pending"), 0),
-        required_deferred=tally.get((1, "deferred"), 0),
+        required_pending=pending_required(connection, now=now),
+        required_deferred=required_deferred,
         required_failed_permanent=tally.get((1, "failed_permanent"), 0),
         optional_succeeded=tally.get((0, "succeeded"), 0),
         optional_skipped=tally.get((0, "superseded"), 0),
-        operational_failures=operational_failures,
-    )
-
-
-def pending_required(connection: sqlite3.Connection) -> int:
-    return int(
-        connection.execute(
-            """
-            SELECT COUNT(*) AS n FROM work_item
-             WHERE required = 1 AND state IN ('pending', 'running')
-            """
-        ).fetchone()["n"]
+        operational_failures=operational_failures_for_run(connection, run_id=run_id),
     )
 ```
 
@@ -4098,8 +4347,8 @@ Every physical external call maps to exactly one immutable attempt row, attribut
 - Test: `tests/run_engine/test_attempts.py`
 
 **Interfaces:**
-- Consumes: `AttemptOutcome`, `FailureCategory`, `AttemptRecord`.
-- Produces: `start_attempt(connection, *, run_id, work_item_id, provider, operation, ordinal, request_fingerprint, destination_host, reserved_nano_usd, now) -> int`; `finish_attempt(connection, *, attempt_id, record, response_bytes, provider_request_id, detail_json, now) -> None`; `attempts_for_run(connection, *, run_id) -> tuple[sqlite3.Row, ...]`.
+- Consumes: `AttemptOutcome`, `FailureCategory`, `AttemptRecord`, `reserve_in_transaction`, and `reconcile_in_transaction`.
+- Produces: `next_attempt_ordinal(connection, *, work_item_id) -> int`; `claim_and_start_attempt(connection, *, run_id, work_item_id, provider, operation, ordinal, request_fingerprint, destination_host, reserved_nano_usd, now) -> int`; `start_attempt` with the same keyword parameters for an already-claimed retry; `finish_attempt(connection, *, attempt_id, record, response_bytes, provider_request_id, detail_json, now, actual_nano_usd=None) -> None`; and `attempts_for_run(connection, *, run_id) -> tuple[sqlite3.Row, ...]`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -4164,7 +4413,12 @@ def context(connection: sqlite3.Connection) -> tuple[int, int]:
 
 def start(connection: sqlite3.Connection, context: tuple[int, int], ordinal: int) -> int:
     run_id, work_id = context
-    return repository.start_attempt(
+    function = (
+        repository.claim_and_start_attempt
+        if ordinal == 1
+        else repository.start_attempt
+    )
+    return function(
         connection,
         run_id=run_id,
         work_item_id=work_id,
@@ -4311,18 +4565,177 @@ def test_an_unfinished_attempt_survives_for_the_sweep(
     assert (
         connection.execute("SELECT outcome FROM attempt").fetchone()["outcome"] == "interrupted"
     )
+
+
+def test_next_ordinal_continues_after_an_interrupted_attempt(
+    connection: sqlite3.Connection, context: tuple[int, int]
+) -> None:
+    start(connection, context, 1)
+    repository.sweep_interrupted(connection, now="2026-07-25T08:00:00Z")
+    assert repository.next_attempt_ordinal(connection, work_item_id=context[1]) == 2
+
+
+def test_first_attempt_claims_and_reserves_in_one_transaction(
+    connection: sqlite3.Connection, context: tuple[int, int]
+) -> None:
+    run_id, work_id = context
+    connection.execute(
+        "UPDATE run SET budget_limit_nano_usd = 1000 WHERE id = ?", (run_id,)
+    )
+    connection.commit()
+    repository.claim_and_start_attempt(
+        connection,
+        run_id=run_id,
+        work_item_id=work_id,
+        provider="openrouter",
+        operation="generate_structured",
+        ordinal=1,
+        request_fingerprint="d" * 64,
+        destination_host=None,
+        reserved_nano_usd=400,
+        now=NOW,
+    )
+    assert connection.execute(
+        "SELECT state FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()["state"] == "running"
+    assert connection.execute(
+        "SELECT budget_reserved_nano_usd FROM run WHERE id = ?", (run_id,)
+    ).fetchone()["budget_reserved_nano_usd"] == 400
+
+
+def test_refused_first_reservation_leaves_work_pending_and_no_attempt(
+    connection: sqlite3.Connection, context: tuple[int, int]
+) -> None:
+    from notable_person_finder.runs.budget import BudgetExhausted
+
+    run_id, work_id = context
+    connection.execute(
+        "UPDATE run SET budget_limit_nano_usd = 100 WHERE id = ?", (run_id,)
+    )
+    connection.commit()
+    with pytest.raises(BudgetExhausted):
+        repository.claim_and_start_attempt(
+            connection,
+            run_id=run_id,
+            work_item_id=work_id,
+            provider="openrouter",
+            operation="generate_structured",
+            ordinal=1,
+            request_fingerprint="e" * 64,
+            destination_host=None,
+            reserved_nano_usd=400,
+            now=NOW,
+        )
+    assert connection.execute(
+        "SELECT state FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()["state"] == "pending"
+    assert connection.execute("SELECT COUNT(*) AS n FROM attempt").fetchone()["n"] == 0
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `uv run pytest tests/run_engine/test_attempts.py -v`
-Expected: FAIL with `AttributeError: module 'notable_person_finder.runs.repository' has no attribute 'start_attempt'`
+Expected: FAIL with `AttributeError: module 'notable_person_finder.runs.repository' has no attribute 'claim_and_start_attempt'`
 
 - [ ] **Step 3: Add the attempt functions**
 
-Append to `src/notable_person_finder/runs/repository.py`, adding `from notable_person_finder.runs.retry import AttemptRecord` to the imports:
+Append to `src/notable_person_finder/runs/repository.py`, adding `from notable_person_finder.runs.retry import AttemptRecord` and `from notable_person_finder.runs.budget import reconcile_in_transaction, reserve_in_transaction` to the imports:
 
 ```python
+def next_attempt_ordinal(
+    connection: sqlite3.Connection, *, work_item_id: int
+) -> int:
+    row = connection.execute(
+        "SELECT COALESCE(MAX(ordinal), 0) + 1 AS ordinal FROM attempt WHERE work_item_id = ?",
+        (work_item_id,),
+    ).fetchone()
+    return int(row["ordinal"])
+
+
+def _insert_attempt(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    work_item_id: int,
+    provider: str,
+    operation: str,
+    ordinal: int,
+    request_fingerprint: str,
+    destination_host: str | None,
+    reserved_nano_usd: int,
+    now: str,
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO attempt (
+            run_id, work_item_id, provider, operation, ordinal,
+            started_at, request_fingerprint, destination_host, reserved_nano_usd
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id, work_item_id, provider, operation, ordinal, now,
+            request_fingerprint, destination_host, reserved_nano_usd,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def claim_and_start_attempt(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    work_item_id: int,
+    provider: str,
+    operation: str,
+    ordinal: int,
+    request_fingerprint: str,
+    destination_host: str | None,
+    reserved_nano_usd: int,
+    now: str,
+) -> int:
+    """Atomically claim work, reserve cost, and persist the first attempt."""
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        changed = connection.execute(
+            """
+            UPDATE work_item
+               SET state = 'running', claimed_by_run_id = ?, updated_at = ?
+             WHERE id = ?
+               AND (
+                       state = 'pending'
+                    OR (state = 'deferred' AND COALESCE(completed_by_run_id, -1) <> ?)
+               )
+            """,
+            (run_id, now, work_item_id, run_id),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError(f"work item {work_item_id} is not claimable by run-{run_id}")
+        reserve_in_transaction(
+            connection,
+            run_id=run_id,
+            nano_usd=reserved_nano_usd,
+        )
+        attempt_id = _insert_attempt(
+            connection,
+            run_id=run_id,
+            work_item_id=work_item_id,
+            provider=provider,
+            operation=operation,
+            ordinal=ordinal,
+            request_fingerprint=request_fingerprint,
+            destination_host=destination_host,
+            reserved_nano_usd=reserved_nano_usd,
+            now=now,
+        )
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+    return attempt_id
+
+
 def start_attempt(
     connection: sqlite3.Connection,
     *,
@@ -4336,30 +4749,26 @@ def start_attempt(
     reserved_nano_usd: int,
     now: str,
 ) -> int:
-    """Record an attempt before the external call so a crash leaves evidence."""
+    """Atomically reserve and persist a retry for already-running work."""
     connection.execute("BEGIN IMMEDIATE")
     try:
-        cursor = connection.execute(
-            """
-            INSERT INTO attempt (
-                run_id, work_item_id, provider, operation, ordinal,
-                started_at, request_fingerprint, destination_host, reserved_nano_usd
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                run_id,
-                work_item_id,
-                provider,
-                operation,
-                ordinal,
-                now,
-                request_fingerprint,
-                destination_host,
-                reserved_nano_usd,
-            ),
+        reserve_in_transaction(
+            connection,
+            run_id=run_id,
+            nano_usd=reserved_nano_usd,
         )
-        attempt_id = int(cursor.lastrowid)
+        attempt_id = _insert_attempt(
+            connection,
+            run_id=run_id,
+            work_item_id=work_item_id,
+            provider=provider,
+            operation=operation,
+            ordinal=ordinal,
+            request_fingerprint=request_fingerprint,
+            destination_host=destination_host,
+            reserved_nano_usd=reserved_nano_usd,
+            now=now,
+        )
     except BaseException:
         connection.rollback()
         raise
@@ -4377,16 +4786,30 @@ def finish_attempt(
     provider_request_id: str | None,
     detail_json: str | None,
     now: str,
+    actual_nano_usd: int | None = None,
 ) -> None:
     """Close one immutable attempt. Retries insert new rows; nothing is rewritten."""
     connection.execute("BEGIN IMMEDIATE")
     try:
-        connection.execute(
+        attempt = connection.execute(
+            "SELECT run_id, reserved_nano_usd FROM attempt WHERE id = ? AND outcome IS NULL",
+            (attempt_id,),
+        ).fetchone()
+        if attempt is None:
+            raise RuntimeError(f"attempt {attempt_id} is already finished or does not exist")
+        reconcile_in_transaction(
+            connection,
+            run_id=int(attempt["run_id"]),
+            reserved_nano_usd=int(attempt["reserved_nano_usd"]),
+            actual_nano_usd=actual_nano_usd,
+        )
+        changed = connection.execute(
             """
             UPDATE attempt
                SET outcome = ?, failure_category = ?, provider_status = ?,
                    retry_after_ms = ?, latency_ms = ?, response_bytes = ?,
-                   provider_request_id = ?, detail_json = ?, finished_at = ?
+                   provider_request_id = ?, detail_json = ?, actual_nano_usd = ?,
+                   finished_at = ?
              WHERE id = ? AND outcome IS NULL
             """,
             (
@@ -4398,10 +4821,13 @@ def finish_attempt(
                 response_bytes,
                 provider_request_id,
                 detail_json,
+                actual_nano_usd,
                 now,
                 attempt_id,
             ),
-        )
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError(f"attempt {attempt_id} could not be finished")
     except BaseException:
         connection.rollback()
         raise
@@ -4910,7 +5336,7 @@ git commit -m "feat(obs): add rotating JSON Lines logging with secret redaction"
 
 The engine assembles the pieces: sweep, create run, claim eligible work, execute each handler through the retry coordinator, persist attempts and outcomes on the application thread, then derive the terminal state.
 
-Terminal-state derivation is a pure function tested independently of SQLite, because it encodes the product rule that a valid empty result is `complete`, that only deferred *required* first-pass work makes a run `partial`, and that a reporting failure makes a run `failed`.
+Terminal-state derivation is a pure function tested independently of SQLite. A valid empty result is `complete`; pending or deferred required work is `partial`; a permanent required failure is `partial` when other meaningful results exist and `failed` when it prevents meaningful work; and a reporting failure is always `failed`. The engine does not store a terminal state until its injected reporter has durably written the artifact.
 
 **Files:**
 - Create: `src/notable_person_finder/runs/engine.py`
@@ -4918,7 +5344,7 @@ Terminal-state derivation is a pure function tested independently of SQLite, bec
 
 **Interfaces:**
 - Consumes: everything from Tasks 4 and 8–14.
-- Produces: `TaskHandler` frozen dataclass; `TaskOutcome` frozen dataclass (`state`, `reason`, `response_bytes`, `provider_request_id`, `detail_json`, `actual_nano_usd`); `derive_run_state(...) -> RunState`; `RunReport` frozen dataclass; `RunEngine` with `execute(handlers) -> RunReport`.
+- Produces: `TaskHandler`, `TaskOutcome`, `ReportArtifact`, and `RunReport` frozen dataclasses; `derive_run_state(...) -> RunState`; `RunEngine(reporter=...)` with `execute(handlers) -> RunReport`. The reporter returns the persisted path, hash, and exact Markdown; the engine then records the one terminal transition.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -4939,6 +5365,7 @@ from notable_person_finder.providers.failures import FailureCategory, ProviderFa
 from notable_person_finder.runs import repository
 from notable_person_finder.runs.clock import FakeClock
 from notable_person_finder.runs.engine import (
+    ReportArtifact,
     RunEngine,
     TaskHandler,
     TaskOutcome,
@@ -4955,34 +5382,51 @@ NOW = "2026-07-25T06:00:00Z"
 
 def test_no_outstanding_required_work_is_complete() -> None:
     assert derive_run_state(
-        required_pending=0, required_deferred=0, reporting_failed=False
+        required_pending=0, required_deferred=0, required_failed_permanent=0,
+        meaningful_results=False, reporting_failed=False
     ) is RunState.COMPLETE
 
 
 def test_an_empty_run_is_complete_not_failed() -> None:
     assert derive_run_state(
-        required_pending=0, required_deferred=0, reporting_failed=False
+        required_pending=0, required_deferred=0, required_failed_permanent=0,
+        meaningful_results=False, reporting_failed=False
     ) is RunState.COMPLETE
 
 
 def test_deferred_required_work_makes_the_run_partial() -> None:
     assert derive_run_state(
-        required_pending=0, required_deferred=2, reporting_failed=False
+        required_pending=0, required_deferred=2, required_failed_permanent=0,
+        meaningful_results=True, reporting_failed=False
     ) is RunState.PARTIAL
 
 
 def test_unevaluated_required_work_makes_the_run_partial() -> None:
     assert derive_run_state(
-        required_pending=3, required_deferred=0, reporting_failed=False
+        required_pending=3, required_deferred=0, required_failed_permanent=0,
+        meaningful_results=True, reporting_failed=False
     ) is RunState.PARTIAL
 
 
 def test_a_reporting_failure_makes_the_run_failed() -> None:
     assert derive_run_state(
-        required_pending=0, required_deferred=0, reporting_failed=True
+        required_pending=0, required_deferred=0, required_failed_permanent=0,
+        meaningful_results=True, reporting_failed=True
     ) is RunState.FAILED
     assert derive_run_state(
-        required_pending=1, required_deferred=1, reporting_failed=True
+        required_pending=1, required_deferred=1, required_failed_permanent=0,
+        meaningful_results=True, reporting_failed=True
+    ) is RunState.FAILED
+
+
+def test_required_permanent_failure_is_never_complete() -> None:
+    assert derive_run_state(
+        required_pending=0, required_deferred=0, required_failed_permanent=1,
+        meaningful_results=True, reporting_failed=False
+    ) is RunState.PARTIAL
+    assert derive_run_state(
+        required_pending=0, required_deferred=0, required_failed_permanent=1,
+        meaningful_results=False, reporting_failed=False
     ) is RunState.FAILED
 
 
@@ -4997,7 +5441,16 @@ def database(tmp_path: Path) -> Path:
     return path
 
 
-def build_engine(connection: sqlite3.Connection, clock: FakeClock) -> RunEngine:
+def memory_reporter(report) -> ReportArtifact:
+    return ReportArtifact(path=None, sha256=None, markdown="")
+
+
+def build_engine(
+    connection: sqlite3.Connection,
+    clock: FakeClock,
+    *,
+    budget_limit_nano_usd: int | None = None,
+) -> RunEngine:
     return RunEngine(
         connection,
         retry=RetryCoordinator(
@@ -5007,9 +5460,10 @@ def build_engine(connection: sqlite3.Connection, clock: FakeClock) -> RunEngine:
         clock=clock,
         timezone="Europe/Paris",
         window_start="2026-07-24T06:00:00Z",
-        budget_limit_nano_usd=None,
+        budget_limit_nano_usd=budget_limit_nano_usd,
         snapshot_fingerprint="a" * 64,
         snapshot_json="{}",
+        reporter=memory_reporter,
     )
 
 
@@ -5068,6 +5522,18 @@ def test_eligible_work_is_executed_and_marked_succeeded(database: Path) -> None:
     connection.close()
 
 
+def test_run_counters_do_not_include_historical_work_or_attempts(database: Path) -> None:
+    connection = connect_database(database)
+    schedule_probe(connection, "7" * 64)
+    handler = succeeding_handler([])
+    first = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+    second = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+    assert first.counters.required_succeeded == 1
+    assert second.counters.required_succeeded == 0
+    assert second.counters.operational_failures == 0
+    connection.close()
+
+
 def test_each_call_persists_one_attributed_attempt(database: Path) -> None:
     connection = connect_database(database)
     schedule_probe(connection, "c" * 64)
@@ -5079,6 +5545,67 @@ def test_each_call_persists_one_attributed_attempt(database: Path) -> None:
     assert attempts[0]["provider"] == "probe_provider"
     assert attempts[0]["outcome"] == "succeeded"
     assert attempts[0]["ordinal"] == 1
+    connection.close()
+
+
+def test_budget_is_reserved_before_the_call_and_actual_cost_is_reconciled(
+    database: Path,
+) -> None:
+    connection = connect_database(database)
+    schedule_probe(connection, "8" * 64)
+
+    def execute(work_item, ordinal: int) -> TaskOutcome:
+        row = connection.execute(
+            "SELECT budget_reserved_nano_usd FROM run ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row["budget_reserved_nano_usd"] == 400
+        return TaskOutcome(
+            state=WorkState.SUCCEEDED, reason=None, actual_nano_usd=120
+        )
+
+    handler = TaskHandler(
+        task_type="probe",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=execute,
+        reserved_nano_usd=400,
+    )
+    report = build_engine(
+        connection, FakeClock(), budget_limit_nano_usd=1000
+    ).execute({handler.task_type: handler})
+    row = connection.execute(
+        "SELECT budget_reserved_nano_usd, budget_actual_nano_usd FROM run WHERE id = ?",
+        (report.run_id,),
+    ).fetchone()
+    assert (row["budget_reserved_nano_usd"], row["budget_actual_nano_usd"]) == (120, 120)
+    assert connection.execute(
+        "SELECT actual_nano_usd FROM attempt WHERE run_id = ?", (report.run_id,)
+    ).fetchone()["actual_nano_usd"] == 120
+    connection.close()
+
+
+def test_refused_budget_reservation_makes_no_external_call(database: Path) -> None:
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "9" * 64)
+    calls: list[int] = []
+    handler = TaskHandler(
+        task_type="probe",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=lambda work, ordinal: calls.append(ordinal) or TaskOutcome(
+            state=WorkState.SUCCEEDED, reason=None
+        ),
+        reserved_nano_usd=200,
+    )
+    report = build_engine(
+        connection, FakeClock(), budget_limit_nano_usd=100
+    ).execute({handler.task_type: handler})
+    assert calls == []
+    assert report.state is RunState.PARTIAL
+    assert connection.execute(
+        "SELECT state FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()["state"] == WorkState.DEFERRED
+    assert repository.attempts_for_run(connection, run_id=report.run_id) == ()
     connection.close()
 
 
@@ -5131,7 +5658,7 @@ def test_exhausted_transient_work_is_deferred_and_the_run_is_partial(database: P
     connection.close()
 
 
-def test_a_permanent_failure_does_not_defer_and_does_not_make_the_run_partial(
+def test_a_permanent_failure_without_useful_results_fails_the_run(
     database: Path,
 ) -> None:
     connection = connect_database(database)
@@ -5156,7 +5683,7 @@ def test_a_permanent_failure_does_not_defer_and_does_not_make_the_run_partial(
         ]
         == WorkState.FAILED_PERMANENT
     )
-    assert report.state is RunState.COMPLETE
+    assert report.state is RunState.FAILED
     connection.close()
 
 
@@ -5223,6 +5750,7 @@ def test_work_for_a_paused_provider_is_deferred(database: Path) -> None:
         budget_limit_nano_usd=None,
         snapshot_fingerprint="a" * 64,
         snapshot_json="{}",
+        reporter=lambda report: ReportArtifact(path=None, sha256=None, markdown=""),
     )
     report = engine.execute({handler.task_type: handler})
 
@@ -5298,6 +5826,39 @@ def test_work_without_a_registered_handler_stays_pending(database: Path) -> None
         == WorkState.PENDING
     )
     connection.close()
+
+
+def test_reporting_failure_is_the_only_terminal_transition(database: Path) -> None:
+    connection = connect_database(database)
+
+    def fail_reporting(report) -> ReportArtifact:
+        raise OSError("digest root unavailable")
+
+    clock = FakeClock()
+    engine = RunEngine(
+        connection,
+        retry=RetryCoordinator(RetryConfig(max_attempts=1), clock=clock),
+        scheduler=BoundedScheduler(max_workers=1),
+        clock=clock,
+        timezone="Europe/Paris",
+        window_start="2026-07-24T06:00:00Z",
+        budget_limit_nano_usd=None,
+        snapshot_fingerprint="a" * 64,
+        snapshot_json="{}",
+        reporter=fail_reporting,
+    )
+    with pytest.raises(OSError, match="digest root"):
+        engine.execute({})
+    latest = repository.latest_run(connection)
+    assert latest is not None and latest.state is RunState.FAILED
+    transitions = [
+        row["state"]
+        for row in connection.execute(
+            "SELECT state FROM run_transition WHERE run_id = ? ORDER BY id", (latest.id,)
+        )
+    ]
+    assert transitions == ["running", "failed"]
+    connection.close()
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -5355,6 +5916,13 @@ class TaskHandler:
 
 
 @dataclass(frozen=True, slots=True)
+class ReportArtifact:
+    path: str | None
+    sha256: str | None
+    markdown: str
+
+
+@dataclass(frozen=True, slots=True)
 class RunReport:
     run_id: int
     state: RunState
@@ -5374,11 +5942,18 @@ class RunReport:
 
 
 def derive_run_state(
-    *, required_pending: int, required_deferred: int, reporting_failed: bool
+    *,
+    required_pending: int,
+    required_deferred: int,
+    required_failed_permanent: int,
+    meaningful_results: bool,
+    reporting_failed: bool,
 ) -> RunState:
-    """A valid empty result is complete; only outstanding required work is partial."""
+    """Derive state from this run's durable outcomes and reporting result."""
     if reporting_failed:
         return RunState.FAILED
+    if required_failed_permanent > 0:
+        return RunState.PARTIAL if meaningful_results else RunState.FAILED
     if required_pending > 0 or required_deferred > 0:
         return RunState.PARTIAL
     return RunState.COMPLETE
@@ -5399,6 +5974,7 @@ class RunEngine:
         budget_limit_nano_usd: int | None,
         snapshot_fingerprint: str,
         snapshot_json: str,
+        reporter: Callable[[RunReport], ReportArtifact],
     ) -> None:
         self._connection = connection
         self._retry = retry
@@ -5409,6 +5985,7 @@ class RunEngine:
         self._budget_limit_nano_usd = budget_limit_nano_usd
         self._snapshot_fingerprint = snapshot_fingerprint
         self._snapshot_json = snapshot_json
+        self._reporter = reporter
 
     def _now(self) -> str:
         return utc_timestamp(self._clock.now())
@@ -5435,42 +6012,33 @@ class RunEngine:
 
         failure_categories: dict[str, int] = {}
         while True:
-            claimed = repository.claim_next(self._connection, run_id=run_id, now=self._now())
-            if claimed is None:
+            item = repository.next_eligible(
+                self._connection,
+                run_id=run_id,
+                now=self._now(),
+                task_types=handlers.keys(),
+            )
+            if item is None:
                 break
-            handler = handlers.get(claimed.task_type)
-            if handler is None:
-                # No registered handler: return the item to the queue untouched
-                # so a later milestone's run can perform it.
-                repository.complete_work(
-                    self._connection,
-                    work_item_id=claimed.id,
-                    run_id=run_id,
-                    state=WorkState.PENDING,
-                    reason="no handler registered for this task type",
-                    now=self._now(),
-                )
-                continue
-            self._perform(run_id, claimed, handler, failure_categories)
+            handler = handlers[item.task_type]
+            self._perform(run_id, item, handler, failure_categories)
 
-        counters = repository.counters(self._connection)
         finished_at = self._now()
+        counters = repository.run_counters(
+            self._connection, run_id=run_id, now=finished_at
+        )
+        meaningful_results = (
+            counters.required_succeeded > 0 or counters.optional_succeeded > 0
+        )
         state = derive_run_state(
-            required_pending=repository.pending_required(self._connection),
+            required_pending=counters.required_pending,
             required_deferred=counters.required_deferred,
+            required_failed_permanent=counters.required_failed_permanent,
+            meaningful_results=meaningful_results,
             reporting_failed=False,
         )
-        repository.finish_run(
-            self._connection,
-            run_id=run_id,
-            state=state,
-            reason=None,
-            digest_path=None,
-            digest_sha256=None,
-            now=finished_at,
-        )
         record = repository.load_run(self._connection, run_id=run_id)
-        return RunReport(
+        report = RunReport(
             run_id=run_id,
             state=state,
             started_at=record.started_at,
@@ -5483,6 +6051,29 @@ class RunEngine:
             interrupted_runs=sweep.runs,
             failure_categories=failure_categories,
         )
+        try:
+            artifact = self._reporter(report)
+        except Exception as error:
+            repository.finish_run(
+                self._connection,
+                run_id=run_id,
+                state=RunState.FAILED,
+                reason=f"reporting failed: {type(error).__name__}",
+                digest_path=None,
+                digest_sha256=None,
+                now=self._now(),
+            )
+            raise
+        repository.finish_run(
+            self._connection,
+            run_id=run_id,
+            state=state,
+            reason=None,
+            digest_path=artifact.path,
+            digest_sha256=artifact.sha256,
+            now=finished_at,
+        )
+        return report
 
     def _perform(
         self,
@@ -5497,10 +6088,18 @@ class RunEngine:
             else work_item.fingerprint
         )
         attempt_ids: dict[int, int] = {}
+        starting_ordinal = repository.next_attempt_ordinal(
+            self._connection, work_item_id=work_item.id
+        )
 
         def action(ordinal: int) -> TaskOutcome:
             # Persist the attempt before the call so a crash leaves evidence.
-            attempt_ids[ordinal] = repository.start_attempt(
+            start = (
+                repository.claim_and_start_attempt
+                if ordinal == starting_ordinal
+                else repository.start_attempt
+            )
+            attempt_ids[ordinal] = start(
                 self._connection,
                 run_id=run_id,
                 work_item_id=work_item.id,
@@ -5529,6 +6128,7 @@ class RunEngine:
                 provider_request_id=None if outcome is None else outcome.provider_request_id,
                 detail_json=None if outcome is None else outcome.detail_json,
                 now=self._now(),
+                actual_nano_usd=None if outcome is None else outcome.actual_nano_usd,
             )
 
         try:
@@ -5537,6 +6137,7 @@ class RunEngine:
                 handler.operation,
                 lambda ordinal: self._capture(action, ordinal, pending_outcome),
                 on_attempt=on_attempt,
+                starting_ordinal=starting_ordinal,
             )
         except ProviderPaused as paused:
             repository.complete_work(
@@ -5973,6 +6574,7 @@ Create `tests/run_engine/test_run_cli.py`:
 from __future__ import annotations
 
 import os
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -6124,6 +6726,39 @@ def test_sigint_during_a_run_returns_one_hundred_thirty(
 # tests/run_engine/test_crash_boundary.py; this case owns the exit status only.
 
 
+def test_reporting_failure_exits_one_and_persists_failed_state(
+    config_file: Path, tmp_path: Path
+) -> None:
+    script = textwrap.dedent(
+        f"""
+        import sys
+        from notable_person_finder.cli import main as cli
+        from notable_person_finder.reporting.digest import DigestWriteError
+
+        def fail(*args, **kwargs):
+            raise DigestWriteError("simulated digest failure")
+
+        cli.write_digest = fail
+        sys.exit(cli.main(["--config", {str(config_file)!r}, "run"]))
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env={**os.environ, **ENVIRONMENT},
+        timeout=120,
+    )
+    assert completed.returncode == 1
+    database = tmp_path / "portable" / "data" / "notable.sqlite3"
+    connection = sqlite3.connect(database)
+    assert connection.execute("SELECT state FROM run").fetchone()[0] == "failed"
+    assert [row[0] for row in connection.execute(
+        "SELECT state FROM run_transition ORDER BY id"
+    )] == ["running", "failed"]
+    connection.close()
+
+
 def test_status_reports_the_latest_run_without_locking(
     config_file: Path, tmp_path: Path
 ) -> None:
@@ -6199,7 +6834,7 @@ from notable_person_finder.providers.transport import build_transport
 from notable_person_finder.reporting.digest import DigestWriteError, write_digest
 from notable_person_finder.runs import repository
 from notable_person_finder.runs.clock import SystemClock, utc_timestamp
-from notable_person_finder.runs.engine import RunEngine
+from notable_person_finder.runs.engine import ReportArtifact, RunEngine
 from notable_person_finder.runs.lock import LockUnavailable, MutationLock
 from notable_person_finder.runs.models import RunState
 from notable_person_finder.runs.retry import RetryCoordinator
@@ -6319,6 +6954,27 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
             pacing = build_pacing_gate(
                 loaded.main.pacing, loaded.main.concurrency, clock=clock
             )
+            local_date = (
+                clock.now().astimezone(ZoneInfo(loaded.main.timezone)).date().isoformat()
+            )
+            written_digest = []
+
+            def report_run(report) -> ReportArtifact:
+                try:
+                    digest = write_digest(
+                        loaded.paths.digests,
+                        report,
+                        local_date=local_date,
+                        config=loaded.main.digest,
+                    )
+                except DigestWriteError:
+                    log_event(logger, "run_reporting_failed", run_id=report.run_id)
+                    raise
+                written_digest.append(digest)
+                return ReportArtifact(
+                    path=str(digest.path), sha256=digest.sha256, markdown=digest.markdown
+                )
+
             engine = RunEngine(
                 connection,
                 retry=RetryCoordinator(loaded.main.retry, clock=clock),
@@ -6329,6 +6985,7 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                 budget_limit_nano_usd=loaded.main.budget.openrouter_nano_usd_per_run(),
                 snapshot_fingerprint=loaded.fingerprint,
                 snapshot_json=loaded.snapshot_json,
+                reporter=report_run,
             )
             log_event(logger, "run_started", fingerprint=loaded.fingerprint)
             try:
@@ -6339,35 +6996,7 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                 transport.close()
                 del pacing
 
-            local_date = (
-                clock.now().astimezone(ZoneInfo(loaded.main.timezone)).date().isoformat()
-            )
-            try:
-                digest = write_digest(
-                    loaded.paths.digests,
-                    report,
-                    local_date=local_date,
-                    config=loaded.main.digest,
-                )
-            except DigestWriteError as error:
-                repository.finish_run(
-                    connection,
-                    run_id=report.run_id,
-                    state=RunState.FAILED,
-                    reason=str(error),
-                    digest_path=None,
-                    digest_sha256=None,
-                    now=utc_timestamp(clock.now()),
-                )
-                log_event(logger, "run_reporting_failed", run_id=report.run_id)
-                print(error, file=sys.stderr)
-                return EXIT_FAILED
-
-            connection.execute(
-                "UPDATE run SET digest_path = ?, digest_sha256 = ? WHERE id = ?",
-                (str(digest.path), digest.sha256, report.run_id),
-            )
-            connection.commit()
+            digest = written_digest[0]
 
             log_event(
                 logger,
@@ -6398,14 +7027,16 @@ def command_status(config_file: Path | None) -> int:
         if record is None:
             print("no run has been recorded yet")
             return EXIT_OK
-        counters = repository.counters(connection)
+        failures = repository.operational_failures_for_run(
+            connection, run_id=record.id
+        )
         print(f"latest run: {record.human_id} ({record.state})")
         print(f"started: {record.started_at}")
         print(f"finished: {record.finished_at or '-'}")
         print(f"digest: {record.digest_path or '-'}")
         print(f"required work pending: {repository.pending_required(connection)}")
-        print(f"required work deferred: {counters.required_deferred}")
-        print(f"operational failures: {counters.operational_failures}")
+        print(f"required work deferred: {repository.deferred_required(connection)}")
+        print(f"operational failures: {failures}")
         # Digest backlog, queue tiers, and the oldest pending candidate arrive
         # with the digest queue in the lead-assessment milestone.
         return EXIT_OK
@@ -6500,7 +7131,12 @@ from notable_person_finder.db.connection import connect_database
 from notable_person_finder.db.migrate import apply_migrations
 from notable_person_finder.runs import repository
 from notable_person_finder.runs.clock import FakeClock
-from notable_person_finder.runs.engine import RunEngine, TaskHandler, TaskOutcome
+from notable_person_finder.runs.engine import (
+    ReportArtifact,
+    RunEngine,
+    TaskHandler,
+    TaskOutcome,
+)
 from notable_person_finder.runs.models import RunState, WorkState
 from notable_person_finder.runs.retry import RetryCoordinator
 from notable_person_finder.runs.scheduler import BoundedScheduler
@@ -6533,6 +7169,7 @@ def engine_for(connection: sqlite3.Connection) -> RunEngine:
         budget_limit_nano_usd=None,
         snapshot_fingerprint="a" * 64,
         snapshot_json="{}",
+        reporter=lambda report: ReportArtifact(path=None, sha256=None, markdown=""),
     )
 
 
@@ -6612,7 +7249,7 @@ def test_the_next_run_records_the_interruption_and_repeats_the_call(
     report = engine_for(connection).execute({handler.task_type: handler})
 
     # This is the documented at-least-once window: the request is made again.
-    assert second_calls == [1]
+    assert second_calls == [2]
     assert report.state is RunState.COMPLETE
     assert report.interrupted_runs != ()
 
@@ -6871,11 +7508,15 @@ The milestone is complete only when every item below holds:
 - Migration `0002` applies cleanly to a database that already has `0001`, and `0001`'s recorded checksum is unchanged.
 - `notable run` on a fresh data root exits `0`, writes an immutable dated digest plus `latest.md`, and emits byte-identical Markdown on standard output.
 - A run with outstanding required work exits `2`; validation, migration, lock, storage, and reporting failures exit `1`; a bad command exits `64`.
+- A required permanent failure cannot produce a `complete` run: it is `partial` when other meaningful results exist and `failed` when it prevents meaningful work.
+- The run remains `running` until reporting succeeds. A reporting failure records exactly one `failed` terminal transition, while a successful report records its digest path and hash with the terminal transition.
 - An overlapping mutating invocation fails immediately without creating a run row.
 - `notable status` inspects committed state while the mutation lock is held.
-- Every external call maps to exactly one attempt row attributed to its run and work item, and retries create new ordinals rather than overwriting predecessors.
-- Budget reservations cannot oversubscribe the configured cap under concurrency.
-- URL, DNS, redirect, timeout, response-size, concurrency, and pacing bounds are enforced and tested.
+- Every external call maps to exactly one attempt row attributed to its run and work item. Retries and post-crash execution continue the persisted ordinal rather than overwriting predecessors or restarting at one.
+- The first external attempt atomically claims work, reserves budget, and creates its row. Budget reservations cannot oversubscribe the configured cap under concurrency, and reported actual cost is reconciled when the attempt finishes.
+- Deferred work cannot run twice in one invocation but becomes eligible in the next ordinary run; unknown task types remain pending without making the engine loop.
+- Digest and status run summaries use only the selected run's attempts and completions; durable pending and deferred backlog counts are queried separately.
+- URL, DNS-preflight, redirect, timeout, encoded/decoded response-size, concurrency, and pacing bounds are enforced and tested. Documentation does not claim that separate preflight DNS resolution pins HTTPX's connection address.
 - No secret value appears in logs, snapshots, digests, terminal output, or test fixtures.
 - No module outside `src/notable_person_finder/providers/` imports `httpx`.
 - `docs/architecture/at-least-once-execution.md` exists and its claims are covered by `tests/run_engine/test_crash_boundary.py`.
@@ -6892,3 +7533,4 @@ Named here so a reviewer does not read their absence as an omission:
 - `notable digest show`, `notable audit run`, and `notable audit person` — milestone 6.
 - `notable status` backlog, queue tiers, and oldest pending candidate — milestone 6.
 - Promptfoo suites, live smoke tests, and the one-time legacy comparison — milestone 7.
+- Connection-level DNS-answer pinning or a custom network transport. Version one performs the approved public-address preflight before each request and redirect, but does not claim multi-tenant-grade DNS-rebinding protection.
