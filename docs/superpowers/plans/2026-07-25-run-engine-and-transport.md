@@ -3765,7 +3765,7 @@ Queue inspection can be restricted to task types for which the current engine ha
 
 **Interfaces:**
 - Consumes: `WorkItem`, `WorkState`, `RunCounters`.
-- Produces: `schedule_work(connection, *, task_type, subject_kind, subject_id, fingerprint, required, priority, eligible_at, run_id, now) -> int`; `supersede_work(connection, *, task_type, fingerprint, now, reason) -> int`; `next_eligible(connection, *, run_id, now, task_types=None) -> WorkItem | None`; `claim_next(connection, *, run_id, now, task_types=None) -> WorkItem | None`; `complete_work(connection, *, work_item_id, run_id, state, reason, now, eligible_at=None) -> None`; `run_counters(connection, *, run_id, now) -> RunCounters`; `pending_required(connection, *, now=None) -> int`; `deferred_required(connection) -> int`; and `operational_failures_for_run(connection, *, run_id) -> int`.
+- Produces: `schedule_work(connection, *, task_type, subject_kind, subject_id, fingerprint, required, priority, eligible_at, run_id, now) -> int`; `supersede_work(connection, *, task_type, fingerprint, run_id, now, reason) -> int`; `next_eligible(connection, *, run_id, now, task_types=None) -> WorkItem | None`; `claim_next(connection, *, run_id, now, task_types=None) -> WorkItem | None`; `complete_work(connection, *, work_item_id, run_id, state, reason, now, eligible_at=None) -> None`; `run_counters(connection, *, run_id, now) -> RunCounters`; `pending_required(connection, *, now=None) -> int`; `deferred_required(connection) -> int`; and `operational_failures_for_run(connection, *, run_id) -> int`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3857,7 +3857,7 @@ def test_a_changed_fingerprint_supersedes_the_old_active_row(
 ) -> None:
     stale = schedule(connection, run_id, fingerprint="c" * 64)
     superseded = repository.supersede_work(
-        connection, task_type="detect_people", fingerprint="c" * 64, now=LATER, reason="input changed"
+        connection, task_type="detect_people", fingerprint="c" * 64, run_id=run_id, now=LATER, reason="input changed"
     )
     assert superseded == 1
     fresh = schedule(connection, run_id, fingerprint="d" * 64)
@@ -4109,6 +4109,7 @@ def supersede_work(
     *,
     task_type: str,
     fingerprint: str,
+    run_id: int,
     now: str,
     reason: str,
 ) -> int:
@@ -4118,11 +4119,12 @@ def supersede_work(
         changed = connection.execute(
             """
             UPDATE work_item
-               SET state = 'superseded', reason = ?, updated_at = ?
+               SET state = 'superseded', reason = ?, updated_at = ?,
+                   completed_by_run_id = ?
              WHERE task_type = ? AND fingerprint = ?
                AND state IN ('pending', 'deferred')
             """,
-            (reason, now, task_type, fingerprint),
+            (reason, now, run_id, task_type, fingerprint),
         ).rowcount
     except BaseException:
         connection.rollback()
@@ -4234,7 +4236,7 @@ def complete_work(
     """Record one item's terminal or deferred outcome; failures are isolated."""
     connection.execute("BEGIN IMMEDIATE")
     try:
-        connection.execute(
+        changed = connection.execute(
             """
             UPDATE work_item
                SET state = ?,
@@ -4244,9 +4246,14 @@ def complete_work(
                    eligible_at = COALESCE(?, eligible_at),
                    updated_at = ?
              WHERE id = ?
+               AND state = 'running'
             """,
             (str(state), reason, run_id, eligible_at, now, work_item_id),
-        )
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError(
+                f"work item {work_item_id} is not completable by run-{run_id}"
+            )
     except BaseException:
         connection.rollback()
         raise
