@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+from collections.abc import Iterable
 
 import httpx
 import pytest
@@ -24,6 +25,23 @@ RESOLVER = StaticHostResolver(
 )
 
 
+def streaming_body(payload: bytes, *, parts: int = 3) -> Iterable[bytes]:
+    """Split `payload` into multiple chunks for a MockTransport handler.
+
+    `httpx.Response(status, content=<bytes>)` eagerly reads and closes its
+    own stream during construction, which makes `iter_raw()` in the
+    transport under test raise `StreamConsumed` before we ever see it.
+    Passing a non-bytes *iterable* of chunks instead makes httpx treat the
+    content as a genuine stream (`IteratorByteStream`), so `iter_raw()`
+    yields the raw chunks the way it would for a real network response,
+    across more than one iteration.
+    """
+    if not payload:
+        return [payload]
+    size = max(1, -(-len(payload) // max(parts, 1)))
+    return [payload[start : start + size] for start in range(0, len(payload), size)]
+
+
 def transport_for(handler, config: TransportConfig | None = None) -> HttpTransport:
     """Build a transport whose network layer is an in-process handler."""
     return build_transport(
@@ -37,7 +55,11 @@ def transport_for(handler, config: TransportConfig | None = None) -> HttpTranspo
 
 def test_successful_request_returns_decoded_body_and_final_url() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text="hello", headers={"content-type": "text/plain"})
+        return httpx.Response(
+            200,
+            content=streaming_body(b"hello"),
+            headers={"content-type": "text/plain"},
+        )
 
     with transport_for(handler) as transport:
         response = transport.request(
@@ -56,7 +78,7 @@ def test_user_agent_is_sent_on_every_request() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request.headers["user-agent"])
-        return httpx.Response(200, text="ok")
+        return httpx.Response(200, content=streaming_body(b"ok"))
 
     with transport_for(handler) as transport:
         transport.request("GET", "https://example.com/a", provider="feeds", operation="fetch_feed")
@@ -68,7 +90,7 @@ def test_adapter_headers_are_merged_without_replacing_the_user_agent() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.update(request.headers)
-        return httpx.Response(200, text="ok")
+        return httpx.Response(200, content=streaming_body(b"ok"))
 
     with transport_for(handler) as transport:
         transport.request(
@@ -91,7 +113,7 @@ def test_redirects_are_followed_and_the_chain_is_recorded() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/a":
             return httpx.Response(301, headers={"location": "https://other.example/b"})
-        return httpx.Response(200, text="final")
+        return httpx.Response(200, content=streaming_body(b"final"))
 
     with transport_for(handler) as transport:
         response = transport.request(
@@ -131,7 +153,7 @@ def test_redirect_limit_is_enforced() -> None:
 
 def test_decoded_body_over_the_limit_is_refused() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b"x" * 5000)
+        return httpx.Response(200, content=streaming_body(b"x" * 5000))
 
     config = TransportConfig(max_api_response_bytes=1000)
     with transport_for(handler, config) as transport:
@@ -151,7 +173,9 @@ def test_compression_cannot_smuggle_a_body_past_the_decoded_limit() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            200, content=payload, headers={"content-encoding": "gzip"}
+            200,
+            content=streaming_body(payload, parts=3),
+            headers={"content-encoding": "gzip"},
         )
 
     config = TransportConfig(max_api_response_bytes=1000)
@@ -169,7 +193,7 @@ def test_compression_cannot_smuggle_a_body_past_the_decoded_limit() -> None:
 
 def test_article_limit_is_larger_than_the_api_limit() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b"x" * 4000)
+        return httpx.Response(200, content=streaming_body(b"x" * 4000))
 
     config = TransportConfig(max_api_response_bytes=1000, max_article_response_bytes=8000)
     with transport_for(handler, config) as transport:

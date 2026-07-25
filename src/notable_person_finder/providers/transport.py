@@ -77,21 +77,7 @@ def _decoder(content_encoding: str) -> Any | None:
 
 
 def _bounded_body(response: httpx.Response, *, byte_limit: int) -> tuple[bytes, int]:
-    """Read encoded bytes and incrementally cap decoded output.
-
-    A response can arrive pre-buffered (e.g. an in-process test transport
-    that builds `httpx.Response(..., content=...)` eagerly reads and closes
-    its own stream during construction, before this transport ever sees it).
-    httpx has already applied its own content decoding in that case, so we
-    just apply the same bound to the already-materialized body rather than
-    calling `iter_raw()` against a stream that is already closed.
-    """
-    if response.is_stream_consumed or response.is_closed:
-        content = response.content
-        if len(content) > byte_limit:
-            raise OverflowError("decoded")
-        return content, response.num_bytes_downloaded
-
+    """Read encoded bytes and incrementally cap decoded output."""
     try:
         decoder = _decoder(response.headers.get("content-encoding", ""))
     except ValueError as error:
