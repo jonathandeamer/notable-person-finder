@@ -95,6 +95,7 @@ def test_reconciliation_replaces_the_reservation_with_the_actual_cost(database: 
         (run_id, work_id, "b" * 64),
     )
     attempt_id = int(cursor.lastrowid)
+    connection.commit()
     reserve(connection, run_id=run_id, nano_usd=500_000_000)
 
     reconcile(
@@ -135,6 +136,7 @@ def test_reconciling_an_unreported_cost_keeps_the_reservation(database: Path) ->
         """,
         (run_id, work_id, "d" * 64),
     )
+    connection.commit()
     reserve(connection, run_id=run_id, nano_usd=500_000_000)
     reconcile(
         connection,
@@ -195,4 +197,25 @@ def test_negative_reservation_is_rejected(database: Path) -> None:
     run_id = make_run(connection, 1_000_000_000)
     with pytest.raises(ValueError):
         reserve(connection, run_id=run_id, nano_usd=-1)
+    connection.close()
+
+
+def test_reserve_refuses_to_reuse_a_connection_already_mid_transaction(
+    database: Path,
+) -> None:
+    """`reserve` must always take its own BEGIN IMMEDIATE lock.
+
+    If it silently reused an already-open transaction instead, the read of
+    the remaining allowance could happen without the write lock BEGIN
+    IMMEDIATE guarantees, which is exactly the race this module exists to
+    close. A connection left mid-transaction must make `reserve` fail loudly
+    rather than adapt to it.
+    """
+    connection = connect_database(database)
+    run_id = make_run(connection, 1_000_000_000)
+    connection.execute("UPDATE run SET budget_reserved_nano_usd = 0 WHERE id = ?", (run_id,))
+    assert connection.in_transaction
+    with pytest.raises(sqlite3.OperationalError):
+        reserve(connection, run_id=run_id, nano_usd=100_000_000)
+    connection.rollback()
     connection.close()

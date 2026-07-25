@@ -32,27 +32,18 @@ def reserve(connection: sqlite3.Connection, *, run_id: int, nano_usd: int) -> No
 
     Opens its own BEGIN IMMEDIATE transaction so that a concurrently scheduled
     external call cannot read the same remaining allowance and spend it twice.
-
-    If the connection is already mid-transaction (the caller, or Python's own
-    implicit begin-before-DML behavior, already opened one), this reuses that
-    transaction rather than nesting a second BEGIN, and leaves committing or
-    rolling it back to whoever opened it.
     """
     if nano_usd < 0:
         raise ValueError("a budget reservation must not be negative")
 
-    owns_transaction = not connection.in_transaction
-    if owns_transaction:
-        connection.execute("BEGIN IMMEDIATE")
+    connection.execute("BEGIN IMMEDIATE")
     try:
         reserve_in_transaction(connection, run_id=run_id, nano_usd=nano_usd)
     except BaseException:
-        if owns_transaction:
-            connection.rollback()
+        connection.rollback()
         raise
     else:
-        if owns_transaction:
-            connection.commit()
+        connection.commit()
 
 
 def reserve_in_transaction(
@@ -93,14 +84,8 @@ def reconcile(
 
     When the provider reports no cost the reservation is retained: releasing it
     would let an unmeasured call escape the cap.
-
-    If the connection is already mid-transaction, this reuses that transaction
-    rather than nesting a second BEGIN, and leaves committing or rolling it
-    back to whoever opened it. See `reserve` for why.
     """
-    owns_transaction = not connection.in_transaction
-    if owns_transaction:
-        connection.execute("BEGIN IMMEDIATE")
+    connection.execute("BEGIN IMMEDIATE")
     try:
         reconcile_in_transaction(
             connection,
@@ -113,12 +98,10 @@ def reconcile(
             (actual_nano_usd, attempt_id),
         )
     except BaseException:
-        if owns_transaction:
-            connection.rollback()
+        connection.rollback()
         raise
     else:
-        if owns_transaction:
-            connection.commit()
+        connection.commit()
 
 
 def reconcile_in_transaction(
