@@ -33,6 +33,9 @@ def reserve(connection: sqlite3.Connection, *, run_id: int, nano_usd: int) -> No
     Opens its own BEGIN IMMEDIATE transaction so that a concurrently scheduled
     external call cannot read the same remaining allowance and spend it twice.
     """
+    # Deliberately duplicated with the check in `reserve_in_transaction`: this
+    # one rejects before opening a transaction at all, so a bad call never
+    # takes the write lock. Do not "de-duplicate" this away.
     if nano_usd < 0:
         raise ValueError("a budget reservation must not be negative")
 
@@ -50,6 +53,9 @@ def reserve_in_transaction(
     connection: sqlite3.Connection, *, run_id: int, nano_usd: int
 ) -> None:
     """Reserve within the caller's existing write transaction."""
+    # Deliberately duplicated with the check in `reserve`: this call site has
+    # no wrapper to catch it, so it must validate independently. Do not
+    # "de-duplicate" this away.
     if nano_usd < 0:
         raise ValueError("a budget reservation must not be negative")
     if not connection.in_transaction:
@@ -114,13 +120,35 @@ def reconcile_in_transaction(
     """Replace a reservation inside the caller's finishing transaction."""
     if not connection.in_transaction:
         raise RuntimeError("reconcile_in_transaction requires an active transaction")
+    if reserved_nano_usd < 0:
+        raise ValueError("a reconciled reservation must not be negative")
+    if actual_nano_usd is not None and actual_nano_usd < 0:
+        raise ValueError("a reconciled actual cost must not be negative")
     if actual_nano_usd is None:
         return
+
+    row = connection.execute(
+        "SELECT budget_reserved_nano_usd FROM run WHERE id = ?", (run_id,)
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"run {run_id} does not exist")
+    current_reserved = row["budget_reserved_nano_usd"]
+    if reserved_nano_usd > current_reserved:
+        # Refuse rather than clamp to zero: clamping would silently absorb an
+        # inconsistent reconciliation (a double reconcile of the same
+        # attempt, or a reconcile with no matching prior reserve) and let
+        # real spend vanish from budget_reserved_nano_usd, the only figure
+        # `remaining()` reads. That is precisely backwards for a spend cap,
+        # so this is a caller-bug RuntimeError, not a clamp.
+        raise RuntimeError(
+            f"reconciliation for run {run_id} releases {reserved_nano_usd} "
+            f"nano-USD but only {current_reserved} nano-USD is currently "
+            "reserved"
+        )
     connection.execute(
         """
         UPDATE run
-           SET budget_reserved_nano_usd =
-                   MAX(budget_reserved_nano_usd - ? + ?, 0),
+           SET budget_reserved_nano_usd = budget_reserved_nano_usd - ? + ?,
                budget_actual_nano_usd = budget_actual_nano_usd + ?
          WHERE id = ?
         """,
