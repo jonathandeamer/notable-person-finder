@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from types import TracebackType
 from typing import Any, Literal
+from urllib.parse import urlsplit
 import zlib
 
 import httpx
@@ -45,6 +46,26 @@ _TRANSPORT_ERROR_CATEGORIES: tuple[tuple[type[Exception], FailureCategory], ...]
     (httpx.DecodingError, FailureCategory.MALFORMED_RESPONSE),
     (httpx.TransportError, FailureCategory.NETWORK),
 )
+
+# Caller-supplied headers exist on this transport almost exclusively to
+# authenticate to the *originally requested* origin (Brave's
+# X-Subscription-Token, OpenRouter's bearer token, ...). httpx's own
+# follow_redirects logic strips Authorization on a cross-origin hop; our
+# manual redirect loop reproduces that guarantee for every caller header, not
+# just the standard ones (`authorization`, `proxy-authorization`, `cookie`
+# are treated as credentials at minimum, but no caller header of any name is
+# forwarded to a different origin), since a provider that can be induced to
+# return a redirect must not hand its credentials to whatever host the
+# Location header names.
+
+
+def _origin(url: str) -> tuple[str, str, int]:
+    """Scheme + host + port, with the scheme's default port made explicit."""
+    parsed = urlsplit(url)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    port = parsed.port if parsed.port is not None else (443 if scheme == "https" else 80)
+    return (scheme, host, port)
 
 
 class ResponseLimit(StrEnum):
@@ -171,6 +192,7 @@ class HttpTransport:
         current_url = url
         redirect_chain: list[str] = []
         byte_limit = self._byte_limit(limit)
+        original_origin = _origin(url)
 
         for _ in range(self._config.max_redirects + 1):
             try:
@@ -182,12 +204,20 @@ class HttpTransport:
                     operation=operation,
                     detail="unsafe request destination",
                 ) from error
+            hop_headers = headers
+            if redirect_chain and headers and _origin(current_url) != original_origin:
+                # A cross-origin redirect target never receives the caller's
+                # headers: they exist on this transport to authenticate to
+                # the originally requested origin, so none of them is safe
+                # to hand to a different host, not only the named
+                # credential headers.
+                hop_headers = None
             response = self._send(
                 method,
                 current_url,
                 provider=provider,
                 operation=operation,
-                headers=headers,
+                headers=hop_headers,
                 params=params if not redirect_chain else None,
                 profile=profile,
                 byte_limit=byte_limit,

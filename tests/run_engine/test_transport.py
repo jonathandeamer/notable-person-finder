@@ -125,6 +125,59 @@ def test_redirects_are_followed_and_the_chain_is_recorded() -> None:
     assert response.content == b"final"
 
 
+def test_cross_origin_redirect_drops_credential_headers() -> None:
+    seen: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.headers))
+        if request.url.host == "example.com":
+            return httpx.Response(302, headers={"location": "https://other.example/b"})
+        return httpx.Response(200, content=streaming_body(b"final"))
+
+    with transport_for(handler) as transport:
+        transport.request(
+            "GET",
+            "https://example.com/a",
+            provider="feeds",
+            operation="fetch_feed",
+            headers={
+                "Authorization": "Bearer SECRET",
+                "X-Subscription-Token": "TOKEN",
+            },
+        )
+    assert len(seen) == 2
+    assert seen[0]["authorization"] == "Bearer SECRET"
+    assert seen[0]["x-subscription-token"] == "TOKEN"
+    assert "authorization" not in seen[1]
+    assert "x-subscription-token" not in seen[1]
+
+
+def test_same_origin_redirect_keeps_credential_headers() -> None:
+    seen: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.headers))
+        if request.url.path == "/a":
+            return httpx.Response(302, headers={"location": "https://example.com/b"})
+        return httpx.Response(200, content=streaming_body(b"final"))
+
+    with transport_for(handler) as transport:
+        transport.request(
+            "GET",
+            "https://example.com/a",
+            provider="feeds",
+            operation="fetch_feed",
+            headers={
+                "Authorization": "Bearer SECRET",
+                "X-Subscription-Token": "TOKEN",
+            },
+        )
+    assert len(seen) == 2
+    assert seen[0]["authorization"] == "Bearer SECRET"
+    assert seen[1]["authorization"] == "Bearer SECRET"
+    assert seen[1]["x-subscription-token"] == "TOKEN"
+
+
 def test_redirect_to_a_private_address_is_refused() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(302, headers={"location": "https://internal.example/secrets"})
