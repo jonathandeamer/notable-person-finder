@@ -3228,8 +3228,8 @@ There is no resume mode: every invocation creates a run, and the sweep is what m
 - Test: `tests/run_engine/test_repository.py`
 
 **Interfaces:**
-- Consumes: `sqlite3.Connection`, `utc_timestamp`, `Clock`.
-- Produces: `RunState`, `WorkState`, `AttemptOutcome` (str enums); `RunRecord`, `WorkItem`, `RunCounters` (frozen dataclasses); repository functions `store_snapshot`, `create_run`, `record_transition`, `finish_run`, `sweep_interrupted`, `load_run`, `latest_run`.
+- Consumes: `sqlite3.Connection`. Callers pass `now` as a UTC ISO-8601 `Z` string; the `Clock` and `utc_timestamp` are threaded by the engine in Task 12, not by this layer.
+- Produces: `RunState`, `WorkState`, `AttemptOutcome` (str enums); `RunRecord`, `WorkItem`, `SweepResult`, `RunCounters` (frozen dataclasses); repository functions `store_snapshot`, `create_run`, `finish_run`, `sweep_interrupted`, `load_run`, `latest_run`. Transition rows are written by the private `_insert_transition` as part of the state change that produces them; there is no public transition writer.
 
 - [ ] **Step 1: Write the failing tests**
 
