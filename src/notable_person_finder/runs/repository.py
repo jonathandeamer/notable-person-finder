@@ -414,6 +414,56 @@ def complete_work(
         connection.commit()
 
 
+def defer_unclaimed(
+    connection: sqlite3.Connection,
+    *,
+    work_item_id: int,
+    run_id: int,
+    reason: str,
+    now: str,
+) -> None:
+    """Defer work this run peeked at but never claimed.
+
+    `complete_work` is the settle path for work that reached the provider: it
+    requires state `running`, because only a claim proves this run owned the
+    item. Two engine paths refuse an item *before* any claim exists — a paused
+    provider (refused by the retry coordinator before the claim UPDATE runs)
+    and a refused budget reservation (which rolls back the claim inside
+    `claim_and_start_attempt`'s own transaction). Both leave a `pending` or
+    `deferred` row that this run must record a decision about, or the engine's
+    peek-and-settle loop re-selects it forever.
+
+    `completed_by_run_id` is stamped for exactly that reason: it is what
+    `_CLAIMABLE_PREDICATE` reads to keep a same-run deferral out of the next
+    peek.
+    """
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        changed = connection.execute(
+            """
+            UPDATE work_item
+               SET state = 'deferred',
+                   reason = ?,
+                   completed_by_run_id = ?,
+                   updated_at = ?
+             WHERE id = ?
+               AND state IN ('pending', 'deferred')
+               AND claimed_by_run_id IS NULL
+            """,
+            (reason, run_id, now, work_item_id),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError(
+                f"work item {work_item_id} is not unclaimed work that "
+                f"run-{run_id} may defer"
+            )
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
 def pending_required(
     connection: sqlite3.Connection, *, now: str | None = None
 ) -> int:

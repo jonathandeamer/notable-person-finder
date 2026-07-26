@@ -449,3 +449,51 @@ def test_counters_cover_deferred_failed_permanent_skipped_and_operational_failur
     assert counters.required_failed_permanent == 1
     assert counters.optional_skipped == 1
     assert counters.operational_failures == 1
+
+
+def test_deferring_unclaimed_work_keeps_it_out_of_the_same_run(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
+    work_id = schedule(connection, run_id)
+
+    repository.defer_unclaimed(
+        connection,
+        work_item_id=work_id,
+        run_id=run_id,
+        reason="not_evaluated_budget",
+        now=NOW,
+    )
+
+    row = connection.execute(
+        "SELECT state, reason, claimed_by_run_id, completed_by_run_id "
+        "FROM work_item WHERE id = ?",
+        (work_id,),
+    ).fetchone()
+    assert row["state"] == WorkState.DEFERRED
+    assert row["reason"] == "not_evaluated_budget"
+    assert row["claimed_by_run_id"] is None
+    assert row["completed_by_run_id"] == run_id
+    assert repository.next_eligible(connection, run_id=run_id, now=LATER) is None
+
+
+def test_deferring_unclaimed_work_refuses_a_claimed_item(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
+    work_id = schedule(connection, run_id)
+    repository.claim_next(connection, run_id=run_id, now=NOW)
+
+    with pytest.raises(RuntimeError, match="unclaimed work"):
+        repository.defer_unclaimed(
+            connection,
+            work_item_id=work_id,
+            run_id=run_id,
+            reason="not_evaluated_budget",
+            now=LATER,
+        )
+    assert (
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (work_id,)
+        ).fetchone()["state"]
+        == WorkState.RUNNING
+    )
+    assert not connection.in_transaction
