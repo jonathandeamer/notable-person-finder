@@ -401,6 +401,91 @@ def test_status_against_an_unmigrated_database_is_actionable(
     assert "Traceback" not in completed.stderr
 
 
+def test_the_cli_wires_the_resolved_secrets_into_the_log_redaction_filter(
+    config_file: Path, tmp_path: Path
+) -> None:
+    """`command_run` must hand the resolved credentials to `configure_logging`.
+
+    An absence assertion cannot guard this wire: this milestone never logs a
+    secret of its own, so `secret not in notable.jsonl` passes even against a
+    `secrets=()` that cuts the redaction wire entirely. So log a
+    secret-bearing field THROUGH the logger the CLI configured, and require
+    the redaction marker to be there. If the CLI stops passing the
+    credentials the filter has nothing to match and the plaintext lands in
+    `notable.jsonl`.
+    """
+    script = textwrap.dedent(
+        f"""
+        import logging
+        import os
+        import sys
+        from notable_person_finder.cli import main as cli
+        from notable_person_finder.obs.logging import EVENT_LOGGER_NAME, log_event
+
+        status = cli.main(["--config", {str(config_file)!r}, "run"])
+        # The logger `command_run` configured is still installed, filter and
+        # handler included. Nothing is reconfigured here.
+        log_event(
+            logging.getLogger(EVENT_LOGGER_NAME),
+            "probe_of_the_cli_configured_logger",
+            detail="openrouter=" + os.environ["TEST_OPENROUTER"],
+            other="brave=" + os.environ["TEST_BRAVE"],
+        )
+        logging.shutdown()
+        sys.exit(status)
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env={**os.environ, **ENVIRONMENT},
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+    log_file = tmp_path / "portable" / "logs" / "notable.jsonl"
+    lines = [
+        line
+        for line in log_file.read_text(encoding="utf-8").splitlines()
+        if "probe_of_the_cli_configured_logger" in line
+    ]
+    # Without this the two assertions below could both hold on an empty file.
+    assert len(lines) == 1, log_file.read_text(encoding="utf-8")
+    assert '"detail":"openrouter=[redacted]"' in lines[0]
+    assert '"other":"brave=[redacted]"' in lines[0]
+    assert "or-secret-value" not in log_file.read_text(encoding="utf-8")
+    assert "brave-secret-value" not in log_file.read_text(encoding="utf-8")
+
+
+def test_the_persisted_configuration_snapshot_holds_no_secret_value(
+    config_file: Path, tmp_path: Path
+) -> None:
+    """`command_run` passes `loaded.snapshot_json` straight into the run row.
+
+    Configuration is the one structure that holds the resolved credentials, so
+    what actually lands in `configuration_snapshot.canonical_json` is the
+    assertion that matters -- not what the loader intends to build.
+    """
+    assert run_notable(config_file, "run").returncode == 0
+
+    connection = sqlite3.connect(tmp_path / "portable" / "data" / "notable.sqlite3")
+    try:
+        rows = connection.execute(
+            "SELECT canonical_json FROM configuration_snapshot"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert len(rows) == 1
+    canonical_json = rows[0][0]
+    # A snapshot that is empty or absent would satisfy the absence assertions
+    # below without recording anything, so pin that it holds real content.
+    assert "Europe/Paris" in canonical_json
+    assert "or-secret-value" not in canonical_json
+    assert "brave-secret-value" not in canonical_json
+
+
 def test_verbose_names_the_digest_without_revealing_secrets(
     config_file: Path, tmp_path: Path
 ) -> None:
