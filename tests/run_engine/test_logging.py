@@ -251,6 +251,86 @@ def test_non_string_percent_args_containing_secrets_are_redacted(tmp_path: Path)
     assert events[-1]["event"].endswith("after 12 ms")
 
 
+def test_top_level_field_names_containing_secrets_are_redacted(tmp_path: Path) -> None:
+    # A secret can arrive as a FIELD NAME, not just as a value or as a key
+    # inside a field's value. `log_event(**fields)` accepts any string key
+    # CPython will pass through `**kwargs` — including non-identifier and
+    # non-ASCII shapes — and the name is serialized as a JSON object key, so
+    # it is exposed to exactly the escaping hazard that hides an unredacted
+    # secret from a raw-text grep while `json.loads` hands it straight back.
+    identifier_secret = "sk_café_1234"
+    awkward_secret = 'sk-café"\\-1234'
+    created = configure_logging(
+        tmp_path / "logs" / "notable.jsonl",
+        LoggingConfig(max_bytes=8192, backup_count=2),
+        secrets=(identifier_secret, awkward_secret),
+    )
+    try:
+        log_event(
+            created,
+            "provider_attempt_failed",
+            **{identifier_secret: "v", awkward_secret: "w"},
+        )
+    finally:
+        for handler in list(created.handlers):
+            handler.close()
+            created.removeHandler(handler)
+
+    events = read_events(tmp_path)
+    assert len(events) == 1
+    assert_secret_absent(events, identifier_secret)
+    assert_secret_absent(events, awkward_secret)
+
+
+def test_args_whose_repr_carries_a_secret_are_redacted_on_the_root_path(
+    tmp_path: Path,
+) -> None:
+    # `%r` renders `repr(arg)`, not `str(arg)`. An arg with a clean `__str__`
+    # and a secret-bearing `__repr__` must still be scrubbed on the RECORD,
+    # because handlers we do not own (every pre-existing root handler, and
+    # the root safety net) render it with their own formatter.
+    secret = 'sk-café"\\-1234'
+
+    class _Sneaky:
+        def __str__(self) -> str:
+            return "<Response>"
+
+        def __repr__(self) -> str:
+            return f"<Response token={secret}>"
+
+    root = logging.getLogger()
+    original_handlers = list(root.handlers)
+    original_level = root.level
+    stream = io.StringIO()
+    pre_existing = logging.StreamHandler(stream)
+    root.addHandler(pre_existing)
+    root.setLevel(logging.WARNING)
+    notable_logger = logging.getLogger(EVENT_LOGGER_NAME)
+
+    try:
+        configure_logging(
+            tmp_path / "logs" / "notable.jsonl",
+            LoggingConfig(max_bytes=2048, backup_count=2),
+            secrets=(secret,),
+        )
+        third_party = logging.getLogger("thirdparty.notable_test_task14_repr")
+        third_party.propagate = True
+        third_party.warning("resp=%r", _Sneaky())
+    finally:
+        pre_existing.close()
+        root.removeHandler(pre_existing)
+        root.handlers[:] = original_handlers
+        root.setLevel(original_level)
+        for handler in list(notable_logger.handlers):
+            handler.close()
+            notable_logger.removeHandler(handler)
+
+    # Plain-text handler output: raw text is the final rendered form here.
+    rendered = stream.getvalue()
+    assert secret not in rendered
+    assert "[redacted]" in rendered
+
+
 class _KeyWhoseStrRaises(str):
     """A `str` subclass whose `str()` raises.
 

@@ -125,23 +125,36 @@ def _redact_arg(arg: Any, secrets: Sequence[str]) -> Any:
     untouched unconditionally means its secret is never scrubbed on the
     record itself, and a handler with a formatter we do not own — every
     pre-existing root handler, and the root safety net — renders it straight
-    out. So: stringify, and only substitute the redacted text when the
-    stringified form actually contained a secret. Secret-free args (the
+    out. So: render it, and only substitute the redacted text when the
+    rendered form actually contained a secret. Secret-free args (the
     overwhelming majority) keep their type and their specifier; a secret
     bearing arg loses its type, which at worst breaks `%d` and costs the
     line, never the secret.
+
+    BOTH `str(arg)` and `repr(arg)` are tested, because the caller chooses
+    which one renders: `%s` uses `str`, `%r` uses `repr`. An object with a
+    clean `__str__` and a secret-bearing `__repr__` leaks unless `repr` is
+    inspected too. `str` is tried first so that the common case (the secret
+    visible in both) substitutes the `str` form and `%s` output keeps its
+    usual shape.
+
+    Neither call is assumed safe: both are caller-controlled code and either
+    may raise. A raise in one does not stop the other being tried; if both
+    fail the arg is returned unchanged, and `getMessage()` raises later
+    inside `Handler.emit` (see the leak inventory's row 3 for what that path
+    does and does not guarantee).
     """
     if isinstance(arg, str):
         return redact(arg, secrets)
-    try:
-        text = str(arg)
-    except Exception:
-        # Unrenderable: `getMessage()` will raise inside `Handler.emit`,
-        # where `handleError` drops the line. Nothing is serialized, so
-        # nothing leaks.
-        return arg
-    redacted = redact(text, secrets)
-    return arg if redacted == text else redacted
+    for render in (str, repr):
+        try:
+            text = render(arg)
+        except Exception:
+            continue
+        redacted = redact(text, secrets)
+        if redacted != text:
+            return redacted
+    return arg
 
 
 class _RedactionFilter(logging.Filter):
@@ -183,8 +196,16 @@ class _RedactionFilter(logging.Filter):
             # guard below.
             fields = getattr(record, "fields", None)
             if fields is not None:
+                # The NAME is redacted on the same footing as a dict key
+                # inside a value (see `_redact_deep`'s dict branch): a field
+                # name is serialized as a JSON object key, so an unredacted
+                # secret used as a name is escaped by `json.dumps` and
+                # recovered verbatim by `json.loads`. The forbidden-name
+                # check deliberately runs against the CALLER's original name,
+                # before redaction, because it is a name-based safety check
+                # rather than a value scrub.
                 record.fields = {  # type: ignore[attr-defined]
-                    name: _redact_deep(value, self._secrets)
+                    redact(str(name), self._secrets): _redact_deep(value, self._secrets)
                     for name, value in fields.items()
                     if not _is_forbidden_field(name)
                 }
