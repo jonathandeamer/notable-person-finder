@@ -146,7 +146,16 @@ class RetryCoordinator:
 
     def _delay(self, retry_number: int, failure: ProviderFailure) -> float:
         if failure.retry_after_ms is not None:
-            return failure.retry_after_ms / 1000
+            # `retry_after_ms` comes from the provider's own Retry-After
+            # header, which is remote input. A legal `Retry-After: 86400`
+            # would otherwise park the coordinator for a day per retry WHILE
+            # THE OS MUTATION LOCK IS HELD, blocking every subsequent
+            # `notable run`. Provider-controlled input must never override an
+            # operator-configured bound, so honour the hint only up to
+            # `max_backoff_seconds`.
+            return min(
+                failure.retry_after_ms / 1000, self._config.max_backoff_seconds
+            )
         base = self._config.initial_backoff_seconds * (
             self._config.backoff_multiplier ** (retry_number - 1)
         )

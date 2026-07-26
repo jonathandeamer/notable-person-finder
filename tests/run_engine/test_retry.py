@@ -90,6 +90,39 @@ def test_retry_after_overrides_computed_backoff() -> None:
     assert clock.slept == [7.0]
 
 
+def test_retry_after_is_capped_by_the_operator_configured_maximum() -> None:
+    """A provider's Retry-After header must not override an operator bound.
+
+    `retry_after_ms` is filled from the remote's own `Retry-After` response
+    header. A legal `Retry-After: 86400` on a 503 is remote input that, left
+    uncapped, parks the coordinator for a day per retry while the OS mutation
+    lock is held, blocking every subsequent `notable run`. The operator's
+    `max_backoff_seconds` is a validated ceiling and must bind here too.
+    """
+    config = RetryConfig(
+        max_attempts=3,
+        initial_backoff_seconds=1.0,
+        max_backoff_seconds=5.0,
+        backoff_multiplier=2.0,
+        jitter_ratio=0.0,
+    )
+    clock = FakeClock()
+
+    def action(ordinal: int) -> str:
+        raise failure(
+            FailureCategory.TRANSIENT_SERVER_ERROR,
+            status_code=503,
+            retry_after_ms=86_400_000,
+        )
+
+    with pytest.raises(RetryExhausted):
+        coordinator(config, clock).call(
+            "brave", "search_web", action, on_attempt=lambda _: None
+        )
+    assert clock.slept == [5.0, 5.0]
+    assert max(clock.slept) <= config.max_backoff_seconds
+
+
 @pytest.mark.parametrize(
     "category",
     [
