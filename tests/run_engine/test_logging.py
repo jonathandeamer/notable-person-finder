@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -95,6 +96,10 @@ def test_secrets_with_non_ascii_or_quote_characters_are_redacted(tmp_path: Path)
             created,
             "provider_attempt_failed",
             detail=f"key={non_ascii_secret} and quoted={quote_secret} rejected",
+            # A secret can also appear as a mapping KEY, not just a value.
+            # The key gets stringified during serialization the same way a
+            # value does, and is just as exposed to the escaping issue.
+            context={non_ascii_secret: "v"},
         )
     finally:
         for handler in list(created.handlers):
@@ -112,6 +117,9 @@ def test_secrets_with_non_ascii_or_quote_characters_are_redacted(tmp_path: Path)
     event = json.loads(raw_text.splitlines()[0])
     assert non_ascii_secret not in event["detail"]
     assert quote_secret not in event["detail"]
+    # Check the parsed KEY strings directly, not a re-dumped (re-escaped)
+    # copy of them — re-dumping would hide the same leak all over again.
+    assert all(non_ascii_secret not in key for key in event["context"])
 
 
 def test_an_exception_traceback_is_captured_and_redacted(
@@ -128,6 +136,72 @@ def test_an_exception_traceback_is_captured_and_redacted(
     event = json.loads(raw_text.splitlines()[0])
     assert "Traceback" in event["exception"]
     assert "ValueError" in event["exception"]
+
+
+def test_a_circular_reference_field_does_not_abort_the_run(
+    tmp_path: Path, logger: logging.Logger
+) -> None:
+    # The redaction filter runs in Logger.handle, outside the handleError
+    # protection that wraps Handler.emit. A self-referential field must be
+    # scrubbed to a placeholder, not sent into infinite recursion that
+    # crashes whatever code was logging about it.
+    circular: dict[str, object] = {"self": None}
+    circular["self"] = circular
+
+    log_event(logger, "provider_attempt_failed", context=circular)
+    # If the filter propagated an exception, this second call would never
+    # run and the assertion below would see only one event.
+    log_event(logger, "run_progress", run_id=1)
+
+    events = read_events(tmp_path)
+    assert [event["event"] for event in events] == ["provider_attempt_failed", "run_progress"]
+
+
+class _RaisesOnStr:
+    def __str__(self) -> str:
+        raise RuntimeError("boom")
+
+
+def test_a_field_whose_str_raises_does_not_abort_the_run(
+    tmp_path: Path, logger: logging.Logger
+) -> None:
+    log_event(logger, "provider_attempt_failed", detail=_RaisesOnStr())
+    log_event(logger, "run_progress", run_id=1)
+
+    events = read_events(tmp_path)
+    assert [event["event"] for event in events] == ["provider_attempt_failed", "run_progress"]
+
+
+def test_percent_style_args_with_non_string_values_still_format(
+    tmp_path: Path, logger: logging.Logger
+) -> None:
+    # A non-str %-arg (e.g. routed through the root safety net from a
+    # third-party logger) must reach %-formatting untouched. Stringifying
+    # it during redaction would break a numeric specifier like %d.
+    logger.info("took %d ms", Decimal("5"))
+
+    raw_text = (tmp_path / "logs" / "notable.jsonl").read_text(encoding="utf-8")
+    events = [json.loads(line) for line in raw_text.splitlines() if line]
+    assert events[-1]["event"] == "took 5 ms"
+
+
+def test_forbidden_fields_are_dropped_even_with_no_secrets_configured(tmp_path: Path) -> None:
+    created = configure_logging(
+        tmp_path / "logs" / "notable.jsonl",
+        LoggingConfig(max_bytes=2048, backup_count=2),
+        secrets=(),
+    )
+    try:
+        log_event(created, "provider_request", authorization="Bearer abc")
+    finally:
+        for handler in list(created.handlers):
+            handler.close()
+            created.removeHandler(handler)
+
+    event = read_events(tmp_path)[0]
+    assert "authorization" not in event
+    raw_text = (tmp_path / "logs" / "notable.jsonl").read_text(encoding="utf-8")
+    assert "Bearer abc" not in raw_text
 
 
 def test_authorization_like_fields_are_dropped_entirely(

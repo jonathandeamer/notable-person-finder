@@ -46,11 +46,25 @@ def redact(text: str, secrets: Sequence[str | None]) -> str:
 
 
 def _is_forbidden_field(name: str) -> bool:
+    # Top-level field names only: a nested value such as
+    # context={"authorization": "..."} is not inspected recursively. Only
+    # the top-level keys passed to log_event are checked against the marker
+    # list; values (including nested dicts) still go through secret
+    # redaction, just not this name-based drop.
     lowered = name.lower()
     return any(marker in lowered for marker in _FORBIDDEN_FIELD_MARKERS)
 
 
-def _redact_deep(value: Any, secrets: Sequence[str]) -> Any:
+_MAX_REDACT_DEPTH = 20
+
+
+def _redact_deep(
+    value: Any,
+    secrets: Sequence[str],
+    *,
+    _seen: frozenset[int] | None = None,
+    _depth: int = 0,
+) -> Any:
     """Redact secrets from a value before it is ever serialized.
 
     Redacting before `json.dumps` (rather than only on the rendered JSON
@@ -58,20 +72,47 @@ def _redact_deep(value: Any, secrets: Sequence[str]) -> Any:
     backslashes by default, and a secret containing any of those characters
     would no longer match a plain `str.replace` on the rendered output.
     Redacting each leaf value first, while it is still the caller's raw
-    string, sidesteps that entirely.
+    string, sidesteps that entirely. Dict keys go through the same
+    `redact()` call as values, for the same reason.
+
+    This function must never raise and must never loop forever: it runs
+    inside a logging Filter, outside the `handleError` protection that
+    normally contains exceptions raised while emitting a record. A
+    self-referential structure or an object whose `__str__` raises must
+    degrade to a placeholder, not abort the caller that logged it.
     """
+    if _depth > _MAX_REDACT_DEPTH:
+        return "[max-depth-exceeded]"
+
     if isinstance(value, str):
         return redact(value, secrets)
-    if isinstance(value, dict):
-        return {str(key): _redact_deep(item, secrets) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_redact_deep(item, secrets) for item in value]
+
+    if isinstance(value, (dict, list, tuple)):
+        marker = id(value)
+        if _seen is not None and marker in _seen:
+            return "[circular-reference]"
+        seen = (_seen or frozenset()) | {marker}
+        if isinstance(value, dict):
+            return {
+                redact(str(key), secrets): _redact_deep(
+                    item, secrets, _seen=seen, _depth=_depth + 1
+                )
+                for key, item in value.items()
+            }
+        return [_redact_deep(item, secrets, _seen=seen, _depth=_depth + 1) for item in value]
+
     if value is None or isinstance(value, (int, float, bool)):
         return value
+
     # Anything else (exceptions, dataclasses, arbitrary objects) is what
     # `json.dumps(..., default=str)` would eventually stringify. Redact that
-    # string form now, before serialization can escape it.
-    return redact(str(value), secrets)
+    # string form now, before serialization can escape it. `str(value)` is
+    # caller-controlled code and may itself raise; that must not propagate.
+    try:
+        text = str(value)
+    except Exception:
+        return "[unrepresentable-value]"
+    return redact(text, secrets)
 
 
 class _RedactionFilter(logging.Filter):
@@ -90,33 +131,57 @@ class _RedactionFilter(logging.Filter):
         self._secrets = tuple(secret for secret in secrets if secret)
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if not self._secrets:
-            return True
-
-        record.msg = _redact_deep(record.msg, self._secrets)
-
-        if record.args:
-            if isinstance(record.args, dict):
-                record.args = {
-                    key: _redact_deep(value, self._secrets) for key, value in record.args.items()
+        # This runs in Logger.handle, outside the handleError protection
+        # that wraps Handler.emit. A record this filter cannot fully
+        # process (a pathological self-referential field, an object whose
+        # __str__ raises, anything unforeseen) must never abort the caller
+        # that logged it — logging must never be able to abort a run. Scrub
+        # whatever can be scrubbed and always let the record through.
+        try:
+            # Forbidden-field dropping is a name-based safety check, not a
+            # secret-value redaction — it applies even when no secrets are
+            # configured, so it must not sit behind the `self._secrets`
+            # guard below.
+            fields = getattr(record, "fields", None)
+            if fields is not None:
+                record.fields = {  # type: ignore[attr-defined]
+                    name: _redact_deep(value, self._secrets)
+                    for name, value in fields.items()
+                    if not _is_forbidden_field(name)
                 }
-            else:
-                record.args = tuple(_redact_deep(arg, self._secrets) for arg in record.args)
 
-        if hasattr(record, "event"):
-            record.event = _redact_deep(record.event, self._secrets)  # type: ignore[attr-defined]
+            if not self._secrets:
+                return True
 
-        fields = getattr(record, "fields", None)
-        if fields is not None:
-            record.fields = {  # type: ignore[attr-defined]
-                name: _redact_deep(value, self._secrets)
-                for name, value in fields.items()
-                if not _is_forbidden_field(name)
-            }
+            record.msg = _redact_deep(record.msg, self._secrets)
 
-        if record.exc_info:
-            traceback_text = "".join(traceback.format_exception(*record.exc_info))
-            record.exception = redact(traceback_text, self._secrets)  # type: ignore[attr-defined]
+            if record.args:
+                # Only str entries are redacted in place. A non-str arg
+                # (e.g. a Decimal paired with a %d specifier) must reach
+                # the eventual `record.getMessage()` % formatting
+                # untouched — stringifying it here would silently break
+                # %-style formatting for numeric specifiers. Its
+                # stringified form is still covered by the post-render
+                # redact() pass in the formatter.
+                if isinstance(record.args, dict):
+                    record.args = {
+                        key: redact(value, self._secrets) if isinstance(value, str) else value
+                        for key, value in record.args.items()
+                    }
+                else:
+                    record.args = tuple(
+                        redact(arg, self._secrets) if isinstance(arg, str) else arg
+                        for arg in record.args
+                    )
+
+            if hasattr(record, "event"):
+                record.event = _redact_deep(record.event, self._secrets)  # type: ignore[attr-defined]
+
+            if record.exc_info:
+                traceback_text = "".join(traceback.format_exception(*record.exc_info))
+                record.exception = redact(traceback_text, self._secrets)  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
         return True
 
@@ -169,6 +234,16 @@ def _harden_root_logger(secrets: Sequence[str | None]) -> None:
     consulted during that propagation walk — only a handler's own filters
     are — so redaction here has to live on the handler(s) root actually
     uses, not on root's logger-level filter list.
+
+    A global hook does exist that would run for every record on every
+    logger before any handler is consulted (`logging.setLogRecordFactory`,
+    invoked from `Logger.makeRecord`). We deliberately did not take that
+    on: it is process-global mutable state that must chain politely with
+    any other code that also sets a record factory, and it still runs
+    before `extra` is merged into the record, so this filter would still be
+    needed to redact `event`/`fields`. Handler-level attachment, covering
+    what `configure_logging` controls plus a one-time root hardening pass,
+    is the boundary this module takes responsibility for.
     """
     root = logging.getLogger()
     redaction_filter = _RedactionFilter(secrets)
