@@ -75,11 +75,13 @@ def _redact_deep(
     string, sidesteps that entirely. Dict keys go through the same
     `redact()` call as values, for the same reason.
 
-    This function must never raise and must never loop forever: it runs
-    inside a logging Filter, outside the `handleError` protection that
-    normally contains exceptions raised while emitting a record. A
-    self-referential structure or an object whose `__str__` raises must
-    degrade to a placeholder, not abort the caller that logged it.
+    This function must never loop forever, and degrades known hazards to a
+    placeholder rather than raising: a self-referential structure, an
+    over-deep subtree, a value whose `__str__` raises. It is NOT
+    raise-proof, though — `redact(str(key), ...)` on a mapping key is
+    unguarded, and any input this walk did not anticipate can propagate
+    out. `_RedactionFilter.filter` is the backstop for that: it catches and
+    fails closed, dropping the record rather than emitting it unscrubbed.
     """
     if _depth > _MAX_REDACT_DEPTH:
         return "[max-depth-exceeded]"
@@ -115,6 +117,33 @@ def _redact_deep(
     return redact(text, secrets)
 
 
+def _redact_arg(arg: Any, secrets: Sequence[str]) -> Any:
+    """Redact one `%`-style argument without breaking `%`-formatting.
+
+    A non-`str` arg must normally reach `record.getMessage()` untouched, or a
+    numeric specifier (`%d` against a `Decimal`) raises. But leaving it
+    untouched unconditionally means its secret is never scrubbed on the
+    record itself, and a handler with a formatter we do not own — every
+    pre-existing root handler, and the root safety net — renders it straight
+    out. So: stringify, and only substitute the redacted text when the
+    stringified form actually contained a secret. Secret-free args (the
+    overwhelming majority) keep their type and their specifier; a secret
+    bearing arg loses its type, which at worst breaks `%d` and costs the
+    line, never the secret.
+    """
+    if isinstance(arg, str):
+        return redact(arg, secrets)
+    try:
+        text = str(arg)
+    except Exception:
+        # Unrenderable: `getMessage()` will raise inside `Handler.emit`,
+        # where `handleError` drops the line. Nothing is serialized, so
+        # nothing leaks.
+        return arg
+    redacted = redact(text, secrets)
+    return arg if redacted == text else redacted
+
+
 class _RedactionFilter(logging.Filter):
     """Rewrites a LogRecord in place so redaction cannot be bypassed.
 
@@ -135,8 +164,18 @@ class _RedactionFilter(logging.Filter):
         # that wraps Handler.emit. A record this filter cannot fully
         # process (a pathological self-referential field, an object whose
         # __str__ raises, anything unforeseen) must never abort the caller
-        # that logged it — logging must never be able to abort a run. Scrub
-        # whatever can be scrubbed and always let the record through.
+        # that logged it — logging must never be able to abort a run.
+        #
+        # It must also never be emitted. If the scrub aborts partway, this
+        # filter cannot vouch for the record: the field rebuild below is
+        # all-or-nothing, so a raise leaves `record.fields` holding the
+        # caller's ORIGINAL values, forbidden field names and all. Falling
+        # through with `return True` would hand exactly that to the
+        # formatter. So we fail CLOSED: swallow the exception (the caller
+        # keeps running) and drop the line (the secret never lands on
+        # disk). Losing one log line is the pre-existing behaviour for any
+        # record that cannot be serialized; emitting it raw is the single
+        # failure this module exists to prevent.
         try:
             # Forbidden-field dropping is a name-based safety check, not a
             # secret-value redaction — it applies even when no secrets are
@@ -156,23 +195,13 @@ class _RedactionFilter(logging.Filter):
             record.msg = _redact_deep(record.msg, self._secrets)
 
             if record.args:
-                # Only str entries are redacted in place. A non-str arg
-                # (e.g. a Decimal paired with a %d specifier) must reach
-                # the eventual `record.getMessage()` % formatting
-                # untouched — stringifying it here would silently break
-                # %-style formatting for numeric specifiers. Its
-                # stringified form is still covered by the post-render
-                # redact() pass in the formatter.
                 if isinstance(record.args, dict):
                     record.args = {
-                        key: redact(value, self._secrets) if isinstance(value, str) else value
+                        key: _redact_arg(value, self._secrets)
                         for key, value in record.args.items()
                     }
                 else:
-                    record.args = tuple(
-                        redact(arg, self._secrets) if isinstance(arg, str) else arg
-                        for arg in record.args
-                    )
+                    record.args = tuple(_redact_arg(arg, self._secrets) for arg in record.args)
 
             if hasattr(record, "event"):
                 record.event = _redact_deep(record.event, self._secrets)  # type: ignore[attr-defined]
@@ -181,7 +210,7 @@ class _RedactionFilter(logging.Filter):
                 traceback_text = "".join(traceback.format_exception(*record.exc_info))
                 record.exception = redact(traceback_text, self._secrets)  # type: ignore[attr-defined]
         except Exception:
-            pass
+            return False
 
         return True
 
@@ -202,7 +231,20 @@ class _RedactingJsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         event_value = getattr(record, "event", None)
         if event_value is None:
-            event_value = record.getMessage()
+            # `record.args` entries that are not already `str` keep their
+            # original type when secret-free, so %-formatting keeps working
+            # for numeric specifiers (`%d` with a Decimal). Their string
+            # form is produced HERE, when getMessage() renders `msg % args`.
+            # Redact that rendered text now, while it is still a raw Python
+            # string — after json.dumps it may be escaped (non-ASCII, quote,
+            # backslash) and the post-render redact() pass below could no
+            # longer match it. This is the last redaction point before
+            # serialization for this axis.
+            event_value = redact(record.getMessage(), self._secrets)
+        elif isinstance(event_value, str):
+            # Already redacted by the filter; idempotent, and the only
+            # guarantee if this formatter is ever reached by another route.
+            event_value = redact(event_value, self._secrets)
 
         payload: dict[str, Any] = {
             "timestamp": datetime.fromtimestamp(record.created, UTC)
@@ -235,15 +277,18 @@ def _harden_root_logger(secrets: Sequence[str | None]) -> None:
     are — so redaction here has to live on the handler(s) root actually
     uses, not on root's logger-level filter list.
 
-    A global hook does exist that would run for every record on every
-    logger before any handler is consulted (`logging.setLogRecordFactory`,
-    invoked from `Logger.makeRecord`). We deliberately did not take that
-    on: it is process-global mutable state that must chain politely with
-    any other code that also sets a record factory, and it still runs
-    before `extra` is merged into the record, so this filter would still be
-    needed to redact `event`/`fields`. Handler-level attachment, covering
-    what `configure_logging` controls plus a one-time root hardening pass,
-    is the boundary this module takes responsibility for.
+    `logging.setLogRecordFactory()` is a supported global hook that would
+    genuinely cover this gap: `Logger.makeRecord` calls it for every record
+    on every logger, so it reaches any future handler on any logger, which
+    handler-level attachment cannot. We decline it on a deliberate
+    trade-off, not because it would not work — it is process-global mutable
+    state, a single slot this library would have to claim from the
+    application and chain politely with anyone else who sets a factory.
+    (It also runs before `extra` is merged onto the record, so the filter
+    would still be needed for `event`/`fields` regardless.) Handler-level
+    attachment, covering what `configure_logging` controls plus a one-time
+    root hardening pass, is the boundary this module takes responsibility
+    for; installing a process-global factory is the application's call.
     """
     root = logging.getLogger()
     redaction_filter = _RedactionFilter(secrets)

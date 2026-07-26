@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+from collections.abc import Iterator
 from decimal import Decimal
 from pathlib import Path
 
@@ -28,6 +29,32 @@ def logger(tmp_path: Path) -> logging.Logger:
 def read_events(tmp_path: Path) -> list[dict[str, object]]:
     text = (tmp_path / "logs" / "notable.jsonl").read_text(encoding="utf-8")
     return [json.loads(line) for line in text.splitlines() if line]
+
+
+def iter_strings(value: object) -> Iterator[str]:
+    """Yield every string reachable in a parsed JSON structure, keys included."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from iter_strings(key)
+            yield from iter_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from iter_strings(item)
+
+
+def assert_secret_absent(events: object, secret: str) -> None:
+    """Assert a secret is absent from the PARSED structure, not the file text.
+
+    A raw-text search is not evidence of absence: `json.dumps` defaults to
+    `ensure_ascii=True` and escapes quotes and backslashes, so a secret that
+    is fully recoverable via `json.loads` can be invisible to a text grep of
+    the same file. Every absence assertion in this module goes through here
+    (or checks a parsed value directly) for that reason.
+    """
+    for text in iter_strings(events):
+        assert secret not in text, f"secret recoverable from parsed log: {text!r}"
 
 
 def test_events_are_json_lines_with_the_required_envelope(
@@ -75,7 +102,9 @@ def test_a_secret_value_is_redacted_from_any_field(
 ) -> None:
     log_event(logger, "provider_attempt_failed", detail="key=or-secret-value rejected")
     event = read_events(tmp_path)[0]
-    assert "or-secret-value" not in json.dumps(event)
+    # Checked against the parsed structure, not `json.dumps(event)`: re-dumping
+    # re-escapes, which would hide the very leak this asserts against.
+    assert_secret_absent(event, "or-secret-value")
     assert "[redacted]" in event["detail"]
 
 
@@ -114,12 +143,11 @@ def test_secrets_with_non_ascii_or_quote_characters_are_redacted(tmp_path: Path)
     # from the raw file text can still be fully recoverable once the line
     # is parsed back with json.loads. Check the parsed value directly,
     # not a re-dumped (re-escaped) version of it.
+    # Walks every parsed string, KEYS included, rather than a re-dumped
+    # (re-escaped) copy — re-dumping would hide the same leak all over again.
     event = json.loads(raw_text.splitlines()[0])
-    assert non_ascii_secret not in event["detail"]
-    assert quote_secret not in event["detail"]
-    # Check the parsed KEY strings directly, not a re-dumped (re-escaped)
-    # copy of them — re-dumping would hide the same leak all over again.
-    assert all(non_ascii_secret not in key for key in event["context"])
+    assert_secret_absent(event, non_ascii_secret)
+    assert_secret_absent(event, quote_secret)
 
 
 def test_an_exception_traceback_is_captured_and_redacted(
@@ -134,6 +162,9 @@ def test_an_exception_traceback_is_captured_and_redacted(
     assert "brave-secret-value" not in raw_text
 
     event = json.loads(raw_text.splitlines()[0])
+    # The traceback is a serialized string; the raw-text check above is not
+    # sufficient on its own, so assert absence on the parsed value too.
+    assert_secret_absent(event, "brave-secret-value")
     assert "Traceback" in event["exception"]
     assert "ValueError" in event["exception"]
 
@@ -175,14 +206,94 @@ def test_a_field_whose_str_raises_does_not_abort_the_run(
 def test_percent_style_args_with_non_string_values_still_format(
     tmp_path: Path, logger: logging.Logger
 ) -> None:
-    # A non-str %-arg (e.g. routed through the root safety net from a
-    # third-party logger) must reach %-formatting untouched. Stringifying
-    # it during redaction would break a numeric specifier like %d.
+    # A secret-free non-str %-arg (e.g. routed through the root safety net
+    # from a third-party logger) must reach %-formatting with its type
+    # intact. Stringifying it during redaction would break a numeric
+    # specifier like %d.
     logger.info("took %d ms", Decimal("5"))
 
     raw_text = (tmp_path / "logs" / "notable.jsonl").read_text(encoding="utf-8")
     events = [json.loads(line) for line in raw_text.splitlines() if line]
     assert events[-1]["event"] == "took 5 ms"
+
+
+def test_non_string_percent_args_containing_secrets_are_redacted(tmp_path: Path) -> None:
+    # `record.args` entries that are not already `str` are deliberately left
+    # untouched by the filter so %-formatting for numeric specifiers keeps
+    # working. Their secret only materialises when `record.getMessage()`
+    # renders them, which happens in the formatter. That rendered message
+    # must be redacted BEFORE `json.dumps` sees it: afterwards the secret is
+    # escaped (non-ASCII, quotes, backslashes) and a plain `str.replace` on
+    # the rendered text can no longer match it — the secret then survives in
+    # the file, invisible to a raw-text grep but recoverable via json.loads.
+    non_ascii_secret = "sk-café-1234"
+
+    class _Response:
+        def __repr__(self) -> str:
+            return f"<Response token={non_ascii_secret}>"
+
+    created = configure_logging(
+        tmp_path / "logs" / "notable.jsonl",
+        LoggingConfig(max_bytes=8192, backup_count=2),
+        secrets=(non_ascii_secret,),
+    )
+    try:
+        created.info("upstream returned %s after %d ms", _Response(), 12)
+    finally:
+        for handler in list(created.handlers):
+            handler.close()
+            created.removeHandler(handler)
+
+    events = read_events(tmp_path)
+    assert_secret_absent(events, non_ascii_secret)
+    # The line must still be written and still be readable.
+    assert "[redacted]" in events[-1]["event"]
+    assert events[-1]["event"].endswith("after 12 ms")
+
+
+class _KeyWhoseStrRaises(str):
+    """A `str` subclass whose `str()` raises.
+
+    `json.dumps` accepts it verbatim as a mapping key (it is a `str`
+    instance), but `redact(str(key), ...)` inside the redaction walk raises
+    — so it is exactly the input that makes the filter's scrub abort partway
+    while the record itself remains perfectly serializable.
+    """
+
+    def __str__(self) -> str:
+        raise RuntimeError("boom")
+
+
+def test_a_record_the_filter_cannot_fully_scrub_is_dropped(tmp_path: Path) -> None:
+    # If the redaction walk raises partway, the filter cannot vouch for the
+    # record. It must fail CLOSED and drop the line, never fall through and
+    # hand the original, unscrubbed record to the formatter.
+    non_ascii_secret = "sk-café-1234"
+    created = configure_logging(
+        tmp_path / "logs" / "notable.jsonl",
+        LoggingConfig(max_bytes=8192, backup_count=2),
+        secrets=(non_ascii_secret,),
+    )
+    try:
+        log_event(
+            created,
+            "provider_attempt_failed",
+            context={_KeyWhoseStrRaises("kk"): "v"},
+            authorization="Bearer abc",
+            detail=f"key={non_ascii_secret} rejected",
+        )
+        # The run must continue: dropping one line is not aborting the caller.
+        log_event(created, "run_progress", run_id=1)
+    finally:
+        for handler in list(created.handlers):
+            handler.close()
+            created.removeHandler(handler)
+
+    events = read_events(tmp_path)
+    assert [event["event"] for event in events] == ["run_progress"]
+    assert_secret_absent(events, non_ascii_secret)
+    assert_secret_absent(events, "Bearer abc")
+    assert all("authorization" not in event for event in events)
 
 
 def test_forbidden_fields_are_dropped_even_with_no_secrets_configured(tmp_path: Path) -> None:
@@ -200,8 +311,7 @@ def test_forbidden_fields_are_dropped_even_with_no_secrets_configured(tmp_path: 
 
     event = read_events(tmp_path)[0]
     assert "authorization" not in event
-    raw_text = (tmp_path / "logs" / "notable.jsonl").read_text(encoding="utf-8")
-    assert "Bearer abc" not in raw_text
+    assert_secret_absent(event, "Bearer abc")
 
 
 def test_authorization_like_fields_are_dropped_entirely(
@@ -211,9 +321,8 @@ def test_authorization_like_fields_are_dropped_entirely(
     event = read_events(tmp_path)[0]
     assert "authorization" not in event
     assert "api_key" not in event
-    raw_text = (tmp_path / "logs" / "notable.jsonl").read_text(encoding="utf-8")
-    assert "Bearer abc" not in raw_text
-    assert "xyz" not in raw_text
+    assert_secret_absent(event, "Bearer abc")
+    assert_secret_absent(event, "xyz")
 
 
 def test_url_and_header_like_fields_are_dropped_entirely(
@@ -228,9 +337,8 @@ def test_url_and_header_like_fields_are_dropped_entirely(
     event = read_events(tmp_path)[0]
     assert "article_url" not in event
     assert "headers" not in event
-    raw_text = (tmp_path / "logs" / "notable.jsonl").read_text(encoding="utf-8")
-    assert "Some_Notable_Person" not in raw_text
-    assert "or-secret-value" not in raw_text
+    assert_secret_absent(event, "Some_Notable_Person")
+    assert_secret_absent(event, "or-secret-value")
 
 
 def test_a_second_handler_on_the_logger_also_receives_redacted_records(
@@ -255,7 +363,9 @@ def test_a_second_handler_on_the_logger_also_receives_redacted_records(
         second_handler.close()
         logger.removeHandler(second_handler)
 
-    assert "or-secret-value" not in stream.getvalue()
+    # That handler's output is itself JSON, so parse it before asserting
+    # absence rather than grepping the escaped text.
+    assert_secret_absent(json.loads(stream.getvalue()), "or-secret-value")
 
 
 def test_direct_logger_calls_and_child_loggers_stay_redacted(
@@ -265,9 +375,10 @@ def test_direct_logger_calls_and_child_loggers_stay_redacted(
     child = logging.getLogger(f"{logger.name}.provider")
     child.info("child message %s", "brave-secret-value")
 
-    raw_text = (tmp_path / "logs" / "notable.jsonl").read_text(encoding="utf-8")
-    assert "or-secret-value" not in raw_text
-    assert "brave-secret-value" not in raw_text
+    events = read_events(tmp_path)
+    assert len(events) == 2
+    assert_secret_absent(events, "or-secret-value")
+    assert_secret_absent(events, "brave-secret-value")
 
 
 def test_third_party_loggers_reaching_root_are_redacted(tmp_path: Path) -> None:
@@ -298,7 +409,55 @@ def test_third_party_loggers_reaching_root_are_redacted(tmp_path: Path) -> None:
             handler.close()
             notable_logger.removeHandler(handler)
 
+    # This handler renders with the stdlib default formatter, so its stream
+    # holds the final plain-text form with no serialization/escaping layer
+    # between it and the reader. Here — unlike the JSON paths above — the
+    # raw text IS the parsed form, so a text search is a valid absence check.
     assert "brave-secret-value" not in stream.getvalue()
+
+
+def test_non_string_percent_args_are_redacted_on_the_root_path_too(tmp_path: Path) -> None:
+    # Handlers we do not own (every pre-existing root handler, and the root
+    # safety net) render with their own formatter, so the rendered-message
+    # redaction inside _RedactingJsonFormatter cannot protect them. A non-str
+    # arg carrying a secret must therefore be scrubbed on the RECORD itself.
+    secret = "sk-café-1234"
+
+    class _Response:
+        def __repr__(self) -> str:
+            return f"<Response token={secret}>"
+
+    root = logging.getLogger()
+    original_handlers = list(root.handlers)
+    original_level = root.level
+    stream = io.StringIO()
+    pre_existing = logging.StreamHandler(stream)
+    root.addHandler(pre_existing)
+    root.setLevel(logging.WARNING)
+    notable_logger = logging.getLogger(EVENT_LOGGER_NAME)
+
+    try:
+        configure_logging(
+            tmp_path / "logs" / "notable.jsonl",
+            LoggingConfig(max_bytes=2048, backup_count=2),
+            secrets=(secret,),
+        )
+        third_party = logging.getLogger("thirdparty.notable_test_task14_args")
+        third_party.propagate = True
+        third_party.warning("upstream returned %s", _Response())
+    finally:
+        pre_existing.close()
+        root.removeHandler(pre_existing)
+        root.handlers[:] = original_handlers
+        root.setLevel(original_level)
+        for handler in list(notable_logger.handlers):
+            handler.close()
+            notable_logger.removeHandler(handler)
+
+    # Plain-text handler output: raw text is the final rendered form here.
+    rendered = stream.getvalue()
+    assert secret not in rendered
+    assert "[redacted]" in rendered
 
 
 def test_rotation_keeps_the_configured_number_of_files(
