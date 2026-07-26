@@ -159,17 +159,41 @@ def test_an_unwritable_digest_root_raises_a_typed_error(tmp_path: Path) -> None:
 def test_no_partial_file_remains_after_a_failed_write(tmp_path: Path, monkeypatch) -> None:
     import os
 
-    # The dated digest -- the authoritative artifact -- is now created with
-    # an exclusive, collision-refusing primitive (os.link from a temp file),
-    # not os.replace. Failing that primitive is the discriminating fault for
-    # "no partial file remains" on the artifact that matters.
-    def failing_link(src: object, dst: object) -> None:
-        raise OSError("link failed")
+    # The dated digest -- the authoritative artifact -- claims its final path
+    # with an exclusive create and then moves the fully written temp file over
+    # that claim. Failing the move is the discriminating fault: neither the
+    # temp file nor the empty claim may survive it, or the claim would block
+    # that date forever.
+    def failing_replace(src: object, dst: object) -> None:
+        raise OSError("replace failed")
 
-    monkeypatch.setattr(os, "link", failing_link)
+    monkeypatch.setattr(os, "replace", failing_replace)
     with pytest.raises(DigestWriteError):
         write_digest(tmp_path, report(), local_date="2026-07-25", config=DigestConfig())
     assert list(tmp_path.iterdir()) == []
+
+
+def test_the_dated_digest_does_not_require_hard_link_support(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A data root on exFAT, SMB/CIFS or some container bind mounts has no
+    hard links: `os.link` there raises `OSError(EOPNOTSUPP)`. A writer that
+    depends on it makes EVERY run fail permanently, with a message naming
+    neither hard links nor the fix, the moment an operator points
+    `paths.root` at an external drive. Nothing on the digest path may call it.
+    """
+    import errno
+    import os
+
+    def unsupported_link(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EOPNOTSUPP, "Operation not supported")
+
+    monkeypatch.setattr(os, "link", unsupported_link)
+    record = write_digest(
+        tmp_path, report(), local_date="2026-07-25", config=DigestConfig()
+    )
+    assert record.path.read_text(encoding="utf-8") == record.markdown
+    assert (tmp_path / "latest.md").read_text(encoding="utf-8") == record.markdown
 
 
 def test_a_dated_digest_collision_is_refused_and_does_not_overwrite(tmp_path: Path) -> None:
@@ -248,10 +272,12 @@ def test_keyboard_interrupt_during_the_dated_write_is_not_swallowed(
     """
     import os
 
-    def interrupting_link(src: object, dst: object) -> None:
+    def interrupting_replace(src: object, dst: object) -> None:
         raise KeyboardInterrupt()
 
-    monkeypatch.setattr(os, "link", interrupting_link)
+    # The dated digest is written first, so this interrupts that write. Both
+    # the temp file and the exclusive claim on the final path must be gone.
+    monkeypatch.setattr(os, "replace", interrupting_replace)
     with pytest.raises(KeyboardInterrupt):
         write_digest(tmp_path, report(), local_date="2026-07-25", config=DigestConfig())
     assert list(tmp_path.iterdir()) == []
@@ -268,10 +294,16 @@ def test_a_failed_latest_copy_does_not_orphan_the_already_durable_dated_digest(
     """
     import os
 
-    def failing_replace(src: object, dst: object) -> None:
-        raise OSError("replace failed")
+    real_replace = os.replace
 
-    monkeypatch.setattr(os, "replace", failing_replace)
+    def failing_latest_replace(src: object, dst: object) -> None:
+        # Both writes now move a temp file into place, so fail only the
+        # convenience copy; the dated digest must still land durably.
+        if Path(os.fspath(dst)).name == "latest.md":
+            raise OSError("replace failed")
+        real_replace(src, dst)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "replace", failing_latest_replace)
     record = write_digest(tmp_path, report(), local_date="2026-07-25", config=DigestConfig())
     assert record.path.is_file()
     assert record.path.read_text(encoding="utf-8") == record.markdown

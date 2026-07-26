@@ -89,7 +89,7 @@ def render_digest(report: RunReport, *, local_date: str) -> str:
 def _fsync_directory(directory: Path) -> None:
     """Fsync the directory entry itself.
 
-    os.replace/os.link are atomic renames, not durability guarantees: fsync
+    os.replace is an atomic rename, not a durability guarantee: fsync
     on the file's own contents says nothing about whether the directory
     entry pointing at it survives a crash. Without this, a power loss
     between write_digest returning and the next filesystem checkpoint can
@@ -106,14 +106,29 @@ def _fsync_directory(directory: Path) -> None:
 def _atomic_write(target: Path, markdown: str, *, exclusive: bool) -> None:
     """Write `markdown` to `target` durably.
 
-    `exclusive=True` is for the dated digest, which is documented immutable:
-    the temp file is linked into place with `os.link`, which raises
-    `FileExistsError` if `target` already exists rather than silently
-    replacing it. `exclusive=False` is for `latest.md`, which is a
-    convenience copy meant to be replaced every run.
+    `exclusive=True` is for the dated digest, which is documented immutable.
+    The final path is first CLAIMED with `os.open(O_CREAT | O_EXCL |
+    O_WRONLY)`, which raises `FileExistsError` if `target` already exists
+    rather than silently replacing it; the fully written temp file is then
+    `os.replace`d over our own zero-byte claim, so the content still appears
+    at the final path in one atomic step. `exclusive=False` is for
+    `latest.md`, which is a convenience copy meant to be replaced every run.
+
+    Hard links are deliberately NOT used for the claim. `os.link` raises
+    `OSError(EOPNOTSUPP)` on exFAT, on many SMB/CIFS mounts and on some
+    container bind mounts, which would make every run on such a data root
+    fail permanently with a message naming neither hard links nor the fix.
+    `O_CREAT | O_EXCL` gives the same atomic create-or-refuse semantics with
+    no filesystem feature beyond ordinary file creation.
     """
     handle, temporary_name = tempfile.mkstemp(dir=target.parent, suffix=".tmp")
     temporary = Path(temporary_name)
+    # True only while `target` exists solely as OUR empty claim. Cleared the
+    # moment the replace lands, so a later failure (an fsync of the directory)
+    # leaves the complete digest in place exactly as the previous `os.link`
+    # implementation did, while a failure between the claim and the replace
+    # cannot leave a zero-byte file permanently blocking that date.
+    claimed = False
     try:
         with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(markdown)
@@ -130,17 +145,20 @@ def _atomic_write(target: Path, markdown: str, *, exclusive: bool) -> None:
 
         if exclusive:
             try:
-                os.link(temporary, target)
+                claim = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             except FileExistsError as error:
                 raise DigestWriteError(
                     f"{target} already exists and is immutable"
                 ) from error
-            temporary.unlink(missing_ok=True)
-        else:
-            os.replace(temporary, target)
+            os.close(claim)
+            claimed = True
+        os.replace(temporary, target)
+        claimed = False
         _fsync_directory(target.parent)
     except Exception as error:
         temporary.unlink(missing_ok=True)
+        if claimed:
+            target.unlink(missing_ok=True)
         if isinstance(error, DigestWriteError):
             raise
         raise DigestWriteError(f"could not write {target}: {error}") from error
@@ -149,6 +167,8 @@ def _atomic_write(target: Path, markdown: str, *, exclusive: bool) -> None:
         # clean up the temp file but let the interrupt keep its identity
         # rather than reporting it as a DigestWriteError.
         temporary.unlink(missing_ok=True)
+        if claimed:
+            target.unlink(missing_ok=True)
         raise
 
 
