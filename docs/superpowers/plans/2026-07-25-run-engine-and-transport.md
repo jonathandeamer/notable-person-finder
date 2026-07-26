@@ -6297,12 +6297,12 @@ def test_a_complete_empty_run_is_unambiguously_successful() -> None:
     assert "fail" not in markdown.lower()
 
 
-def test_a_partial_run_warns_prominently_and_names_the_audit_command() -> None:
+def test_a_partial_run_warns_prominently_and_names_a_command_that_exists_today() -> None:
     counters = RunCounters(2, 1, 3, 0, 0, 0, 5)
     markdown = render_digest(report(RunState.PARTIAL, counters=counters), local_date="2026-07-25")
     warning_line = markdown.splitlines()[2]
     assert "PARTIAL" in warning_line
-    assert "notable audit run 42" in markdown
+    assert "notable status" in warning_line
 
 
 def test_a_failed_run_says_so_prominently() -> None:
@@ -6448,7 +6448,7 @@ def render_digest(report: RunReport, *, local_date: str) -> str:
 
     warning = _PROMINENT_STATES.get(report.state)
     if warning is not None:
-        lines.append(f"> **{warning}** See `notable audit run {report.run_id}`.")
+        lines.append(f"> **{warning}** Run `notable status` for details.")
     else:
         lines.append(f"> Run {report.human_id} completed normally.")
     lines.append("")

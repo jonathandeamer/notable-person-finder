@@ -35,7 +35,7 @@ def render_digest(report: RunReport, *, local_date: str) -> str:
 
     warning = _PROMINENT_STATES.get(report.state)
     if warning is not None:
-        lines.append(f"> **{warning}** See `notable audit run {report.run_id}`.")
+        lines.append(f"> **{warning}** Run `notable status` for details.")
     else:
         lines.append(f"> Run {report.human_id} completed normally.")
     lines.append("")
