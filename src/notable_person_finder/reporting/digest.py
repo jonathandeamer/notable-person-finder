@@ -126,8 +126,17 @@ def _atomic_write(target: Path, markdown: str, *, exclusive: bool) -> None:
     # True only while `target` exists solely as OUR empty claim. Cleared the
     # moment the replace lands, so a later failure (an fsync of the directory)
     # leaves the complete digest in place exactly as the previous `os.link`
-    # implementation did, while a failure between the claim and the replace
-    # cannot leave a zero-byte file permanently blocking that date.
+    # implementation did.
+    #
+    # An exception or an interrupt between the claim and the replace is
+    # unwound by the handlers below, which remove the empty claim. A HARD KILL
+    # in that window is not: SIGKILL, the OOM killer or power loss can leave a
+    # zero-byte file at the dated path. `os.link` could not, because it was a
+    # single atomic step. That regression is accepted deliberately -- POSIX has
+    # no portable no-clobber rename (`RENAME_NOREPLACE` is Linux-only), the
+    # filename is scoped to one run so a stranded claim blocks only the dead
+    # run's own path and nothing ever rewrites it, and it is far narrower than
+    # the total exFAT/SMB failure `os.link` caused.
     claimed = False
     try:
         with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:

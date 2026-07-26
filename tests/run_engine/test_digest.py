@@ -283,6 +283,37 @@ def test_keyboard_interrupt_during_the_dated_write_is_not_swallowed(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_a_failed_directory_fsync_does_not_delete_the_already_durable_dated_digest(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The exclusive claim on the final path is OURS to delete only until the
+    replace lands; after it, that path holds the complete digest. A directory
+    fsync can still fail after the replace -- EIO on a dying volume, ENOSPC on
+    a full one -- and it raises into the same handler. If the writer still
+    believed it held a bare claim there, the cleanup would delete the finished,
+    already-durable dated digest: the orphaning that
+    test_a_failed_latest_copy_does_not_orphan_the_already_durable_dated_digest
+    forbids, on the more important artifact.
+    """
+    import errno
+
+    from notable_person_finder.reporting import digest as digest_module
+
+    expected = render_digest(report(), local_date="2026-07-25")
+
+    def failing_fsync_directory(directory: Path) -> None:
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(digest_module, "_fsync_directory", failing_fsync_directory)
+    with pytest.raises(DigestWriteError):
+        write_digest(tmp_path, report(), local_date="2026-07-25", config=DigestConfig())
+
+    dated = tmp_path / "2026-07-25-run-42.md"
+    assert dated.is_file(), "the fsync failure deleted the already-durable dated digest"
+    assert dated.read_text(encoding="utf-8") == expected
+    assert [path.name for path in tmp_path.iterdir()] == [dated.name]
+
+
 def test_a_failed_latest_copy_does_not_orphan_the_already_durable_dated_digest(
     tmp_path: Path, monkeypatch
 ) -> None:
