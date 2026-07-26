@@ -88,7 +88,10 @@ def test_a_missing_secret_names_the_variable_but_not_its_value(tmp_path: Path) -
     )
     assert completed.returncode == 1
     assert "TEST_OPENROUTER" in completed.stderr
-    assert "or-secret-value" not in completed.stderr
+    # No value-absence assertion belongs here: this process never held
+    # `or-secret-value`, so such an assertion could not fail whatever the code
+    # did. `test_a_secret_that_is_present_is_not_echoed_when_another_is_missing`
+    # owns that property, in a process that genuinely holds the value.
 
 
 def test_no_secret_value_appears_in_output_or_digest(
@@ -113,7 +116,14 @@ def test_an_overlapping_run_fails_immediately_without_creating_a_run(
         portalocker.lock(handle, portalocker.LOCK_EX | portalocker.LOCK_NB)
         completed = run_notable(config_file, "run")
     assert completed.returncode == 1
-    assert "lock" in completed.stderr.lower()
+    # Assert the contention message itself. "lock" alone would be satisfied by
+    # the substring inside the path `notable.lock`, so it would still pass if
+    # the message stopped explaining that another process holds the lock.
+    # The owner detail is deliberately not asserted: lock file contents are
+    # diagnostic only and never determine ownership, so this test holds the
+    # lock without writing them.
+    assert "another mutation is using" in completed.stderr
+    assert str(lock_file) in completed.stderr
 
 
 def test_usage_error_returns_sixty_four(config_file: Path) -> None:
@@ -336,6 +346,59 @@ def test_a_configuration_error_does_not_echo_secret_values(tmp_path: Path) -> No
     combined = completed.stdout + completed.stderr
     assert "or-secret-value" not in combined
     assert "brave-secret-value" not in combined
+
+
+def test_the_digest_is_dated_from_the_same_instant_as_the_window(
+    config_file: Path, tmp_path: Path
+) -> None:
+    """One clock reading dates both the window and the digest file name.
+
+    The clock crosses local midnight between its first and second observation.
+    An implementation that reads it once per use files the digest under the
+    following day while the run's own window belongs to the previous one.
+    """
+    script = textwrap.dedent(
+        f"""
+        import sys
+        from datetime import UTC, datetime
+        from notable_person_finder.cli import main as cli
+        from notable_person_finder.runs.clock import SystemClock
+
+        # In Europe/Paris (UTC+1 in January) the first instant is
+        # 2026-01-01 23:59:59.9 local and every later one is 2026-01-02.
+        first = [datetime(2026, 1, 1, 22, 59, 59, 900000, tzinfo=UTC)]
+        later = datetime(2026, 1, 1, 23, 0, 0, 100000, tzinfo=UTC)
+
+        SystemClock.now = lambda self: first.pop() if first else later
+        sys.exit(cli.main(["--config", {str(config_file)!r}, "run"]))
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env={**os.environ, **ENVIRONMENT},
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr
+    digests = tmp_path / "portable" / "data" / "digests"
+    assert (digests / "2026-01-01-run-1.md").is_file()
+    assert not (digests / "2026-01-02-run-1.md").exists()
+
+
+def test_status_against_an_unmigrated_database_is_actionable(
+    config_file: Path, tmp_path: Path
+) -> None:
+    """A half-migrated data root must not read as an empty, healthy one."""
+    from notable_person_finder.db.connection import connect_database
+
+    connect_database(tmp_path / "portable" / "data" / "notable.sqlite3").close()
+
+    completed = run_notable(config_file, "status")
+    assert completed.returncode == 1
+    assert "no such table" not in completed.stderr
+    assert "notable db migrate" in completed.stderr
+    assert "Traceback" not in completed.stderr
 
 
 def test_verbose_names_the_digest_without_revealing_secrets(

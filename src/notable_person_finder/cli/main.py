@@ -110,10 +110,11 @@ def command_db_migrate(config_file: Path | None) -> int:
     return EXIT_OK
 
 
-def _observation_window(loaded: ResolvedConfig, now: datetime) -> tuple[str, str]:
+def _window_start(loaded: ResolvedConfig, now: datetime) -> str:
+    """The most recent local midnight, as the UTC text the run table stores."""
     local = now.astimezone(ZoneInfo(loaded.main.timezone))
     start = local.replace(hour=0, minute=0, second=0, microsecond=0)
-    return utc_timestamp(start), utc_timestamp(now)
+    return utc_timestamp(start)
 
 
 def command_run(config_file: Path | None, *, verbose: bool) -> int:
@@ -133,8 +134,13 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
         try:
             apply_migrations(connection, loaded.paths.database, loaded.paths.backups)
 
+            # One observation of the clock dates both the observation window
+            # and the digest. Reading the clock twice would let a run that
+            # starts a few milliseconds before local midnight file its digest
+            # under the following day, and the digest file name is immutable.
             now = clock.now()
-            window_start, _ = _observation_window(loaded, now)
+            window_start = _window_start(loaded, now)
+            local_date = now.astimezone(ZoneInfo(loaded.main.timezone)).date().isoformat()
             transport = build_transport(
                 loaded.main.transport,
                 version=__version__,
@@ -143,9 +149,6 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
             )
             # The pacing gate is built by the first adapter milestone that has
             # a provider to pace; nothing in this milestone makes requests.
-            local_date = (
-                clock.now().astimezone(ZoneInfo(loaded.main.timezone)).date().isoformat()
-            )
             written: DigestRecord | None = None
 
             def report_run(report: RunReport) -> ReportArtifact:
@@ -186,7 +189,13 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
             finally:
                 transport.close()
 
-            assert written is not None
+            if written is None:
+                # The engine always calls the reporter before returning, so
+                # this is unreachable today. It is an explicit raise rather
+                # than an assert because `python -O` strips asserts, and the
+                # stripped version would fail with an AttributeError on the
+                # next line instead of a handled reporting failure.
+                raise DigestWriteError("the run finished without writing a digest")
 
             log_event(
                 logger,
@@ -205,6 +214,15 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
             connection.close()
 
 
+def _run_schema_present(connection: sqlite3.Connection) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run'"
+        ).fetchone()
+        is not None
+    )
+
+
 def command_status(config_file: Path | None) -> int:
     loaded = load_config(config_file, require_secrets=False)
     if not loaded.paths.database.exists():
@@ -213,6 +231,16 @@ def command_status(config_file: Path | None) -> int:
 
     connection = connect_database(loaded.paths.database, readonly=True)
     try:
+        if not _run_schema_present(connection):
+            # Reachable when a migration failed partway: the file exists but
+            # the run tables do not. Reporting "no run yet" would read as an
+            # empty but healthy data root, so name the fault and the fix.
+            print(
+                f"{loaded.paths.database} exists but has no run schema; "
+                "apply migrations with 'notable db migrate'",
+                file=sys.stderr,
+            )
+            return EXIT_FAILED
         record = repository.latest_run(connection)
         if record is None:
             print("no run has been recorded yet")

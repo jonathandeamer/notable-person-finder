@@ -6660,7 +6660,10 @@ def test_a_missing_secret_names_the_variable_but_not_its_value(tmp_path: Path) -
     )
     assert completed.returncode == 1
     assert "TEST_OPENROUTER" in completed.stderr
-    assert "or-secret-value" not in completed.stderr
+    # No value-absence assertion belongs here: this process never held
+    # `or-secret-value`, so such an assertion could not fail whatever the code
+    # did. `test_a_secret_that_is_present_is_not_echoed_when_another_is_missing`
+    # owns that property, in a process that genuinely holds the value.
 
 
 def test_no_secret_value_appears_in_output_or_digest(
@@ -6685,7 +6688,14 @@ def test_an_overlapping_run_fails_immediately_without_creating_a_run(
         portalocker.lock(handle, portalocker.LOCK_EX | portalocker.LOCK_NB)
         completed = run_notable(config_file, "run")
     assert completed.returncode == 1
-    assert "lock" in completed.stderr.lower()
+    # Assert the contention message itself. "lock" alone would be satisfied by
+    # the substring inside the path `notable.lock`, so it would still pass if
+    # the message stopped explaining that another process holds the lock. The
+    # owner detail is deliberately not asserted: lock file contents are
+    # diagnostic only and never determine ownership, so this test holds the
+    # lock without writing them.
+    assert "another mutation is using" in completed.stderr
+    assert str(lock_file) in completed.stderr
 
 
 def test_usage_error_returns_sixty_four(config_file: Path) -> None:
