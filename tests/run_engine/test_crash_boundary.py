@@ -80,12 +80,32 @@ def durable_state(database: Path) -> dict[str, list[tuple[object, ...]]]:
     Deliberately reopens the file rather than reusing the connection that
     "crashed", so the result is what the last COMMITTED transaction left on
     disk and nothing that only exists in a live connection's memory.
+
+    Every column of every row is compared, not a hand-picked projection: a
+    projection would silently exempt whatever it left out -- reservations,
+    actual cost, request fingerprints, digest paths -- from the claim that two
+    crashes leave the same state.
     """
     inspect = connect_database(database, readonly=True)
     try:
         return {
+            table: [
+                tuple(row)
+                for row in inspect.execute(f"SELECT * FROM {table} ORDER BY id")
+            ]
+            for table in ("run", "work_item", "attempt", "run_transition")
+        }
+    finally:
+        inspect.close()
+
+
+def shape(database: Path) -> dict[str, list[tuple[object, ...]]]:
+    """The few columns a human reads when describing an on-disk crash shape."""
+    inspect = connect_database(database, readonly=True)
+    try:
+        return {
             "run": [
-                (row["id"], row["state"], row["started_at"], row["finished_at"])
+                (row["id"], row["state"], row["finished_at"])
                 for row in inspect.execute("SELECT * FROM run ORDER BY id")
             ],
             "work_item": [
@@ -93,20 +113,8 @@ def durable_state(database: Path) -> dict[str, list[tuple[object, ...]]]:
                 for row in inspect.execute("SELECT * FROM work_item ORDER BY id")
             ],
             "attempt": [
-                (
-                    row["id"],
-                    row["run_id"],
-                    row["ordinal"],
-                    row["outcome"],
-                    row["finished_at"],
-                    row["started_at"],
-                )
+                (row["id"], row["run_id"], row["ordinal"], row["outcome"])
                 for row in inspect.execute("SELECT * FROM attempt ORDER BY id")
-            ],
-            "run_transition": [
-                (row["run_id"], row["state"]) for row in inspect.execute(
-                    "SELECT * FROM run_transition ORDER BY id"
-                )
             ],
         }
     finally:
@@ -133,9 +141,41 @@ def crash_in_flight(database: Path) -> None:
     connection.close()
 
 
-# Executed in a real child process that kills itself with SIGKILL from inside
-# the provider call. Nothing unwinds: no `finally`, no `__del__`, no implicit
-# rollback, no buffered write flushed on the way out.
+def crash_before_settle(database: Path) -> None:
+    """Die between the two transactions of step 3, in this process.
+
+    The provider answered and `finish_attempt` committed the attempt as
+    `succeeded`; the process then dies before `complete_work` commits the work
+    item's outcome. Patching `repository.complete_work` is the seam because the
+    engine resolves it as a module attribute at call time, so the substitution
+    is exactly the call the engine would have made.
+    """
+    connection = connect_database(database)
+
+    def succeeding(work_item: WorkItem, ordinal: int) -> TaskOutcome:
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    def dying(*args: object, **kwargs: object) -> None:
+        raise SimulatedCrash
+
+    handler = TaskHandler(
+        task_type="probe", provider="probe_provider", operation="probe_call", execute=succeeding
+    )
+    original = repository.complete_work
+    repository.complete_work = dying  # type: ignore[assignment]
+    try:
+        with pytest.raises(SimulatedCrash):
+            engine_for(connection).execute({handler.task_type: handler})
+    finally:
+        repository.complete_work = original  # type: ignore[assignment]
+    assert connection.in_transaction is False
+    connection.close()
+
+
+# Executed in a real child process that kills itself with SIGKILL. `sys.argv[3]`
+# selects the kill point: "provider" kills inside the external call, "settle"
+# kills between the two transactions of step 3. Nothing unwinds: no `finally`,
+# no `__del__`, no implicit rollback, no buffered write flushed on the way out.
 _SIGKILL_CHILD = '''
 import os
 import signal
@@ -144,6 +184,7 @@ from pathlib import Path
 
 from notable_person_finder.config.models import RetryConfig
 from notable_person_finder.db.connection import connect_database
+from notable_person_finder.runs import repository
 from notable_person_finder.runs.clock import FakeClock
 from notable_person_finder.runs.engine import (
     ReportArtifact,
@@ -151,18 +192,33 @@ from notable_person_finder.runs.engine import (
     TaskHandler,
     TaskOutcome,
 )
+from notable_person_finder.runs.models import WorkState
 from notable_person_finder.runs.retry import RetryCoordinator
 from notable_person_finder.runs.scheduler import BoundedScheduler
 
 database = Path(sys.argv[1])
 marker = Path(sys.argv[2])
+kill_point = sys.argv[3] if len(sys.argv) > 3 else "provider"
 connection = connect_database(database)
+
+
+def die():
+    os.kill(os.getpid(), signal.SIGKILL)
+    raise AssertionError("SIGKILL did not end the process")
 
 
 def execute(work_item, ordinal):
     marker.write_text(str(ordinal), encoding="utf-8")
-    os.kill(os.getpid(), signal.SIGKILL)
-    raise AssertionError("SIGKILL did not end the process")
+    if kill_point == "provider":
+        die()
+    return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+
+if kill_point == "settle":
+    def _dying_complete_work(*args, **kwargs):
+        die()
+
+    repository.complete_work = _dying_complete_work
 
 
 handler = TaskHandler(
@@ -187,18 +243,24 @@ RunEngine(
 '''
 
 
-def sigkill_in_flight(database: Path, workspace: Path) -> None:
-    """Run one work item and SIGKILL the process inside the provider call."""
-    script = workspace / "sigkill_child.py"
+def sigkill_at(database: Path, workspace: Path, kill_point: str) -> None:
+    """Run one work item and SIGKILL the process at `kill_point`."""
+    script = workspace / f"sigkill_child_{kill_point}.py"
     script.write_text(_SIGKILL_CHILD, encoding="utf-8")
-    marker = workspace / "provider-called"
+    marker = workspace / f"provider-called-{kill_point}"
     finished = subprocess.run(
-        [sys.executable, str(script), str(database), str(marker)],
+        [sys.executable, str(script), str(database), str(marker), kill_point],
         capture_output=True,
         timeout=120,
     )
     assert finished.returncode == -signal.SIGKILL, finished.stderr.decode()
+    # The kill really happened after the provider was called, not before.
     assert marker.read_text(encoding="utf-8") == "1"
+
+
+def sigkill_in_flight(database: Path, workspace: Path) -> None:
+    """Run one work item and SIGKILL the process inside the provider call."""
+    sigkill_at(database, workspace, "provider")
 
 
 def test_a_crash_after_the_provider_accepted_leaves_an_in_flight_attempt(
@@ -265,9 +327,15 @@ def test_a_real_sigkill_leaves_exactly_what_the_simulated_crash_leaves(
     sigkill_in_flight(killed, killed_root)
 
     assert durable_state(simulated) == durable_state(killed)
-    # And that shared state is the in-flight one, not an orderly shutdown.
-    assert durable_state(killed)["run"] == [(1, RunState.RUNNING, NOW, None)]
-    assert durable_state(killed)["attempt"] == [(1, 1, 1, None, None, NOW)]
+    # Equality of two empty dumps would prove nothing.
+    assert all(rows for rows in durable_state(killed).values())
+    # And that shared state is the in-flight one, not an orderly shutdown: two
+    # clean runs could never satisfy these.
+    assert shape(killed) == {
+        "run": [(1, RunState.RUNNING, None)],
+        "work_item": [(1, WorkState.RUNNING, 1, None)],
+        "attempt": [(1, 1, 1, None)],
+    }
 
 
 def test_the_next_run_after_a_real_sigkill_recovers_the_work(tmp_path: Path) -> None:
@@ -471,5 +539,109 @@ def test_abandoned_work_returns_to_pending_not_to_deferred(database: Path) -> No
             "AND claimed_by_run_id IS NULL"
         ).fetchone()["n"]
         == 0
+    )
+    connection.close()
+
+
+def test_a_crash_between_the_two_step_three_transactions_leaves_a_settled_attempt(
+    tmp_path: Path,
+) -> None:
+    """Step 3 is two transactions, and the gap between them is a second window.
+
+    `finish_attempt` and `complete_work` each open their own `BEGIN IMMEDIATE`.
+    A crash between them commits the attempt as `succeeded` while leaving the
+    work item `running` and claimed. The sweep only touches attempts whose
+    `outcome IS NULL`, so this attempt is never marked `interrupted`: the
+    duplicate call the next run makes is traceable ONLY through the predecessor
+    run's `interrupted` state, never through the attempt rows.
+
+    If this test ever fails because step 3 became one transaction, that is a
+    fix, not a regression -- but `docs/architecture/at-least-once-execution.md`
+    must be corrected in the same change, because this test is what makes that
+    document's "what a crash looks like on disk" section true.
+    """
+    simulated_root = tmp_path / "simulated"
+    simulated_root.mkdir()
+    simulated = make_database(simulated_root)
+    connection = connect_database(simulated)
+    schedule(connection)
+    connection.close()
+    crash_before_settle(simulated)
+
+    killed_root = tmp_path / "killed"
+    killed_root.mkdir()
+    killed = make_database(killed_root)
+    connection = connect_database(killed)
+    schedule(connection)
+    connection.close()
+    sigkill_at(killed, killed_root, "settle")
+
+    # Real process death and the in-process simulation agree here too.
+    assert durable_state(simulated) == durable_state(killed)
+    assert all(rows for rows in durable_state(killed).values())
+    assert shape(killed) == {
+        "run": [(1, RunState.RUNNING, None)],
+        # Settled attempt, UNSETTLED work item: the shape that distinguishes
+        # this window from the in-flight one.
+        "work_item": [(1, WorkState.RUNNING, 1, None)],
+        "attempt": [(1, 1, 1, "succeeded")],
+    }
+
+
+def test_the_next_run_repeats_a_call_whose_attempt_was_already_settled(
+    tmp_path: Path,
+) -> None:
+    """The recovery is correct, and the duplicate is invisible in `attempt`."""
+    database = make_database(tmp_path)
+    connection = connect_database(database)
+    schedule(connection)
+    connection.close()
+    sigkill_at(database, tmp_path, "settle")
+
+    connection = connect_database(database)
+    calls: list[int] = []
+
+    def succeeding(work_item: WorkItem, ordinal: int) -> TaskOutcome:
+        calls.append(ordinal)
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    handler = TaskHandler(
+        task_type="probe", provider="probe_provider", operation="probe_call", execute=succeeding
+    )
+    report = engine_for(connection).execute({handler.task_type: handler})
+
+    # At-least-once holds: no work is lost, and the sweep did recover the item.
+    assert calls == [2]
+    assert report.interrupted_runs == (1,)
+    assert report.state is RunState.COMPLETE
+    assert (
+        connection.execute("SELECT state FROM work_item").fetchone()["state"]
+        == WorkState.SUCCEEDED
+    )
+
+    # But nothing in the attempt rows marks the first call as lost. Two
+    # succeeded attempts against the same request fingerprint, and no
+    # 'interrupted' row anywhere -- this is the honest, and more dangerous,
+    # difference from the in-flight window.
+    attempts = list(
+        connection.execute(
+            "SELECT run_id, ordinal, outcome, provider, operation, request_fingerprint "
+            "FROM attempt ORDER BY id"
+        )
+    )
+    assert [row["outcome"] for row in attempts] == ["succeeded", "succeeded"]
+    assert [row["run_id"] for row in attempts] == [1, 2]
+    assert len({row["request_fingerprint"] for row in attempts}) == 1
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) AS n FROM attempt WHERE outcome = 'interrupted'"
+        ).fetchone()["n"]
+        == 0
+    )
+
+    # The only durable trace of the duplicate is the predecessor run's state.
+    assert (
+        connection.execute("SELECT state FROM run WHERE id = 1").fetchone()["state"]
+        == RunState.INTERRUPTED
     )
     connection.close()
