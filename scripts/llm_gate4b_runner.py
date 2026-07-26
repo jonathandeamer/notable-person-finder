@@ -21,9 +21,10 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
 from urllib import parse as urlparse
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -32,7 +33,7 @@ from name_utils import sort_by_priority_recency
 
 
 def utc_now_iso() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def safe_json_parse(text: str) -> tuple[bool, object | None, str | None]:
@@ -96,22 +97,12 @@ def gate4b_unlisted_output_schema() -> dict:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": [
-                        "rank",
-                        "about_subject",
-                        "is_reliable_source",
-                        "confidence",
-                        "reasoning",
-                    ],
+                    "required": ["rank", "about_subject", "is_reliable_source", "confidence", "reasoning"],
                     "properties": {
                         "rank": {"type": "integer"},
                         "about_subject": {"type": "boolean"},
                         "is_reliable_source": {"type": "boolean"},
-                        "confidence": {
-                            "type": "number",
-                            "minimum": 0.0,
-                            "maximum": 1.0,
-                        },
+                        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                         "reasoning": {"type": "string"},
                     },
                 },
@@ -137,7 +128,9 @@ def _is_original_source(result: dict, source_context: dict) -> bool:
     domain = (result.get("source_domain") or "").lower()
     if source_name and domain:
         tokens = [
-            t.lower() for t in re.split(r"[^a-zA-Z]+", source_name) if len(t) >= 3
+            t.lower()
+            for t in re.split(r"[^a-zA-Z]+", source_name)
+            if len(t) >= 3
         ]
         if tokens and tokens[0] in domain:
             return True
@@ -442,8 +435,7 @@ def build_source_context(record: dict) -> dict:
         "entry_title": record.get("entry_title"),
         "summary": record.get("summary"),
         "source": record.get("source_feed_title") or record.get("source"),
-        "publication_date": record.get("published_at_utc")
-        or record.get("publication_date"),
+        "publication_date": record.get("published_at_utc") or record.get("publication_date"),
     }
 
 
@@ -456,10 +448,7 @@ def run(args: argparse.Namespace) -> int:
     brave_index: dict[str, dict] = {}
     if args.brave_input is not None:
         if args.unlisted_prompt is None:
-            print(
-                "error: --unlisted-prompt required when --brave-input is set",
-                file=sys.stderr,
-            )
+            print("error: --unlisted-prompt required when --brave-input is set", file=sys.stderr)
             return 1
         unlisted_prompt_body = args.unlisted_prompt.read_text(encoding="utf-8")
         for row in load_input(args.brave_input):
@@ -489,8 +478,7 @@ def run(args: argparse.Namespace) -> int:
             if isinstance(eid, str):
                 last_by_id[eid] = r
         failed_ids = {
-            eid
-            for eid, r in last_by_id.items()
+            eid for eid, r in last_by_id.items()
             if not r.get("json_parse_ok") or r.get("llm_error")
         }
         if not failed_ids:
@@ -681,20 +669,13 @@ def run(args: argparse.Namespace) -> int:
 
             if args.brave_input is not None and gate4b_status != "LIKELY_NOTABLE":
                 brave_record = brave_index.get(event_id) if event_id else None
-                all_brave = (
-                    (brave_record.get("brave_results") or []) if brave_record else []
-                )
-                candidates = [
-                    r for r in all_brave if not _is_original_source(r, source_context)
-                ]
+                all_brave = (brave_record.get("brave_results") or []) if brave_record else []
+                candidates = [r for r in all_brave if not _is_original_source(r, source_context)]
                 if candidates:
                     second_pass_results_sent = candidates
                     try:
                         sp_prompt = format_gate4b_unlisted_prompt(
-                            unlisted_prompt_body,
-                            subject_name,
-                            source_context,
-                            candidates,
+                            unlisted_prompt_body, subject_name, source_context, candidates
                         )
                         if args.backend == "codex-cli":
                             sp_raw, _ = call_codex_cli_with_retries(
@@ -719,15 +700,11 @@ def run(args: argparse.Namespace) -> int:
                             second_pass_by_rank = {
                                 int(r.get("rank")): r
                                 for r in candidates
-                                if isinstance(r, dict)
-                                and isinstance(r.get("rank"), int)
+                                if isinstance(r, dict) and isinstance(r.get("rank"), int)
                             }
                             domains: list[str] = []
-                            for r in sp_parsed.get("results") or []:
-                                if (
-                                    r.get("about_subject") is True
-                                    and r.get("is_reliable_source") is True
-                                ):
+                            for r in (sp_parsed.get("results") or []):
+                                if r.get("about_subject") is True and r.get("is_reliable_source") is True:
                                     domain = _domain_by_rank(r, second_pass_by_rank)
                                     if domain:
                                         domains.append(domain)
@@ -735,9 +712,7 @@ def run(args: argparse.Namespace) -> int:
                             second_pass_confirmed_count = len(second_pass_domains)
                             # POSSIBLY_NOTABLE requires combined distinct domains
                             # across first and second pass to hit the same bar.
-                            combined_domains = _dedup_ordered(
-                                first_pass_domains + second_pass_domains
-                            )
+                            combined_domains = _dedup_ordered(first_pass_domains + second_pass_domains)
                             if len(combined_domains) >= 2:
                                 gate4b_status = "POSSIBLY_NOTABLE"
                     except Exception as exc:  # noqa: BLE001
@@ -779,9 +754,7 @@ def run(args: argparse.Namespace) -> int:
                 "reliable_domain_count": len(all_domains),
                 "second_pass_llm_error": second_pass_llm_error,
                 "second_pass_json_parse_ok": second_pass_json_parse_ok,
-                "second_pass_raw_output": (second_pass_raw_output or "")[
-                    : args.max_output_chars
-                ],
+                "second_pass_raw_output": (second_pass_raw_output or "")[: args.max_output_chars],
                 "second_pass_parsed_output": second_pass_parsed_output,
             }
             out_f.write(

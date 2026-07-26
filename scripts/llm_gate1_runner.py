@@ -23,20 +23,19 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
+
 
 CODEX_BATCH_SIZE = 10
 
 
 def utc_now_iso() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Run Gate1 prompt trials on events.jsonl"
-    )
+    parser = argparse.ArgumentParser(description="Run Gate1 prompt trials on events.jsonl")
     parser.add_argument(
         "--events",
         type=Path,
@@ -46,9 +45,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prompt", type=Path, required=True, help="Path to Gate 1 prompt file"
     )
-    parser.add_argument(
-        "--output", type=Path, required=True, help="Path to output jsonl"
-    )
+    parser.add_argument("--output", type=Path, required=True, help="Path to output jsonl")
     parser.add_argument("--model", default="gpt-5.2", help="Model name")
     parser.add_argument(
         "--backend",
@@ -68,16 +65,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=Path.cwd(),
         help="Working directory for claude CLI when using claude-cli backend",
     )
-    parser.add_argument(
-        "--sample-size", type=int, default=20, help="Number of events to test"
-    )
+    parser.add_argument("--sample-size", type=int, default=20, help="Number of events to test")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
         "--sort-by",
         choices=["recency", "random", "priority"],
         default="priority",
         help="How to prioritise events from the unprocessed pool: "
-        "'priority' (by feed_priority then recency), 'recency' (most-recently published first), or 'random' (default: priority)",
+             "'priority' (by feed_priority then recency), 'recency' (most-recently published first), or 'random' (default: priority)",
     )
     parser.add_argument(
         "--keyword-regex",
@@ -159,8 +154,7 @@ def map_gate_input(event: dict) -> dict:
     return {
         "title": event.get("entry_title"),
         "summary": event.get("summary"),
-        "source": event.get("source_feed_title")
-        or event.get("source_feed_url_resolved"),
+        "source": event.get("source_feed_title") or event.get("source_feed_url_resolved"),
         "publication_date": event.get("published_at_utc"),
     }
 
@@ -193,9 +187,7 @@ def _extract_response_text(body: dict) -> str:
     return "\n".join(chunks).strip()
 
 
-def call_openai(
-    prompt_text: str, model: str, temperature: float | None
-) -> tuple[str, dict]:
+def call_openai(prompt_text: str, model: str, temperature: float | None) -> tuple[str, dict]:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set.")
@@ -387,13 +379,8 @@ def call_claude_cli(prompt_text: str, model: str, cwd: Path) -> tuple[str, dict]
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
     cmd = ["claude", "--model", model, "-p", "-"]
     proc = subprocess.run(
-        cmd,
-        input=prompt_text,
-        capture_output=True,
-        text=True,
-        check=False,
-        cwd=str(cwd),
-        env=env,
+        cmd, input=prompt_text, capture_output=True, text=True,
+        check=False, cwd=str(cwd), env=env,
     )
     meta = {
         "backend": "claude-cli",
@@ -481,8 +468,7 @@ def main() -> int:
     if args.keyword_regex is not None:
         rx = re.compile(args.keyword_regex, re.IGNORECASE)
         filtered = [
-            e
-            for e in events
+            e for e in events
             if rx.search(f"{e.get('entry_title', '')} {e.get('summary', '')}")
         ]
         if not filtered:
@@ -516,8 +502,7 @@ def main() -> int:
             if isinstance(eid, str):
                 last_by_id[eid] = r
         failed_ids = {
-            eid
-            for eid, r in last_by_id.items()
+            eid for eid, r in last_by_id.items()
             if not r.get("json_parse_ok") or r.get("llm_error")
         }
         if not failed_ids:
@@ -525,9 +510,7 @@ def main() -> int:
             return 0
         sampled = [e for e in events if e.get("event_id") in failed_ids]
     else:
-        unprocessed = [
-            e for e in filtered if e.get("event_id") not in already_processed
-        ]
+        unprocessed = [e for e in filtered if e.get("event_id") not in already_processed]
         if already_processed:
             print(
                 f"Skipping {len(already_processed)} already-processed event_id(s); "
@@ -542,11 +525,7 @@ def main() -> int:
             )
             _PRIORITY_MAX = float("inf")
             unprocessed.sort(
-                key=lambda e: (
-                    e.get("feed_priority")
-                    if e.get("feed_priority") is not None
-                    else _PRIORITY_MAX
-                ),
+                key=lambda e: e.get("feed_priority") if e.get("feed_priority") is not None else _PRIORITY_MAX,
             )
             sampled = unprocessed[: args.sample_size]
         elif args.sort_by == "recency":
@@ -556,9 +535,7 @@ def main() -> int:
             )
             sampled = unprocessed[: args.sample_size]
         else:
-            sampled = random.sample(
-                unprocessed, min(args.sample_size, len(unprocessed))
-            )
+            sampled = random.sample(unprocessed, min(args.sample_size, len(unprocessed)))
 
     sample_size = len(sampled)
 
@@ -568,7 +545,9 @@ def main() -> int:
         if args.backend == "openai-api":
             for idx, event in enumerate(sampled, start=1):
                 gate_input = map_gate_input(event)
-                trial_prompt = f"{prompt_body}\n\nInput:\n{json.dumps(gate_input, ensure_ascii=False)}"
+                trial_prompt = (
+                    f"{prompt_body}\n\nInput:\n{json.dumps(gate_input, ensure_ascii=False)}"
+                )
 
                 started = time.time()
                 error = None
@@ -589,9 +568,7 @@ def main() -> int:
                     response_id = raw_body.get("id")
                     response_status = raw_body.get("status")
                     if not raw_output:
-                        response_debug_excerpt = json.dumps(
-                            raw_body, ensure_ascii=False
-                        )[:1000]
+                        response_debug_excerpt = json.dumps(raw_body, ensure_ascii=False)[:1000]
                     parse_ok, parsed_output, parse_error = safe_json_parse(raw_output)
                     if parse_ok:
                         valid_json_count += 1
@@ -628,9 +605,7 @@ def main() -> int:
                     "parsed_output": parsed_output,
                     "raw_output": (raw_output or "")[: args.max_output_chars],
                 }
-                out_f.write(
-                    json.dumps(trial_record, ensure_ascii=False, sort_keys=True) + "\n"
-                )
+                out_f.write(json.dumps(trial_record, ensure_ascii=False, sort_keys=True) + "\n")
                 out_f.flush()
 
                 status = decision or ("ERROR" if error else "INVALID_JSON")
@@ -684,21 +659,15 @@ def main() -> int:
                     "duration_ms": duration_ms,
                     "llm_error": error,
                     "response_id": None,
-                    "response_status": f"claude_rc_{call_meta.get('returncode')}"
-                    if call_meta
-                    else None,
-                    "response_debug_excerpt": call_meta.get("stderr_excerpt")
-                    if not raw_output
-                    else None,
+                    "response_status": f"claude_rc_{call_meta.get('returncode')}" if call_meta else None,
+                    "response_debug_excerpt": call_meta.get("stderr_excerpt") if not raw_output else None,
                     "json_parse_ok": parse_ok,
                     "json_parse_error": parse_error,
                     "gate1_decision": decision,
                     "parsed_output": parsed_output,
                     "raw_output": (raw_output or "")[: args.max_output_chars],
                 }
-                out_f.write(
-                    json.dumps(trial_record, ensure_ascii=False, sort_keys=True) + "\n"
-                )
+                out_f.write(json.dumps(trial_record, ensure_ascii=False, sort_keys=True) + "\n")
                 out_f.flush()
 
                 status = decision or ("ERROR" if error else "INVALID_JSON")
@@ -710,9 +679,7 @@ def main() -> int:
                     time.sleep(args.delay_seconds)
         else:
             processed = 0
-            for batch_idx, batch_events in enumerate(
-                chunked(sampled, CODEX_BATCH_SIZE), start=1
-            ):
+            for batch_idx, batch_events in enumerate(chunked(sampled, CODEX_BATCH_SIZE), start=1):
                 batch_inputs = []
                 for event in batch_events:
                     batch_inputs.append(
@@ -752,9 +719,7 @@ def main() -> int:
                     )
                     response_status = f"codex_rc_{raw_body.get('returncode')}"
                     if not raw_output:
-                        response_debug_excerpt = json.dumps(
-                            raw_body, ensure_ascii=False
-                        )[:1000]
+                        response_debug_excerpt = json.dumps(raw_body, ensure_ascii=False)[:1000]
                     parse_ok, parsed_output, parse_error = safe_json_parse(raw_output)
                 except Exception as exc:  # noqa: BLE001
                     error = str(exc)
@@ -775,9 +740,7 @@ def main() -> int:
                     # Key by event_id rather than array position so we can still
                     # map outputs correctly if the model reorders items.
                     for item in parsed_items:
-                        if isinstance(item, dict) and isinstance(
-                            item.get("event_id"), str
-                        ):
+                        if isinstance(item, dict) and isinstance(item.get("event_id"), str):
                             batch_result_by_event_id[item["event_id"]] = item
                 elif parse_ok:
                     parse_ok = False
@@ -791,14 +754,10 @@ def main() -> int:
                     item_parse_ok = bool(item_output)
                     if item_parse_ok:
                         valid_json_count += 1
-                    item_parse_error = (
-                        None
-                        if item_parse_ok
-                        else (parse_error or "event_id_missing_in_batch_output")
+                    item_parse_error = None if item_parse_ok else (
+                        parse_error or "event_id_missing_in_batch_output"
                     )
-                    decision = (
-                        item_output.get("gate1_decision") if item_parse_ok else None
-                    )
+                    decision = item_output.get("gate1_decision") if item_parse_ok else None
 
                     trial_record = {
                         "trial_at_utc": utc_now_iso(),
@@ -822,16 +781,11 @@ def main() -> int:
                         "parsed_output": item_output,
                         "raw_output": (raw_output or "")[: args.max_output_chars],
                     }
-                    out_f.write(
-                        json.dumps(trial_record, ensure_ascii=False, sort_keys=True)
-                        + "\n"
-                    )
+                    out_f.write(json.dumps(trial_record, ensure_ascii=False, sort_keys=True) + "\n")
                     out_f.flush()
 
                     status = decision or ("ERROR" if error else "INVALID_JSON")
-                    print(
-                        f"[{processed}/{sample_size}] {status} - {event.get('entry_title')}"
-                    )
+                    print(f"[{processed}/{sample_size}] {status} - {event.get('entry_title')}")
                     if error:
                         print(f"  ↳ {error}", file=sys.stderr)
                     if not item_parse_ok and args.retry_missing_event_ids:
@@ -864,8 +818,8 @@ def main() -> int:
                                 single_response_debug = json.dumps(
                                     single_body, ensure_ascii=False
                                 )[:1000]
-                            single_parse_ok, single_parsed, single_parse_error = (
-                                safe_json_parse(single_raw)
+                            single_parse_ok, single_parsed, single_parse_error = safe_json_parse(
+                                single_raw
                             )
                             if single_parse_ok:
                                 valid_json_count += 1
@@ -898,8 +852,7 @@ def main() -> int:
                             "retry_of_batch": batch_idx,
                         }
                         out_f.write(
-                            json.dumps(retry_record, ensure_ascii=False, sort_keys=True)
-                            + "\n"
+                            json.dumps(retry_record, ensure_ascii=False, sort_keys=True) + "\n"
                         )
                         out_f.flush()
                         status = single_decision or (

@@ -26,10 +26,7 @@ class TestPrefilterGate0(unittest.TestCase):
         )
 
     def test_classify_full_name_pass(self) -> None:
-        event = {
-            "entry_title": "Ed Crane dies at 86",
-            "summary": "Policy leader remembered",
-        }
+        event = {"entry_title": "Ed Crane dies at 86", "summary": "Policy leader remembered"}
         out = self.prefilter.classify_event(event)
         self.assertEqual(out["prefilter_decision"], "PREFILTER_PASS_TO_LLM")
         self.assertEqual(out["prefilter_reason_codes"], ["NAME_FULL_MATCH"])
@@ -41,15 +38,10 @@ class TestPrefilterGate0(unittest.TestCase):
         self.assertEqual(out["prefilter_reason_codes"], ["NAME_INITIAL_SURNAME_MATCH"])
 
     def test_classify_obit_guardrail_pass(self) -> None:
-        event = {
-            "entry_title": "Poet remembered",
-            "summary": "Obituary for celebrated artist",
-        }
+        event = {"entry_title": "Poet remembered", "summary": "Obituary for celebrated artist"}
         out = self.prefilter.classify_event(event)
         self.assertEqual(out["prefilter_decision"], "PREFILTER_PASS_TO_LLM")
-        self.assertEqual(
-            out["prefilter_reason_codes"], ["OBIT_CUE_WITH_CAPITALIZED_TOKEN"]
-        )
+        self.assertEqual(out["prefilter_reason_codes"], ["OBIT_CUE_WITH_CAPITALIZED_TOKEN"])
 
     def test_classify_obit_without_guardrail_skip(self) -> None:
         event = {"entry_title": "man died", "summary": "tributes paid by locals"}
@@ -61,10 +53,7 @@ class TestPrefilterGate0(unittest.TestCase):
         )
 
     def test_classify_default_skip(self) -> None:
-        event = {
-            "entry_title": "rain expected this weekend",
-            "summary": "travel update",
-        }
+        event = {"entry_title": "rain expected this weekend", "summary": "travel update"}
         out = self.prefilter.classify_event(event)
         self.assertEqual(out["prefilter_decision"], "PREFILTER_SKIP_NO_NAME")
         self.assertEqual(out["prefilter_reason_codes"], ["NO_NAME_SIGNAL_DEFAULT_SKIP"])
@@ -79,11 +68,7 @@ class TestPrefilterGate0(unittest.TestCase):
 
             rows = [
                 {"event_id": "1", "entry_title": "Ed Crane dies at 86", "summary": ""},
-                {
-                    "event_id": "2",
-                    "entry_title": "man died",
-                    "summary": "tributes paid",
-                },
+                {"event_id": "2", "entry_title": "man died", "summary": "tributes paid"},
                 {"event_id": "3", "entry_title": "weather forecast", "summary": ""},
             ]
             with events.open("w", encoding="utf-8") as f:
@@ -100,12 +85,8 @@ class TestPrefilterGate0(unittest.TestCase):
             )
             self.assertEqual(rc, 0)
 
-            pass_rows = [
-                json.loads(x) for x in pass_out.read_text(encoding="utf-8").splitlines()
-            ]
-            skip_rows = [
-                json.loads(x) for x in skip_out.read_text(encoding="utf-8").splitlines()
-            ]
+            pass_rows = [json.loads(x) for x in pass_out.read_text(encoding="utf-8").splitlines()]
+            skip_rows = [json.loads(x) for x in skip_out.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(len(pass_rows), 1)
             self.assertEqual(len(skip_rows), 2)
             self.assertEqual(pass_rows[0]["event_id"], "1")
@@ -119,11 +100,7 @@ class TestPrefilterGate0(unittest.TestCase):
             events = tmp / "events.jsonl"
             pass_out = tmp / "pass.jsonl"
             skip_out = tmp / "skip.jsonl"
-            events.write_text(
-                json.dumps({"event_id": "1", "entry_title": "a", "summary": "b"})
-                + "\n",
-                encoding="utf-8",
-            )
+            events.write_text(json.dumps({"event_id": "1", "entry_title": "a", "summary": "b"}) + "\n", encoding="utf-8")
             pass_out.write_text("", encoding="utf-8")
             skip_out.write_text("", encoding="utf-8")
 
@@ -153,32 +130,18 @@ class TestPrefilterGate0(unittest.TestCase):
                 encoding="utf-8",
             )
             events.write_text(
-                json.dumps(
-                    {
-                        "event_id": "1",
-                        "entry_title": "Ed Crane dies at 86",
-                        "summary": "",
-                    }
-                )
+                json.dumps({"event_id": "1", "entry_title": "Ed Crane dies at 86", "summary": ""})
                 + "\n",
                 encoding="utf-8",
             )
 
             rc = self.prefilter.run_prefilter(
-                events,
-                pass_out,
-                skip_out,
-                overwrite=False,
-                known_pages_path=known_pages,
+                events, pass_out, skip_out, overwrite=False, known_pages_path=known_pages
             )
             self.assertEqual(rc, 0)
 
-            pass_rows = [
-                json.loads(x) for x in pass_out.read_text(encoding="utf-8").splitlines()
-            ]
-            skip_rows = [
-                json.loads(x) for x in skip_out.read_text(encoding="utf-8").splitlines()
-            ]
+            pass_rows = [json.loads(x) for x in pass_out.read_text(encoding="utf-8").splitlines()]
+            skip_rows = [json.loads(x) for x in skip_out.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(len(pass_rows), 0)
             self.assertEqual(len(skip_rows), 1)
             self.assertEqual(
@@ -211,16 +174,8 @@ class TestPrefilterGate0(unittest.TestCase):
             pass_out = tmp / "pass.jsonl"
             skip_out = tmp / "skip.jsonl"
             rows = [
-                {
-                    "event_id": "1",
-                    "entry_title": "Letters: John Lucas obituary",
-                    "summary": "",
-                },
-                {
-                    "event_id": "2",
-                    "entry_title": "Letter: Mark Fisher obituary",
-                    "summary": "",
-                },
+                {"event_id": "1", "entry_title": "Letters: John Lucas obituary", "summary": ""},
+                {"event_id": "2", "entry_title": "Letter: Mark Fisher obituary", "summary": ""},
                 {"event_id": "3", "entry_title": "Ed Crane dies at 86", "summary": ""},
             ]
             with events.open("w", encoding="utf-8") as f:
@@ -230,19 +185,11 @@ class TestPrefilterGate0(unittest.TestCase):
                 events, pass_out, skip_out, overwrite=False, known_pages_path=None
             )
             self.assertEqual(rc, 0)
-            pass_rows = [
-                json.loads(x) for x in pass_out.read_text(encoding="utf-8").splitlines()
-            ]
-            skip_rows = [
-                json.loads(x) for x in skip_out.read_text(encoding="utf-8").splitlines()
-            ]
+            pass_rows = [json.loads(x) for x in pass_out.read_text(encoding="utf-8").splitlines()]
+            skip_rows = [json.loads(x) for x in skip_out.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(len(pass_rows), 1)
             self.assertEqual(pass_rows[0]["event_id"], "3")
-            letters_skips = [
-                r
-                for r in skip_rows
-                if r.get("prefilter_decision") == "LETTERS_HEADER_SKIP"
-            ]
+            letters_skips = [r for r in skip_rows if r.get("prefilter_decision") == "LETTERS_HEADER_SKIP"]
             self.assertEqual(len(letters_skips), 2)
             self.assertEqual({r["event_id"] for r in letters_skips}, {"1", "2"})
 
@@ -332,15 +279,8 @@ class TestPrefilterGate0(unittest.TestCase):
                 encoding="utf-8",
             )
             priorities = self.prefilter.parse_feed_priorities(feeds)
-            self.assertEqual(
-                priorities.get(
-                    "https://rss.nytimes.com/services/xml/rss/nyt/Obituaries.xml"
-                ),
-                1,
-            )
-            self.assertEqual(
-                priorities.get("https://www.theguardian.com/tone/obituaries/rss"), 2
-            )
+            self.assertEqual(priorities.get("https://rss.nytimes.com/services/xml/rss/nyt/Obituaries.xml"), 1)
+            self.assertEqual(priorities.get("https://www.theguardian.com/tone/obituaries/rss"), 2)
             self.assertNotIn("https://www.theatlantic.com/feed/all/", priorities)
 
     def test_parse_feed_priorities_missing_file(self) -> None:
@@ -359,35 +299,26 @@ class TestPrefilterGate0(unittest.TestCase):
             feeds = tmp / "feeds.md"
 
             feeds.write_text(
-                "# Feeds\n- https://example.com/feed1 5\n",
+                "# Feeds\n"
+                "- https://example.com/feed1 5\n",
                 encoding="utf-8",
             )
             events.write_text(
-                json.dumps(
-                    {
-                        "event_id": "1",
-                        "entry_title": "John Smith dies at 90",
-                        "summary": "",
-                        "source_feed_url_original": "https://example.com/feed1",
-                    }
-                )
-                + "\n",
+                json.dumps({
+                    "event_id": "1",
+                    "entry_title": "John Smith dies at 90",
+                    "summary": "",
+                    "source_feed_url_original": "https://example.com/feed1",
+                }) + "\n",
                 encoding="utf-8",
             )
 
             rc = self.prefilter.run_prefilter(
-                events,
-                pass_out,
-                skip_out,
-                overwrite=False,
-                known_pages_path=None,
-                feeds_path=feeds,
+                events, pass_out, skip_out, overwrite=False, known_pages_path=None, feeds_path=feeds
             )
             self.assertEqual(rc, 0)
 
-            pass_rows = [
-                json.loads(x) for x in pass_out.read_text(encoding="utf-8").splitlines()
-            ]
+            pass_rows = [json.loads(x) for x in pass_out.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(len(pass_rows), 1)
             self.assertEqual(pass_rows[0].get("feed_priority"), 5)
 
@@ -400,35 +331,26 @@ class TestPrefilterGate0(unittest.TestCase):
             feeds = tmp / "feeds.md"
 
             feeds.write_text(
-                "# Feeds\n- https://example.com/feed1 5\n",
+                "# Feeds\n"
+                "- https://example.com/feed1 5\n",
                 encoding="utf-8",
             )
             events.write_text(
-                json.dumps(
-                    {
-                        "event_id": "1",
-                        "entry_title": "John Smith dies at 90",
-                        "summary": "",
-                        "source_feed_url_original": "https://example.com/unknown",
-                    }
-                )
-                + "\n",
+                json.dumps({
+                    "event_id": "1",
+                    "entry_title": "John Smith dies at 90",
+                    "summary": "",
+                    "source_feed_url_original": "https://example.com/unknown",
+                }) + "\n",
                 encoding="utf-8",
             )
 
             rc = self.prefilter.run_prefilter(
-                events,
-                pass_out,
-                skip_out,
-                overwrite=False,
-                known_pages_path=None,
-                feeds_path=feeds,
+                events, pass_out, skip_out, overwrite=False, known_pages_path=None, feeds_path=feeds
             )
             self.assertEqual(rc, 0)
 
-            pass_rows = [
-                json.loads(x) for x in pass_out.read_text(encoding="utf-8").splitlines()
-            ]
+            pass_rows = [json.loads(x) for x in pass_out.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(len(pass_rows), 1)
             self.assertIsNone(pass_rows[0].get("feed_priority"))
 

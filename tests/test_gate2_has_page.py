@@ -18,9 +18,7 @@ class TestGate2HasPage(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         root = Path(__file__).resolve().parents[1]
-        cls.mod = load_module(
-            "det_gate2_has_page", root / "scripts" / "det_gate2_has_page.py"
-        )
+        cls.mod = load_module("det_gate2_has_page", root / "scripts" / "det_gate2_has_page.py")
 
     def test_levenshtein_normalization(self) -> None:
         norm = self.mod.normalize_name
@@ -413,18 +411,8 @@ class TestGate2HasPage(unittest.TestCase):
         # Note: biography_prioritized is set upstream by det_mw_candidates based on score >= 3.
         # Here we test that pick_best_match correctly ranks score=3 above score=2.
         candidates = [
-            {
-                "title": "Sam Rivers",
-                "pageid": 1,
-                "biography_score": 2,
-                "biography_prioritized": True,
-            },
-            {
-                "title": "Sam Rivers",
-                "pageid": 2,
-                "biography_score": 3,
-                "biography_prioritized": True,
-            },
+            {"title": "Sam Rivers", "pageid": 1, "biography_score": 2, "biography_prioritized": True},
+            {"title": "Sam Rivers", "pageid": 2, "biography_score": 3, "biography_prioritized": True},
         ]
         best = self.mod.pick_best_match(candidates)
         self.assertEqual(best["pageid"], 2)
@@ -465,9 +453,7 @@ class TestGate2HasPage(unittest.TestCase):
                 log_file=None,
             )
             self.assertEqual(rc, 0)
-            self.assertFalse(
-                known.exists(), "known_pages file must not be written by Gate 2"
-            )
+            self.assertFalse(known.exists(), "known_pages file must not be written by Gate 2")
 
 
 if __name__ == "__main__":

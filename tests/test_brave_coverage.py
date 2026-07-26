@@ -169,8 +169,7 @@ class TestBraveCoverage(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             output_rows = [
-                json.loads(l)
-                for l in output_path.read_text(encoding="utf-8").splitlines()
+                json.loads(l) for l in output_path.read_text(encoding="utf-8").splitlines()
             ]
             self.assertEqual(len(output_rows), 2)
             self.assertEqual(output_rows[0]["event_id"], "aaa")
@@ -186,23 +185,13 @@ class TestBraveCoverage(unittest.TestCase):
                     "event_id": "aaa",
                     "subject_name": "Has Page Person",
                     "gate3_status": "HAS_PAGE",
-                    "source_context": {
-                        "entry_title": None,
-                        "summary": None,
-                        "source": None,
-                        "publication_date": None,
-                    },
+                    "source_context": {"entry_title": None, "summary": None, "source": None, "publication_date": None},
                 },
                 {
                     "event_id": "bbb",
                     "subject_name": "Missing Person",
                     "gate3_status": "MISSING",
-                    "source_context": {
-                        "entry_title": None,
-                        "summary": None,
-                        "source": None,
-                        "publication_date": None,
-                    },
+                    "source_context": {"entry_title": None, "summary": None, "source": None, "publication_date": None},
                 },
             ]
             input_path = self._make_input(tmp, rows)
@@ -235,8 +224,7 @@ class TestBraveCoverage(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             output_rows = [
-                json.loads(l)
-                for l in output_path.read_text(encoding="utf-8").splitlines()
+                json.loads(l) for l in output_path.read_text(encoding="utf-8").splitlines()
             ]
             self.assertEqual(len(output_rows), 1)
             self.assertEqual(output_rows[0]["subject_name"], "Missing Person")
@@ -270,10 +258,7 @@ class TestBraveCoverage(unittest.TestCase):
                 return {
                     "results": [
                         {"title": "Duplicate story", "url": "https://example.com/dup"},
-                        {
-                            "title": "Unique story",
-                            "url": f"https://example.com/unique-{call_count[0]}",
-                        },
+                        {"title": "Unique story", "url": f"https://example.com/unique-{call_count[0]}"},
                     ]
                 }
 
@@ -300,8 +285,7 @@ class TestBraveCoverage(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             output_rows = [
-                json.loads(l)
-                for l in output_path.read_text(encoding="utf-8").splitlines()
+                json.loads(l) for l in output_path.read_text(encoding="utf-8").splitlines()
             ]
             self.assertEqual(len(output_rows), 1)
             urls = [r["url"] for r in output_rows[0]["brave_results"]]
@@ -399,12 +383,9 @@ class TestBraveCoverage(unittest.TestCase):
             # fetch should not have been called
             self.assertEqual(fetch_calls, [])
             output_rows = [
-                json.loads(l)
-                for l in output_path.read_text(encoding="utf-8").splitlines()
+                json.loads(l) for l in output_path.read_text(encoding="utf-8").splitlines()
             ]
-            self.assertEqual(
-                output_rows[0]["brave_results"][0]["title"], "Cached story"
-            )
+            self.assertEqual(output_rows[0]["brave_results"][0]["title"], "Cached story")
 
 
 if __name__ == "__main__":

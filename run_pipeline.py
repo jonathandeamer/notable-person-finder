@@ -21,8 +21,9 @@ import subprocess
 import sys
 import textwrap
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 # Project root: directory containing this script
 PROJECT_ROOT = Path(__file__).parent
@@ -51,14 +52,11 @@ STAGE_ORDER = [
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-
 def count_jsonl_rows(path: Path) -> int:
     """Count non-empty lines in a JSONL file (returns 0 if file missing)."""
     if not path.exists():
         return 0
-    return sum(
-        1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
-    )
+    return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
 
 
 def load_jsonl(path: Path) -> list:
@@ -76,7 +74,7 @@ def load_jsonl(path: Path) -> list:
     return out
 
 
-def resolve_brave_api_key() -> str | None:
+def resolve_brave_api_key() -> Optional[str]:
     """Return Brave API key from BRAVE_API_KEY env var or ~/.brave file."""
     key = os.environ.get("BRAVE_API_KEY", "").strip()
     if key:
@@ -113,7 +111,6 @@ def warn_llm_errors(path: Path, stage_name: str, skip_rows: int = 0) -> None:
 # Stage result
 # ──────────────────────────────────────────────────────────────────────────────
 
-
 @dataclass
 class StageResult:
     name: str
@@ -143,7 +140,6 @@ def make_skipped(name: str, reason: str) -> StageResult:
 # Stage runner
 # ──────────────────────────────────────────────────────────────────────────────
 
-
 def run_stage_cmd(name: str, cmd: list, dry_run: bool) -> StageResult:
     """
     Run a subprocess stage, streaming output to the terminal.
@@ -161,19 +157,16 @@ def run_stage_cmd(name: str, cmd: list, dry_run: bool) -> StageResult:
     print(f"{'─' * 64}")
     sys.stdout.flush()
 
-    t0 = datetime.now(UTC)
+    t0 = datetime.now(timezone.utc)
     proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
-    duration_s = (datetime.now(UTC) - t0).total_seconds()
+    duration_s = (datetime.now(timezone.utc) - t0).total_seconds()
 
-    return StageResult(
-        name=name, cmd=cmd, duration_s=duration_s, exit_code=proc.returncode
-    )
+    return StageResult(name=name, cmd=cmd, duration_s=duration_s, exit_code=proc.returncode)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Run manifest
 # ──────────────────────────────────────────────────────────────────────────────
-
 
 def write_manifest(
     state_dir: Path,
@@ -181,13 +174,13 @@ def write_manifest(
     started_at: str,
     stage_results: list,
     new_gate1_events: int = 0,
-    likely_notable_subjects: list | None = None,
-    possibly_notable_subjects: list | None = None,
+    likely_notable_subjects: Optional[list] = None,
+    possibly_notable_subjects: Optional[list] = None,
 ) -> Path:
     manifest = {
         "run_id": run_ts,
         "started_at": started_at,
-        "finished_at": datetime.now(UTC).isoformat(),
+        "finished_at": datetime.now(timezone.utc).isoformat(),
         "stages": [r.to_dict() for r in stage_results],
         "new_gate1_events": new_gate1_events,
         "likely_notable_subjects": likely_notable_subjects or [],
@@ -205,8 +198,9 @@ def write_manifest(
 # Output report generation
 # ──────────────────────────────────────────────────────────────────────────────
 
-
-def generate_report(state_dir: Path, output_dir: Path, run_ts: str) -> tuple:
+def generate_report(
+    state_dir: Path, output_dir: Path, run_ts: str
+) -> tuple:
     """
     Read gate4b_llm_results.jsonl and write:
       output/runs/{run_ts}_summary.json    — machine-readable
@@ -221,9 +215,7 @@ def generate_report(state_dir: Path, output_dir: Path, run_ts: str) -> tuple:
         best: dict[str, dict] = {}
         for rec in recs:
             name = rec.get("subject_name") or ""
-            if name not in best or rec.get("confirmed_count", 0) > best[name].get(
-                "confirmed_count", 0
-            ):
+            if name not in best or rec.get("confirmed_count", 0) > best[name].get("confirmed_count", 0):
                 best[name] = rec
         return list(best.values())
 
@@ -254,7 +246,7 @@ def generate_report(state_dir: Path, output_dir: Path, run_ts: str) -> tuple:
 
     summary = {
         "run_id": run_ts,
-        "generated_at": datetime.now(UTC).isoformat(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "likely_notable_count": len(likely_notable),
         "possibly_notable_count": len(possibly_notable),
         "likely_notable": [_entry(r) for r in likely_notable],
@@ -313,14 +305,13 @@ def generate_report(state_dir: Path, output_dir: Path, run_ts: str) -> tuple:
 # Parse-failure retry helper
 # ──────────────────────────────────────────────────────────────────────────────
 
-
 def _run_parse_failure_retry(
     stage_name: str,
     base_cmd: list,
     output_path: Path,
     dry_run: bool,
     pre_rows: int = 0,
-) -> StageResult | None:
+) -> Optional[StageResult]:
     """
     If the records written by the current run contain parse failures, fire one
     retry pass with --retry-parse-failures appended to base_cmd.
@@ -332,23 +323,17 @@ def _run_parse_failure_retry(
     """
     all_records = load_jsonl(output_path)
     new_records = all_records[pre_rows:]
-    failures = [
-        r for r in new_records if not r.get("json_parse_ok") or r.get("llm_error")
-    ]
+    failures = [r for r in new_records if not r.get("json_parse_ok") or r.get("llm_error")]
     if not failures:
         return None
 
     # Track failing IDs so we can measure resolution after retry using
     # last-wins semantics on the append-only JSONL output.
-    failed_ids = {
-        r.get("event_id") for r in failures if isinstance(r.get("event_id"), str)
-    }
+    failed_ids = {r.get("event_id") for r in failures if isinstance(r.get("event_id"), str)}
 
     retry_name = f"{stage_name}_retry"
     retry_cmd = base_cmd + ["--retry-parse-failures"]
-    print(
-        f"\n  {len(failures)} parse failure(s) in {stage_name} — running retry pass..."
-    )
+    print(f"\n  {len(failures)} parse failure(s) in {stage_name} — running retry pass...")
 
     result = run_stage_cmd(retry_name, retry_cmd, dry_run)
 
@@ -360,15 +345,12 @@ def _run_parse_failure_retry(
             if isinstance(eid, str):
                 last_by_id[eid] = r
         remaining = sum(
-            1
-            for eid in failed_ids
+            1 for eid in failed_ids
             if not last_by_id.get(eid, {}).get("json_parse_ok")
             or last_by_id.get(eid, {}).get("llm_error")
         )
         resolved = len(failures) - remaining
-        result.notes = (
-            f"resolved {resolved}/{len(failures)} failure(s); {remaining} still failing"
-        )
+        result.notes = f"resolved {resolved}/{len(failures)} failure(s); {remaining} still failing"
     else:
         warn(f"{retry_name} exited {result.exit_code} — continuing")
         result.notes = f"retry of {len(failures)} failure(s) — exit {result.exit_code}"
@@ -379,7 +361,6 @@ def _run_parse_failure_retry(
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
-
 
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -467,7 +448,6 @@ def parse_args(argv=None) -> argparse.Namespace:
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
-
 def main(argv=None) -> None:
     args = parse_args(argv)
 
@@ -475,8 +455,8 @@ def main(argv=None) -> None:
     output_dir: Path = args.output_dir
     python = sys.executable
 
-    run_ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
-    started_at = datetime.now(UTC).isoformat()
+    run_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    started_at = datetime.now(timezone.utc).isoformat()
 
     # ── Validate --from-gate ──────────────────────────────────────────────────
     if args.from_gate and args.from_gate not in STAGE_ORDER:
@@ -538,159 +518,110 @@ def main(argv=None) -> None:
         (
             "rss_ingest",
             [
-                python,
-                "ingest/rss_ingest.py",
-                "--feeds",
-                "config/feeds.md",
-                "--state-dir",
-                str(state_dir),
+                python, "ingest/rss_ingest.py",
+                "--feeds", "config/feeds.md",
+                "--state-dir", str(state_dir),
             ],
         ),
         (
             "gate0",
             [
-                python,
-                "scripts/det_gate0_prefilter.py",
+                python, "scripts/det_gate0_prefilter.py",
                 "--overwrite",
-                "--known-pages",
-                str(state_dir / "wiki_known_pages.json"),
-                "--feeds",
-                str(PROJECT_ROOT / "config" / "feeds.md"),
+                "--known-pages", str(state_dir / "wiki_known_pages.json"),
+                "--feeds", str(PROJECT_ROOT / "config" / "feeds.md"),
             ],
         ),
         (
             "gate1",
             [
-                python,
-                "scripts/llm_gate1_runner.py",
-                "--events",
-                str(state_dir / "prefilter_pass.jsonl"),
-                "--prompt",
-                "prompts/gate1.md",
-                "--output",
-                str(state_dir / "gate1_llm_results.jsonl"),
-                "--backend",
-                args.backend_gate1,
-                "--model",
-                args.model_gate1,
-                "--sample-size",
-                str(args.gate1_budget),
+                python, "scripts/llm_gate1_runner.py",
+                "--events", str(state_dir / "prefilter_pass.jsonl"),
+                "--prompt", "prompts/gate1.md",
+                "--output", str(state_dir / "gate1_llm_results.jsonl"),
+                "--backend", args.backend_gate1,
+                "--model", args.model_gate1,
+                "--sample-size", str(args.gate1_budget),
             ],
         ),
         (
             "gate1_index",
             [
-                python,
-                "scripts/det_gate1_index_update.py",
-                "--input",
-                str(state_dir / "gate1_llm_results.jsonl"),
-                "--known-pages",
-                str(state_dir / "wiki_known_pages.json"),
+                python, "scripts/det_gate1_index_update.py",
+                "--input", str(state_dir / "gate1_llm_results.jsonl"),
+                "--known-pages", str(state_dir / "wiki_known_pages.json"),
             ],
         ),
         (
             "mw_candidates",
             [
-                python,
-                "scripts/det_mw_candidates.py",
-                "--input",
-                str(state_dir / "gate1_llm_results.jsonl"),
-                "--output",
-                str(state_dir / "wiki_candidates.jsonl"),
+                python, "scripts/det_mw_candidates.py",
+                "--input", str(state_dir / "gate1_llm_results.jsonl"),
+                "--output", str(state_dir / "wiki_candidates.jsonl"),
                 "--overwrite",
-                "--cache-dir",
-                str(state_dir / "mw_cache"),
+                "--cache-dir", str(state_dir / "mw_cache"),
             ],
         ),
         (
             "gate2",
             [
-                python,
-                "scripts/det_gate2_has_page.py",
-                "--input",
-                str(state_dir / "wiki_candidates.jsonl"),
-                "--pass-output",
-                str(state_dir / "wiki_candidates_pass.jsonl"),
-                "--skip-output",
-                str(state_dir / "wiki_candidates_skip.jsonl"),
+                python, "scripts/det_gate2_has_page.py",
+                "--input", str(state_dir / "wiki_candidates.jsonl"),
+                "--pass-output", str(state_dir / "wiki_candidates_pass.jsonl"),
+                "--skip-output", str(state_dir / "wiki_candidates_skip.jsonl"),
                 "--overwrite",
             ],
         ),
         (
             "gate3",
             [
-                python,
-                "scripts/llm_gate3_runner.py",
-                "--input",
-                str(state_dir / "wiki_candidates_pass.jsonl"),
-                "--prompt",
-                "prompts/gate3.md",
-                "--output",
-                str(state_dir / "gate3_llm_results.jsonl"),
-                "--backend",
-                args.backend_gate3,
-                "--model",
-                args.model_gate3,
+                python, "scripts/llm_gate3_runner.py",
+                "--input", str(state_dir / "wiki_candidates_pass.jsonl"),
+                "--prompt", "prompts/gate3.md",
+                "--output", str(state_dir / "gate3_llm_results.jsonl"),
+                "--backend", args.backend_gate3,
+                "--model", args.model_gate3,
             ],
         ),
         (
             "gate3_index",
             [
-                python,
-                "scripts/det_gate3_index_update.py",
-                "--input",
-                str(state_dir / "gate3_llm_results.jsonl"),
-                "--known-pages",
-                str(state_dir / "wiki_known_pages.json"),
+                python, "scripts/det_gate3_index_update.py",
+                "--input", str(state_dir / "gate3_llm_results.jsonl"),
+                "--known-pages", str(state_dir / "wiki_known_pages.json"),
             ],
         ),
         (
             "brave",
             [
-                python,
-                "scripts/det_brave_coverage.py",
-                "--input",
-                str(state_dir / "gate3_llm_results.jsonl"),
-                "--output",
-                str(state_dir / "brave_coverage.jsonl"),
-                "--cache-dir",
-                str(state_dir / "brave_cache"),
+                python, "scripts/det_brave_coverage.py",
+                "--input", str(state_dir / "gate3_llm_results.jsonl"),
+                "--output", str(state_dir / "brave_coverage.jsonl"),
+                "--cache-dir", str(state_dir / "brave_cache"),
                 "--overwrite",
-                "--throttle-ms",
-                "1100",
+                "--throttle-ms", "1100",
             ],
         ),
         (
             "gate4_filter",
             [
-                python,
-                "scripts/det_gate4_reliable_filter.py",
-                "--input",
-                str(state_dir / "brave_coverage.jsonl"),
-                "--output",
-                str(state_dir / "gate4_reliable_coverage.jsonl"),
+                python, "scripts/det_gate4_reliable_filter.py",
+                "--input", str(state_dir / "brave_coverage.jsonl"),
+                "--output", str(state_dir / "gate4_reliable_coverage.jsonl"),
                 "--overwrite",
             ],
         ),
         (
             "gate4b",
             [
-                python,
-                "scripts/llm_gate4b_runner.py",
-                "--input",
-                str(state_dir / "gate4_reliable_coverage.jsonl"),
-                "--output",
-                str(state_dir / "gate4b_llm_results.jsonl"),
-                "--prompt",
-                "prompts/gate4b.md",
-                "--backend",
-                args.backend_gate4b,
-                "--model",
-                args.model_gate4b,
-                "--brave-input",
-                str(state_dir / "brave_coverage.jsonl"),
-                "--unlisted-prompt",
-                "prompts/gate4b_unlisted.md",
+                python, "scripts/llm_gate4b_runner.py",
+                "--input", str(state_dir / "gate4_reliable_coverage.jsonl"),
+                "--output", str(state_dir / "gate4b_llm_results.jsonl"),
+                "--prompt", "prompts/gate4b.md",
+                "--backend", args.backend_gate4b,
+                "--model", args.model_gate4b,
+                "--brave-input", str(state_dir / "brave_coverage.jsonl"),
+                "--unlisted-prompt", "prompts/gate4b_unlisted.md",
             ],
         ),
     ]
@@ -731,9 +662,7 @@ def main(argv=None) -> None:
             "gate3": state_dir / "gate3_llm_results.jsonl",
             "gate4b": state_dir / "gate4b_llm_results.jsonl",
         }
-        pre_rows = (
-            count_jsonl_rows(_llm_files[stage_name]) if stage_name in _llm_files else 0
-        )
+        pre_rows = count_jsonl_rows(_llm_files[stage_name]) if stage_name in _llm_files else 0
 
         # Run the stage
         result = run_stage_cmd(stage_name, cmd, args.dry_run)
@@ -747,10 +676,7 @@ def main(argv=None) -> None:
             )
             if not args.dry_run:
                 write_manifest(
-                    state_dir,
-                    run_ts,
-                    started_at,
-                    stage_results,
+                    state_dir, run_ts, started_at, stage_results,
                     new_gate1_events=new_gate1_events,
                 )
             sys.exit(result.exit_code)
@@ -778,11 +704,7 @@ def main(argv=None) -> None:
                 )
                 short_circuited = True
             retry = _run_parse_failure_retry(
-                "gate1",
-                cmd,
-                state_dir / "gate1_llm_results.jsonl",
-                args.dry_run,
-                pre_rows,
+                "gate1", cmd, state_dir / "gate1_llm_results.jsonl", args.dry_run, pre_rows
             )
             if retry:
                 stage_results.append(retry)
@@ -800,18 +722,10 @@ def main(argv=None) -> None:
 
         elif stage_name == "gate3":
             post_rows = count_jsonl_rows(state_dir / "gate3_llm_results.jsonl")
-            result.notes = (
-                f"{post_rows - pre_rows} new / {post_rows} total gate3 results"
-            )
-            warn_llm_errors(
-                state_dir / "gate3_llm_results.jsonl", "gate3", skip_rows=pre_rows
-            )
+            result.notes = f"{post_rows - pre_rows} new / {post_rows} total gate3 results"
+            warn_llm_errors(state_dir / "gate3_llm_results.jsonl", "gate3", skip_rows=pre_rows)
             retry = _run_parse_failure_retry(
-                "gate3",
-                cmd,
-                state_dir / "gate3_llm_results.jsonl",
-                args.dry_run,
-                pre_rows,
+                "gate3", cmd, state_dir / "gate3_llm_results.jsonl", args.dry_run, pre_rows
             )
             if retry:
                 stage_results.append(retry)
@@ -829,25 +743,17 @@ def main(argv=None) -> None:
 
         elif stage_name == "gate4b":
             post_rows = count_jsonl_rows(state_dir / "gate4b_llm_results.jsonl")
-            result.notes = (
-                f"{post_rows - pre_rows} new / {post_rows} total gate4b results"
-            )
-            warn_llm_errors(
-                state_dir / "gate4b_llm_results.jsonl", "gate4b", skip_rows=pre_rows
-            )
+            result.notes = f"{post_rows - pre_rows} new / {post_rows} total gate4b results"
+            warn_llm_errors(state_dir / "gate4b_llm_results.jsonl", "gate4b", skip_rows=pre_rows)
             retry = _run_parse_failure_retry(
-                "gate4b",
-                cmd,
-                state_dir / "gate4b_llm_results.jsonl",
-                args.dry_run,
-                pre_rows,
+                "gate4b", cmd, state_dir / "gate4b_llm_results.jsonl", args.dry_run, pre_rows
             )
             if retry:
                 stage_results.append(retry)
 
     # ── Report stage (built-in Python, not a subprocess) ─────────────────────
     report_result = StageResult(name="report", cmd=[])
-    t0 = datetime.now(UTC)
+    t0 = datetime.now(timezone.utc)
 
     if STAGE_ORDER.index("report") < start_idx:
         report_result = make_skipped("report", "--from-gate")
@@ -861,17 +767,17 @@ def main(argv=None) -> None:
         report_result.notes = "[dry-run]"
     else:
         try:
-            likely_notable_names, possibly_notable_names = generate_report(
-                state_dir, output_dir, run_ts
+            likely_notable_names, possibly_notable_names = generate_report(state_dir, output_dir, run_ts)
+            report_result.notes = (
+                f"{len(likely_notable_names)} likely notable, {len(possibly_notable_names)} possibly notable"
             )
-            report_result.notes = f"{len(likely_notable_names)} likely notable, {len(possibly_notable_names)} possibly notable"
         except Exception as exc:
             warn(f"Report generation failed: {exc}")
             report_result.exit_code = 1
             report_result.notes = f"error: {exc}"
             likely_notable_names, possibly_notable_names = [], []
 
-    report_result.duration_s = (datetime.now(UTC) - t0).total_seconds()
+    report_result.duration_s = (datetime.now(timezone.utc) - t0).total_seconds()
     stage_results.append(report_result)
 
     # ── Collect final subject lists for manifest ──────────────────────────────
@@ -880,23 +786,16 @@ def main(argv=None) -> None:
     if not args.dry_run and not short_circuited:
         records = load_jsonl(state_dir / "gate4b_llm_results.jsonl")
         likely_notable_names = [
-            r.get("subject_name")
-            for r in records
-            if r.get("gate4b_status") == "LIKELY_NOTABLE"
+            r.get("subject_name") for r in records if r.get("gate4b_status") == "LIKELY_NOTABLE"
         ]
         possibly_notable_names = [
-            r.get("subject_name")
-            for r in records
-            if r.get("gate4b_status") == "POSSIBLY_NOTABLE"
+            r.get("subject_name") for r in records if r.get("gate4b_status") == "POSSIBLY_NOTABLE"
         ]
 
     # ── Write run manifest ────────────────────────────────────────────────────
     if not args.dry_run:
         manifest_path = write_manifest(
-            state_dir,
-            run_ts,
-            started_at,
-            stage_results,
+            state_dir, run_ts, started_at, stage_results,
             new_gate1_events=new_gate1_events,
             likely_notable_subjects=likely_notable_names,
             possibly_notable_subjects=possibly_notable_names,

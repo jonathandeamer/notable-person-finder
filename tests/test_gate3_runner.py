@@ -17,9 +17,7 @@ class TestGate3Runner(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         root = Path(__file__).resolve().parents[1]
-        cls.mod = load_module(
-            "llm_gate3_runner", root / "scripts" / "llm_gate3_runner.py"
-        )
+        cls.mod = load_module("llm_gate3_runner", root / "scripts" / "llm_gate3_runner.py")
 
     # --- select_candidates ---
 
@@ -265,14 +263,12 @@ class TestGate3Runner(unittest.TestCase):
 
     def test_safe_json_parse_missing_status_field(self) -> None:
         """Valid JSON dict missing 'status' field → parses OK, but downstream extracts None."""
-        incomplete = json.dumps(
-            {
-                "matched_title": "Some Title",
-                "confidence": 0.8,
-                "evidence": ["reason"],
-                # 'status' intentionally absent
-            }
-        )
+        incomplete = json.dumps({
+            "matched_title": "Some Title",
+            "confidence": 0.8,
+            "evidence": ["reason"],
+            # 'status' intentionally absent
+        })
         ok, parsed, err = self.mod.safe_json_parse(incomplete)
         self.assertTrue(ok)
         self.assertIsInstance(parsed, dict)
@@ -281,15 +277,13 @@ class TestGate3Runner(unittest.TestCase):
 
     def test_safe_json_parse_extra_fields_ok(self) -> None:
         """Extra unexpected fields don't break parsing."""
-        full = json.dumps(
-            {
-                "status": "MISSING",
-                "matched_title": None,
-                "confidence": 0.1,
-                "evidence": ["no match"],
-                "extra_field": "surprise",
-            }
-        )
+        full = json.dumps({
+            "status": "MISSING",
+            "matched_title": None,
+            "confidence": 0.1,
+            "evidence": ["no match"],
+            "extra_field": "surprise",
+        })
         ok, parsed, err = self.mod.safe_json_parse(full)
         self.assertTrue(ok)
         self.assertEqual(parsed.get("status"), "MISSING")
@@ -310,11 +304,7 @@ class TestGate3Runner(unittest.TestCase):
     def test_gate3_status_uncertain_on_missing_status_field(self) -> None:
         """Valid JSON dict that omits 'status' → gate3_status falls back to UNCERTAIN."""
         parse_ok = True
-        parsed_output = {
-            "matched_title": None,
-            "confidence": 0.5,
-            "evidence": ["unclear"],
-        }
+        parsed_output = {"matched_title": None, "confidence": 0.5, "evidence": ["unclear"]}
         gate3_status: str | None = None
         if parse_ok and isinstance(parsed_output, dict):
             gate3_status = parsed_output.get("status")
@@ -339,12 +329,7 @@ class TestGate3Runner(unittest.TestCase):
 
     def test_format_gate3_prompt_numbered_candidates(self) -> None:
         prompt_body = "Gate 3 prompt."
-        source_context = {
-            "entry_title": "T",
-            "summary": "S",
-            "source": "P",
-            "publication_date": "2026-01-01",
-        }
+        source_context = {"entry_title": "T", "summary": "S", "source": "P", "publication_date": "2026-01-01"}
         candidates = [
             {"title": "First", "description": "Desc1", "extract": "Extract1"},
             {"title": "Second", "description": "Desc2", "extract": "Extract2"},

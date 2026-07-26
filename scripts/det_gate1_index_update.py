@@ -17,7 +17,7 @@ import argparse
 import json
 import sys
 from collections import Counter
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -26,7 +26,7 @@ from name_utils import normalize_name
 
 
 def utc_now_iso() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -90,10 +90,7 @@ def read_jsonl(path: Path) -> list[dict]:
             try:
                 obj = json.loads(raw)
             except json.JSONDecodeError:
-                print(
-                    f"warning: invalid JSON at line {line_no}; skipping",
-                    file=sys.stderr,
-                )
+                print(f"warning: invalid JSON at line {line_no}; skipping", file=sys.stderr)
                 continue
             if isinstance(obj, dict):
                 rows.append(obj)
@@ -110,9 +107,7 @@ def extract_subject_name(row: dict) -> str | None:
     if not subject:
         parsed = row.get("parsed_output")
         if isinstance(parsed, dict):
-            subject = parsed.get("subject_name_full") or parsed.get(
-                "subject_name_as_written"
-            )
+            subject = parsed.get("subject_name_full") or parsed.get("subject_name_as_written")
     return subject or None
 
 

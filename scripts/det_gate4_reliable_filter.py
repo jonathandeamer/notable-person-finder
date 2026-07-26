@@ -11,6 +11,8 @@ import argparse
 import json
 from collections import Counter
 from pathlib import Path
+from urllib import parse as urlparse
+
 
 # ---------------------------------------------------------------------------
 # Wikipedia reliable-source domain list
@@ -353,8 +355,7 @@ def run(
         for idx, row in enumerate(rows, start=1):
             all_results = row.get("brave_results") or []
             reliable = [
-                r
-                for r in all_results
+                r for r in all_results
                 if is_reliable_source(r.get("url", ""), r.get("source_domain", ""))
             ]
             # Re-rank

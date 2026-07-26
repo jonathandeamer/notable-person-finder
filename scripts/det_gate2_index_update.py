@@ -7,7 +7,7 @@ import argparse
 import json
 import sys
 from collections import Counter
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -16,7 +16,7 @@ from name_utils import normalize_name
 
 
 def utc_now_iso() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -69,9 +69,7 @@ def load_index(path: Path, overwrite: bool) -> dict:
 def write_index(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
     tmp_path.replace(path)
 
 
@@ -85,10 +83,7 @@ def read_jsonl(path: Path) -> list[dict]:
             try:
                 obj = json.loads(raw)
             except json.JSONDecodeError:
-                print(
-                    f"warning: invalid JSON at line {line_no}; skipping",
-                    file=sys.stderr,
-                )
+                print(f"warning: invalid JSON at line {line_no}; skipping", file=sys.stderr)
                 continue
             if isinstance(obj, dict):
                 rows.append(obj)
@@ -96,9 +91,7 @@ def read_jsonl(path: Path) -> list[dict]:
 
 
 def extract_gate2_status(row: dict) -> str | None:
-    parsed = (
-        row.get("parsed_output") if isinstance(row.get("parsed_output"), dict) else {}
-    )
+    parsed = row.get("parsed_output") if isinstance(row.get("parsed_output"), dict) else {}
     for key in ("gate2_status", "gate2_decision", "status"):
         val = row.get(key)
         if isinstance(val, str):
@@ -111,9 +104,7 @@ def extract_gate2_status(row: dict) -> str | None:
 
 
 def extract_match_info(row: dict) -> dict:
-    parsed = (
-        row.get("parsed_output") if isinstance(row.get("parsed_output"), dict) else {}
-    )
+    parsed = row.get("parsed_output") if isinstance(row.get("parsed_output"), dict) else {}
     for key in ("matched_page", "match", "matched"):
         val = row.get(key)
         if isinstance(val, dict):
@@ -158,9 +149,7 @@ def extract_subject_name(row: dict) -> str | None:
         val = row.get(key)
         if isinstance(val, str):
             return val
-    parsed = (
-        row.get("parsed_output") if isinstance(row.get("parsed_output"), dict) else {}
-    )
+    parsed = row.get("parsed_output") if isinstance(row.get("parsed_output"), dict) else {}
     for key in ("subject_name_full", "subject_name_as_written", "subject_name"):
         val = parsed.get(key)
         if isinstance(val, str):
@@ -168,9 +157,7 @@ def extract_subject_name(row: dict) -> str | None:
     return None
 
 
-def run_update(
-    input_path: Path, known_pages_path: Path, gate2_run_id: str | None, overwrite: bool
-) -> int:
+def run_update(input_path: Path, known_pages_path: Path, gate2_run_id: str | None, overwrite: bool) -> int:
     rows = read_jsonl(input_path)
     index = load_index(known_pages_path, overwrite)
     entries = index.get("entries")
