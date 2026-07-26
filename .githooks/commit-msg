@@ -4,12 +4,20 @@ set -e
 COMMIT_MSG_FILE="$1"
 COMMIT_MSG=$(cat "$COMMIT_MSG_FILE")
 
-PATTERN="^(feat|fix|docs|style|refactor|test|chore|perf|ci|build)(\([a-z0-9_-]+\))?!?: .+$"
+# Allow merge commits and revert commits as-is.
+case "$COMMIT_MSG" in
+  "Merge "*|"Revert "*)
+    exit 0
+    ;;
+esac
+
+PATTERN="^(feat|fix|docs|style|refactor|test|chore|perf|ci|build|revert)(\([a-z0-9_-]+\))?!?: .+$"
 
 if ! echo "$COMMIT_MSG" | grep -Eq "$PATTERN"; then
     echo "ERROR: Invalid commit message format."
     echo "Commit message must follow conventional commit subject guidelines, e.g.:"
     echo "  feat: add ruff and pyright configuration"
     echo "  fix: resolve type error in config loader"
+    echo "  revert: undo bad commit"
     exit 1
 fi
