@@ -158,6 +158,7 @@ def test_a_run_with_no_work_is_complete(database: Path) -> None:
     report = build_engine(connection, FakeClock()).execute({})
     assert report.state is RunState.COMPLETE
     assert report.counters.required_succeeded == 0
+    assert report.human_id == f"run-{report.run_id}"
     connection.close()
 
 
@@ -289,6 +290,47 @@ def test_a_transient_failure_is_retried_and_both_attempts_persist(database: Path
     outcomes = [row["outcome"] for row in repository.attempts_for_run(connection, run_id=report.run_id)]
     assert outcomes == ["failed", "succeeded"]
     assert report.state is RunState.COMPLETE
+    assert report.failure_categories == {"transient_server_error": 1}
+    connection.close()
+
+
+def test_attempt_ordinals_continue_across_runs_for_re_attempted_work(
+    database: Path,
+) -> None:
+    """Ordinals are per work item and monotone, not per run.
+
+    `attempt` carries UNIQUE (work_item_id, ordinal), and deferred work is
+    re-attempted by the next run by design, so an engine that restarted
+    numbering at 1 would not produce a soft wrong answer -- it would crash on
+    the unique index the moment any item is retried across runs.
+    """
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "a" * 64)
+
+    def execute(work_item, ordinal: int) -> TaskOutcome:
+        raise ProviderFailure(
+            FailureCategory.TIMEOUT, provider="probe_provider", operation="probe_call"
+        )
+
+    handler = TaskHandler(
+        task_type="probe", provider="probe_provider", operation="probe_call", execute=execute
+    )
+    # max_attempts=2, so each run burns two ordinals and defers the item.
+    first = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+    second = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    rows = connection.execute(
+        "SELECT ordinal, run_id FROM attempt WHERE work_item_id = ? ORDER BY id",
+        (work_id,),
+    ).fetchall()
+    assert [row["ordinal"] for row in rows] == [1, 2, 3, 4]
+    assert [row["run_id"] for row in rows] == [
+        first.run_id,
+        first.run_id,
+        second.run_id,
+        second.run_id,
+    ]
+    assert second.state is RunState.PARTIAL
     connection.close()
 
 
@@ -342,6 +384,7 @@ def test_a_permanent_failure_without_useful_results_fails_the_run(
         == WorkState.FAILED_PERMANENT
     )
     assert report.state is RunState.FAILED
+    assert report.failure_categories == {"authentication": 1}
     connection.close()
 
 
@@ -486,6 +529,64 @@ def test_work_without_a_registered_handler_stays_pending(database: Path) -> None
     connection.close()
 
 
+def test_the_reporter_receives_the_run_report_and_its_artifact_is_recorded(
+    database: Path,
+) -> None:
+    """The reporter is handed the report and hands back the durable artifact.
+
+    The engine records the artifact's persisted identity on the run row and
+    leaves `markdown` alone: the reporter has already written it, and it is
+    carried for the CLI to render, not for the database.
+    """
+    connection = connect_database(database)
+    seen: list[object] = []
+    markdown = "# run\n\nnothing to report\n"
+
+    produced: list[ReportArtifact] = []
+
+    def reporter(report) -> ReportArtifact:
+        seen.append(report)
+        artifact = ReportArtifact(
+            path="/digests/2026-07-25.md", sha256="c" * 64, markdown=markdown
+        )
+        produced.append(artifact)
+        return artifact
+
+    clock = FakeClock()
+    engine = RunEngine(
+        connection,
+        retry=RetryCoordinator(RetryConfig(max_attempts=1), clock=clock),
+        scheduler=BoundedScheduler(max_workers=1),
+        clock=clock,
+        timezone="Europe/Paris",
+        window_start="2026-07-24T06:00:00Z",
+        budget_limit_nano_usd=None,
+        snapshot_fingerprint="a" * 64,
+        snapshot_json="{}",
+        reporter=reporter,
+    )
+    report = engine.execute({})
+
+    assert len(seen) == 1
+    handed = seen[0]
+    assert handed.run_id == report.run_id
+    assert handed.human_id == f"run-{report.run_id}"
+    assert handed.state is RunState.COMPLETE
+
+    row = connection.execute(
+        "SELECT digest_path, digest_sha256 FROM run WHERE id = ?", (report.run_id,)
+    ).fetchone()
+    assert (row["digest_path"], row["digest_sha256"]) == (
+        "/digests/2026-07-25.md",
+        "c" * 64,
+    )
+    # The artifact carries the reporter's exact Markdown for the CLI to
+    # render; only its persisted identity reaches the database.
+    assert produced[0].markdown == markdown
+    assert markdown not in str(tuple(row))
+    connection.close()
+
+
 def test_reporting_failure_is_the_only_terminal_transition(database: Path) -> None:
     connection = connect_database(database)
 
@@ -597,9 +698,17 @@ def test_a_handler_that_returns_a_non_settling_state_is_rejected(database: Path)
     connection.close()
 
 
-def test_the_engine_logs_lifecycle_events_through_the_redacting_logger(
+def test_the_engine_logs_run_lifecycle_events_and_never_the_snapshot(
     database: Path,
 ) -> None:
+    """Pin the lifecycle events and the fields the engine hands the log.
+
+    The capture logger below has no redaction filter attached, so this does
+    not exercise redaction -- Task 14's own tests do that. What it pins is
+    what the engine *offers* the logger: the configuration snapshot, the only
+    value the engine holds that could carry operator-supplied text, is never
+    passed as a field, so redaction is never asked to save it.
+    """
     connection = connect_database(database)
     schedule_probe(connection, "0" * 64)
     handler = succeeding_handler([])
@@ -610,36 +719,35 @@ def test_the_engine_logs_lifecycle_events_through_the_redacting_logger(
         def emit(self, record: logging.LogRecord) -> None:
             records.append(record)
 
+    capture = Capture()
     logger = logging.getLogger("test.engine.events")
     logger.propagate = False
     logger.setLevel(logging.INFO)
-    logger.addHandler(Capture())
+    logger.addHandler(capture)
+    try:
+        clock = FakeClock()
+        engine = RunEngine(
+            connection,
+            retry=RetryCoordinator(RetryConfig(max_attempts=1), clock=clock),
+            scheduler=BoundedScheduler(max_workers=1),
+            clock=clock,
+            timezone="Europe/Paris",
+            window_start="2026-07-24T06:00:00Z",
+            budget_limit_nano_usd=None,
+            snapshot_fingerprint="a" * 64,
+            snapshot_json="{}",
+            reporter=memory_reporter,
+            logger=logger,
+        )
+        report = engine.execute({handler.task_type: handler})
 
-    clock = FakeClock()
-    engine = RunEngine(
-        connection,
-        retry=RetryCoordinator(RetryConfig(max_attempts=1), clock=clock),
-        scheduler=BoundedScheduler(max_workers=1),
-        clock=clock,
-        timezone="Europe/Paris",
-        window_start="2026-07-24T06:00:00Z",
-        budget_limit_nano_usd=None,
-        snapshot_fingerprint="a" * 64,
-        snapshot_json="{}",
-        reporter=memory_reporter,
-        logger=logger,
-    )
-    report = engine.execute({handler.task_type: handler})
-
-    events = [record.event for record in records]  # type: ignore[attr-defined]
-    assert events == ["run.started", "run.work_settled", "run.finished"]
-    finished = records[-1].fields  # type: ignore[attr-defined]
-    assert finished["run_id"] == report.run_id
-    assert finished["state"] == str(RunState.COMPLETE)
-    # The engine never hands the log the configuration snapshot, which is the
-    # only value it holds that could carry operator-supplied text.
-    for record in records:
-        assert "{}" not in str(record.fields)  # type: ignore[attr-defined]
-
-    logger.handlers.clear()
+        events = [record.event for record in records]  # type: ignore[attr-defined]
+        assert events == ["run.started", "run.work_settled", "run.finished"]
+        finished = records[-1].fields  # type: ignore[attr-defined]
+        assert finished["run_id"] == report.run_id
+        assert finished["state"] == str(RunState.COMPLETE)
+        for record in records:
+            assert "{}" not in str(record.fields)  # type: ignore[attr-defined]
+    finally:
+        logger.removeHandler(capture)
     connection.close()
