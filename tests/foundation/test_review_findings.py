@@ -46,7 +46,10 @@ def test_process_variable_still_overrides_dotenv(tmp_path: Path) -> None:
 
     loaded = load_config(
         config_file,
-        environ={"TEST_OPENROUTER": "process-openrouter", "TEST_BRAVE": "process-brave"},
+        environ={
+            "TEST_OPENROUTER": "process-openrouter",
+            "TEST_BRAVE": "process-brave",
+        },
         require_secrets=True,
     )
 

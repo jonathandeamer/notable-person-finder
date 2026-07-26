@@ -3,11 +3,11 @@ from __future__ import annotations
 import hashlib
 import re
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
-from typing import Iterable
 
 from notable_person_finder.db.connection import connect_database
 

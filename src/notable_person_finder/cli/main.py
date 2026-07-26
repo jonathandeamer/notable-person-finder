@@ -94,7 +94,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_usage(sys.stderr)
         print(f"{parser.prog}: error: {error}", file=sys.stderr)
         return 64
-    except (ConfigLoadError, MigrationError, LockUnavailable, OSError, sqlite3.Error) as error:
+    except (
+        ConfigLoadError,
+        MigrationError,
+        LockUnavailable,
+        OSError,
+        sqlite3.Error,
+    ) as error:
         print(error, file=sys.stderr)
         return 1
 

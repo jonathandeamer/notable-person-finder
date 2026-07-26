@@ -68,9 +68,7 @@ class SecretEnvConfig(StrictModel):
     @classmethod
     def environment_variable_identifier(cls, value: str) -> str:
         if re.fullmatch(r"[A-Z_][A-Z0-9_]*", value) is None:
-            raise ValueError(
-                "must be an uppercase environment-variable identifier"
-            )
+            raise ValueError("must be an uppercase environment-variable identifier")
         return value
 
 

@@ -79,7 +79,9 @@ def load_config(
 
     portable_root = _portable_root(main_path.parent, main.paths.root)
     paths = resolve_paths(main_path, portable_root)
-    credentials = _resolve_credentials(main, main_path, environ, require_secrets, errors)
+    credentials = _resolve_credentials(
+        main, main_path, environ, require_secrets, errors
+    )
 
     if errors:
         raise ConfigLoadError(tuple(errors))
@@ -224,7 +226,9 @@ def _snapshot(
     main_settings["feeds_file"] = str(feeds_path)
     main_settings["domain_profile_file"] = str(domain_profile_path)
     if main.paths.root is not None:
-        main_settings["paths"]["root"] = str(_portable_root(main_path.parent, main.paths.root))
+        main_settings["paths"]["root"] = str(
+            _portable_root(main_path.parent, main.paths.root)
+        )
 
     feeds_by_status = {
         "enabled": [

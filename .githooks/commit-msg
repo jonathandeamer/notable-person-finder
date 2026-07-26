@@ -1,23 +1,23 @@
-#!/usr/bin/env sh
-set -eu
+#!/bin/sh
+set -e
 
-MSG_FILE="$1"
-MSG="$(cat "$MSG_FILE")"
+COMMIT_MSG_FILE="$1"
+COMMIT_MSG=$(cat "$COMMIT_MSG_FILE")
 
-# Allow merge commits and revert commits
-case "$MSG" in
+# Allow merge commits and revert commits as-is.
+case "$COMMIT_MSG" in
   "Merge "*|"Revert "*)
     exit 0
     ;;
 esac
 
-# Conventional Commits regex
-# type(scope?): description
-PATTERN='^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([a-z0-9-]+\))?: .+'
+PATTERN="^(feat|fix|docs|style|refactor|test|chore|perf|ci|build|revert)(\([a-z0-9_-]+\))?!?: .+$"
 
-if ! printf "%s" "$MSG" | grep -Eq "$PATTERN"; then
-  echo "Commit message does not follow Conventional Commits." >&2
-  echo "Expected: <type>(optional-scope): <description>" >&2
-  echo "Allowed types: build, chore, ci, docs, feat, fix, perf, refactor, revert, style, test" >&2
-  exit 1
+if ! echo "$COMMIT_MSG" | grep -Eq "$PATTERN"; then
+    echo "ERROR: Invalid commit message format."
+    echo "Commit message must follow conventional commit subject guidelines, e.g.:"
+    echo "  feat: add ruff and pyright configuration"
+    echo "  fix: resolve type error in config loader"
+    echo "  revert: undo bad commit"
+    exit 1
 fi

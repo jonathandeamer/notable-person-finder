@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from platformdirs import user_cache_path, user_config_path, user_data_path, user_log_path
+from platformdirs import (
+    user_cache_path,
+    user_config_path,
+    user_data_path,
+    user_log_path,
+)
 
 APP_NAME = "notable-person-finder"
 
