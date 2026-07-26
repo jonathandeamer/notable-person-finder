@@ -1,5 +1,7 @@
 # Run Engine and Shared Transport Implementation Plan
 
+> **Status of the code blocks below:** every reference implementation and reference test in this plan is a STARTING POINT, not a specification; where it disagrees with the merged code, the shipped code and its tests govern.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the durable run engine — run, work-item, and attempt state; the retry coordinator and budget reservation; the bounded shared HTTP transport with URL, DNS, redirect, and response-size safety; structured redacted logging; and terminal-state reporting that writes a real digest for an empty run.
