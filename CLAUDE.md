@@ -20,11 +20,68 @@ Read the applicable design and plan before implementing. If a progress ledger
 exists for an active plan, use it as the recovery authority and do not repeat
 tasks already recorded complete.
 
+## What Is Actually Built
+
+Two milestones are complete: the application foundation, and the run engine and
+shared transport. A cold-starting agent should assume nothing beyond this list.
+
+Delivered and usable:
+
+- `notable config validate`, `notable paths`, `notable db migrate`.
+- `notable run` — validates configuration, migrates, takes the mutation lock,
+  sweeps interrupted predecessor runs, executes eligible work through the
+  scheduler, writes a dated digest plus `latest.md`, and prints the same
+  Markdown on standard output.
+- The shared HTTP transport with URL, DNS-preflight, redirect, timeout,
+  response-size, concurrency, and pacing bounds; the retry coordinator; the
+  per-run budget reservation; and redacting structured logging.
+
+Delivered only in part — do not describe these as finished:
+
+- `notable status` reports the latest run, its digest, required pending and
+  deferred counts, and operational failures. It has no digest backlog, no
+  oldest pending candidate, and no queue tiers; those need the digest queue
+  from the lead-assessment milestone.
+- The digest emits its header, banner, and operational summary. Its shortlist
+  section is a placeholder: there is no ranking and no model synthesis yet.
+
+Not built at all, so do not document, import, or assume any of it:
+
+- Any concrete provider adapter (feeds, MediaWiki, web search, article fetch
+  and extraction, LLM). `providers/` is transport plumbing only.
+- Any domain table — source items, people, Wikipedia observations, articles,
+  assessments, digest queue.
+- `notable digest show`, `notable audit run`, `notable audit person`.
+
+Known gaps carried forward, recorded so a later change does not mistake them
+for regressions:
+
+- `RunReport` carries no budget fields, so neither the digest nor `status` can
+  currently explain *why* work was deferred.
+- A handler that returns a non-settling work state escapes as an uncaught
+  `ValueError` with a traceback rather than a handled run failure.
+- Two crash windows can repeat a paid provider call; see
+  `docs/architecture/at-least-once-execution.md`.
+
 ## Rewrite Structure
 
 - `src/notable_person_finder/` — installable application package.
-- `tests/foundation/` — application-foundation tests. Later milestones add
-  their own rewrite test areas as specified by their plans.
+  - `cli/` — argument parsing and the `notable` commands.
+  - `config/` — strict configuration models, loading, and path resolution.
+  - `db/` — SQLite connections and forward-only checked migrations.
+  - `runs/` — run engine, clock, repository, work-item scheduling, retry
+    coordination, budget reservation, and the mutation lock.
+  - `providers/` — the shared HTTP transport, request safety checks, pacing,
+    and provider failure classification. This is the only package that may
+    import `httpx`. It contains no concrete provider adapter yet.
+  - `obs/` — redacting structured logging.
+  - `reporting/` — the daily digest writer.
+- `tests/foundation/` — application-foundation tests.
+- `tests/run_engine/` — run engine and shared transport tests. Later milestones
+  add their own rewrite test areas as specified by their plans.
+- `docs/architecture/at-least-once-execution.md` — the operator-facing note on
+  the crash windows in which a paid provider call can be repeated. Point at it
+  rather than restating it.
 - `config/*.example.toml` — tracked, copyable configuration examples; local
   configuration variants remain untracked.
 - `docs/superpowers/specs/` — approved architecture and policy.
@@ -42,6 +99,11 @@ import or wrap prototype modules to shortcut rewrite work.
   milestone plan.
 - For the completed application foundation, use
   `uv run pytest tests/foundation`.
+- For the completed run engine and shared transport, use
+  `uv run pytest tests/run_engine`.
+- Both completed milestones together gate with
+  `uv run pytest tests/foundation tests/run_engine`. Run it from a real
+  checkout: it needs the tracked `config/` directory.
 - Exercise the installed interface with `uv run notable ...`.
 - Keep default rewrite verification offline and isolate configuration and
   storage with temporary paths.
@@ -65,6 +127,11 @@ confirm `git diff --check` and `git status --short` are clean as applicable.
   up before changing an existing database.
 - Mutating commands use the nonblocking, OS-managed lock scoped to one data
   root. File contents are diagnostic and never determine lock ownership.
+- Every external network call maps to exactly one persisted attempt attributed
+  to its run and work item. Only the central retry coordinator starts a repeat
+  request, and no transaction is held across a network call.
+- External execution is at-least-once. See
+  `docs/architecture/at-least-once-execution.md`.
 - Preserve these reviewed contracts unless a later approved design explicitly
   replaces them.
 

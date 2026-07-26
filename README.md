@@ -101,6 +101,60 @@ uv run notable --config config/notable.toml db migrate
 
 The prototype remains available but is not imported by the new package.
 
+### Rewrite commands
+
+| Command | Purpose |
+| --- | --- |
+| `notable run` | Validate configuration, migrate, continue eligible work, and write the daily digest. |
+| `notable status` | Show the latest run state and outstanding work. Performs no work and takes no lock. |
+| `notable config validate` | Validate the configuration graph offline. |
+| `notable paths` | Print every resolved storage location. |
+| `notable db migrate` | Apply pending checked migrations explicitly. |
+
+Exit statuses: `0` complete, `1` failed, `2` partial, `64` usage, `130` interrupted.
+
+Global options are `--config PATH` and `--verbose`. There are no other
+subcommands or flags yet.
+
+#### What these commands do today
+
+The rewrite currently has no provider adapters and no domain tables, so a run
+on a fresh data root performs no external work. What it does exercise for real
+is the run lifecycle: migration, the mutation lock, recovery of interrupted
+predecessor runs, work-item scheduling with attempt attribution, and digest
+writing.
+
+Two commands are deliberately partial:
+
+- `notable status` reports the latest run, its digest path, required pending
+  and deferred counts, and operational failures. Digest backlog, queue tiers,
+  and the oldest pending candidate arrive with the digest queue in a later
+  milestone.
+- The digest emits its header, banner, and operational summary. Its shortlist
+  section is a placeholder — ranking and optional model synthesis are not
+  implemented.
+
+Neither the digest nor `status` can yet explain *why* a work item was deferred,
+because the run report carries no budget detail.
+
+#### At-least-once execution
+
+External execution is at-least-once, not exactly-once: a crash can cause a paid
+provider call to be repeated. The two windows in which this happens, what each
+leaves on disk, and what an operator should do are documented in
+[`docs/architecture/at-least-once-execution.md`](docs/architecture/at-least-once-execution.md).
+Recovery is an ordinary `notable run`; there is no separate resume mode and no
+manual cleanup.
+
+### Rewrite verification
+
+```bash
+uv sync --frozen
+uv run pytest tests/foundation tests/run_engine
+```
+
+The legacy prototype suite is not a rewrite gate.
+
 ---
 
 ## Usage
