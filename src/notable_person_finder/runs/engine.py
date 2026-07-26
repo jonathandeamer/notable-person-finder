@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
@@ -36,6 +37,19 @@ SETTLING_WORK_STATES = frozenset(
 )
 
 
+class NonSettlingStateError(ValueError):
+    """A handler returned a work state that does not settle the item."""
+
+    def __init__(self, run_id: int, task_type: str, state: WorkState) -> None:
+        self.run_id = run_id
+        self.task_type = task_type
+        self.state = state
+        super().__init__(
+            f"handler for {task_type!r} returned {state!r}, "
+            "which is not a settling state"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class TaskOutcome:
     state: WorkState
@@ -65,6 +79,9 @@ class ReportArtifact:
 
 @dataclass(frozen=True, slots=True)
 class RunReport:
+    # TODO(milestone 3): add budget fields (reserved_nano_usd, actual_nano_usd,
+    # deferred_reason) so the digest and `notable status` can explain why work
+    # was deferred. Currently unreachable because no handlers are registered.
     run_id: int
     state: RunState
     started_at: str
@@ -134,6 +151,7 @@ class RunEngine:
         self._snapshot_json = snapshot_json
         self._reporter = reporter
         self._logger = logger or logging.getLogger(EVENT_LOGGER_NAME)
+        self._failure_categories_lock = threading.Lock()
 
     def _now(self) -> str:
         return utc_timestamp(self._clock.now())
@@ -312,7 +330,8 @@ class RunEngine:
             outcome = last_outcome if record.outcome == "succeeded" else None
             if record.failure_category is not None:
                 key = str(record.failure_category)
-                failure_categories[key] = failure_categories.get(key, 0) + 1
+                with self._failure_categories_lock:
+                    failure_categories[key] = failure_categories.get(key, 0) + 1
             repository.finish_attempt(
                 self._connection,
                 attempt_id=attempt_ids[record.ordinal],
@@ -386,10 +405,7 @@ class RunEngine:
             return
 
         if result.state not in SETTLING_WORK_STATES:
-            raise ValueError(
-                f"handler for {handler.task_type!r} returned {result.state!r}, "
-                "which is not a settling state"
-            )
+            raise NonSettlingStateError(run_id, handler.task_type, result.state)
         self._settle(
             run_id,
             work_item,

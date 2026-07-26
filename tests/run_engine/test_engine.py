@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from notable_person_finder.providers.failures import FailureCategory, ProviderFa
 from notable_person_finder.runs import repository
 from notable_person_finder.runs.clock import FakeClock
 from notable_person_finder.runs.engine import (
+    NonSettlingStateError,
     ReportArtifact,
     RunEngine,
     TaskHandler,
@@ -750,4 +752,33 @@ def test_the_engine_logs_run_lifecycle_events_and_never_the_snapshot(
             assert "{}" not in str(record.fields)  # type: ignore[attr-defined]
     finally:
         logger.removeHandler(capture)
+    connection.close()
+
+
+def test_non_settling_handler_state_raises(database: Path) -> None:
+    connection = connect_database(database)
+    schedule_probe(connection, "n" * 64)
+
+    def execute(work_item, ordinal: int) -> TaskOutcome:
+        return TaskOutcome(state=WorkState.PENDING, reason="not settling")
+
+    handler = TaskHandler(
+        task_type="probe",
+        provider="probe_provider",
+        operation="probe_call",
+        execute=execute,
+    )
+    engine = build_engine(connection, FakeClock())
+    with pytest.raises(NonSettlingStateError) as captured:
+        engine.execute({handler.task_type: handler})
+    assert captured.value.task_type == "probe"
+    assert captured.value.state is WorkState.PENDING
+    connection.close()
+
+
+def test_failure_categories_tally_uses_a_threading_lock(database: Path) -> None:
+    """`on_attempt` mutates a shared tally; the engine must hold a lock for it."""
+    connection = connect_database(database)
+    engine = build_engine(connection, FakeClock())
+    assert isinstance(engine._failure_categories_lock, threading.Lock)
     connection.close()

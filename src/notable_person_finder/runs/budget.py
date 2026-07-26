@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import sqlite3
 
+# TODO(milestone 3): these reserve/reconcile helpers are unit-tested but not yet
+# exercised by RunEngine, because no provider adapters are registered. Compose
+# them once adapters perform real spend reservations.
+
 
 class BudgetExhausted(Exception):
     """The configured hard per-run cap cannot cover this reservation."""

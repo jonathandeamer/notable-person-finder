@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -9,6 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from notable_person_finder.cli.main import EXIT_FAILED, main
+from notable_person_finder.db.connection import connect_database
+from notable_person_finder.runs.models import WorkState
 from tests.run_engine.helpers import ENVIRONMENT, write_graph
 
 
@@ -188,7 +190,7 @@ def test_reporting_failure_exits_one_and_persists_failed_state(
     )
     assert completed.returncode == 1
     database = tmp_path / "portable" / "data" / "notable.sqlite3"
-    connection = sqlite3.connect(database)
+    connection = connect_database(database)
     assert connection.execute("SELECT state FROM run").fetchone()[0] == "failed"
     assert [row[0] for row in connection.execute(
         "SELECT state FROM run_transition ORDER BY id"
@@ -458,6 +460,70 @@ def test_the_cli_wires_the_resolved_secrets_into_the_log_redaction_filter(
     assert "brave-secret-value" not in log_file.read_text(encoding="utf-8")
 
 
+def test_non_settling_handler_state_records_run_as_interrupted(
+    config_file: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """A handler returning a non-settling state must exit failed and leave the
+    run recorded as interrupted, not as a traceback."""
+    for name, value in ENVIRONMENT.items():
+        monkeypatch.setenv(name, value)
+
+    captured_run_id: list[int] = []
+
+    class BrokenEngine:
+        def __init__(self, connection, *args, **kwargs) -> None:
+            self._connection = connection
+
+        def execute(self, handlers) -> None:
+            from notable_person_finder.runs import repository
+            from notable_person_finder.runs.engine import NonSettlingStateError
+
+            now = "2026-07-25T06:00:00Z"
+            snapshot_id = repository.store_snapshot(
+                self._connection,
+                fingerprint="a" * 64,
+                canonical_json="{}",
+                now=now,
+            )
+            run_id = repository.create_run(
+                self._connection,
+                snapshot_id=snapshot_id,
+                timezone="Europe/Paris",
+                window_start=now,
+                window_end=now,
+                budget_limit_nano_usd=None,
+                now=now,
+            )
+            captured_run_id.append(run_id)
+            raise NonSettlingStateError(run_id, "probe", WorkState.PENDING)
+
+    monkeypatch.setattr("notable_person_finder.cli.main.RunEngine", BrokenEngine)
+
+    assert main(["--config", str(config_file), "run"]) == EXIT_FAILED
+    assert len(captured_run_id) == 1
+    run_id = captured_run_id[0]
+
+    database = tmp_path / "portable" / "data" / "notable.sqlite3"
+    connection = connect_database(database)
+    try:
+        row = connection.execute(
+            "SELECT state FROM run WHERE id = ?", (run_id,)
+        ).fetchone()
+        transitions = [
+            row[0]
+            for row in connection.execute(
+                "SELECT state FROM run_transition WHERE run_id = ? ORDER BY id",
+                (run_id,),
+            )
+        ]
+    finally:
+        connection.close()
+
+    assert row is not None
+    assert row["state"] == "interrupted"
+    assert transitions == ["running", "interrupted"]
+
+
 def test_the_persisted_configuration_snapshot_holds_no_secret_value(
     config_file: Path, tmp_path: Path
 ) -> None:
@@ -469,7 +535,7 @@ def test_the_persisted_configuration_snapshot_holds_no_secret_value(
     """
     assert run_notable(config_file, "run").returncode == 0
 
-    connection = sqlite3.connect(tmp_path / "portable" / "data" / "notable.sqlite3")
+    connection = connect_database(tmp_path / "portable" / "data" / "notable.sqlite3")
     try:
         rows = connection.execute(
             "SELECT canonical_json FROM configuration_snapshot"

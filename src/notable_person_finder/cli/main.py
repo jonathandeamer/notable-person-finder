@@ -10,13 +10,10 @@ from pathlib import Path
 from typing import NoReturn
 from zoneinfo import ZoneInfo
 
-from notable_person_finder import __version__
 from notable_person_finder.config.loader import ConfigLoadError, ResolvedConfig, load_config
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.db.migrate import MigrationError, apply_migrations
 from notable_person_finder.obs.logging import configure_logging, log_event
-from notable_person_finder.providers.safety import SystemHostResolver
-from notable_person_finder.providers.transport import build_transport
 from notable_person_finder.reporting.digest import (
     DigestRecord,
     DigestWriteError,
@@ -24,7 +21,12 @@ from notable_person_finder.reporting.digest import (
 )
 from notable_person_finder.runs import repository
 from notable_person_finder.runs.clock import SystemClock, utc_timestamp
-from notable_person_finder.runs.engine import ReportArtifact, RunEngine, RunReport
+from notable_person_finder.runs.engine import (
+    NonSettlingStateError,
+    ReportArtifact,
+    RunEngine,
+    RunReport,
+)
 from notable_person_finder.runs.lock import LockUnavailable, MutationLock
 from notable_person_finder.runs.models import RunState
 from notable_person_finder.runs.retry import RetryCoordinator
@@ -141,14 +143,9 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
             now = clock.now()
             window_start = _window_start(loaded, now)
             local_date = now.astimezone(ZoneInfo(loaded.main.timezone)).date().isoformat()
-            transport = build_transport(
-                loaded.main.transport,
-                version=__version__,
-                resolver=SystemHostResolver(),
-                clock=clock,
-            )
-            # The pacing gate is built by the first adapter milestone that has
-            # a provider to pace; nothing in this milestone makes requests.
+            # The transport and pacing gate will be built by the first adapter
+            # milestone that has a provider to pace; nothing in this milestone
+            # makes requests, so no transport is constructed yet.
             written: DigestRecord | None = None
 
             def report_run(report: RunReport) -> ReportArtifact:
@@ -186,8 +183,27 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                 # No provider adapters exist in this milestone, so no task
                 # handlers are registered. Milestones 3-6 supply them.
                 report = engine.execute({})
-            finally:
-                transport.close()
+            except NonSettlingStateError as error:
+                repository.finish_run(
+                    connection,
+                    run_id=error.run_id,
+                    state=RunState.INTERRUPTED,
+                    reason=(
+                        f"handler for {error.task_type!r} returned "
+                        f"non-settling state {error.state!r}"
+                    ),
+                    digest_path=None,
+                    digest_sha256=None,
+                    now=utc_timestamp(clock.now()),
+                )
+                log_event(
+                    logger,
+                    "run_non_settling_state",
+                    run_id=error.run_id,
+                    task_type=error.task_type,
+                    state=str(error.state),
+                )
+                return EXIT_FAILED
 
             if written is None:
                 # The engine always calls the reporter before returning, so

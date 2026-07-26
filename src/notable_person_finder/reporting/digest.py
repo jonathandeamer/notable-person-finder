@@ -64,6 +64,8 @@ def render_digest(report: RunReport, *, local_date: str) -> str:
         f"- Required work deferred: {counters.required_deferred}",
         f"- Optional work succeeded: {counters.optional_succeeded}",
     ]
+    # TODO(milestone 3): render budget summary from RunReport budget fields
+    # once budget-driven deferrals are reachable.
 
     if counters.required_failed_permanent:
         lines.append(

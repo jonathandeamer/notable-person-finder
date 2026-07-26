@@ -337,11 +337,36 @@ def test_no_httpx_exception_escapes_the_boundary() -> None:
 def test_llm_profile_uses_the_longer_read_timeout() -> None:
     config = TransportConfig(read_timeout_seconds=30.0, llm_read_timeout_seconds=300.0)
     with transport_for(lambda request: httpx.Response(200, text="ok"), config) as transport:
-        assert transport.timeout_for(profile="llm").read == 300.0
-        assert transport.timeout_for(profile="ordinary").read == 30.0
-        assert transport.timeout_for(profile="ordinary").connect == 10.0
+        assert transport._timeout_for(profile="llm").read == 300.0
+        assert transport._timeout_for(profile="ordinary").read == 30.0
+        assert transport._timeout_for(profile="ordinary").connect == 10.0
 
 
 def test_client_level_automatic_retries_are_disabled() -> None:
     with transport_for(lambda request: httpx.Response(200, text="ok")) as transport:
         assert transport.automatic_retries_enabled() is False
+
+
+class _BuildRequestRaisesUnicode(httpx.Client):
+    def build_request(self, *args, **kwargs):
+        raise UnicodeEncodeError(
+            "ascii", "café", 0, 1, "ordinal not in range(128)"
+        )
+
+
+def test_unicode_encode_error_in_build_request_is_translated() -> None:
+    """A non-ASCII header/value must not leak as a raw UnicodeEncodeError."""
+    client = _BuildRequestRaisesUnicode(transport=httpx.MockTransport(lambda request: httpx.Response(200)))
+    transport = HttpTransport(
+        client,
+        config=TransportConfig(),
+        user_agent="test",
+        resolver=RESOLVER,
+        clock=FakeClock(),
+    )
+    with pytest.raises(ProviderFailure) as captured:
+        transport.request(
+            "GET", "https://example.com/a", provider="feeds", operation="fetch_feed"
+        )
+    assert captured.value.category is FailureCategory.CONFIGURATION
+    assert "non-ASCII" in captured.value.detail

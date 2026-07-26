@@ -161,7 +161,7 @@ class HttpTransport:
         """Only the central retry coordinator starts a repeat request."""
         return False
 
-    def timeout_for(self, *, profile: Literal["ordinary", "llm"]) -> httpx.Timeout:
+    def _timeout_for(self, *, profile: Literal["ordinary", "llm"]) -> httpx.Timeout:
         read = (
             self._config.llm_read_timeout_seconds
             if profile == "llm"
@@ -267,13 +267,21 @@ class HttpTransport:
                     continue
                 merged[lowered] = value
 
-        request = self._client.build_request(
-            method,
-            url,
-            headers=merged,
-            params=params,
-            timeout=self.timeout_for(profile=profile),
-        )
+        try:
+            request = self._client.build_request(
+                method,
+                url,
+                headers=merged,
+                params=params,
+                timeout=self._timeout_for(profile=profile),
+            )
+        except UnicodeEncodeError as error:
+            raise ProviderFailure(
+                FailureCategory.CONFIGURATION,
+                provider=provider,
+                operation=operation,
+                detail="request contains non-ASCII characters",
+            ) from error
         try:
             response = self._client.send(request, stream=True)
         except Exception as error:  # translated below; no httpx type escapes
