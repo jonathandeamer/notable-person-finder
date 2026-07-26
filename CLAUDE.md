@@ -34,6 +34,28 @@ tasks already recorded complete.
 Follow the file structure and interfaces in the active milestone plan. Do not
 import or wrap prototype modules to shortcut rewrite work.
 
+## Plans and Specifications
+
+Plans and specs are authorities, not source-code repositories. Keep them
+reviewable and executable.
+
+- **Keep milestone plans under ~1,500 lines.** If a plan grows larger, the
+  milestone is too big: split it, or move reference material into an appendix
+  or separate design note.
+- **Reference code blocks are illustrative, not canonical.** Do not paste
+  large implementation fragments into a plan. The shipped code and its tests
+  govern; the plan describes interfaces, invariants, the completion gate, and
+  sequencing.
+- **A plan specifies *what* and *why*, not *how* line-by-line.** Include:
+  public interfaces, constraints, failure modes, test strategy, and the exact
+  verification command that closes the milestone.
+- **Track progress in a ledger, not in the plan file.** Use a separate
+  progress ledger or task list for checkbox tracking; do not leave the plan
+  itself full of unchecked boxes once implementation is complete.
+- **Specs are for architecture and policy; plans are for executable
+  milestones.** A spec may be long-lived and revised; a plan should be small
+  enough to read in one sitting before starting work.
+
 ## Environment and Verification
 
 - Python version: 3.13 or newer.
