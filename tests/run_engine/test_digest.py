@@ -144,6 +144,11 @@ def test_dated_digests_are_immutable_across_runs(tmp_path: Path) -> None:
     assert (tmp_path / "2026-07-25-run-43.md").is_file()
 
 
+def test_an_interrupted_run_says_so_prominently() -> None:
+    markdown = render_digest(report(RunState.INTERRUPTED), local_date="2026-07-25")
+    assert "INTERRUPTED" in markdown.splitlines()[2]
+
+
 def test_an_unwritable_digest_root_raises_a_typed_error(tmp_path: Path) -> None:
     blocked = tmp_path / "digests"
     blocked.write_text("not a directory", encoding="utf-8")
@@ -154,10 +159,120 @@ def test_an_unwritable_digest_root_raises_a_typed_error(tmp_path: Path) -> None:
 def test_no_partial_file_remains_after_a_failed_write(tmp_path: Path, monkeypatch) -> None:
     import os
 
+    # The dated digest -- the authoritative artifact -- is now created with
+    # an exclusive, collision-refusing primitive (os.link from a temp file),
+    # not os.replace. Failing that primitive is the discriminating fault for
+    # "no partial file remains" on the artifact that matters.
+    def failing_link(src: object, dst: object) -> None:
+        raise OSError("link failed")
+
+    monkeypatch.setattr(os, "link", failing_link)
+    with pytest.raises(DigestWriteError):
+        write_digest(tmp_path, report(), local_date="2026-07-25", config=DigestConfig())
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_dated_digest_collision_is_refused_and_does_not_overwrite(tmp_path: Path) -> None:
+    """The dated digest is documented as immutable. A second write attempt
+    for the same run_id and local_date must not silently replace it -- if it
+    did, a previously-recorded sha256 would stop matching its own file.
+    """
+    first = write_digest(tmp_path, report(RunState.COMPLETE), local_date="2026-07-25", config=DigestConfig())
+    with pytest.raises(DigestWriteError):
+        write_digest(tmp_path, report(RunState.FAILED), local_date="2026-07-25", config=DigestConfig())
+    assert first.path.read_text(encoding="utf-8") == first.markdown
+    assert "FAILED" not in first.path.read_text(encoding="utf-8")
+
+
+def test_write_digest_fsyncs_the_digest_directory_after_replace(tmp_path: Path, monkeypatch) -> None:
+    """os.replace/os.link are atomic but not durable on their own: without an
+    fsync of the directory entry, a crash between write_digest returning and
+    the next disk flush can lose the rename even though the caller believes
+    the digest exists. The parent directory itself must be fsynced.
+    """
+    import os
+
+    opened_dirs: list[tuple[str, int]] = []
+    real_open = os.open
+
+    def spy_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        opened_dirs.append((os.fspath(path), flags))
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", spy_open)
+    write_digest(tmp_path, report(), local_date="2026-07-25", config=DigestConfig())
+
+    directory_opens = [
+        (path, flags)
+        for path, flags in opened_dirs
+        if Path(path) == tmp_path and flags == os.O_RDONLY
+    ]
+    assert len(directory_opens) >= 1
+
+
+def test_a_corrupted_temp_write_is_detected_before_it_reaches_the_final_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """If the bytes actually landing on disk ever diverge from the rendered
+    markdown -- a buffering bug, a bad encode, a truncated write -- the
+    digest must fail loudly rather than silently hash and report the
+    corrupt content as a successful write.
+    """
+    import os
+
+    real_fdopen = os.fdopen
+
+    def corrupting_fdopen(fd: int, *args: object, **kwargs: object):
+        stream = real_fdopen(fd, *args, **kwargs)  # type: ignore[arg-type]
+        real_write = stream.write
+
+        def corrupt_write(data: str) -> int:
+            return real_write(data + "TAMPERED")
+
+        stream.write = corrupt_write  # type: ignore[method-assign]
+        return stream
+
+    monkeypatch.setattr(os, "fdopen", corrupting_fdopen)
+    with pytest.raises(DigestWriteError):
+        write_digest(tmp_path, report(), local_date="2026-07-25", config=DigestConfig())
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_keyboard_interrupt_during_the_dated_write_is_not_swallowed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Cleaning up the temp file on interrupt is correct; converting the
+    interrupt into a DigestWriteError is not -- that would let ordinary
+    exception handling upstream swallow what should propagate as Ctrl-C or
+    interpreter shutdown.
+    """
+    import os
+
+    def interrupting_link(src: object, dst: object) -> None:
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(os, "link", interrupting_link)
+    with pytest.raises(KeyboardInterrupt):
+        write_digest(tmp_path, report(), local_date="2026-07-25", config=DigestConfig())
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_failed_latest_copy_does_not_orphan_the_already_durable_dated_digest(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The dated digest is the authoritative artifact; latest.md is a
+    convenience copy. A failure writing the convenience copy must not throw
+    away the record of the artifact that already landed durably -- otherwise
+    the engine marks the run failed with digest_path=None even though a
+    perfectly good digest exists on disk.
+    """
+    import os
+
     def failing_replace(src: object, dst: object) -> None:
         raise OSError("replace failed")
 
     monkeypatch.setattr(os, "replace", failing_replace)
-    with pytest.raises(DigestWriteError):
-        write_digest(tmp_path, report(), local_date="2026-07-25", config=DigestConfig())
-    assert list(tmp_path.iterdir()) == []
+    record = write_digest(tmp_path, report(), local_date="2026-07-25", config=DigestConfig())
+    assert record.path.is_file()
+    assert record.path.read_text(encoding="utf-8") == record.markdown
+    assert not (tmp_path / "latest.md").exists()
