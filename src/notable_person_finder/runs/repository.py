@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import sqlite3
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 
 from notable_person_finder.runs.budget import (
     reconcile_in_transaction,
@@ -622,6 +622,30 @@ def run_counters(
         optional_skipped=tally.get((0, "superseded"), 0),
         operational_failures=operational_failures_for_run(connection, run_id=run_id),
     )
+
+
+def deferred_reasons_for_run(
+    connection: sqlite3.Connection, *, run_id: int
+) -> Mapping[str, int]:
+    """Count this run's own deferred settlements, grouped by reason.
+
+    Scoped to `completed_by_run_id = run_id`, the same run-attribution
+    `run_counters` uses for outcomes it owns: a reason belongs to the run that
+    recorded it, not to the whole queue, so a re-armed retry or a prior run's
+    deferral never inflates this run's breakdown.
+    """
+    return {
+        str(row["reason"]): int(row["n"])
+        for row in connection.execute(
+            """
+            SELECT reason, COUNT(*) AS n
+              FROM work_item
+             WHERE completed_by_run_id = ? AND state = 'deferred' AND reason IS NOT NULL
+             GROUP BY reason
+            """,
+            (run_id,),
+        )
+    }
 
 
 def next_attempt_ordinal(connection: sqlite3.Connection, *, work_item_id: int) -> int:

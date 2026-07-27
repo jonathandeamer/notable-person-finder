@@ -202,9 +202,6 @@ class ReportArtifact:
 
 @dataclass(frozen=True, slots=True)
 class RunReport:
-    # TODO(milestone 3): add budget fields (reserved_nano_usd, actual_nano_usd,
-    # deferred_reason) so the digest and `notable status` can explain why work
-    # was deferred. Currently unreachable because no handlers are registered.
     run_id: int
     state: RunState
     started_at: str
@@ -216,6 +213,13 @@ class RunReport:
     paused_providers: frozenset[str]
     interrupted_runs: tuple[int, ...] = ()
     failure_categories: Mapping[str, int] = field(default_factory=dict)
+    budget_limit_nano_usd: int | None = None
+    budget_reserved_nano_usd: int = 0
+    budget_actual_nano_usd: int = 0
+    # Counts this run's own deferred settlements, grouped by reason -- e.g.
+    # `{"not_evaluated_budget": 2}` -- so an operator reading the digest can
+    # tell *why* required work was deferred, not just that it was.
+    deferred_reasons: Mapping[str, int] = field(default_factory=dict)
 
     @property
     def human_id(self) -> str:
@@ -347,6 +351,9 @@ class RunEngine:
             reporting_failed=False,
         )
         record = repository.load_run(self._connection, run_id=run_id)
+        deferred_reasons = repository.deferred_reasons_for_run(
+            self._connection, run_id=run_id
+        )
         report = RunReport(
             run_id=run_id,
             state=state,
@@ -359,6 +366,10 @@ class RunEngine:
             paused_providers=self._retry.paused_providers(),
             interrupted_runs=sweep.runs,
             failure_categories=dict(failure_categories),
+            budget_limit_nano_usd=record.budget_limit_nano_usd,
+            budget_reserved_nano_usd=record.budget_reserved_nano_usd,
+            budget_actual_nano_usd=record.budget_actual_nano_usd,
+            deferred_reasons=dict(deferred_reasons),
         )
         try:
             artifact = self._reporter(report)
@@ -495,12 +506,20 @@ class RunEngine:
         loop no longer routes through, so the engine owns it explicitly.
         """
         if self._retry.is_paused(handler.provider):
+            # Deliberately NOT `f"{handler.provider} paused for this run"`:
+            # `deferred_reasons` groups by this exact string, and
+            # interpolating the provider would mint one distinct key per
+            # paused provider -- five paused providers would render as five
+            # separate reason rows instead of one row with a count of five.
+            # Which provider is already answered by `paused_providers` on the
+            # report, which the digest renders as its own line, so nothing is
+            # lost by keeping this token stable.
             self._settle(
                 run_id,
                 work_item,
                 handler,
                 state=WorkState.DEFERRED,
-                reason=f"{handler.provider} paused for this run",
+                reason="provider paused for this run",
             )
             return None
         prepared = handler.prepare(work_item) if handler.prepare is not None else None
@@ -590,7 +609,38 @@ class RunEngine:
             )
             self._retry.record_success(handler.provider)
             if outcome.state not in SETTLING_WORK_STATES:
-                raise NonSettlingStateError(run_id, handler.task_type, outcome.state)
+                # A handler bug, not a provider failure: the call itself
+                # succeeded, but the state it handed back would leave the
+                # item claimable forever. This used to escape as
+                # `NonSettlingStateError`, which the CLI caught by aborting
+                # the whole run as `interrupted` with no digest -- discarding
+                # every other item's outcome over one handler's mistake. The
+                # engine now settles just this item as `failed_permanent`
+                # with a diagnostic reason and lets the run finish and report
+                # normally, the same as any other permanent failure. The
+                # handler's own outcome (its `payload`) is deliberately not
+                # persisted: a state we refused to honour is not a trustworthy
+                # instruction to write domain data either.
+                log_event(
+                    self._logger,
+                    "run.non_settling_state",
+                    severity=logging.ERROR,
+                    run_id=run_id,
+                    work_item_id=work_item.id,
+                    task_type=handler.task_type,
+                    state=str(outcome.state),
+                )
+                self._settle(
+                    run_id,
+                    work_item,
+                    handler,
+                    state=WorkState.FAILED_PERMANENT,
+                    reason=(
+                        f"handler for {handler.task_type!r} returned "
+                        f"{outcome.state!r}, which is not a settling state"
+                    ),
+                )
+                return
             self._settle(
                 run_id,
                 work_item,

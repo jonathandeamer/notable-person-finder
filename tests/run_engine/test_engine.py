@@ -17,7 +17,6 @@ from notable_person_finder.providers.failures import FailureCategory, ProviderFa
 from notable_person_finder.runs import repository
 from notable_person_finder.runs.clock import FakeClock
 from notable_person_finder.runs.engine import (
-    NonSettlingStateError,
     ReportArtifact,
     RunEngine,
     RunReport,
@@ -801,16 +800,58 @@ def test_a_failed_attempt_keeps_its_reservation_and_can_refuse_the_retry(
     connection.close()
 
 
-def test_a_handler_that_returns_a_non_settling_state_is_rejected(
+def test_budget_exhaustion_is_reported_by_cap_reserved_and_deferral_reason(
     database: Path,
 ) -> None:
-    """A handler may not hand back a state that would leave the item claimable.
+    """Reproduces the milestone-2 review gap with the real engine, cap, and
+    digest inputs: three required items at 1 USD each against a 1.5 USD cap.
+    Two must defer for budget, and `RunReport` must be able to say why --
+    not just that "required work deferred: 2" happened, but the reason and
+    the cap/reserved/actual figures that explain it.
+    """
+    connection = connect_database(database)
+    one_usd = 1_000_000_000
+    for fingerprint in ("1" * 64, "2" * 64, "3" * 64):
+        schedule_probe(connection, fingerprint)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        return TaskOutcome(
+            state=WorkState.SUCCEEDED, reason=None, actual_nano_usd=one_usd
+        )
+
+    handler = TaskHandler(
+        task_type="probe",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=execute,
+        reserved_nano_usd=one_usd,
+    )
+    report = build_engine(
+        connection, FakeClock(), budget_limit_nano_usd=int(1.5 * one_usd)
+    ).execute({handler.task_type: handler})
+
+    assert report.counters.required_succeeded == 1
+    assert report.counters.required_deferred == 2
+    assert report.deferred_reasons == {"not_evaluated_budget": 2}
+    assert report.budget_limit_nano_usd == int(1.5 * one_usd)
+    assert report.budget_reserved_nano_usd == one_usd
+    assert report.budget_actual_nano_usd == one_usd
+    connection.close()
+
+
+def test_a_handler_that_returns_a_non_settling_state_settles_as_failed_permanent(
+    database: Path,
+) -> None:
+    """A handler may hand back a state that would otherwise leave the item
+    claimable forever. The engine no longer lets that escape as a process
+    crash: it settles just that item as `failed_permanent` with a diagnostic
+    reason and lets the run finish normally.
 
     Without this guard the engine's peek-and-settle loop would re-select the
     same item forever instead of terminating.
     """
     connection = connect_database(database)
-    schedule_probe(connection, "6" * 64)
+    work_id = schedule_probe(connection, "6" * 64)
     handler = TaskHandler(
         task_type="probe",
         provider="probe_provider",
@@ -819,8 +860,17 @@ def test_a_handler_that_returns_a_non_settling_state_is_rejected(
             state=WorkState.PENDING, reason=None
         ),
     )
-    with pytest.raises(ValueError, match="settling state"):
-        build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+    report = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    row = connection.execute(
+        "SELECT state, reason, completed_by_run_id FROM work_item WHERE id = ?",
+        (work_id,),
+    ).fetchone()
+    assert row["state"] == WorkState.FAILED_PERMANENT
+    assert row["completed_by_run_id"] == report.run_id
+    assert row["reason"] is not None
+    assert "settling state" in row["reason"]
+    assert report.counters.required_failed_permanent == 1
     connection.close()
 
 
@@ -879,9 +929,14 @@ def test_the_engine_logs_run_lifecycle_events_and_never_the_snapshot(
     connection.close()
 
 
-def test_non_settling_handler_state_raises(database: Path) -> None:
+def test_non_settling_handler_state_settles_permanently_and_does_not_raise(
+    database: Path,
+) -> None:
+    """The engine used to raise `NonSettlingStateError` here. It no longer
+    does: the one bad item is settled `failed_permanent` and the run reaches
+    a terminal state instead of aborting."""
     connection = connect_database(database)
-    schedule_probe(connection, "n" * 64)
+    work_id = schedule_probe(connection, "n" * 64)
 
     def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
         return TaskOutcome(state=WorkState.PENDING, reason="not settling")
@@ -893,10 +948,82 @@ def test_non_settling_handler_state_raises(database: Path) -> None:
         execute=execute,
     )
     engine = build_engine(connection, FakeClock())
-    with pytest.raises(NonSettlingStateError) as captured:
-        engine.execute({handler.task_type: handler})
-    assert captured.value.task_type == "probe"
-    assert captured.value.state is WorkState.PENDING
+    report = engine.execute({handler.task_type: handler})
+
+    row = connection.execute(
+        "SELECT state, reason FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["state"] == WorkState.FAILED_PERMANENT
+    assert "probe" in row["reason"]
+    assert "pending" in row["reason"].lower()
+    # No other required item succeeded this run, so the failure is not
+    # meaningless-outranked: the run reports FAILED, not PARTIAL.
+    assert report.state is RunState.FAILED
+    connection.close()
+
+
+def test_a_non_settling_item_does_not_stop_a_healthy_item_in_the_same_run(
+    database: Path,
+) -> None:
+    """One bad handler must not abort the whole run: a healthy item scheduled
+    alongside it still succeeds, and the run still finishes and reports,
+    rather than aborting with no digest."""
+    connection = connect_database(database)
+    bad_id = schedule_probe(connection, "bad" * 21 + "1")
+    good_id = schedule_probe(connection, "good" * 16)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        if work_item.id == bad_id:
+            return TaskOutcome(state=WorkState.PENDING, reason=None)
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    handler = TaskHandler(
+        task_type="probe",
+        provider="probe_provider",
+        operation="probe_call",
+        execute=execute,
+    )
+    reported: list[RunReport] = []
+
+    def spy_reporter(report: RunReport) -> ReportArtifact:
+        reported.append(report)
+        return ReportArtifact(path="fake-digest.md", sha256="d" * 64, markdown="x")
+
+    clock = FakeClock()
+    engine = RunEngine(
+        connection,
+        retry=RetryPolicy(RetryConfig(max_attempts=2, jitter_ratio=0.0), clock=clock),
+        scheduler=BoundedScheduler(max_workers=2),
+        clock=clock,
+        timezone="Europe/Paris",
+        window_start="2026-07-24T06:00:00Z",
+        budget_limit_nano_usd=None,
+        snapshot_fingerprint="a" * 64,
+        snapshot_json="{}",
+        reporter=spy_reporter,
+    )
+    report = engine.execute({handler.task_type: handler})
+
+    assert len(reported) == 1
+    bad_row = connection.execute(
+        "SELECT state FROM work_item WHERE id = ?", (bad_id,)
+    ).fetchone()
+    good_row = connection.execute(
+        "SELECT state FROM work_item WHERE id = ?", (good_id,)
+    ).fetchone()
+    assert bad_row["state"] == WorkState.FAILED_PERMANENT
+    assert good_row["state"] == WorkState.SUCCEEDED
+    assert report.counters.required_succeeded == 1
+    assert report.counters.required_failed_permanent == 1
+    # The good item's success is meaningful, so the failed one is outranked
+    # to PARTIAL rather than FAILED, and -- critically -- a digest was
+    # recorded rather than the run aborting with none.
+    assert report.state is RunState.PARTIAL
+    run_row = connection.execute(
+        "SELECT state, digest_path FROM run WHERE id = ?", (report.run_id,)
+    ).fetchone()
+    assert run_row["state"] == RunState.PARTIAL
+    assert run_row["digest_path"] == "fake-digest.md"
     connection.close()
 
 

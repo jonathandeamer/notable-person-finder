@@ -26,7 +26,6 @@ from notable_person_finder.reporting.digest import (
 from notable_person_finder.runs import repository
 from notable_person_finder.runs.clock import SystemClock, utc_timestamp
 from notable_person_finder.runs.engine import (
-    NonSettlingStateError,
     ReportArtifact,
     RunEngine,
     RunReport,
@@ -185,31 +184,13 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                 reporter=report_run,
             )
             log_event(logger, "run_started", fingerprint=loaded.fingerprint)
-            try:
-                # No provider adapters exist in this milestone, so no task
-                # handlers are registered. Milestones 3-6 supply them.
-                report = engine.execute({})
-            except NonSettlingStateError as error:
-                repository.finish_run(
-                    connection,
-                    run_id=error.run_id,
-                    state=RunState.INTERRUPTED,
-                    reason=(
-                        f"handler for {error.task_type!r} returned "
-                        f"non-settling state {error.state!r}"
-                    ),
-                    digest_path=None,
-                    digest_sha256=None,
-                    now=utc_timestamp(clock.now()),
-                )
-                log_event(
-                    logger,
-                    "run_non_settling_state",
-                    run_id=error.run_id,
-                    task_type=error.task_type,
-                    state=str(error.state),
-                )
-                return EXIT_FAILED
+            # No provider adapters exist in this milestone, so no task
+            # handlers are registered. Milestones 3-6 supply them. A handler
+            # returning a non-settling state is now handled inside the
+            # engine -- it settles just that item and the run finishes
+            # normally -- so there is no longer a non-settling failure mode
+            # for this call to catch.
+            report = engine.execute({})
 
             if written is None:
                 # The engine always calls the reporter before returning, so
