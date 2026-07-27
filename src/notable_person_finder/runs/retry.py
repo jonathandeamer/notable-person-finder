@@ -67,6 +67,10 @@ class RetryPolicy:
         self._consecutive_exhaustions: dict[str, int] = {}
         self._paused: set[str] = set()
 
+    @property
+    def max_attempts(self) -> int:
+        return self._config.max_attempts
+
     def is_paused(self, provider: str) -> bool:
         with self._guard:
             return provider in self._paused
@@ -101,11 +105,19 @@ class RetryPolicy:
         # generations. This branch never grants an attempt beyond
         # max_attempts; it only forecloses a second malformed
         # retry early when budget would otherwise allow one.
+        #
+        # This is reported as `PERMANENT`, not `EXHAUSTED`: the two rules
+        # are independent, not mutually exclusive, so a second malformed
+        # response that also happens to land on the final budget slot must
+        # still surface as an immediate answer from the provider (the
+        # coordinator resets the pause counter and re-raises the original
+        # failure), never as a retry-budget exhaustion that the engine would
+        # classify as a deferral and repeat on a later run.
         if (
             failure.category is FailureCategory.MALFORMED_RESPONSE
             and malformed_retries >= 1
         ):
-            return RetryDecision(action="EXHAUSTED", delay_seconds=None)
+            return RetryDecision(action="PERMANENT", delay_seconds=None)
 
         if attempt_index + 1 >= self._config.max_attempts:
             return RetryDecision(action="EXHAUSTED", delay_seconds=None)
@@ -159,7 +171,6 @@ class RetryCoordinator:
     ) -> None:
         self._clock = clock
         self._policy = RetryPolicy(config, clock=clock, random_source=random_source)
-        self._max_attempts = config.max_attempts
 
     def is_paused(self, provider: str) -> bool:
         return self._policy.is_paused(provider)
@@ -182,7 +193,7 @@ class RetryCoordinator:
 
         last_failure: ProviderFailure | None = None
         malformed_retries = 0
-        for attempt_index in range(self._max_attempts):
+        for attempt_index in range(self._policy.max_attempts):
             ordinal = starting_ordinal + attempt_index
             started = self._clock.monotonic()
             try:
@@ -206,17 +217,10 @@ class RetryCoordinator:
                     malformed_retries=malformed_retries,
                 )
                 if decision.action == "PERMANENT":
-                    self._policy.record_success(provider)
-                    raise
-                if (
-                    decision.action == "EXHAUSTED"
-                    and attempt_index + 1 < self._max_attempts
-                ):
-                    # The policy forecloses a fresh retry here even though
-                    # attempt budget remains (the malformed-response rule),
-                    # so this is an immediate answer from the provider, not a
-                    # retry-budget exhaustion -- it must surface as the
-                    # original failure, not `RetryExhausted`.
+                    # Covers both a non-retryable failure and a second
+                    # malformed response (foreclosed regardless of remaining
+                    # attempt budget): both are immediate answers from the
+                    # provider, so the original failure is re-raised as-is.
                     self._policy.record_success(provider)
                     raise
                 if failure.category is FailureCategory.MALFORMED_RESPONSE:
@@ -224,7 +228,10 @@ class RetryCoordinator:
                 last_failure = failure
                 if decision.action == "EXHAUSTED":
                     break
-                assert decision.delay_seconds is not None
+                if decision.delay_seconds is None:
+                    raise RuntimeError(
+                        "RetryPolicy.decide returned action=RETRY with no delay_seconds"
+                    ) from None
                 self._clock.sleep(decision.delay_seconds)
                 continue
 
@@ -248,7 +255,7 @@ class RetryCoordinator:
             self._policy.record_success(provider)
         else:
             self._policy.record_exhaustion(provider)
-        raise RetryExhausted(last_failure, attempts=self._max_attempts)
+        raise RetryExhausted(last_failure, attempts=self._policy.max_attempts)
 
     def _elapsed_ms(self, started: float) -> int:
         return max(int((self._clock.monotonic() - started) * 1000), 0)
