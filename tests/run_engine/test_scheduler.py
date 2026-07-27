@@ -196,3 +196,22 @@ def test_single_worker_serializes_work() -> None:
     with BoundedScheduler(max_workers=1) as scheduler:
         list(scheduler.run(range(4), lambda value: order.append(value) or value))
     assert order == [0, 1, 2, 3]
+
+
+def test_unwrap_returns_a_success_and_re_raises_a_failure() -> None:
+    # `result` is `R | None` because a failed completion has none, which forces
+    # every caller into an unchecked optional access at exactly the point it is
+    # draining results. `unwrap()` is the narrowing the type cannot express on
+    # its own: a success yields its properly typed result, and a failure
+    # re-raises the worker's own exception with its traceback intact.
+    def worker(value: int) -> str:
+        if value == 1:
+            raise ValueError("bad item")
+        return f"ok-{value}"
+
+    with BoundedScheduler(max_workers=2) as scheduler:
+        completions = {c.item: c for c in scheduler.run([0, 1], worker)}
+
+    assert completions[0].unwrap() == "ok-0"
+    with pytest.raises(ValueError, match="bad item"):
+        completions[1].unwrap()

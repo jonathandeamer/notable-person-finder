@@ -33,7 +33,7 @@ from notable_person_finder.runs.engine import (
 )
 from notable_person_finder.runs.lock import LockUnavailable, MutationLock
 from notable_person_finder.runs.models import RunState
-from notable_person_finder.runs.retry import RetryCoordinator
+from notable_person_finder.runs.retry import RetryPolicy
 from notable_person_finder.runs.scheduler import BoundedScheduler
 
 EXIT_OK = 0
@@ -174,7 +174,7 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
 
             engine = RunEngine(
                 connection,
-                retry=RetryCoordinator(loaded.main.retry, clock=clock),
+                retry=RetryPolicy(loaded.main.retry, clock=clock),
                 scheduler=BoundedScheduler(loaded.main.concurrency.http_workers),
                 clock=clock,
                 timezone=loaded.main.timezone,

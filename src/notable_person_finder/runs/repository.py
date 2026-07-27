@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import sqlite3
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 
 from notable_person_finder.runs.budget import (
     reconcile_in_transaction,
@@ -458,8 +458,19 @@ def complete_work(
     reason: str | None,
     now: str,
     eligible_at: str | None = None,
+    domain_writes: Callable[[sqlite3.Connection], None] | None = None,
 ) -> None:
-    """Record one item's terminal or deferred outcome; failures are isolated."""
+    """Record one item's outcome; failures are isolated.
+
+    Also the re-arm path: passing `state='pending'` with a later `eligible_at`
+    returns a claimed item to the queue for a retry inside the same run.
+
+    `domain_writes` runs inside this transaction, after the state change and
+    before the commit, so a handler's domain rows and the settlement that
+    justifies them commit or roll back together. A handler that raises there
+    leaves the item `running` and claimed, which the next run's sweep
+    recovers -- never a settled item whose domain writes vanished.
+    """
     connection.execute("BEGIN IMMEDIATE")
     try:
         changed = connection.execute(
@@ -479,6 +490,8 @@ def complete_work(
             raise RuntimeError(
                 f"work item {work_item_id} is not completable by run-{run_id}"
             )
+        if domain_writes is not None:
+            domain_writes(connection)
     except BaseException:
         connection.rollback()
         raise
