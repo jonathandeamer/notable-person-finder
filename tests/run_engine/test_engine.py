@@ -2005,6 +2005,122 @@ def test_a_handler_supplied_reason_far_over_120_characters_is_truncated_visibly(
     connection.close()
 
 
+def test_a_reason_at_exactly_120_characters_survives_byte_identical(
+    database: Path,
+) -> None:
+    """Pins the truncation boundary from the other side: `>` rather than
+    `>=` at 120 must not be a fluke the 200-character test alone can't catch.
+    A reason of exactly 120 characters must survive untouched -- no marker,
+    no shortening -- or a stray `>=` here would silently truncate a
+    legitimate reason with no test failing.
+    """
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "15" * 32)
+    exactly_120 = "y" * 120
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        return TaskOutcome(state=WorkState.DEFERRED, reason=exactly_120)
+
+    handler = probe_handler(execute)
+    build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    row = connection.execute(
+        "SELECT reason FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["reason"] == exactly_120
+    connection.close()
+
+
+def test_a_reason_at_121_characters_is_truncated_to_120(database: Path) -> None:
+    """The sibling of the 120-character pin: one character over the bound
+    must truncate, with the marker landing inside the 120, not past it.
+    """
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "16" * 32)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        return TaskOutcome(state=WorkState.DEFERRED, reason="z" * 121)
+
+    handler = probe_handler(execute)
+    build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    row = connection.execute(
+        "SELECT reason FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["reason"] == "z" * 117 + "..."
+    assert len(row["reason"]) == 120
+    connection.close()
+
+
+def test_a_handler_deferring_with_no_reason_still_counts_in_the_breakdown(
+    database: Path,
+) -> None:
+    """`TaskOutcome(state=DEFERRED, reason=None)` type-checks -- nothing stops
+    a handler from returning it -- but `_sanitize_reason` leaves `None` as
+    `None` on purpose, so the door has to be closed in `_settle` itself, and
+    only for `DEFERRED`: `repository.deferred_reasons` filters `reason IS NOT
+    NULL` while `required_deferred` does not, so a `NULL` reason on a
+    deferred item would reopen the exact sum mismatch Task 4's fix round
+    closed.
+    """
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "17" * 32)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        return TaskOutcome(state=WorkState.DEFERRED, reason=None)
+
+    handler = probe_handler(execute)
+    report = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    row = connection.execute(
+        "SELECT reason FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["reason"] == "unspecified"
+    assert report.deferred_reasons == {"unspecified": 1}
+    connection.close()
+
+
+def test_a_succeeded_item_with_no_reason_stays_null(database: Path) -> None:
+    """The fix for a `None` reason on a deferred item is deliberately scoped
+    to `DEFERRED`: a succeeded item with no reason is ordinary, and `NULL` is
+    the correct, unchanged value there -- this must not regress into
+    `"unspecified"` for every settling state.
+    """
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "18" * 32)
+    handler = succeeding_handler([])
+
+    build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    row = connection.execute(
+        "SELECT reason FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["reason"] is None
+    connection.close()
+
+
+def test_a_zero_width_only_reason_becomes_unspecified(database: Path) -> None:
+    """A reason made of only zero-width or bidi-override characters is not
+    empty by `str.strip()` -- so without widening the control-character class
+    beyond ASCII, this would survive as a blank-looking digest bullet and
+    mint its own `GROUP BY` key instead of becoming `"unspecified"`.
+    """
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "19" * 32)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        return TaskOutcome(state=WorkState.DEFERRED, reason="​​")
+
+    handler = probe_handler(execute)
+    build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    row = connection.execute(
+        "SELECT reason FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["reason"] == "unspecified"
+    connection.close()
+
+
 def test_a_whitespace_only_reason_becomes_unspecified_and_still_counts_in_the_breakdown(
     database: Path,
 ) -> None:

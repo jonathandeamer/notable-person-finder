@@ -175,6 +175,29 @@ def test_the_twelve_highest_count_reasons_are_the_ones_shown() -> None:
         assert f"reason_{index:02d}:" not in markdown
 
 
+def test_exactly_one_reason_past_the_cap_is_shown_not_folded() -> None:
+    """Folding costs the operator a row of detail; showing the one row that
+    would otherwise be folded costs nothing extra when there is only one.
+    Thirteen distinct reasons -- one past the twelve-row cap -- must render
+    as thirteen plain rows, with no remainder row at all.
+    """
+    deferred_reasons = {f"reason_{index:02d}": index + 1 for index in range(13)}
+    counters = RunCounters(0, 0, sum(deferred_reasons.values()), 0, 0, 0, 0)
+    markdown = render_digest(
+        report(RunState.PARTIAL, counters=counters, deferred_reasons=deferred_reasons),
+        local_date="2026-07-25",
+    )
+    breakdown_lines = [
+        line
+        for line in markdown.splitlines()
+        if line.startswith("  - ") and ":" in line
+    ]
+    assert len(breakdown_lines) == 13
+    assert "folded" not in markdown
+    for index in range(13):
+        assert f"reason_{index:02d}: {index + 1}" in markdown
+
+
 def test_the_budget_cap_reserved_and_spent_are_reported_in_usd() -> None:
     one_usd = 1_000_000_000
     markdown = render_digest(

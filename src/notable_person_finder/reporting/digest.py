@@ -91,13 +91,24 @@ def render_digest(report: RunReport, *, local_date: str) -> str:
     ordered_reasons = sorted(
         report.deferred_reasons.items(), key=lambda item: (-item[1], item[0])
     )
-    shown_reasons = ordered_reasons[:_MAX_RENDERED_DEFERRAL_REASONS]
-    folded_reasons = ordered_reasons[_MAX_RENDERED_DEFERRAL_REASONS:]
+    # Folding costs the operator a row of detail; showing it costs nothing
+    # extra when there is only one row to fold. So a lone reason past the cap
+    # is rendered on its own line instead, and folding only ever kicks in for
+    # two or more -- otherwise the remainder row's noun would need to be
+    # singular AND the row it replaces would already have fit within one more
+    # line.
+    if len(ordered_reasons) <= _MAX_RENDERED_DEFERRAL_REASONS + 1:
+        shown_reasons = ordered_reasons
+        folded_reasons: list[tuple[str, int]] = []
+    else:
+        shown_reasons = ordered_reasons[:_MAX_RENDERED_DEFERRAL_REASONS]
+        folded_reasons = ordered_reasons[_MAX_RENDERED_DEFERRAL_REASONS:]
     for reason, count in shown_reasons:
         lines.append(f"  - {reason}: {count}")
     if folded_reasons:
         folded_count = sum(count for _, count in folded_reasons)
-        lines.append(f"  - ({len(folded_reasons)} more reasons folded): {folded_count}")
+        noun = "reason" if len(folded_reasons) == 1 else "reasons"
+        lines.append(f"  - ({len(folded_reasons)} more {noun} folded): {folded_count}")
     if (
         report.budget_limit_nano_usd is not None
         or report.budget_reserved_nano_usd

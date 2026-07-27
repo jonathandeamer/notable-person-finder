@@ -159,12 +159,35 @@ def _elapsed_ms(clock: Clock, started: float) -> int:
     return max(int((clock.monotonic() - started) * 1000), 0)
 
 
-# `_settle` is the one place a settled reason is written, so this is the one
-# place it is bounded. `\t`, `\n`, `\r`, `\v`, and `\f` are whitespace and are
-# handled by the collapse below; everything else in C0 plus DEL is dropped
-# outright, because a control character has no legitimate place in a digest
-# bullet or a `GROUP BY` key.
-_REASON_CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# `_settle` is the engine's production settle path, and this bounds what it
+# writes. It is not the only place a `reason` column is ever written, though:
+# `RunEngine._rearm` also writes one directly (state `pending`, always one of
+# the engine's own enum-derived literals, so leaving it unsanitised is
+# benign), and `repository.defer_unclaimed` / `repository.supersede_work`
+# both accept a caller-supplied reason with no sanitisation at all. Neither
+# repository function has a production caller today -- `defer_unclaimed` is
+# a regression harness with its removal already flagged for pull request 2
+# (see its own docstring) -- but that removal decision needs to know
+# `defer_unclaimed` writes `state='deferred'` directly, so reviving it would
+# feed `repository.deferred_reasons`'s `GROUP BY` with unsanitised text,
+# bypassing everything below.
+#
+# `\t`, `\n`, `\r`, `\v`, and `\f` are whitespace and are handled by the
+# collapse below; everything else in C0 plus DEL is dropped outright, because
+# a control character has no legitimate place in a digest bullet or a
+# `GROUP BY` key. The same is true of zero-width and bidi-override
+# characters -- U+200B-U+200F (zero-width space/joiners/directional marks),
+# U+202A-U+202E (bidi embedding/override controls), and U+FEFF (BOM /
+# zero-width no-break space) -- none of which `str.strip()` treats as
+# whitespace, so a reason made of only these would otherwise survive as a
+# blank-looking, non-`"unspecified"` digest bullet and its own distinct
+# `GROUP BY` key. U+0085, U+00A0, U+2028, and U+2029 need no entry here:
+# Python's Unicode-aware `\s` already matches all four, so the whitespace
+# collapse below handles them and they must not be added a second time.
+_REASON_CONTROL_CHARACTERS = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f"
+    r"\u200b-\u200f\u202a-\u202e\ufeff]"
+)
 _REASON_WHITESPACE_RUN = re.compile(r"\s+")
 _REASON_MAX_LENGTH = 120
 _REASON_TRUNCATION_SUFFIX = "..."
@@ -979,12 +1002,26 @@ class RunEngine:
         that justifies them commit or roll back together.
 
         `reason` is sanitised here, once, whether it came from a handler or
-        from the engine's own literals: this is the single choke point every
-        settled reason passes through on its way to `complete_work`, to the
+        from the engine's own literals: this is where every reason this
+        engine settles gets bounded on its way to `complete_work`, to the
         `_PersistFailed` path's second settlement, and to the closing
-        `run.work_settled` log event below.
+        `run.work_settled` log event below. See the comment above
+        `_REASON_CONTROL_CHARACTERS` for the other, non-`_settle` writers of
+        this column and why they are out of scope here.
         """
         reason = _sanitize_reason(reason)
+        if state is WorkState.DEFERRED and reason is None:
+            # `TaskOutcome(state=DEFERRED, reason=None)` type-checks: nothing
+            # stops a handler from returning it. `_sanitize_reason` leaves
+            # `None` as `None` on purpose (it means "nothing to sanitise", not
+            # "empty"), so that door has to be closed here instead, and only
+            # for DEFERRED: `repository.deferred_reasons` filters
+            # `reason IS NOT NULL` while the `required_deferred` headline does
+            # not, so a NULL reason on a deferred item would reopen the exact
+            # sum mismatch Task 4's fix round closed. A succeeded item with no
+            # reason is ordinary and NULL is the right value there, so this
+            # does not touch any other settling state.
+            reason = _UNSPECIFIED_REASON
         try:
             repository.complete_work(
                 self._connection,
