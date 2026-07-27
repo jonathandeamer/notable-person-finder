@@ -38,8 +38,7 @@ class MutationLock:
             mode="a+",
             timeout=0,
             flags=(
-                portalocker.LockFlags.EXCLUSIVE
-                | portalocker.LockFlags.NON_BLOCKING
+                portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING
             ),
         )
         try:

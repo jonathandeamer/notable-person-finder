@@ -22,7 +22,11 @@ dependencies = [
 notable = "notable_person_finder.cli.main:entrypoint"
 
 [dependency-groups]
-dev = ["pytest>=8.4,<9"]
+dev = [
+    "pyright>=1.1.390",
+    "pytest>=8.4,<9",
+    "ruff>=0.9.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/notable_person_finder"]
@@ -31,3 +35,39 @@ packages = ["src/notable_person_finder"]
 testpaths = ["tests"]
 addopts = "-ra"
 markers = ["live: explicitly invoked tests that contact external providers"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+extend-exclude = [
+    "run_pipeline.py",
+    "name_utils.py",
+    "scripts",
+    "ingest",
+    "prompts",
+    "output",
+    "state",
+    "tests/test_*",
+    "tests/conftest.py",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # Pyflakes
+    "I",   # isort (import sorting)
+    "UP",  # pyupgrade (modern Python syntax)
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+]
+ignore = []
+
+[tool.ruff.lint.isort]
+known-first-party = ["notable_person_finder"]
+
+[tool.pyright]
+pythonVersion = "3.13"
+typeCheckingMode = "standard"
+include = ["src", "tests/foundation"]
+exclude = ["**/__pycache__", ".venv", ".worktrees"]
+

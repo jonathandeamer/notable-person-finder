@@ -267,13 +267,16 @@ def test_portable_root_contains_all_mutable_paths(tmp_path: Path) -> None:
     assert paths.database == paths.data_root / "notable.sqlite3"
     assert paths.backups == paths.data_root / "backups"
     assert paths.digests == paths.data_root / "digests"
-    assert paths.log_file == (tmp_path / "portable" / "logs" / "notable.jsonl").resolve()
+    assert (
+        paths.log_file == (tmp_path / "portable" / "logs" / "notable.jsonl").resolve()
+    )
     assert paths.cache_root == (tmp_path / "portable" / "cache").resolve()
     assert paths.lock_file == paths.data_root / "notable.lock"
 
 
 def test_default_paths_do_not_depend_on_current_directory(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
     paths = resolve_paths(config_file=None)
@@ -297,7 +300,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from platformdirs import user_cache_path, user_config_path, user_data_path, user_log_path
+from platformdirs import (
+    user_cache_path,
+    user_config_path,
+    user_data_path,
+    user_log_path,
+)
 
 APP_NAME = "notable-person-finder"
 
@@ -414,7 +422,11 @@ def test_feeds_require_unique_keys_and_public_http_urls() -> None:
             {
                 "schema_version": 1,
                 "feeds": [
-                    {"key": "bad", "label": "Bad", "url": "https://u:p@example.com/feed"}
+                    {
+                        "key": "bad",
+                        "label": "Bad",
+                        "url": "https://u:p@example.com/feed",
+                    }
                 ],
             }
         )
@@ -435,9 +447,7 @@ def test_domain_profile_accepts_only_known_attention_signals() -> None:
     )
 
     assert profile.key == "visual-arts-en"
-    assert profile.attention_examples["significant_recognition"] == (
-        "major art prize",
-    )
+    assert profile.attention_examples["significant_recognition"] == ("major art prize",)
 ```
 
 - [ ] **Step 2: Run the model tests and verify they fail**
@@ -541,7 +551,9 @@ class DomainProfileConfig(StrictModel):
     key: StableKey
     label: str = Field(min_length=1, max_length=120)
     language: Literal["en"]
-    attention_examples: dict[AttentionSignal, tuple[str, ...]] = Field(default_factory=dict)
+    attention_examples: dict[AttentionSignal, tuple[str, ...]] = Field(
+        default_factory=dict
+    )
 ```
 
 - [ ] **Step 4: Run the configuration-model tests**
@@ -935,7 +947,9 @@ import pytest
 from notable_person_finder.runs.lock import LockUnavailable, MutationLock
 
 
-def test_second_lock_fails_without_treating_metadata_as_authority(tmp_path: Path) -> None:
+def test_second_lock_fails_without_treating_metadata_as_authority(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "notable.lock"
     with MutationLock(path) as first:
         assert first.owner.pid > 0
@@ -1007,8 +1021,7 @@ class MutationLock:
             mode="a+",
             timeout=0,
             flags=(
-                portalocker.LockFlags.EXCLUSIVE
-                | portalocker.LockFlags.NON_BLOCKING
+                portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING
             ),
         )
         try:
@@ -1101,7 +1114,14 @@ def run_cli(config_file: Path, *arguments: str, env: dict[str, str] | None = Non
     command_env = os.environ.copy()
     command_env.update(env or {})
     return subprocess.run(
-        [sys.executable, "-m", "notable_person_finder", "--config", str(config_file), *arguments],
+        [
+            sys.executable,
+            "-m",
+            "notable_person_finder",
+            "--config",
+            str(config_file),
+            *arguments,
+        ],
         check=False,
         capture_output=True,
         text=True,
