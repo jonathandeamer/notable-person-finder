@@ -12,7 +12,7 @@ from notable_person_finder.config.models import RetryConfig
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.db.migrate import apply_migrations
 from notable_person_finder.runs import repository
-from notable_person_finder.runs.clock import FakeClock
+from notable_person_finder.runs.clock import FakeClock, utc_timestamp
 from notable_person_finder.runs.engine import (
     ReportArtifact,
     RunEngine,
@@ -23,7 +23,10 @@ from notable_person_finder.runs.models import RunState, WorkItem, WorkState
 from notable_person_finder.runs.retry import RetryPolicy
 from notable_person_finder.runs.scheduler import BoundedScheduler
 
-NOW = "2026-07-25T06:00:00Z"
+# Derived from the production renderer; see the note on the same constant in
+# `test_engine.py`. A hard-coded whole-second literal silently stops matching
+# `eligible_at <= now` once the canonical format carries microseconds.
+NOW = utc_timestamp(FakeClock().now())
 
 
 class SimulatedCrash(BaseException):

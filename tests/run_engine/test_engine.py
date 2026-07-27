@@ -15,7 +15,7 @@ from notable_person_finder.db.connection import connect_database
 from notable_person_finder.db.migrate import apply_migrations
 from notable_person_finder.providers.failures import FailureCategory, ProviderFailure
 from notable_person_finder.runs import repository
-from notable_person_finder.runs.clock import FakeClock
+from notable_person_finder.runs.clock import FakeClock, utc_timestamp
 from notable_person_finder.runs.engine import (
     ReportArtifact,
     RunEngine,
@@ -28,7 +28,14 @@ from notable_person_finder.runs.models import RunState, WorkState
 from notable_person_finder.runs.retry import RetryPolicy
 from notable_person_finder.runs.scheduler import BoundedScheduler
 
-NOW = "2026-07-25T06:00:00Z"
+# Derived from the production renderer rather than written out, so a change to
+# the canonical timestamp format cannot leave the fixture seeding rows in a
+# format the engine no longer produces. It previously read
+# `"2026-07-25T06:00:00Z"`, which stopped matching once `utc_timestamp` began
+# emitting microseconds unconditionally -- and because `eligible_at <= now` is
+# a TEXT comparison, the mismatch made every seeded item unclaimable rather
+# than failing an assertion outright.
+NOW = utc_timestamp(FakeClock().now())
 
 
 # --- pure terminal-state rules -------------------------------------------------

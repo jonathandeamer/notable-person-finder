@@ -6,7 +6,7 @@ import sqlite3
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 from notable_person_finder.obs.logging import EVENT_LOGGER_NAME, log_event
 from notable_person_finder.providers.failures import FailureCategory, ProviderFailure
@@ -280,20 +280,6 @@ def _domain_writes(
             raise _PersistFailed(type(error).__name__) from error
 
     return write
-
-
-def _rearm_timestamp(moment: datetime) -> str:
-    """Render a re-arm deadline so string comparison cannot strand the item.
-
-    `eligible_at <= now` is a text comparison in SQL, and `utc_timestamp`
-    omits the fractional part on a whole second. `'...:01Z' <= '...:01.5Z'` is
-    false because `'Z' > '.'`, so a whole-second deadline could read as not
-    yet due after its instant had passed -- and the loop would stop with the
-    retry still parked. Always emitting microseconds makes the mismatch fall
-    the safe way: a deadline sorts before any `now` in the same second, so a
-    due item is claimable rather than stranded.
-    """
-    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
 @dataclass(slots=True)
@@ -968,7 +954,7 @@ class RunEngine:
             state=WorkState.PENDING,
             reason=f"retrying after {failure.category}",
             now=self._now(),
-            eligible_at=_rearm_timestamp(deadline),
+            eligible_at=utc_timestamp(deadline),
         )
         deadlines[work_item.id] = deadline
         log_event(
