@@ -39,7 +39,7 @@ def test_migrations_apply_once_and_create_backup_before_upgrade(tmp_path: Path) 
     finally:
         connection.close()
 
-    assert first.applied_versions == (1,)
+    assert first.applied_versions == (1, 2)
     assert first.backup_path is not None and first.backup_path.exists()
     assert second.applied_versions == ()
     assert second.backup_path is None
