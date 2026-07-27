@@ -22,8 +22,9 @@ from notable_person_finder.runs.retry import AttemptRecord, RetryPolicy
 from notable_person_finder.runs.scheduler import BoundedScheduler, Completion
 
 # A handler must hand back a state that takes the item out of the claimable
-# set. Anything else (pending, running) would leave the item eligible and the
-# engine's peek-and-settle loop would re-select it forever.
+# set. Anything else (pending, running) would leave the item eligible, and the
+# engine's batch-claim state machine -- claim a batch, execute it on the
+# scheduler, persist each outcome -- would claim it again on its next pass.
 SETTLING_WORK_STATES = frozenset(
     {
         WorkState.SUCCEEDED,
@@ -226,9 +227,14 @@ class RunReport:
     budget_limit_nano_usd: int | None = None
     budget_reserved_nano_usd: int = 0
     budget_actual_nano_usd: int = 0
-    # Counts this run's own deferred settlements, grouped by reason -- e.g.
-    # `{"not_evaluated_budget": 2}` -- so an operator reading the digest can
-    # tell *why* required work was deferred, not just that it was.
+    # Whole-queue, not this-run-only: every outstanding due-and-deferred
+    # required item, grouped by reason -- e.g. `{"not_evaluated_budget": 2}`
+    # -- matching `counters.required_deferred` exactly (see
+    # `repository.deferred_reasons`). A whole-queue headline needs a
+    # whole-queue breakdown: scoping this to only the settlements this run
+    # made would let the two numbers disagree the moment a later run reclaims
+    # and re-defers only part of an earlier run's backlog. Do not narrow this
+    # back to `completed_by_run_id`-scoped counting.
     deferred_reasons: Mapping[str, int] = field(default_factory=dict)
 
     @property

@@ -1174,7 +1174,14 @@ def test_a_non_settling_item_does_not_stop_a_healthy_item_in_the_same_run(
 
 
 def test_failure_categories_tally_uses_a_threading_lock(database: Path) -> None:
-    """`on_attempt` mutates a shared tally; the engine must hold a lock for it."""
+    """The tally is built on the application thread only; the lock is defensive.
+
+    `on_attempt` no longer exists -- the batch-claim reshape moved tally
+    construction entirely onto the application thread in `persist`, so nothing
+    concurrent mutates it today. The lock is retained anyway, against a future
+    off-thread tally reintroducing exactly the race it guards against, so this
+    test pins its presence rather than asserting it is load-bearing right now.
+    """
     connection = connect_database(database)
     engine = build_engine(connection, FakeClock())
     assert isinstance(engine._failure_categories_lock, threading.Lock)

@@ -6,10 +6,14 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
+from notable_person_finder.cli import main as cli_main
 from notable_person_finder.db.connection import connect_database
+from notable_person_finder.runs.engine import RunEngine, RunReport
+from notable_person_finder.runs.scheduler import BoundedScheduler
 from tests.run_engine.helpers import ENVIRONMENT, write_graph
 
 
@@ -548,3 +552,74 @@ def test_verbose_names_the_digest_without_revealing_secrets(
     combined = completed.stdout + completed.stderr
     assert "or-secret-value" not in combined
     assert "brave-secret-value" not in combined
+
+
+class _SpyScheduler(BoundedScheduler):
+    """Records every instance built and whether `close` ever ran on it.
+
+    In-process rather than subprocess: this milestone registers no task
+    handlers, so `BoundedScheduler`'s pool never submits work and never spawns
+    a worker thread either way -- there is nothing to observe from outside the
+    process. Spying on `close()` is what actually distinguishes "released" from
+    "constructed and abandoned" here.
+    """
+
+    instances: ClassVar[list[_SpyScheduler]] = []
+
+    def __init__(self, max_workers: int) -> None:
+        super().__init__(max_workers)
+        self.closed = False
+        _SpyScheduler.instances.append(self)
+
+    def close(self) -> None:
+        self.closed = True
+        super().close()
+
+
+def _configure_in_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TEST_OPENROUTER", ENVIRONMENT["TEST_OPENROUTER"])
+    monkeypatch.setenv("TEST_BRAVE", ENVIRONMENT["TEST_BRAVE"])
+    monkeypatch.setattr(cli_main, "BoundedScheduler", _SpyScheduler)
+    _SpyScheduler.instances.clear()
+
+
+def test_command_run_closes_the_scheduler_on_a_successful_run(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`BoundedScheduler` must not outlive `command_run` on the success path.
+
+    Only one exit path is "successful"; the paired test below covers the
+    exception path, which is the one the finding is actually about.
+    """
+    _configure_in_process(monkeypatch)
+    exit_code = cli_main.command_run(config_file, verbose=False)
+    assert exit_code == cli_main.EXIT_OK
+    assert len(_SpyScheduler.instances) == 1
+    assert _SpyScheduler.instances[0].closed is True
+
+
+def test_command_run_closes_the_scheduler_when_the_run_raises(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scheduler must be released even when the run itself blows up.
+
+    A handler-level failure isolates inside `RunEngine.execute` and never
+    reaches here, so this forces the one kind of exception that genuinely
+    propagates out of `execute` today: a non-`ProviderFailure` raised while
+    the run is in flight. Before the fix, the scheduler was constructed
+    inline and never closed on any exit path -- this is the exit path most
+    likely to leave a worker mid-call when a future handler is registered,
+    which is exactly what the finding warns about.
+    """
+    _configure_in_process(monkeypatch)
+
+    def _boom(self: RunEngine, handlers: object, *, seed: object = None) -> RunReport:
+        raise RuntimeError("synthetic failure for the scheduler-shutdown test")
+
+    monkeypatch.setattr(RunEngine, "execute", _boom)
+
+    with pytest.raises(RuntimeError, match="synthetic failure"):
+        cli_main.command_run(config_file, verbose=False)
+
+    assert len(_SpyScheduler.instances) == 1
+    assert _SpyScheduler.instances[0].closed is True

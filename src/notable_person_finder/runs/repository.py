@@ -317,10 +317,11 @@ def supersede_work(
     return changed
 
 
-# Shared by `next_eligible`, `claim_next`, and `claim_and_start_attempt` so the
-# three claim paths cannot silently diverge on what "claimable" means. Binds
-# two placeholders, in this order: run_id (for the same-run deferred check),
-# then now (for the eligibility check).
+# Shared by `claim_batch` -- the engine's production claim path -- and by
+# `next_eligible`, `claim_next`, and `claim_and_start_attempt`, so no claim
+# path can silently diverge on what "claimable" means. Binds two
+# placeholders, in this order: run_id (for the same-run deferred check), then
+# now (for the eligibility check).
 _CLAIMABLE_PREDICATE = """(
     state = 'pending'
     OR (state = 'deferred' AND COALESCE(completed_by_run_id, -1) <> ?)
@@ -347,7 +348,13 @@ def next_eligible(
     now: str,
     task_types: Collection[str] | None = None,
 ) -> WorkItem | None:
-    """Inspect the next eligible item without mutating it."""
+    """Inspect the next eligible item without mutating it.
+
+    No production caller since the batch-claim reshape (the engine calls
+    `claim_batch` directly); retained as a regression harness for
+    `_CLAIMABLE_PREDICATE`'s peek semantics. Removal to be considered in pull
+    request 2.
+    """
     if task_types is not None and not task_types:
         return None
     task_filter = ""
@@ -442,7 +449,13 @@ def claim_next(
     now: str,
     task_types: Collection[str] | None = None,
 ) -> WorkItem | None:
-    """Claim deterministic work; external calls use claim_and_start_attempt."""
+    """Claim deterministic work; external calls use claim_and_start_attempt.
+
+    No production caller since the batch-claim reshape (the engine claims in
+    batches of more than one via `claim_batch` directly); retained as a
+    regression harness for single-item claim semantics. Removal to be
+    considered in pull request 2.
+    """
     claimed = claim_batch(
         connection, run_id=run_id, now=now, task_types=task_types, limit=1
     )
@@ -509,14 +522,15 @@ def defer_unclaimed(
 ) -> None:
     """Defer work this run peeked at but never claimed.
 
-    `complete_work` is the settle path for work that reached the provider: it
-    requires state `running`, because only a claim proves this run owned the
-    item. Two engine paths refuse an item *before* any claim exists — a paused
-    provider (refused by the retry coordinator before the claim UPDATE runs)
-    and a refused budget reservation (which rolls back the claim inside
-    `claim_and_start_attempt`'s own transaction). Both leave a `pending` or
-    `deferred` row that this run must record a decision about, or the engine's
-    peek-and-settle loop re-selects it forever.
+    No production caller since the batch-claim reshape: every item the engine
+    sees has already been claimed by `claim_batch` before any check runs
+    (including the pause check in `_prepare`), so `complete_work` -- which
+    requires state `running` as proof of that claim -- is the engine's only
+    settle path now, via `_settle`. There is no longer an engine path that
+    refuses an item *before* a claim exists for this function to serve.
+    Retained as a regression harness for the peek-then-defer-without-claiming
+    shape `next_eligible` also exercises. Removal to be considered in pull
+    request 2.
 
     `completed_by_run_id` is stamped for exactly that reason: it is what
     `_CLAIMABLE_PREDICATE` reads to keep a same-run deferral out of the next
@@ -716,7 +730,13 @@ def claim_and_start_attempt(
     reserved_nano_usd: int,
     now: str,
 ) -> int:
-    """Atomically claim work, reserve cost, and persist the first attempt."""
+    """Atomically claim work, reserve cost, and persist the first attempt.
+
+    No production caller since the batch-claim reshape (the engine claims via
+    `claim_batch`, then reserves and inserts the attempt as separate steps in
+    `prepare`); retained as a regression harness for the combined claim/
+    reserve/insert transaction. Removal to be considered in pull request 2.
+    """
     connection.execute("BEGIN IMMEDIATE")
     try:
         changed = connection.execute(

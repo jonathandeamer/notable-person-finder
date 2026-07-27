@@ -179,32 +179,42 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                     markdown=written.markdown,
                 )
 
-            engine = RunEngine(
-                connection,
-                retry=RetryPolicy(loaded.main.retry, clock=clock),
-                scheduler=BoundedScheduler(loaded.main.concurrency.http_workers),
-                clock=clock,
-                timezone=loaded.main.timezone,
-                window_start=window_start,
-                budget_limit_nano_usd=loaded.main.budget.openrouter_nano_usd_per_run(),
-                snapshot_fingerprint=loaded.fingerprint,
-                snapshot_json=loaded.snapshot_json,
-                reporter=report_run,
-            )
-            # `cli.run_started`, not `run.started`: the engine emits its own
-            # `run.started` with a disjoint field set (run_id, window_start,
-            # window_end, swept_runs, task_types). Reusing that name here
-            # would give one dotted event name two schemas in the same log,
-            # which is the defect the dotted rename was meant to remove, not
-            # reintroduce in a different shape.
-            log_event(logger, "cli.run_started", fingerprint=loaded.fingerprint)
-            # No provider adapters exist in this milestone, so no task
-            # handlers are registered. Milestones 3-6 supply them. A handler
-            # returning a non-settling state is now handled inside the
-            # engine -- it settles just that item and the run finishes
-            # normally -- so there is no longer a non-settling failure mode
-            # for this call to catch.
-            report = engine.execute({})
+            # Scoped tightly around engine construction and execution -- the
+            # only place the scheduler's worker pool is used -- so the pool
+            # is always shut down before `connection.close()` runs in the
+            # outer `finally`, on both the success and the exception path.
+            # Closing the connection first would let a worker thread still
+            # inside an HTTP call outlive the SQLite connection it will need
+            # for `persist`.
+            with BoundedScheduler(loaded.main.concurrency.http_workers) as scheduler:
+                engine = RunEngine(
+                    connection,
+                    retry=RetryPolicy(loaded.main.retry, clock=clock),
+                    scheduler=scheduler,
+                    clock=clock,
+                    timezone=loaded.main.timezone,
+                    window_start=window_start,
+                    budget_limit_nano_usd=(
+                        loaded.main.budget.openrouter_nano_usd_per_run()
+                    ),
+                    snapshot_fingerprint=loaded.fingerprint,
+                    snapshot_json=loaded.snapshot_json,
+                    reporter=report_run,
+                )
+                # `cli.run_started`, not `run.started`: the engine emits its own
+                # `run.started` with a disjoint field set (run_id, window_start,
+                # window_end, swept_runs, task_types). Reusing that name here
+                # would give one dotted event name two schemas in the same log,
+                # which is the defect the dotted rename was meant to remove, not
+                # reintroduce in a different shape.
+                log_event(logger, "cli.run_started", fingerprint=loaded.fingerprint)
+                # No provider adapters exist in this milestone, so no task
+                # handlers are registered. Milestones 3-6 supply them. A handler
+                # returning a non-settling state is now handled inside the
+                # engine -- it settles just that item and the run finishes
+                # normally -- so there is no longer a non-settling failure mode
+                # for this call to catch.
+                report = engine.execute({})
 
             if written is None:
                 # The engine always calls the reporter before returning, so

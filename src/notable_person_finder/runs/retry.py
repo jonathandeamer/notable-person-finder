@@ -60,8 +60,14 @@ class RetryPolicy:
         clock: Clock,
         random_source: random.Random | None = None,
     ) -> None:
+        # `clock` is accepted, not stored: it exists only so every call site
+        # that builds a `RetryPolicy` -- `RetryCoordinator`, the CLI, and the
+        # tests -- can pass the same clock it already has, without a special
+        # case for this one pure, non-sleeping component. Jitter and delay
+        # come from `self._random` and `config`, never from wall-clock or
+        # monotonic time; `RetryCoordinator` is the one that sleeps and
+        # measures elapsed time, and it keeps its own `self._clock` for that.
         self._config = config
-        self._clock = clock
         self._random = random_source or random.Random()
         self._guard = threading.Lock()
         self._consecutive_exhaustions: dict[str, int] = {}
@@ -160,7 +166,15 @@ class RetryPolicy:
 
 
 class RetryCoordinator:
-    """The only component permitted to start a repeat provider request."""
+    """The only component permitted to start a repeat provider request.
+
+    No production caller since the batch-claim reshape: the engine calls
+    `RetryPolicy` directly and owns its own sleep-and-retry loop across
+    submissions, rather than routing a single call through `.call()`.
+    Retained as a regression harness for the sleep/retry/pause bookkeeping
+    this class still performs correctly on its own. Removal to be considered
+    in pull request 2.
+    """
 
     def __init__(
         self,
