@@ -130,16 +130,57 @@ These are milestone 2 review findings that this milestone's own code depends on,
 | `src/notable_person_finder/reporting/digest.py` | Ingestion summary and budget-aware deferral reasons |
 | `src/notable_person_finder/cli/main.py` | Build the feed client, register the handler, pass the seeding hook |
 | `src/notable_person_finder/obs/logging.py` (or call sites) | One event-name taxonomy |
-| `pyproject.toml` | `feedparser` dependency; `addopts` deselecting `live`; Pyright includes `tests/ingestion` |
+| `pyproject.toml` | Pyright includes `tests/run_engine` (Task 0) and `tests/ingestion` (Task 14); `feedparser` dependency; `addopts` deselecting `live` |
 | `uv.lock` | Regenerated |
 | `CLAUDE.md` | "What Is Actually Built" updated |
 | `docs/running.md`, `docs/troubleshooting.md` | Ingestion behaviour and failure guidance |
 
 ---
 
+## Delivery: Two Pull Requests
+
+Tasks 0–5 are engine and transport surgery with no ingestion dependency, and they touch code every later milestone depends on. The batch-claim state machine (Task 3) is this milestone's real engineering risk. Landing it behind the same review as the ingestion feature work would mean a reviewer judging a foundational concurrency change and a new provider adapter in one sitting — which is how milestone 2's seam defects survived per-task review.
+
+**Pull request 1 — Engine and transport (Tasks 0–5).** Branch from `refactor/rearchitecture`, target `refactor/rearchitecture`. Its gate is:
+
+```bash
+uv run ruff check . && uv run ruff format --check . && uv run pyright
+uv run pytest tests/foundation tests/run_engine
+```
+
+No new tests directory, no new dependency, no schema change. The test count must not fall; if a reshaped test is deleted rather than adapted, say so explicitly in the pull request.
+
+**Pull request 2 — Ingestion (Tasks 6–14).** Branch from PR 1 once merged. Its gate is the full Milestone Completion Gate below.
+
+Both paths are new work, not remediation, so each needs its own pull request and independent review before merge, and explicit authorization to push or merge.
+
+---
+
 ## Task Sequence
 
-Tasks 1–5 are engine and transport work with no ingestion dependency. Tasks 6–11 build ingestion on top. Tasks 12–14 close the milestone. Task 6 may be done in parallel with 1–5; everything else is sequential.
+Task 0 comes first so the run engine tests are type-checked *before* Task 3 reshapes them. Tasks 1–5 are engine and transport work with no ingestion dependency. Tasks 6–11 build ingestion on top. Tasks 12–14 close the milestone. Task 6 may be done in parallel with 1–5; everything else is sequential.
+
+---
+
+### Task 0: Type-check the run engine tests
+
+**Files:**
+- Modify: `pyproject.toml`, and whichever `tests/run_engine/*.py` files the checker faults
+- Test: `uv run pyright`
+
+**Why this comes first.** Pyright's `include` is `["src", "tests/foundation"]`, so `tests/run_engine` has never been type-checked. Adding it surfaces roughly 61 errors. Fixing them *before* Task 3 reshapes those same tests means the reshape happens against a checked baseline, and a type error introduced by the reshape is visible rather than lost in pre-existing noise.
+
+**Constraint that matters more than the error count:** these are tests, and a type fix must never weaken an assertion. The known clusters are generator-typed fixtures needing `Iterator[T]` return annotations, `fetchone()` results needing a `None` guard before member access, and `sorted()` over `int | None`. Each is a genuine looseness, not a checker complaint to silence.
+
+**Prohibited:** blanket `# type: ignore`, `Any` annotations added to make an error disappear, and `reportOptionalMemberAccess` downgraded in configuration. If a fault cannot be fixed honestly, leave it and say why in the pull request.
+
+**Steps:**
+
+- [ ] Add `tests/run_engine` to Pyright's `include` in `pyproject.toml`.
+- [ ] Run `uv run pyright` and record the starting error count.
+- [ ] Fix the faults in clusters, running `uv run pytest tests/run_engine` after each cluster to confirm the test count has not changed and no assertion was softened.
+- [ ] Run the PR 1 gate; expect zero Pyright errors and an unchanged test count.
+- [ ] Commit.
 
 ---
 
