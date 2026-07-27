@@ -66,13 +66,20 @@ def test_contact_url_is_appended_and_override_replaces_completely() -> None:
     ],
 )
 def test_transport_bounds_must_be_positive(field: str, value: float) -> None:
+    # The field under test varies per parametrize case and its value never
+    # matches the corresponding attribute's declared type (e.g. a float
+    # standing in for `max_redirects: int`), which is the point: pydantic,
+    # not the constructor's static signature, is what must reject it.
+    # `model_validate` is pydantic's own entry point for validating a
+    # dynamically-shaped mapping, so it is used here instead of splatting
+    # into the strongly-typed `__init__`.
     with pytest.raises(ValidationError):
-        TransportConfig(**{field: value})
+        TransportConfig.model_validate({field: value})
 
 
 def test_unknown_operational_field_is_rejected() -> None:
     with pytest.raises(ValidationError):
-        TransportConfig(max_redirect=5)
+        TransportConfig.model_validate({"max_redirect": 5})
 
 
 def test_budget_is_optional_and_parsed_as_exact_nano_usd() -> None:

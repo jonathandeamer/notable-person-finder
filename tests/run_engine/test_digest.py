@@ -257,7 +257,9 @@ def test_write_digest_fsyncs_the_digest_directory_after_replace(
     opened_dirs: list[tuple[str, int]] = []
     real_open = os.open
 
-    def spy_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+    def spy_open(
+        path: str | os.PathLike[str], flags: int, *args: object, **kwargs: object
+    ) -> int:
         opened_dirs.append((os.fspath(path), flags))
         return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
 
@@ -365,7 +367,9 @@ def test_a_failed_latest_copy_does_not_orphan_the_already_durable_dated_digest(
 
     real_replace = os.replace
 
-    def failing_latest_replace(src: object, dst: object) -> None:
+    def failing_latest_replace(
+        src: str | os.PathLike[str], dst: str | os.PathLike[str]
+    ) -> None:
         # Both writes now move a temp file into place, so fail only the
         # convenience copy; the dated digest must still land durably.
         if Path(os.fspath(dst)).name == "latest.md":

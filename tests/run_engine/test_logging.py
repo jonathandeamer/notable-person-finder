@@ -6,6 +6,7 @@ import logging
 from collections.abc import Iterator
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -19,7 +20,7 @@ from notable_person_finder.obs.logging import (
 
 
 @pytest.fixture
-def logger(tmp_path: Path) -> logging.Logger:
+def logger(tmp_path: Path) -> Iterator[logging.Logger]:
     created = configure_logging(
         tmp_path / "logs" / "notable.jsonl",
         LoggingConfig(max_bytes=2048, backup_count=2),
@@ -71,7 +72,9 @@ def test_events_are_json_lines_with_the_required_envelope(
     event = read_events(tmp_path)[0]
     assert event["event"] == "provider_attempt_finished"
     assert event["severity"] == "INFO"
-    assert event["timestamp"].endswith("Z")
+    timestamp = event["timestamp"]
+    assert isinstance(timestamp, str)
+    assert timestamp.endswith("Z")
     assert event["run_id"] == 1
     assert event["outcome"] == "succeeded"
 
@@ -112,7 +115,9 @@ def test_a_secret_value_is_redacted_from_any_field(
     # Checked against the parsed structure, not `json.dumps(event)`: re-dumping
     # re-escapes, which would hide the very leak this asserts against.
     assert_secret_absent(event, "or-secret-value")
-    assert "[redacted]" in event["detail"]
+    detail = event["detail"]
+    assert isinstance(detail, str)
+    assert "[redacted]" in detail
 
 
 def test_secrets_with_non_ascii_or_quote_characters_are_redacted(
@@ -264,8 +269,10 @@ def test_non_string_percent_args_containing_secrets_are_redacted(
     events = read_events(tmp_path)
     assert_secret_absent(events, non_ascii_secret)
     # The line must still be written and still be readable.
-    assert "[redacted]" in events[-1]["event"]
-    assert events[-1]["event"].endswith("after 12 ms")
+    last_event = events[-1]["event"]
+    assert isinstance(last_event, str)
+    assert "[redacted]" in last_event
+    assert last_event.endswith("after 12 ms")
 
 
 def test_top_level_field_names_containing_secrets_are_redacted(tmp_path: Path) -> None:
@@ -282,11 +289,19 @@ def test_top_level_field_names_containing_secrets_are_redacted(tmp_path: Path) -
         LoggingConfig(max_bytes=8192, backup_count=2),
         secrets=(identifier_secret, awkward_secret),
     )
+    # Typed with the two literal keys actually used, rather than the wider
+    # `dict[str, str]` a plain literal would infer: unpacking `**dict[str, str]`
+    # into a call with a typed keyword-only parameter (`severity: int`) reads,
+    # to the checker, as a value that might land on that parameter.
+    fields: dict[Literal["sk_café_1234", 'sk-café"\\-1234'], str] = {
+        identifier_secret: "v",
+        awkward_secret: "w",
+    }
     try:
         log_event(
             created,
             "provider_attempt_failed",
-            **{identifier_secret: "v", awkward_secret: "w"},
+            **fields,
         )
     finally:
         for handler in list(created.handlers):

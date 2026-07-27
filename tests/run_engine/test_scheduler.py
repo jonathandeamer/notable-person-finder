@@ -1,18 +1,35 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 
 import pytest
 
 from notable_person_finder.runs.scheduler import BoundedScheduler, Completion
 
 
+def ok_results[I](completions: Iterable[Completion[I, int]]) -> list[int]:
+    """Extract results from completions already known to have succeeded.
+
+    `Completion.result` is `int | None` in general -- `None` on a failed
+    item -- so pulling it out unconditionally would be exactly the kind of
+    unchecked optional access this checker is right to catch. Asserting
+    `error is None` up front documents and enforces the invariant these
+    tests actually rely on: every completion here succeeded, so its result
+    is present.
+    """
+    values: list[int] = []
+    for completion in completions:
+        assert completion.error is None
+        assert completion.result is not None
+        values.append(completion.result)
+    return values
+
+
 def test_all_items_are_processed_and_results_returned() -> None:
     with BoundedScheduler(max_workers=3) as scheduler:
         completions = list(scheduler.run(range(5), lambda value: value * 2))
-    assert sorted(c.result for c in completions) == [0, 2, 4, 6, 8]
-    assert all(c.error is None for c in completions)
+    assert sorted(ok_results(completions)) == [0, 2, 4, 6, 8]
 
 
 def test_completion_carries_the_originating_item() -> None:
@@ -129,7 +146,8 @@ def test_a_worker_failure_is_returned_not_raised() -> None:
     failures = [c for c in completions if c.error is not None]
     assert len(failures) == 1
     assert isinstance(failures[0].error, ValueError)
-    assert sorted(c.result for c in completions if c.error is None) == [0, 1, 3]
+    successes = [c for c in completions if c.error is None]
+    assert sorted(ok_results(successes)) == [0, 1, 3]
 
 
 def test_one_failure_does_not_cancel_unrelated_work() -> None:
@@ -141,7 +159,8 @@ def test_one_failure_does_not_cancel_unrelated_work() -> None:
     with BoundedScheduler(max_workers=4) as scheduler:
         completions = list(scheduler.run(range(10), worker))
     assert len(completions) == 10
-    assert sorted(c.result for c in completions if c.error is None) == [1, 3, 5, 7, 9]
+    successes = [c for c in completions if c.error is None]
+    assert sorted(ok_results(successes)) == [1, 3, 5, 7, 9]
 
 
 def test_results_are_yielded_on_the_calling_thread() -> None:

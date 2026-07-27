@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ DONE = "2026-07-25T06:00:02Z"
 
 
 @pytest.fixture
-def connection(tmp_path: Path) -> sqlite3.Connection:
+def connection(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     database = tmp_path / "notable.sqlite3"
     connection = connect_database(database)
     apply_migrations(connection, database, tmp_path / "backups")

@@ -30,8 +30,23 @@ def coordinator(
     return RetryCoordinator(config, clock=clock or FakeClock())
 
 
-def failure(category: FailureCategory, **kwargs: object) -> ProviderFailure:
-    return ProviderFailure(category, provider="brave", operation="search_web", **kwargs)
+def failure(
+    category: FailureCategory,
+    *,
+    retryable: bool | None = None,
+    status_code: int | None = None,
+    retry_after_ms: int | None = None,
+    detail: str | None = None,
+) -> ProviderFailure:
+    return ProviderFailure(
+        category,
+        provider="brave",
+        operation="search_web",
+        retryable=retryable,
+        status_code=status_code,
+        retry_after_ms=retry_after_ms,
+        detail=detail,
+    )
 
 
 def test_successful_call_records_one_attempt() -> None:

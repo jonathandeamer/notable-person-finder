@@ -42,7 +42,8 @@ def make_run(connection: sqlite3.Connection, limit_nano_usd: int | None) -> int:
         (snapshot_id(connection), limit_nano_usd),
     )
     connection.commit()
-    return int(cursor.lastrowid)
+    assert cursor.lastrowid is not None
+    return cursor.lastrowid
 
 
 def test_reservation_reduces_the_remaining_allowance(database: Path) -> None:
@@ -104,7 +105,8 @@ def test_reconciliation_replaces_the_reservation_with_the_actual_cost(
         """,
         (run_id, work_id, "b" * 64),
     )
-    attempt_id = int(cursor.lastrowid)
+    assert cursor.lastrowid is not None
+    attempt_id = cursor.lastrowid
     connection.commit()
     reserve(connection, run_id=run_id, nano_usd=500_000_000)
 
@@ -146,12 +148,14 @@ def test_reconciling_an_unreported_cost_keeps_the_reservation(database: Path) ->
         """,
         (run_id, work_id, "d" * 64),
     )
+    assert cursor.lastrowid is not None
+    attempt_id = cursor.lastrowid
     connection.commit()
     reserve(connection, run_id=run_id, nano_usd=500_000_000)
     reconcile(
         connection,
         run_id=run_id,
-        attempt_id=int(cursor.lastrowid),
+        attempt_id=attempt_id,
         reserved_nano_usd=500_000_000,
         actual_nano_usd=None,
     )
@@ -179,7 +183,8 @@ def test_reconciling_the_same_attempt_twice_is_refused(database: Path) -> None:
         """,
         (run_id, work_id, "e" * 64),
     )
-    attempt_id = int(cursor.lastrowid)
+    assert cursor.lastrowid is not None
+    attempt_id = cursor.lastrowid
     connection.commit()
     reserve(connection, run_id=run_id, nano_usd=500_000_000)
 
@@ -224,7 +229,8 @@ def test_reconciling_with_no_prior_reserve_is_refused(database: Path) -> None:
         """,
         (run_id, work_id, "f" * 64),
     )
-    attempt_id = int(cursor.lastrowid)
+    assert cursor.lastrowid is not None
+    attempt_id = cursor.lastrowid
     connection.commit()
 
     with pytest.raises(RuntimeError):

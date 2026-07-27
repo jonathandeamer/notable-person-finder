@@ -17,6 +17,7 @@ from notable_person_finder.runs.engine import (
     NonSettlingStateError,
     ReportArtifact,
     RunEngine,
+    RunReport,
     TaskHandler,
     TaskOutcome,
     derive_run_state,
@@ -638,12 +639,12 @@ def test_the_reporter_receives_the_run_report_and_its_artifact_is_recorded(
     carried for the CLI to render, not for the database.
     """
     connection = connect_database(database)
-    seen: list[object] = []
+    seen: list[RunReport] = []
     markdown = "# run\n\nnothing to report\n"
 
     produced: list[ReportArtifact] = []
 
-    def reporter(report) -> ReportArtifact:
+    def reporter(report: RunReport) -> ReportArtifact:
         seen.append(report)
         artifact = ReportArtifact(
             path="/digests/2026-07-25.md", sha256="c" * 64, markdown=markdown

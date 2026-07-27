@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,7 @@ LATER = "2026-07-25T07:00:00Z"
 
 
 @pytest.fixture
-def connection(tmp_path: Path) -> sqlite3.Connection:
+def connection(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     database = tmp_path / "notable.sqlite3"
     connection = connect_database(database)
     apply_migrations(connection, database, tmp_path / "backups")
@@ -136,8 +137,12 @@ def test_claims_are_ordered_by_priority_then_identity(
 ) -> None:
     low = schedule(connection, run_id, fingerprint="e" * 64, priority=500)
     high = schedule(connection, run_id, fingerprint="f" * 64, priority=10)
-    assert repository.claim_next(connection, run_id=run_id, now=NOW).id == high
-    assert repository.claim_next(connection, run_id=run_id, now=NOW).id == low
+    first_claim = repository.claim_next(connection, run_id=run_id, now=NOW)
+    assert first_claim is not None
+    assert first_claim.id == high
+    second_claim = repository.claim_next(connection, run_id=run_id, now=NOW)
+    assert second_claim is not None
+    assert second_claim.id == low
 
 
 def test_work_is_not_claimed_before_its_eligibility_time(

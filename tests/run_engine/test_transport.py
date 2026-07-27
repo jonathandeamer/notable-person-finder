@@ -382,4 +382,6 @@ def test_unicode_encode_error_in_build_request_is_translated() -> None:
             "GET", "https://example.com/a", provider="feeds", operation="fetch_feed"
         )
     assert captured.value.category is FailureCategory.CONFIGURATION
-    assert "non-ASCII" in captured.value.detail
+    detail = captured.value.detail
+    assert detail is not None
+    assert "non-ASCII" in detail
