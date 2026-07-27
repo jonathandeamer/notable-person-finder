@@ -78,6 +78,6 @@ known-first-party = ["notable_person_finder"]
 [tool.pyright]
 pythonVersion = "3.13"
 typeCheckingMode = "standard"
-include = ["src", "tests/foundation", "tests/run_engine"]
+include = ["src", "tests/foundation", "tests/run_engine", "tests/ingestion"]
 exclude = ["**/__pycache__", ".venv", ".worktrees"]
 
