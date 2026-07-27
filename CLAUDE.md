@@ -42,8 +42,9 @@ Delivered only in part — do not describe these as finished:
   deferred counts, and operational failures. It has no digest backlog, no
   oldest pending candidate, and no queue tiers; those need the digest queue
   from the lead-assessment milestone.
-- The digest emits its header, banner, and operational summary. Its shortlist
-  section is a placeholder: there is no ranking and no model synthesis yet.
+- The digest emits its header, banner, operational summary, per-run budget
+  line, and deferral-reason breakdown. Its shortlist section is a placeholder:
+  there is no ranking and no model synthesis yet.
 
 Not built at all, so do not document, import, or assume any of it:
 
@@ -56,10 +57,9 @@ Not built at all, so do not document, import, or assume any of it:
 Known gaps carried forward, recorded so a later change does not mistake them
 for regressions:
 
-- `RunReport` carries no budget fields, so neither the digest nor `status` can
-  currently explain *why* work was deferred.
-- A handler that returns a non-settling work state escapes as an uncaught
-  `ValueError` with a traceback rather than a handled run failure.
+- `notable status` prints bare pending and deferred counts, with no budget
+  figures and no deferral-reason breakdown, so it still cannot explain *why*
+  work was deferred. The digest now can; `status` has not caught up.
 - Two crash windows can repeat a paid provider call; see
   `docs/architecture/at-least-once-execution.md`.
 
