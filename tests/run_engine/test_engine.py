@@ -1687,8 +1687,17 @@ def test_a_handler_whose_prepare_raises_settles_that_item_and_lets_siblings_run(
     ).fetchone()
     assert bad_row["state"] == WorkState.FAILED_PERMANENT
     assert "ValueError" in bad_row["reason"]
+    # The reason carries the exception TYPE and never its message. `reason`
+    # reaches both the digest and the `work_item` table, and a handler that
+    # interpolates remote text into its exception would leak it there. A
+    # regression swapping `type(error).__name__` for `str(error)` passes
+    # every other assertion in this test, so pin the absence explicitly.
+    assert "blew up" not in bad_row["reason"]
     assert good_row["state"] == WorkState.SUCCEEDED
     assert report.counters.required_succeeded == 1
+    # The failed item's contribution to the report is the operator-visible
+    # half of this change: the digest must show it, not silently drop it.
+    assert report.counters.required_failed_permanent == 1
     assert len(reported) == 1
     connection.close()
 
@@ -1748,9 +1757,11 @@ def test_a_handler_whose_persist_raises_settles_that_item_without_its_domain_wri
     notes = [row["note"] for row in connection.execute("SELECT note FROM probe_note2")]
     assert bad_row["state"] == WorkState.FAILED_PERMANENT
     assert "RuntimeError" in bad_row["reason"]
+    assert "blew up" not in bad_row["reason"]
     assert good_row["state"] == WorkState.SUCCEEDED
     assert notes == ["good"]
     assert report.counters.required_succeeded == 1
+    assert report.counters.required_failed_permanent == 1
     assert len(reported) == 1
     connection.close()
 
