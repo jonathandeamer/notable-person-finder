@@ -38,11 +38,11 @@ This plan is **milestone 3a: Ingestion**. Milestone 3b: People carries `LlmClien
 
 A 3a source item therefore carries **no triage observation**. The domain spec's "every new source item receives an immutable triage observation" is satisfied in 3b; it is not violated in 3a, because no run in 3a can produce one.
 
-A 3a run registers only `fetch_feed`, so it creates no downstream pending work and reaches `complete` rather than `partial`. Milestone 3a therefore never exercises the `partial` path with a real handler. 3b does.
+A 3a run registers only `fetch_feed`, so it creates no *downstream* pending work. It does **not** follow that every 3a run is `complete`: seeded `fetch_feed` items are required, and `derive_run_state` returns `partial` whenever `required_deferred > 0`, or when required work fails permanently alongside some successes. Task 9's own outcome mapping makes that routine — a malformed feed, an oversized response, or an exhausted transient failure all defer. A run in which one feed fails and the rest ingest is a `partial` run, and Task 11's tests must assert that state and its exit code rather than assuming `complete`.
 
 ### D2. The engine gains a batch-claim state machine
 
-Milestone 2's review finding I6 recorded that `RunEngine` and the `BoundedScheduler` it holds cannot compose: `scheduler.py` documents "a worker thread never touches SQLite", while `engine._perform` interleaves attempt persistence with the provider call, and `engine.execute` pulls one eligible item at a time. Calling `claim_and_start_attempt` from a worker raises `sqlite3.ProgrammingError`, which the scheduler swallows into `Completion.error`.
+Milestone 2's review recorded that `RunEngine` and the `BoundedScheduler` it holds cannot compose: `scheduler.py` documents "a worker thread never touches SQLite", while `engine._perform` interleaves attempt persistence with the provider call, and `engine.execute` pulls one eligible item at a time. Calling `claim_and_start_attempt` from a worker raises `sqlite3.ProgrammingError`, which the scheduler swallows into `Completion.error`.
 
 Ingestion alone would not force this (roughly ten feeds), but 3b issues one `detect_people` call per source item at a 300-second timeout, where sequential execution is unusable. Resolving it here — against a deterministic, cheap, fully fakeable handler — is materially safer than resolving it beside the LLM gateway.
 
@@ -72,6 +72,8 @@ The unique canonical-URL constraint is the only gate — which the domain spec a
 
 Accepted cost: a first run over ten feeds may yield several hundred source items. Milestone 3b's budget cap and durable work queue meter those out across runs.
 
+**This plan's own decision, not a spec requirement:** an entry is never dropped for a date problem, so undated, unparseable, and implausible dates all ingest with the raw text retained and a typed issue recorded (Task 10). The domain spec only implies date problems are *storable* — it does not say an entry must survive one. The choice follows from high-recall semantics, since a missing date says nothing about whether an entry names a person, but it is an inference and a later design may narrow it.
+
 ### D5. Article identity is staged
 
 3a owns `canonicalize_article_url` as the single application-owned URL identity policy, creates `canonical_article` with its unique normalized-URL constraint and provenance aliases, and stores a canonical publisher key derived mechanically from the registrable domain.
@@ -94,12 +96,14 @@ These are milestone 2 review findings that this milestone's own code depends on,
 
 | Finding | Why it must land in 3a |
 | --- | --- |
-| I6 — engine and scheduler cannot compose | D2; this milestone performs the reshape |
+| Engine and scheduler hold mutually exclusive contracts and cannot compose | D2; this milestone performs the reshape |
 | `RunReport` budget fields | The `TODO(milestone 3)` in `engine.py`; the digest cannot explain deferral without them |
-| I5 — `build_request` sits outside the try, so a raw `UnicodeEncodeError` escapes `providers/` untranslated | Unreachable in milestone 2, reachable by the first real adapter, which this is |
-| Uncaught `ValueError` from a non-settling work state | Same defect class, same fix site as I5 |
+| The `build_request` guard catches only `UnicodeEncodeError`, so any other exception it raises still escapes `providers/` untranslated | Unreachable in milestone 2, reachable by the first real adapter, which this is |
+| A non-settling work state aborts the run without settling the item or writing a digest | The first milestone with a real handler that could return one |
 | `actual_nano_usd=0` for zero-cost failed attempts | The transport-wiring decision milestone 2 deferred to the first adapter |
 | Two event-name taxonomies (`run.started` vs `run_started`) | Cheap now, entrenched once ingestion adds a third set |
+
+**On attribution.** Milestone 2's review record exists only in the PR #4 body and its progress ledger; no review document was committed and the findings carry no official identifiers. Findings are described here rather than referenced by identifier, because no identifier scheme exists outside this plan. The last two rows above are real code issues observed during planning rather than recorded review findings — the defects are verifiable, the provenance label would not be.
 
 ---
 
@@ -126,13 +130,13 @@ These are milestone 2 review findings that this milestone's own code depends on,
 | `src/notable_person_finder/runs/retry.py` | Extract `RetryPolicy`; `RetryCoordinator.call` becomes a wrapper |
 | `src/notable_person_finder/runs/engine.py` | Batch-claim state machine; seeding hook; `RunReport` budget fields; non-settling state handled |
 | `src/notable_person_finder/runs/repository.py` | `claim_batch`; budget columns in `run_counters` or a sibling query |
-| `src/notable_person_finder/providers/transport.py` | I5 fix: request construction inside the translated guard |
+| `src/notable_person_finder/providers/transport.py` | Widen the `build_request` guard beyond `UnicodeEncodeError` |
 | `src/notable_person_finder/reporting/digest.py` | Ingestion summary and budget-aware deferral reasons |
 | `src/notable_person_finder/cli/main.py` | Build the feed client, register the handler, pass the seeding hook |
 | `src/notable_person_finder/obs/logging.py` (or call sites) | One event-name taxonomy |
 | `pyproject.toml` | Pyright includes `tests/run_engine` (Task 0) and `tests/ingestion` (Task 14); `feedparser` dependency; `addopts` deselecting `live` |
 | `uv.lock` | Regenerated |
-| `CLAUDE.md` | "What Is Actually Built" updated |
+| `CLAUDE.md`, `AGENTS.md` | "What Is Actually Built" and the "Known gaps" list updated in both; repo policy requires them to stay in step |
 | `docs/running.md`, `docs/troubleshooting.md` | Ingestion behaviour and failure guidance |
 
 ---
@@ -158,7 +162,7 @@ Both paths are new work, not remediation, so each needs its own pull request and
 
 ## Task Sequence
 
-Task 0 comes first so the run engine tests are type-checked *before* Task 3 reshapes them. Tasks 1–5 are engine and transport work with no ingestion dependency. Tasks 6–11 build ingestion on top. Tasks 12–14 close the milestone. Task 6 may be done in parallel with 1–5; everything else is sequential.
+Task 0 comes first so the run engine tests are type-checked *before* Task 3 reshapes them. Tasks 1–5 are engine and transport work with no ingestion dependency. Tasks 6–11 build ingestion on top. Tasks 12–14 close the milestone. Task 6 (`canonicalize_article_url`) has no dependency on Tasks 0–5 and may be written early, but it ships in pull request 2: start its branch from pull request 1 once merged, or rebase onto it. Everything else is sequential.
 
 ---
 
@@ -229,7 +233,8 @@ Task 0 comes first so the run engine tests are type-checked *before* Task 3 resh
 - Produces: `claim_batch(connection, *, run_id, now, task_types, limit) -> tuple[WorkItem, ...]` — claims up to `limit` eligible items in one transaction, moving each to `running` and setting `claimed_by_run_id`.
 
 **Constraints:**
-- Ordering matches `next_eligible`: `eligible_at`, then `priority`, then `id`. Required work before optional work.
+- Ordering matches `next_eligible` exactly: `ORDER BY priority ASC, id ASC`. `eligible_at` is **not** a sort key — it is part of `_CLAIMABLE_PREDICATE` (`repository.py:324`), which also requires `state = 'pending'`, or `state = 'deferred'` from a *different* run. Required-before-optional is not expressed by the `required` column at all; it holds only insofar as seeding encodes it in `priority`.
+- Because a `deferred` item is not claimable by the run that deferred it, Task 3's re-arm must return an item to `pending` with a future `eligible_at`, never to `deferred`. Deferring inside a run makes the item unclaimable for the remainder of that run.
 - The whole batch claims in one transaction, so a crash leaves either all or none of the batch `running`. Milestone 2's startup sweep already returns abandoned `running` items to `pending`.
 - `limit` must be at least 1; reject anything lower with `ValueError`.
 - `claim_next` stays for any caller that wants a single item, implemented over `claim_batch` if that is clean, duplicated if not.
@@ -265,15 +270,17 @@ Task 0 comes first so the run engine tests are type-checked *before* Task 3 resh
 **The loop:**
 
 1. Claim a batch of up to `concurrency.http_workers` items.
-2. For each claimed item, on the application thread: call `handler.prepare` if present, compute the request fingerprint and destination host, and write the attempt row for the item's next ordinal.
+2. For each claimed item, on the application thread, **check the provider pause first**: if `RetryPolicy.is_paused(handler.provider)`, settle the item as `DEFERRED` with reason `provider paused` and write **no attempt row** — a paused provider means no call was made, and an attempt row must always correspond to exactly one external call. Milestone 2 enforced this inside `RetryCoordinator.call`, which the reshaped engine no longer routes through, so the engine must now own it explicitly. Only for unpaused items: call `handler.prepare` if present, compute the request fingerprint and destination host, and write the attempt row for the item's next ordinal.
 3. Submit one closure per item to the scheduler. The closure captures the handler, the work item, and the prepared value — never the connection.
-4. Drain completions on the application thread. For each, in one transaction: persist the attempt outcome, call `handler.persist` if present, and either settle the work item or re-arm it with an `eligible_at` at the backoff deadline that `RetryPolicy` returned. A handler's domain writes and its work-item settlement therefore commit or roll back together.
-5. Re-armed items rejoin the next claim batch when due. When only re-armed items remain and none is yet due, wait until the earliest deadline rather than spinning.
-6. Stop when no eligible items remain.
+4. Drain completions on the application thread. For each, in one transaction: persist the attempt outcome, call `handler.persist` if present, and either settle the work item or re-arm it. A handler's domain writes and its work-item settlement therefore commit or roll back together.
+5. **Re-arm means `pending` with a future `eligible_at`**, never `deferred`. `_CLAIMABLE_PREDICATE` excludes a `deferred` item from the run that deferred it, so re-arming to `deferred` would silently strand the item for the rest of the run. `deferred` remains the correct *terminal* state for an exhausted item, which should not be retried again until tomorrow.
+6. Re-armed items rejoin the next claim batch when due. When only re-armed items remain and none is yet due, wait until the earliest deadline rather than spinning.
+7. Stop when no eligible items remain.
 
 **Invariants to test explicitly:**
 - No worker thread touches SQLite. Assert structurally: the submitted closure must not close over the connection. A test that passes a connection-detecting sentinel, or that asserts on the thread identity at the point of every repository call, is acceptable; a comment is not.
-- No transaction is open across a call. Milestone 2 already has a variant test that holds `BEGIN IMMEDIATE` across `handler.execute` and fails 14 tests; keep an equivalent guard.
+- No transaction is open across a call. The existing guard is `test_engine.py:586` (`test_no_transaction_is_open_while_a_handler_runs`), which samples `connection.in_transaction` from inside the handler, plus the `in_transaction is False` asserts in `test_crash_boundary.py` (lines 150, 184, 299, 503). Keep an equivalent that samples from inside `execute` now that `execute` runs on a worker.
+- A paused provider settles its items as `DEFERRED` with no attempt row written.
 - Bounded concurrency is actually observed: with `http_workers=2` and four items, at most two closures are ever in flight. Use a barrier or a counting fake, not timing.
 - Backoff does not sleep the application thread: with one item re-armed for a long delay and another eligible now, the second completes before the first's deadline.
 - Attempt ordinals stay contiguous per work item across re-arms.
@@ -300,7 +307,11 @@ Task 0 comes first so the run engine tests are type-checked *before* Task 3 resh
 
 **Why:** milestone 2's review reproduced this with the real engine, cap, and digest — three required items at 1 USD against a 1.5 USD cap render "Required work deferred: 2" with the reason living only in SQLite.
 
-**Also in this task:** a handler returning a non-settling work state currently escapes as an uncaught `ValueError` with a traceback. Catch `NonSettlingStateError` at the engine's top level, record the work item as `failed_permanent` with a diagnostic reason, and let the run finish and report rather than crashing the process.
+**Also in this task — and this is a behaviour change, not a crash fix.** `NonSettlingStateError` is already caught: `cli/main.py:192-212` finishes the run as `interrupted`, logs `run_non_settling_state`, and returns `EXIT_FAILED`. No traceback escapes today.
+
+The actual defect is what that path leaves behind: the offending work item is never settled, the whole run aborts on one bad item, and **no digest is written** even though other work may have succeeded. Move the handling into the engine — settle just that item as `failed_permanent` with a diagnostic reason, let the loop continue, and let the run finish and report normally. The CLI's `NonSettlingStateError` branch then becomes unreachable and should be removed rather than left as dead code.
+
+Write the test against the new behaviour, not the old: a run with one non-settling handler and one healthy handler must produce a digest, settle the bad item `failed_permanent`, and record the healthy item's success.
 
 **Steps:**
 
@@ -318,7 +329,11 @@ Task 0 comes first so the run engine tests are type-checked *before* Task 3 resh
 - Modify: `src/notable_person_finder/providers/transport.py`, `src/notable_person_finder/obs/logging.py` and its call sites in `src/notable_person_finder/cli/main.py`
 - Test: `tests/run_engine/test_transport.py`, `tests/run_engine/test_logging.py`
 
-**Part A — finding I5.** Request construction sits outside the `try` guarding `client.send`, so a raw `UnicodeEncodeError` escapes the `providers/` boundary untranslated. Newline-in-header and non-`str` params *are* translated, so the guard is one call too late rather than absent. Move request construction inside the guard and translate anything it raises to `ProviderFailure(FailureCategory.CONFIGURATION)`.
+**Part A — widen the request-construction guard.** Commit `f9541cf` already moved `build_request` inside a `try` (`transport.py:276-290`), so the original finding is closed and a non-ASCII header value is already translated. Do **not** write that test: it passes today.
+
+The remaining gap is narrower. The `except` clause catches only `UnicodeEncodeError`, so anything else `build_request` raises — `httpx.InvalidURL` is the realistic one — still escapes the `providers/` boundary untranslated. Widen the clause to catch `Exception` and translate to `ProviderFailure(FailureCategory.CONFIGURATION)`, keeping the existing sanitized detail for the encoding case so its message does not regress.
+
+Test with an input that makes `build_request` raise something other than `UnicodeEncodeError`, and confirm it fails before the widening.
 
 **Part B — `actual_nano_usd`.** `finish_attempt` defaults `actual_nano_usd=None`, and reconciliation deliberately retains the reservation in that case, so a failed attempt that cost nothing still consumes cap unless the caller passes `0`. Wire the HTTP path to pass `0` explicitly for attempts that cannot have incurred a charge. Document at the call site why this is deliberate, since 3b's LLM path must *not* do the same for a call the provider may have accepted.
 
@@ -326,7 +341,7 @@ Task 0 comes first so the run engine tests are type-checked *before* Task 3 resh
 
 **Steps:**
 
-- [ ] Write failing tests: a non-ASCII header value produces a `ProviderFailure` with `FailureCategory.CONFIGURATION`, not a `UnicodeEncodeError`; a failed HTTP attempt records `actual_nano_usd = 0` and releases its reservation; a real run's `notable.jsonl` contains only dotted event names.
+- [ ] Write failing tests: an input making `build_request` raise something other than `UnicodeEncodeError` produces a `ProviderFailure` with `FailureCategory.CONFIGURATION`; a failed HTTP attempt records `actual_nano_usd = 0` and releases its reservation; a real run's `notable.jsonl` contains only dotted event names. Confirm each fails first — the pre-existing non-ASCII case already passes and is not a valid TDD step.
 - [ ] Run them; expect failures.
 - [ ] Implement all three.
 - [ ] Run `uv run pytest tests/foundation tests/run_engine -v`.
@@ -384,7 +399,7 @@ Task 0 comes first so the run engine tests are type-checked *before* Task 3 resh
 - `id`, `key` UNIQUE (the configured stable key — **never** the URL), `current_label`, `current_url`, `first_seen_at`, `last_seen_at`.
 
 `feed_fetch`
-- `id`, `feed_identity_id`, `run_id`, `requested_at`, `requested_url`, `resolved_url`, `redirect_chain_json`, `http_status`, `etag`, `last_modified`, `outcome` CHECK in (`not_modified`, `modified`, `failed`), `feed_type`, `parse_outcome` CHECK in (`ok`, `recovered`, `unusable`), `parser_warnings_json`, `failure_category`, `entry_count`, `response_bytes`.
+- `id`, `feed_identity_id`, `run_id`, `requested_at`, `requested_url`, `resolved_url`, `redirect_chain_json`, `http_status`, `etag`, `last_modified`, `outcome` CHECK in (`not_modified`, `modified`, `failed`), `feed_type`, `parse_outcome` CHECK in (`ok`, `recovered`, `unusable`), `parser_warnings_json`, `failure_category` CHECK against the `FailureCategory` values, `entry_count`, `response_bytes`.
 - Conditional state for the next fetch is **derived** from the latest fetch whose `outcome` is not `failed`. Do not store mutable validator state on `feed_identity`.
 
 `canonical_article`
@@ -444,7 +459,11 @@ The second index is deliberately narrow: entry-id dedup applies only where there
 - HTTP failures already arrive as `ProviderFailure` from the transport. Pass them through.
 - HTTP 304 is `NotModified` — a success, not a failure.
 - A payload feedparser recognizes as RSS or Atom yields `Modified` with its entries **and** its warnings retained, even when `bozo` is set. Recovered entries are accepted; warnings are never silently erased.
-- A payload that is not recognizably RSS or Atom, or has no trustworthy feed structure, raises `ProviderFailure(FailureCategory.MALFORMED_RESPONSE)`. Per Task 9 this is **retryable and exhausts to `deferred`**, not permanent — a CDN error page served where a feed should be is common and self-healing, and treating it as permanent would silently drop a publisher until an operator noticed.
+- A payload that is not recognizably RSS or Atom, or has no trustworthy feed structure, raises `ProviderFailure(FailureCategory.MALFORMED_RESPONSE, retryable=True, ...)`.
+
+  **The explicit `retryable=True` is required and is a deliberate policy choice.** `MALFORMED_RESPONSE` is *not* in `RETRYABLE_CATEGORIES` (`failures.py:28-36`), so `ProviderFailure.retryable` defaults to `False` for it, and the engine settles a non-retryable failure as `FAILED_PERMANENT`. Raising it without the override would produce the exact opposite of the intended behaviour — a publisher serving one bad response would be dropped permanently, waiting on changed input rather than being retried tomorrow.
+
+  The policy: for a *feed*, a malformed payload is usually a CDN or origin error page and is self-healing, so it should retry within the run and settle `deferred` when exhausted. Note this differs from the LLM case in 3b, where `malformed_response` means schema-nonconforming generated output and the existing at-most-one-fresh-attempt ceiling in `RetryCoordinator` applies. Same category, different provider, different correct disposition — which is precisely why `retryable` is a per-raise field rather than a category property.
 - `detail` on every raised failure must be sanitized: no response bodies, no full URLs with query strings, no credentials.
 
 **Dependency.** Add `feedparser>=6.0,<7` and regenerate `uv.lock` with `uv sync`. Note that feedparser is used **only** to parse supplied bytes — it must never fetch, so pass bytes, never a URL.
@@ -478,8 +497,8 @@ The second index is deliberately narrow: entry-id dedup applies only where there
 **Seeding, in one transaction per feed:**
 - Upsert `feed_identity` for every **enabled** feed, refreshing `current_label`, `current_url`, and `last_seen_at`.
 - Schedule one **required** `fetch_feed` work item per enabled feed, `subject_kind="feed_identity"`, `subject_id` the feed identity id.
-- The fingerprint is SHA-256 over canonical JSON of `{feed key, resolved URL, parser version}`. The parser version is a module constant bumped when parsing behaviour changes materially, so a parser change legitimately reschedules and a config comment change does not.
-- Rely on the existing partial unique index rather than checking first: a *succeeded* item from yesterday is terminal and does not block today's, while a *deferred* item is active and is reused rather than duplicated. Milestone 2's `schedule_work` already handles the constraint violation; do not add a second code path.
+- The fingerprint is SHA-256 over canonical JSON of `{feed key, configured URL, parser version}` — at seed time no fetch has happened, so the configured URL is the only one that exists. The parser version is a module constant bumped when parsing behaviour changes materially, so a parser change legitimately reschedules and a config comment change does not.
+- Call `schedule_work` unconditionally and let it decide. It already opens `BEGIN IMMEDIATE`, selects any existing item in `pending`/`running`/`deferred`, and returns that id instead of inserting (`repository.py:246-287`) — the partial unique index backs that pre-check rather than replacing it. So a *succeeded* item from yesterday is terminal and does not block today's, while a *deferred* item is reused rather than duplicated. Do not add a second existence check in the ingestion layer.
 - Supersede active work for feeds that have been disabled or removed from configuration, with reason `feed disabled`.
 
 **The handler is split across the two threads**, and this is the one place the division is easy to get wrong:
@@ -493,7 +512,7 @@ State this in the code, not only here. Task 10's persistence likewise runs on th
 - `NotModified` → `WorkState.SUCCEEDED`, reason `not modified`, with the result on `TaskOutcome.payload` so the fetch row is still written.
 - `Modified` → `WorkState.SUCCEEDED`, with the parsed result on `TaskOutcome.payload` for Task 10's `persist`.
 - `ProviderFailure` propagates; the engine's retry policy decides. Exhausted transient failures settle as `DEFERRED`, eligible tomorrow. Non-retryable failures settle as `FAILED_PERMANENT`.
-- `response_too_large` and `unsupported_content` settle as `DEFERRED` and are recorded honestly as *not inspected* — never as an empty feed.
+- `response_too_large` and `unsupported_content` settle as `DEFERRED` and are recorded honestly as *not inspected* — never as an empty feed. Neither is in `RETRYABLE_CATEGORIES`, so both default to `FAILED_PERMANENT`. Because retrying them within the run is pointless — the response will be just as large next time — do **not** override `retryable`. Instead the handler catches these two categories and returns `TaskOutcome(state=WorkState.DEFERRED, ...)` directly, so they are deferred without burning attempts. (`unsupported_content` is not raised anywhere in `src/` today; the mapping is written now so the first adapter that raises it behaves correctly.)
 
 **Steps:**
 
@@ -544,7 +563,7 @@ State this in the code, not only here. Task 10's persistence likewise runs on th
 - Modify: `src/notable_person_finder/cli/main.py`, `src/notable_person_finder/reporting/digest.py`
 - Test: `tests/ingestion/test_run_cli.py`
 
-**Wiring.** `command_run` builds a `FeedparserClient` over the existing run-scoped transport, constructs the `fetch_feed` handler via `build_fetch_handler`, and passes `build_seed_hook(...)` as the engine's `seed` hook. The transport is closed reliably at run end, as it already is.
+**Wiring.** `command_run` constructs no transport today (`cli/main.py:152-154` notes it is left to the first adapter milestone), so this task builds that lifecycle from scratch: call `build_transport(...)` inside `command_run`, wrap it in a `with` block so it closes on every exit path including failure, build a `FeedparserClient` over it, construct the handler via `build_fetch_handler`, and pass `build_seed_hook(...)` as the engine's `seed` hook. A test must prove the transport is closed when the run raises, not only when it succeeds.
 
 **Digest.** The operational summary gains an ingestion section: feeds fetched, feeds not modified, feeds failed, source items created, and articles created. Milestone 6 still owns the ranked shortlist; this section sits in the operational summary, not in the placeholder shortlist.
 
@@ -605,7 +624,7 @@ Record in the commit message which mutations were run and which test caught each
 
 These must skip cleanly, not fail, when the network is unavailable.
 
-**Why it matters.** Milestone 2's review endorsed its own Task 19 concern that "354 passing is weaker evidence for transport behaviour against a real remote than the number suggests", and named I1, I5, and a truncated-gzip case as concrete instances. This is the first milestone that can test that claim.
+**Why it matters.** Milestone 2's review recorded that "359 passing is weaker evidence for transport behaviour against a real remote than the number suggests", naming the uncapped `Retry-After`, the narrow `build_request` guard, and a truncated-gzip case as concrete instances. This is the first milestone that can test that claim.
 
 **Steps:**
 
@@ -620,10 +639,10 @@ These must skip cleanly, not fail, when the network is unavailable.
 ### Task 14: Milestone acceptance and documentation
 
 **Files:**
-- Modify: `CLAUDE.md`, `docs/running.md`, `docs/troubleshooting.md`, `pyproject.toml`
+- Modify: `CLAUDE.md`, `AGENTS.md`, `docs/running.md`, `docs/troubleshooting.md`, `pyproject.toml`
 
 **Documentation:**
-- `CLAUDE.md` "What Is Actually Built": move feed ingestion into "delivered", state plainly that source items carry no triage observation until 3b, and remove the carried gaps this milestone closed (`RunReport` budget fields; the uncaught `ValueError`).
+- `CLAUDE.md` **and `AGENTS.md`**: both carry "What Is Actually Built" and the same "Known gaps" list, and both are currently stale — they still record the uncaught `ValueError` that `f9541cf` already handled. Move feed ingestion into "delivered", state plainly that source items carry no triage observation until 3b, and remove the gaps this milestone closed (`RunReport` budget fields; the non-settling-state abort). Update both files identically.
 - `docs/running.md`: what ingestion does, what the digest's ingestion section means, and how to run the live smoke.
 - `docs/troubleshooting.md`: a feed stuck in `deferred`, a feed producing `malformed_response`, and what `url_issue` and `published_issue` values mean.
 - `pyproject.toml`: add `tests/ingestion` to Pyright's `include`.
@@ -694,9 +713,9 @@ Mapped from the approved designs:
 
 - `LlmClient` and OpenRouter; `detect_people`; triage observations; person mentions; people; sourced names; entity resolution; `possible_same_person`; merges — milestone 3b.
 - `MediaWikiClient` and Wikipedia identity — milestone 4.
-- `WebSearchClient`, `ArticleFetcher`, `ArticleExtractor`, search occurrences, article views, source-policy screening and its provenance, and the `search_result` alias kind — milestone 5.
+- `WebSearchClient`, `ArticleFetcher`, `ArticleExtractor`, search occurrences, article views, person–article assessment, source-policy screening and its provenance, and the `search_result` alias kind — milestone 5.
 - Lead assessment, ranking, the digest queue and its shortlist section, model synthesis, `notable digest show`, `notable audit run`, `notable audit person`, and `notable status` backlog and tiers — milestone 6.
-- Promptfoo suites, the full-system offline acceptance, the one-time legacy comparison, and the prototype cutover decision — milestone 7.
+- Promptfoo suites, manual live checks, the full-system offline acceptance, the one-time legacy comparison, and the prototype cutover decision — milestone 7.
 - `source_item_sighting` for duplicate-feed discovery (D6).
 - A real public-suffix list for publisher keys (Task 6).
 - `robots.txt` handling, explicitly deferred by the provider adapters design.
