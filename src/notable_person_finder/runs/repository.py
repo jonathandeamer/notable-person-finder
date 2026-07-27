@@ -369,6 +369,72 @@ def next_eligible(
     return None if row is None else _work_item(row)
 
 
+def claim_batch(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    now: str,
+    task_types: Collection[str] | None = None,
+    limit: int,
+) -> tuple[WorkItem, ...]:
+    """Claim up to `limit` eligible items in one transaction.
+
+    Ordering matches `next_eligible` exactly: `priority ASC, id ASC`.
+    `eligible_at` is not a sort key; it is enforced by `_CLAIMABLE_PREDICATE`,
+    the same predicate `next_eligible` and `claim_and_start_attempt` use, so
+    the claim paths cannot diverge on what "claimable" means. The select and
+    the update run inside one transaction, so a crash between them leaves
+    every item in the batch `pending` (or `deferred`), never partially
+    `running`.
+    """
+    if limit < 1:
+        raise ValueError(f"limit must be at least 1, got {limit}")
+    if task_types is not None and not task_types:
+        return ()
+    task_filter = ""
+    parameters: list[object] = [run_id, now]
+    if task_types is not None:
+        ordered = sorted(task_types)
+        task_filter = f" AND task_type IN ({','.join('?' for _ in ordered)})"
+        parameters.extend(ordered)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        rows = connection.execute(
+            f"""
+            SELECT * FROM work_item
+             WHERE {_CLAIMABLE_PREDICATE}
+               {task_filter}
+             ORDER BY priority ASC, id ASC
+             LIMIT ?
+            """,
+            (*parameters, limit),
+        ).fetchall()
+        if not rows:
+            connection.rollback()
+            return ()
+        items = [_work_item(row) for row in rows]
+        ids = [item.id for item in items]
+        placeholders = ",".join("?" for _ in ids)
+        changed = connection.execute(
+            f"""
+            UPDATE work_item
+               SET state = 'running', claimed_by_run_id = ?, updated_at = ?
+             WHERE id IN ({placeholders}) AND {_CLAIMABLE_PREDICATE}
+            """,
+            (run_id, now, *ids, run_id, now),
+        ).rowcount
+        if changed != len(ids):
+            raise RuntimeError(
+                f"batch claim for run-{run_id} raced with a concurrent claim"
+            )
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+    return tuple(dataclasses.replace(item, state=WorkState.RUNNING) for item in items)
+
+
 def claim_next(
     connection: sqlite3.Connection,
     *,
@@ -377,28 +443,10 @@ def claim_next(
     task_types: Collection[str] | None = None,
 ) -> WorkItem | None:
     """Claim deterministic work; external calls use claim_and_start_attempt."""
-    connection.execute("BEGIN IMMEDIATE")
-    try:
-        item = next_eligible(connection, run_id=run_id, now=now, task_types=task_types)
-        if item is None:
-            connection.rollback()
-            return None
-        changed = connection.execute(
-            f"""
-            UPDATE work_item
-               SET state = 'running', claimed_by_run_id = ?, updated_at = ?
-             WHERE id = ? AND {_CLAIMABLE_PREDICATE}
-            """,
-            (run_id, now, item.id, run_id, now),
-        ).rowcount
-        if changed != 1:
-            raise RuntimeError(f"work item {item.id} was no longer claimable")
-    except BaseException:
-        connection.rollback()
-        raise
-    else:
-        connection.commit()
-    return dataclasses.replace(item, state=WorkState.RUNNING)
+    claimed = claim_batch(
+        connection, run_id=run_id, now=now, task_types=task_types, limit=1
+    )
+    return claimed[0] if claimed else None
 
 
 def complete_work(
