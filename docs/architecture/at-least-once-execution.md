@@ -70,10 +70,11 @@ of the two windows but the more operationally dangerous one, because it leaves
 no marker to search for.
 
 The same sweep also covers the aborts that are not process death but leave the
-same in-flight shape. A handler that returns a work state which does not settle
-the item raises `ValueError` and aborts the whole run rather than isolating the
-item; the run row stays `running` and the next sweep marks it `interrupted`.
-So does an interrupt during the digest write, which exits 130. The observed
+same in-flight shape. An exception that is not a `ProviderFailure` — raised
+from a handler's `prepare`, `execute`, or `persist` — propagates out of the
+engine before the run is finished, so the run row stays `running` and the next
+sweep marks it `interrupted`. So does an interrupt during the digest write,
+which exits 130. The observed
 run-transition sequence across a crash and its recovery is
 `running, interrupted, running, complete`.
 

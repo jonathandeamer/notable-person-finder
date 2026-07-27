@@ -23,6 +23,18 @@ class DigestWriteError(Exception):
     """The digest could not be persisted atomically."""
 
 
+def _format_nano_usd(nano_usd: int) -> str:
+    """Render nano-USD as a two-decimal dollar figure using only integers.
+
+    Money is integer nano-USD throughout the run engine; this formats it for
+    a human reader without ever converting through a float.
+    """
+    sign = "-" if nano_usd < 0 else ""
+    dollars, remainder_nano = divmod(abs(nano_usd), 1_000_000_000)
+    cents = (remainder_nano * 100) // 1_000_000_000
+    return f"{sign}${dollars}.{cents:02d}"
+
+
 @dataclass(frozen=True, slots=True)
 class DigestRecord:
     path: Path
@@ -62,10 +74,25 @@ def render_digest(report: RunReport, *, local_date: str) -> str:
         f"- Required work succeeded: {counters.required_succeeded}",
         f"- Required work still pending: {counters.required_pending}",
         f"- Required work deferred: {counters.required_deferred}",
-        f"- Optional work succeeded: {counters.optional_succeeded}",
     ]
-    # TODO(milestone 3): render budget summary from RunReport budget fields
-    # once budget-driven deferrals are reachable.
+    for reason, count in sorted(report.deferred_reasons.items()):
+        lines.append(f"  - {reason}: {count}")
+    if (
+        report.budget_limit_nano_usd is not None
+        or report.budget_reserved_nano_usd
+        or report.budget_actual_nano_usd
+    ):
+        cap = (
+            _format_nano_usd(report.budget_limit_nano_usd)
+            if report.budget_limit_nano_usd is not None
+            else "none"
+        )
+        lines.append(
+            f"- Budget: cap {cap}, "
+            f"reserved {_format_nano_usd(report.budget_reserved_nano_usd)}, "
+            f"spent {_format_nano_usd(report.budget_actual_nano_usd)}"
+        )
+    lines.append(f"- Optional work succeeded: {counters.optional_succeeded}")
 
     if counters.required_failed_permanent:
         lines.append(

@@ -26,14 +26,13 @@ from notable_person_finder.reporting.digest import (
 from notable_person_finder.runs import repository
 from notable_person_finder.runs.clock import SystemClock, utc_timestamp
 from notable_person_finder.runs.engine import (
-    NonSettlingStateError,
     ReportArtifact,
     RunEngine,
     RunReport,
 )
 from notable_person_finder.runs.lock import LockUnavailable, MutationLock
 from notable_person_finder.runs.models import RunState
-from notable_person_finder.runs.retry import RetryCoordinator
+from notable_person_finder.runs.retry import RetryPolicy
 from notable_person_finder.runs.scheduler import BoundedScheduler
 
 EXIT_OK = 0
@@ -164,7 +163,15 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                         config=loaded.main.digest,
                     )
                 except DigestWriteError:
-                    log_event(logger, "run_reporting_failed", run_id=report.run_id)
+                    # `cli.` prefix, not `run.`: the engine already emits
+                    # `run.reporting_failed` for the same failure, with a
+                    # different field set (error_type, no run_id-only
+                    # shape). Two emitters sharing one dotted name would
+                    # make the name insufficient to know which schema
+                    # applies without inspecting the payload -- so every
+                    # CLI-originated event in this function is under its
+                    # own `cli.` namespace instead.
+                    log_event(logger, "cli.run_reporting_failed", run_id=report.run_id)
                     raise
                 return ReportArtifact(
                     path=str(written.path),
@@ -172,44 +179,42 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                     markdown=written.markdown,
                 )
 
-            engine = RunEngine(
-                connection,
-                retry=RetryCoordinator(loaded.main.retry, clock=clock),
-                scheduler=BoundedScheduler(loaded.main.concurrency.http_workers),
-                clock=clock,
-                timezone=loaded.main.timezone,
-                window_start=window_start,
-                budget_limit_nano_usd=loaded.main.budget.openrouter_nano_usd_per_run(),
-                snapshot_fingerprint=loaded.fingerprint,
-                snapshot_json=loaded.snapshot_json,
-                reporter=report_run,
-            )
-            log_event(logger, "run_started", fingerprint=loaded.fingerprint)
-            try:
-                # No provider adapters exist in this milestone, so no task
-                # handlers are registered. Milestones 3-6 supply them.
-                report = engine.execute({})
-            except NonSettlingStateError as error:
-                repository.finish_run(
+            # Scoped tightly around engine construction and execution -- the
+            # only place the scheduler's worker pool is used -- so the pool
+            # is always shut down before `connection.close()` runs in the
+            # outer `finally`, on both the success and the exception path.
+            # Closing the connection first would let a worker thread still
+            # inside an HTTP call outlive the SQLite connection it will need
+            # for `persist`.
+            with BoundedScheduler(loaded.main.concurrency.http_workers) as scheduler:
+                engine = RunEngine(
                     connection,
-                    run_id=error.run_id,
-                    state=RunState.INTERRUPTED,
-                    reason=(
-                        f"handler for {error.task_type!r} returned "
-                        f"non-settling state {error.state!r}"
+                    retry=RetryPolicy(loaded.main.retry, clock=clock),
+                    scheduler=scheduler,
+                    clock=clock,
+                    timezone=loaded.main.timezone,
+                    window_start=window_start,
+                    budget_limit_nano_usd=(
+                        loaded.main.budget.openrouter_nano_usd_per_run()
                     ),
-                    digest_path=None,
-                    digest_sha256=None,
-                    now=utc_timestamp(clock.now()),
+                    snapshot_fingerprint=loaded.fingerprint,
+                    snapshot_json=loaded.snapshot_json,
+                    reporter=report_run,
                 )
-                log_event(
-                    logger,
-                    "run_non_settling_state",
-                    run_id=error.run_id,
-                    task_type=error.task_type,
-                    state=str(error.state),
-                )
-                return EXIT_FAILED
+                # `cli.run_started`, not `run.started`: the engine emits its own
+                # `run.started` with a disjoint field set (run_id, window_start,
+                # window_end, swept_runs, task_types). Reusing that name here
+                # would give one dotted event name two schemas in the same log,
+                # which is the defect the dotted rename was meant to remove, not
+                # reintroduce in a different shape.
+                log_event(logger, "cli.run_started", fingerprint=loaded.fingerprint)
+                # No provider adapters exist in this milestone, so no task
+                # handlers are registered. Milestones 3-6 supply them. A handler
+                # returning a non-settling state is now handled inside the
+                # engine -- it settles just that item and the run finishes
+                # normally -- so there is no longer a non-settling failure mode
+                # for this call to catch.
+                report = engine.execute({})
 
             if written is None:
                 # The engine always calls the reporter before returning, so
@@ -219,9 +224,12 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                 # next line instead of a handled reporting failure.
                 raise DigestWriteError("the run finished without writing a digest")
 
+            # `cli.run_finished`, not `run.finished`: same reasoning as
+            # `cli.run_started` above -- the engine already emits
+            # `run.finished` with its own field set for the same moment.
             log_event(
                 logger,
-                "run_finished",
+                "cli.run_finished",
                 run_id=report.run_id,
                 state=str(report.state),
                 required_succeeded=report.counters.required_succeeded,

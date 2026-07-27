@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,7 @@ from notable_person_finder.db.migrate import apply_migrations
 
 
 @pytest.fixture
-def connection(tmp_path: Path) -> sqlite3.Connection:
+def connection(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     database = tmp_path / "notable.sqlite3"
     connection = connect_database(database)
     apply_migrations(connection, database, tmp_path / "backups")
@@ -26,7 +27,8 @@ def snapshot_id(connection: sqlite3.Connection) -> int:
         """,
         ("a" * 64,),
     )
-    return int(cursor.lastrowid)
+    assert cursor.lastrowid is not None
+    return cursor.lastrowid
 
 
 def start_run(connection: sqlite3.Connection) -> int:
@@ -41,7 +43,8 @@ def start_run(connection: sqlite3.Connection) -> int:
         """,
         (snapshot_id(connection),),
     )
-    return int(cursor.lastrowid)
+    assert cursor.lastrowid is not None
+    return cursor.lastrowid
 
 
 def add_work(connection: sqlite3.Connection, *, state: str, fingerprint: str) -> int:
@@ -57,7 +60,8 @@ def add_work(connection: sqlite3.Connection, *, state: str, fingerprint: str) ->
         """,
         (fingerprint, state),
     )
-    return int(cursor.lastrowid)
+    assert cursor.lastrowid is not None
+    return cursor.lastrowid
 
 
 def test_migration_0002_is_applied(connection: sqlite3.Connection) -> None:
@@ -168,7 +172,8 @@ def test_failed_attempt_requires_a_failure_category(
         """,
         (run_id, work_id, "0" * 64),
     )
-    attempt_id = int(cursor.lastrowid)
+    assert cursor.lastrowid is not None
+    attempt_id = cursor.lastrowid
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
             "UPDATE attempt SET outcome = 'failed', "
@@ -200,10 +205,11 @@ def test_finished_attempt_requires_an_outcome(connection: sqlite3.Connection) ->
         """,
         (run_id, work_id, "3" * 64),
     )
+    assert cursor.lastrowid is not None
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
             "UPDATE attempt SET finished_at = '2026-07-25T06:00:01Z' WHERE id = ?",
-            (int(cursor.lastrowid),),
+            (cursor.lastrowid,),
         )
 
 

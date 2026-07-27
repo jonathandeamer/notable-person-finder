@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import sqlite3
-from collections.abc import Collection
+from collections.abc import Callable, Collection, Mapping
 
 from notable_person_finder.runs.budget import (
     reconcile_in_transaction,
@@ -317,10 +317,11 @@ def supersede_work(
     return changed
 
 
-# Shared by `next_eligible`, `claim_next`, and `claim_and_start_attempt` so the
-# three claim paths cannot silently diverge on what "claimable" means. Binds
-# two placeholders, in this order: run_id (for the same-run deferred check),
-# then now (for the eligibility check).
+# Shared by `claim_batch` -- the engine's production claim path -- and by
+# `next_eligible`, `claim_next`, and `claim_and_start_attempt`, so no claim
+# path can silently diverge on what "claimable" means. Binds two
+# placeholders, in this order: run_id (for the same-run deferred check), then
+# now (for the eligibility check).
 _CLAIMABLE_PREDICATE = """(
     state = 'pending'
     OR (state = 'deferred' AND COALESCE(completed_by_run_id, -1) <> ?)
@@ -347,7 +348,13 @@ def next_eligible(
     now: str,
     task_types: Collection[str] | None = None,
 ) -> WorkItem | None:
-    """Inspect the next eligible item without mutating it."""
+    """Inspect the next eligible item without mutating it.
+
+    No production caller since the batch-claim reshape (the engine calls
+    `claim_batch` directly); retained as a regression harness for
+    `_CLAIMABLE_PREDICATE`'s peek semantics. Removal to be considered in pull
+    request 2.
+    """
     if task_types is not None and not task_types:
         return None
     task_filter = ""
@@ -369,6 +376,72 @@ def next_eligible(
     return None if row is None else _work_item(row)
 
 
+def claim_batch(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    now: str,
+    task_types: Collection[str] | None = None,
+    limit: int,
+) -> tuple[WorkItem, ...]:
+    """Claim up to `limit` eligible items in one transaction.
+
+    Ordering matches `next_eligible` exactly: `priority ASC, id ASC`.
+    `eligible_at` is not a sort key; it is enforced by `_CLAIMABLE_PREDICATE`,
+    the same predicate `next_eligible` and `claim_and_start_attempt` use, so
+    the claim paths cannot diverge on what "claimable" means. The select and
+    the update run inside one transaction, so a crash between them leaves
+    every item in the batch `pending` (or `deferred`), never partially
+    `running`.
+    """
+    if limit < 1:
+        raise ValueError(f"limit must be at least 1, got {limit}")
+    if task_types is not None and not task_types:
+        return ()
+    task_filter = ""
+    parameters: list[object] = [run_id, now]
+    if task_types is not None:
+        ordered = sorted(task_types)
+        task_filter = f" AND task_type IN ({','.join('?' for _ in ordered)})"
+        parameters.extend(ordered)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        rows = connection.execute(
+            f"""
+            SELECT * FROM work_item
+             WHERE {_CLAIMABLE_PREDICATE}
+               {task_filter}
+             ORDER BY priority ASC, id ASC
+             LIMIT ?
+            """,
+            (*parameters, limit),
+        ).fetchall()
+        if not rows:
+            connection.rollback()
+            return ()
+        items = [_work_item(row) for row in rows]
+        ids = [item.id for item in items]
+        placeholders = ",".join("?" for _ in ids)
+        changed = connection.execute(
+            f"""
+            UPDATE work_item
+               SET state = 'running', claimed_by_run_id = ?, updated_at = ?
+             WHERE id IN ({placeholders}) AND {_CLAIMABLE_PREDICATE}
+            """,
+            (run_id, now, *ids, run_id, now),
+        ).rowcount
+        if changed != len(ids):
+            raise RuntimeError(
+                f"batch claim for run-{run_id} raced with a concurrent claim"
+            )
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+    return tuple(dataclasses.replace(item, state=WorkState.RUNNING) for item in items)
+
+
 def claim_next(
     connection: sqlite3.Connection,
     *,
@@ -376,29 +449,17 @@ def claim_next(
     now: str,
     task_types: Collection[str] | None = None,
 ) -> WorkItem | None:
-    """Claim deterministic work; external calls use claim_and_start_attempt."""
-    connection.execute("BEGIN IMMEDIATE")
-    try:
-        item = next_eligible(connection, run_id=run_id, now=now, task_types=task_types)
-        if item is None:
-            connection.rollback()
-            return None
-        changed = connection.execute(
-            f"""
-            UPDATE work_item
-               SET state = 'running', claimed_by_run_id = ?, updated_at = ?
-             WHERE id = ? AND {_CLAIMABLE_PREDICATE}
-            """,
-            (run_id, now, item.id, run_id, now),
-        ).rowcount
-        if changed != 1:
-            raise RuntimeError(f"work item {item.id} was no longer claimable")
-    except BaseException:
-        connection.rollback()
-        raise
-    else:
-        connection.commit()
-    return dataclasses.replace(item, state=WorkState.RUNNING)
+    """Claim deterministic work; external calls use claim_and_start_attempt.
+
+    No production caller since the batch-claim reshape (the engine claims in
+    batches of more than one via `claim_batch` directly); retained as a
+    regression harness for single-item claim semantics. Removal to be
+    considered in pull request 2.
+    """
+    claimed = claim_batch(
+        connection, run_id=run_id, now=now, task_types=task_types, limit=1
+    )
+    return claimed[0] if claimed else None
 
 
 def complete_work(
@@ -410,8 +471,19 @@ def complete_work(
     reason: str | None,
     now: str,
     eligible_at: str | None = None,
+    domain_writes: Callable[[sqlite3.Connection], None] | None = None,
 ) -> None:
-    """Record one item's terminal or deferred outcome; failures are isolated."""
+    """Record one item's outcome; failures are isolated.
+
+    Also the re-arm path: passing `state='pending'` with a later `eligible_at`
+    returns a claimed item to the queue for a retry inside the same run.
+
+    `domain_writes` runs inside this transaction, after the state change and
+    before the commit, so a handler's domain rows and the settlement that
+    justifies them commit or roll back together. A handler that raises there
+    leaves the item `running` and claimed, which the next run's sweep
+    recovers -- never a settled item whose domain writes vanished.
+    """
     connection.execute("BEGIN IMMEDIATE")
     try:
         changed = connection.execute(
@@ -431,6 +503,8 @@ def complete_work(
             raise RuntimeError(
                 f"work item {work_item_id} is not completable by run-{run_id}"
             )
+        if domain_writes is not None:
+            domain_writes(connection)
     except BaseException:
         connection.rollback()
         raise
@@ -448,14 +522,15 @@ def defer_unclaimed(
 ) -> None:
     """Defer work this run peeked at but never claimed.
 
-    `complete_work` is the settle path for work that reached the provider: it
-    requires state `running`, because only a claim proves this run owned the
-    item. Two engine paths refuse an item *before* any claim exists — a paused
-    provider (refused by the retry coordinator before the claim UPDATE runs)
-    and a refused budget reservation (which rolls back the claim inside
-    `claim_and_start_attempt`'s own transaction). Both leave a `pending` or
-    `deferred` row that this run must record a decision about, or the engine's
-    peek-and-settle loop re-selects it forever.
+    No production caller since the batch-claim reshape: every item the engine
+    sees has already been claimed by `claim_batch` before any check runs
+    (including the pause check in `_prepare`), so `complete_work` -- which
+    requires state `running` as proof of that claim -- is the engine's only
+    settle path now, via `_settle`. There is no longer an engine path that
+    refuses an item *before* a claim exists for this function to serve.
+    Retained as a regression harness for the peek-then-defer-without-claiming
+    shape `next_eligible` also exercises. Removal to be considered in pull
+    request 2.
 
     `completed_by_run_id` is stamped for exactly that reason: it is what
     `_CLAIMABLE_PREDICATE` reads to keep a same-run deferral out of the next
@@ -563,6 +638,33 @@ def run_counters(
     )
 
 
+def deferred_reasons(connection: sqlite3.Connection, *, now: str) -> Mapping[str, int]:
+    """Count all outstanding due-and-deferred required work, grouped by reason.
+
+    Matches `run_counters`'s `required_deferred` exactly: whole-queue and
+    `eligible_at <= now`, not `completed_by_run_id`-scoped. `required_deferred`
+    is a deliberately whole-queue count -- it includes carryover a previous
+    run deferred and this run never re-touched -- so the reason breakdown must
+    describe that same population, or the two numbers disagree the moment a
+    later run only reclaims and re-defers part of an earlier run's backlog.
+    The reason text a prior run recorded persists on those older rows, so a
+    whole-queue breakdown can still explain them.
+    """
+    return {
+        str(row["reason"]): int(row["n"])
+        for row in connection.execute(
+            """
+            SELECT reason, COUNT(*) AS n
+              FROM work_item
+             WHERE required = 1 AND state = 'deferred' AND eligible_at <= ?
+               AND reason IS NOT NULL
+             GROUP BY reason
+            """,
+            (now,),
+        )
+    }
+
+
 def next_attempt_ordinal(connection: sqlite3.Connection, *, work_item_id: int) -> int:
     """Advisory next ordinal for a work item.
 
@@ -628,7 +730,13 @@ def claim_and_start_attempt(
     reserved_nano_usd: int,
     now: str,
 ) -> int:
-    """Atomically claim work, reserve cost, and persist the first attempt."""
+    """Atomically claim work, reserve cost, and persist the first attempt.
+
+    No production caller since the batch-claim reshape (the engine claims via
+    `claim_batch`, then reserves and inserts the attempt as separate steps in
+    `prepare`); retained as a regression harness for the combined claim/
+    reserve/insert transaction. Removal to be considered in pull request 2.
+    """
     connection.execute("BEGIN IMMEDIATE")
     try:
         changed = connection.execute(

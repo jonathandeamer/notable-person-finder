@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import sqlite3
 
-# TODO(milestone 3): these reserve/reconcile helpers are unit-tested but not yet
-# exercised by RunEngine, because no provider adapters are registered. Compose
-# them once adapters perform real spend reservations.
+# These reserve/reconcile helpers are driven by `RunEngine.execute` through
+# `repository.start_attempt`/`finish_attempt` on every attempt -- see
+# tests/run_engine/test_engine.py's budget-reservation and
+# budget-exhaustion-reporting tests -- and no longer wait on a provider
+# adapter to exercise them.
 
 
 class BudgetExhausted(Exception):

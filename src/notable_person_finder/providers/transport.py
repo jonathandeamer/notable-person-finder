@@ -281,12 +281,27 @@ class HttpTransport:
                 params=params,
                 timeout=self._timeout_for(profile=profile),
             )
-        except UnicodeEncodeError as error:
+        except Exception as error:
+            # `build_request` raises more than `UnicodeEncodeError`:
+            # `httpx.InvalidURL` for a malformed URL (a non-printable
+            # character, an unparsable port) is the realistic other case, and
+            # anything else it might ever raise is equally a configuration
+            # problem, not a retryable one. The encoding case keeps its
+            # existing, already-reviewed detail so that message does not
+            # regress; every other cause gets `type(error).__name__` rather
+            # than `str(error)`, because the raw httpx message embeds the
+            # rejected URL text verbatim (query string, any credentials in
+            # it, all of it) and `detail` must never carry that.
+            detail = (
+                "request contains non-ASCII characters"
+                if isinstance(error, UnicodeEncodeError)
+                else type(error).__name__
+            )
             raise ProviderFailure(
                 FailureCategory.CONFIGURATION,
                 provider=provider,
                 operation=operation,
-                detail="request contains non-ASCII characters",
+                detail=detail,
             ) from error
         try:
             response = self._client.send(request, stream=True)

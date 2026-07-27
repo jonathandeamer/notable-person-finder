@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
-from notable_person_finder.cli.main import EXIT_FAILED, main
+from notable_person_finder.cli import main as cli_main
 from notable_person_finder.db.connection import connect_database
-from notable_person_finder.runs.models import WorkState
+from notable_person_finder.runs.engine import RunEngine, RunReport
+from notable_person_finder.runs.scheduler import BoundedScheduler
 from tests.run_engine.helpers import ENVIRONMENT, write_graph
 
 
@@ -253,7 +256,35 @@ def test_run_writes_structured_logs(config_file: Path, tmp_path: Path) -> None:
     run_notable(config_file, "run")
     log_file = tmp_path / "portable" / "logs" / "notable.jsonl"
     assert log_file.is_file()
-    assert "run_started" in log_file.read_text(encoding="utf-8")
+    # `cli.run_started`, not `run.started`: the engine also emits
+    # `run.started` (with a disjoint field set), so that literal was
+    # already present before the CLI ever logged anything, and would not
+    # discriminate a regression in the CLI's own emission. `cli.run_started`
+    # is emitted only here, so it does discriminate -- see the demonstration
+    # in the task-5 report.
+    assert "cli.run_started" in log_file.read_text(encoding="utf-8")
+
+
+def test_every_emitted_event_name_uses_the_dotted_taxonomy(
+    config_file: Path, tmp_path: Path
+) -> None:
+    """One taxonomy, one style: every event name is dotted (`run.started`),
+
+    never underscored (`run_started`). This scans the whole log rather than
+    checking for the two specific names the CLI used to emit underscored, so
+    it also catches any other underscored name nobody thought to look for --
+    including ones added after this test was written.
+    """
+    run_notable(config_file, "run")
+    log_file = tmp_path / "portable" / "logs" / "notable.jsonl"
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert lines, "expected at least one log line from a real run"
+    event_names = [json.loads(line)["event"] for line in lines]
+    assert event_names
+    violations = [name for name in event_names if "." not in name]
+    assert violations == [], (
+        f"found underscored event name(s) outside the dotted taxonomy: {violations}"
+    )
 
 
 # --- Supplementary coverage -------------------------------------------------
@@ -483,70 +514,6 @@ def test_the_cli_wires_the_resolved_secrets_into_the_log_redaction_filter(
     assert "brave-secret-value" not in log_file.read_text(encoding="utf-8")
 
 
-def test_non_settling_handler_state_records_run_as_interrupted(
-    config_file: Path, tmp_path: Path, monkeypatch
-) -> None:
-    """A handler returning a non-settling state must exit failed and leave the
-    run recorded as interrupted, not as a traceback."""
-    for name, value in ENVIRONMENT.items():
-        monkeypatch.setenv(name, value)
-
-    captured_run_id: list[int] = []
-
-    class BrokenEngine:
-        def __init__(self, connection, *args, **kwargs) -> None:
-            self._connection = connection
-
-        def execute(self, handlers) -> None:
-            from notable_person_finder.runs import repository
-            from notable_person_finder.runs.engine import NonSettlingStateError
-
-            now = "2026-07-25T06:00:00Z"
-            snapshot_id = repository.store_snapshot(
-                self._connection,
-                fingerprint="a" * 64,
-                canonical_json="{}",
-                now=now,
-            )
-            run_id = repository.create_run(
-                self._connection,
-                snapshot_id=snapshot_id,
-                timezone="Europe/Paris",
-                window_start=now,
-                window_end=now,
-                budget_limit_nano_usd=None,
-                now=now,
-            )
-            captured_run_id.append(run_id)
-            raise NonSettlingStateError(run_id, "probe", WorkState.PENDING)
-
-    monkeypatch.setattr("notable_person_finder.cli.main.RunEngine", BrokenEngine)
-
-    assert main(["--config", str(config_file), "run"]) == EXIT_FAILED
-    assert len(captured_run_id) == 1
-    run_id = captured_run_id[0]
-
-    database = tmp_path / "portable" / "data" / "notable.sqlite3"
-    connection = connect_database(database)
-    try:
-        row = connection.execute(
-            "SELECT state FROM run WHERE id = ?", (run_id,)
-        ).fetchone()
-        transitions = [
-            row[0]
-            for row in connection.execute(
-                "SELECT state FROM run_transition WHERE run_id = ? ORDER BY id",
-                (run_id,),
-            )
-        ]
-    finally:
-        connection.close()
-
-    assert row is not None
-    assert row["state"] == "interrupted"
-    assert transitions == ["running", "interrupted"]
-
-
 def test_the_persisted_configuration_snapshot_holds_no_secret_value(
     config_file: Path, tmp_path: Path
 ) -> None:
@@ -585,3 +552,74 @@ def test_verbose_names_the_digest_without_revealing_secrets(
     combined = completed.stdout + completed.stderr
     assert "or-secret-value" not in combined
     assert "brave-secret-value" not in combined
+
+
+class _SpyScheduler(BoundedScheduler):
+    """Records every instance built and whether `close` ever ran on it.
+
+    In-process rather than subprocess: this milestone registers no task
+    handlers, so `BoundedScheduler`'s pool never submits work and never spawns
+    a worker thread either way -- there is nothing to observe from outside the
+    process. Spying on `close()` is what actually distinguishes "released" from
+    "constructed and abandoned" here.
+    """
+
+    instances: ClassVar[list[_SpyScheduler]] = []
+
+    def __init__(self, max_workers: int) -> None:
+        super().__init__(max_workers)
+        self.closed = False
+        _SpyScheduler.instances.append(self)
+
+    def close(self) -> None:
+        self.closed = True
+        super().close()
+
+
+def _configure_in_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TEST_OPENROUTER", ENVIRONMENT["TEST_OPENROUTER"])
+    monkeypatch.setenv("TEST_BRAVE", ENVIRONMENT["TEST_BRAVE"])
+    monkeypatch.setattr(cli_main, "BoundedScheduler", _SpyScheduler)
+    _SpyScheduler.instances.clear()
+
+
+def test_command_run_closes_the_scheduler_on_a_successful_run(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`BoundedScheduler` must not outlive `command_run` on the success path.
+
+    Only one exit path is "successful"; the paired test below covers the
+    exception path, which is the one the finding is actually about.
+    """
+    _configure_in_process(monkeypatch)
+    exit_code = cli_main.command_run(config_file, verbose=False)
+    assert exit_code == cli_main.EXIT_OK
+    assert len(_SpyScheduler.instances) == 1
+    assert _SpyScheduler.instances[0].closed is True
+
+
+def test_command_run_closes_the_scheduler_when_the_run_raises(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scheduler must be released even when the run itself blows up.
+
+    A handler-level failure isolates inside `RunEngine.execute` and never
+    reaches here, so this forces the one kind of exception that genuinely
+    propagates out of `execute` today: a non-`ProviderFailure` raised while
+    the run is in flight. Before the fix, the scheduler was constructed
+    inline and never closed on any exit path -- this is the exit path most
+    likely to leave a worker mid-call when a future handler is registered,
+    which is exactly what the finding warns about.
+    """
+    _configure_in_process(monkeypatch)
+
+    def _boom(self: RunEngine, handlers: object, *, seed: object = None) -> RunReport:
+        raise RuntimeError("synthetic failure for the scheduler-shutdown test")
+
+    monkeypatch.setattr(RunEngine, "execute", _boom)
+
+    with pytest.raises(RuntimeError, match="synthetic failure"):
+        cli_main.command_run(config_file, verbose=False)
+
+    assert len(_SpyScheduler.instances) == 1
+    assert _SpyScheduler.instances[0].closed is True

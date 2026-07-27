@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,7 @@ LATER = "2026-07-25T07:00:00Z"
 
 
 @pytest.fixture
-def connection(tmp_path: Path) -> sqlite3.Connection:
+def connection(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     database = tmp_path / "notable.sqlite3"
     connection = connect_database(database)
     apply_migrations(connection, database, tmp_path / "backups")
@@ -136,8 +137,12 @@ def test_claims_are_ordered_by_priority_then_identity(
 ) -> None:
     low = schedule(connection, run_id, fingerprint="e" * 64, priority=500)
     high = schedule(connection, run_id, fingerprint="f" * 64, priority=10)
-    assert repository.claim_next(connection, run_id=run_id, now=NOW).id == high
-    assert repository.claim_next(connection, run_id=run_id, now=NOW).id == low
+    first_claim = repository.claim_next(connection, run_id=run_id, now=NOW)
+    assert first_claim is not None
+    assert first_claim.id == high
+    second_claim = repository.claim_next(connection, run_id=run_id, now=NOW)
+    assert second_claim is not None
+    assert second_claim.id == low
 
 
 def test_work_is_not_claimed_before_its_eligibility_time(
@@ -514,4 +519,182 @@ def test_deferring_unclaimed_work_refuses_a_claimed_item(
         ).fetchone()["state"]
         == WorkState.RUNNING
     )
+    assert not connection.in_transaction
+
+
+def test_claim_batch_claims_a_subset_in_priority_then_identity_order(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
+    ids = [
+        schedule(connection, run_id, fingerprint=str(n) * 64, priority=priority)
+        for n, priority in enumerate([50, 10, 30, 10, 20], start=1)
+    ]
+    # priority 10 appears twice (ids[1], ids[3]); ties break by id ascending.
+    expected_order = [ids[1], ids[3], ids[4]]
+
+    claimed = repository.claim_batch(connection, run_id=run_id, now=NOW, limit=3)
+
+    assert [item.id for item in claimed] == expected_order
+    assert all(item.state is WorkState.RUNNING for item in claimed)
+    rows = {
+        row["id"]: row["state"]
+        for row in connection.execute("SELECT id, state FROM work_item")
+    }
+    remaining_pending = {ids[0], ids[2]}
+    for work_id in remaining_pending:
+        assert rows[work_id] == WorkState.PENDING
+    for work_id in expected_order:
+        assert rows[work_id] == WorkState.RUNNING
+
+
+def test_claim_batch_does_not_reclaim_already_claimed_items(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
+    first = schedule(connection, run_id, fingerprint="1" * 64, priority=10)
+    second = schedule(connection, run_id, fingerprint="2" * 64, priority=20)
+
+    first_batch = repository.claim_batch(connection, run_id=run_id, now=NOW, limit=1)
+    assert [item.id for item in first_batch] == [first]
+
+    second_batch = repository.claim_batch(connection, run_id=run_id, now=NOW, limit=5)
+    assert [item.id for item in second_batch] == [second]
+
+
+def test_claim_batch_respects_task_type_filter(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
+    wanted = schedule(
+        connection, run_id, fingerprint="1" * 64, task_type="detect_people"
+    )
+    schedule(connection, run_id, fingerprint="2" * 64, task_type="future_task")
+
+    claimed = repository.claim_batch(
+        connection, run_id=run_id, now=NOW, task_types={"detect_people"}, limit=5
+    )
+
+    assert [item.id for item in claimed] == [wanted]
+
+
+def test_claim_batch_excludes_items_not_yet_eligible(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
+    ready = schedule(connection, run_id, fingerprint="1" * 64, eligible_at=NOW)
+    schedule(
+        connection,
+        run_id,
+        fingerprint="2" * 64,
+        eligible_at="2026-07-26T00:00:00Z",
+    )
+
+    claimed = repository.claim_batch(connection, run_id=run_id, now=NOW, limit=5)
+
+    assert [item.id for item in claimed] == [ready]
+
+
+def test_claim_batch_rejects_a_limit_below_one(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
+    schedule(connection, run_id)
+    with pytest.raises(ValueError):
+        repository.claim_batch(connection, run_id=run_id, now=NOW, limit=0)
+    with pytest.raises(ValueError):
+        repository.claim_batch(connection, run_id=run_id, now=NOW, limit=-1)
+    # Rejection must not leave a stray transaction or touch any row.
+    assert not connection.in_transaction
+    row = connection.execute("SELECT state FROM work_item").fetchone()
+    assert row["state"] == WorkState.PENDING
+
+
+def test_claim_batch_includes_work_deferred_by_a_different_run(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
+    work_id = schedule(connection, run_id)
+    repository.claim_next(connection, run_id=run_id, now=NOW)
+    repository.complete_work(
+        connection,
+        work_item_id=work_id,
+        run_id=run_id,
+        state=WorkState.DEFERRED,
+        reason="exhausted transient failure",
+        now=NOW,
+    )
+    next_run = repository.create_run(
+        connection,
+        snapshot_id=1,
+        timezone="Europe/Paris",
+        window_start=NOW,
+        window_end=LATER,
+        budget_limit_nano_usd=None,
+        now=LATER,
+    )
+
+    claimed = repository.claim_batch(connection, run_id=next_run, now=LATER, limit=5)
+
+    assert [item.id for item in claimed] == [work_id]
+
+
+class _RacingConnection:
+    """Forwards to a real connection, but intercepts `execute` to inject a
+    same-connection, same-transaction "steal" of a row right before the
+    batch claim's UPDATE runs.
+
+    `sqlite3.Connection.execute` cannot be monkeypatched directly (it is a
+    read-only attribute on the C type), so this thin proxy stands in for the
+    connection object instead.
+    """
+
+    def __init__(self, real: sqlite3.Connection, stolen_id: int, thief_run_id: int):
+        self._real = real
+        self._stolen_id = stolen_id
+        self._thief_run_id = thief_run_id
+
+    def execute(self, sql: str, parameters: Sequence[object] = ()) -> sqlite3.Cursor:
+        if sql.lstrip().startswith("UPDATE work_item") and "'running'" in sql:
+            self._real.execute(
+                "UPDATE work_item SET state = 'running', claimed_by_run_id = ? "
+                "WHERE id = ?",
+                (self._thief_run_id, self._stolen_id),
+            )
+        return self._real.execute(sql, parameters)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._real, name)
+
+
+def test_claim_batch_is_all_or_nothing_when_the_update_detects_a_race(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
+    """A crash (or a lost race) partway through the claim must not leave a
+    partially-claimed batch: either every selected item ends up `running`, or
+    none does.
+
+    This is simulated by stealing one of the two selected items — via the
+    same connection, inside the still-open transaction — right before the
+    batch UPDATE runs. That makes the UPDATE's row count come up short, which
+    must raise and roll back everything, including the "steal" itself.
+    """
+    first = schedule(connection, run_id, fingerprint="1" * 64, priority=10)
+    second = schedule(connection, run_id, fingerprint="2" * 64, priority=20)
+    thief_run_id = repository.create_run(
+        connection,
+        snapshot_id=1,
+        timezone="Europe/Paris",
+        window_start=NOW,
+        window_end=LATER,
+        budget_limit_nano_usd=None,
+        now=NOW,
+    )
+    racing = _RacingConnection(connection, stolen_id=first, thief_run_id=thief_run_id)
+
+    with pytest.raises(RuntimeError):
+        repository.claim_batch(racing, run_id=run_id, now=NOW, limit=2)  # type: ignore[arg-type]
+
+    rows = {
+        row["id"]: (row["state"], row["claimed_by_run_id"])
+        for row in connection.execute(
+            "SELECT id, state, claimed_by_run_id FROM work_item"
+        )
+    }
+    assert rows[first] == (WorkState.PENDING, None)
+    assert rows[second] == (WorkState.PENDING, None)
     assert not connection.in_transaction

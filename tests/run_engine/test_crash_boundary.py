@@ -20,7 +20,7 @@ from notable_person_finder.runs.engine import (
     TaskOutcome,
 )
 from notable_person_finder.runs.models import RunState, WorkItem, WorkState
-from notable_person_finder.runs.retry import RetryCoordinator
+from notable_person_finder.runs.retry import RetryPolicy
 from notable_person_finder.runs.scheduler import BoundedScheduler
 
 NOW = "2026-07-25T06:00:00Z"
@@ -47,9 +47,7 @@ def engine_for(connection: sqlite3.Connection) -> RunEngine:
     clock = FakeClock()
     return RunEngine(
         connection,
-        retry=RetryCoordinator(
-            RetryConfig(max_attempts=1, jitter_ratio=0.0), clock=clock
-        ),
+        retry=RetryPolicy(RetryConfig(max_attempts=1, jitter_ratio=0.0), clock=clock),
         scheduler=BoundedScheduler(max_workers=1),
         clock=clock,
         timezone="Europe/Paris",
@@ -132,7 +130,7 @@ def crash_in_flight(database: Path) -> None:
     """Run one work item and die inside the provider call, in this process."""
     connection = connect_database(database)
 
-    def crashing(work_item: WorkItem, ordinal: int) -> TaskOutcome:
+    def crashing(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
         # The provider has accepted and charged for the request at this point.
         raise SimulatedCrash
 
@@ -162,7 +160,7 @@ def crash_before_settle(database: Path) -> None:
     """
     connection = connect_database(database)
 
-    def succeeding(work_item: WorkItem, ordinal: int) -> TaskOutcome:
+    def succeeding(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
         return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
 
     def dying(*args: object, **kwargs: object) -> None:
@@ -206,7 +204,7 @@ from notable_person_finder.runs.engine import (
     TaskOutcome,
 )
 from notable_person_finder.runs.models import WorkState
-from notable_person_finder.runs.retry import RetryCoordinator
+from notable_person_finder.runs.retry import RetryPolicy
 from notable_person_finder.runs.scheduler import BoundedScheduler
 
 database = Path(sys.argv[1])
@@ -220,7 +218,7 @@ def die():
     raise AssertionError("SIGKILL did not end the process")
 
 
-def execute(work_item, ordinal):
+def execute(work_item, ordinal, prepared):
     marker.write_text(str(ordinal), encoding="utf-8")
     if kill_point == "provider":
         die()
@@ -243,7 +241,7 @@ handler = TaskHandler(
 clock = FakeClock()
 RunEngine(
     connection,
-    retry=RetryCoordinator(RetryConfig(max_attempts=1, jitter_ratio=0.0), clock=clock),
+    retry=RetryPolicy(RetryConfig(max_attempts=1, jitter_ratio=0.0), clock=clock),
     scheduler=BoundedScheduler(max_workers=1),
     clock=clock,
     timezone="Europe/Paris",
@@ -283,7 +281,7 @@ def test_a_crash_after_the_provider_accepted_leaves_an_in_flight_attempt(
     work_id = schedule(connection)
     provider_calls: list[int] = []
 
-    def execute(work_item: WorkItem, ordinal: int) -> TaskOutcome:
+    def execute(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
         provider_calls.append(ordinal)
         # The provider has accepted and charged for the request at this point.
         raise SimulatedCrash
@@ -364,7 +362,7 @@ def test_the_next_run_after_a_real_sigkill_recovers_the_work(tmp_path: Path) -> 
     connection = connect_database(database)
     calls: list[int] = []
 
-    def succeeding(work_item: WorkItem, ordinal: int) -> TaskOutcome:
+    def succeeding(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
         calls.append(ordinal)
         return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
 
@@ -399,7 +397,7 @@ def test_the_next_run_records_the_interruption_and_repeats_the_call(
     connection = connect_database(database)
     second_calls: list[int] = []
 
-    def succeeding(work_item: WorkItem, ordinal: int) -> TaskOutcome:
+    def succeeding(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
         second_calls.append(ordinal)
         return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
 
@@ -437,7 +435,7 @@ def test_a_persisted_result_is_never_repeated(database: Path) -> None:
     schedule(connection)
     calls: list[int] = []
 
-    def execute(work_item: WorkItem, ordinal: int) -> TaskOutcome:
+    def execute(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
         calls.append(ordinal)
         return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
 
@@ -486,7 +484,9 @@ def test_a_persisted_result_survives_a_later_crash_and_is_not_repeated(
     )
     calls: list[int] = []
 
-    def crash_on_second(work_item: WorkItem, ordinal: int) -> TaskOutcome:
+    def crash_on_second(
+        work_item: WorkItem, ordinal: int, prepared: object
+    ) -> TaskOutcome:
         calls.append(work_item.id)
         if work_item.id == second:
             raise SimulatedCrash
@@ -507,7 +507,7 @@ def test_a_persisted_result_survives_a_later_crash_and_is_not_repeated(
     connection = connect_database(database)
     recovered: list[int] = []
 
-    def succeeding(work_item: WorkItem, ordinal: int) -> TaskOutcome:
+    def succeeding(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
         recovered.append(work_item.id)
         return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
 
@@ -633,7 +633,7 @@ def test_the_next_run_repeats_a_call_whose_attempt_was_already_settled(
     connection = connect_database(database)
     calls: list[int] = []
 
-    def succeeding(work_item: WorkItem, ordinal: int) -> TaskOutcome:
+    def succeeding(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
         calls.append(ordinal)
         return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
 

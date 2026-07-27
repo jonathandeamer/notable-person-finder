@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import dataclasses
+import inspect
 import logging
 import sqlite3
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -14,15 +17,15 @@ from notable_person_finder.providers.failures import FailureCategory, ProviderFa
 from notable_person_finder.runs import repository
 from notable_person_finder.runs.clock import FakeClock
 from notable_person_finder.runs.engine import (
-    NonSettlingStateError,
     ReportArtifact,
     RunEngine,
+    RunReport,
     TaskHandler,
     TaskOutcome,
     derive_run_state,
 )
 from notable_person_finder.runs.models import RunState, WorkState
-from notable_person_finder.runs.retry import RetryCoordinator
+from notable_person_finder.runs.retry import RetryPolicy
 from notable_person_finder.runs.scheduler import BoundedScheduler
 
 NOW = "2026-07-25T06:00:00Z"
@@ -166,13 +169,14 @@ def build_engine(
     clock: FakeClock,
     *,
     budget_limit_nano_usd: int | None = None,
+    retry: RetryPolicy | None = None,
+    scheduler: BoundedScheduler | None = None,
 ) -> RunEngine:
     return RunEngine(
         connection,
-        retry=RetryCoordinator(
-            RetryConfig(max_attempts=2, jitter_ratio=0.0), clock=clock
-        ),
-        scheduler=BoundedScheduler(max_workers=2),
+        retry=retry
+        or RetryPolicy(RetryConfig(max_attempts=2, jitter_ratio=0.0), clock=clock),
+        scheduler=scheduler or BoundedScheduler(max_workers=2),
         clock=clock,
         timezone="Europe/Paris",
         window_start="2026-07-24T06:00:00Z",
@@ -184,7 +188,7 @@ def build_engine(
 
 
 def succeeding_handler(calls: list[int]) -> TaskHandler:
-    def execute(work_item, ordinal: int) -> TaskOutcome:
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
         calls.append(work_item.id)
         return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
 
@@ -275,10 +279,19 @@ def test_budget_is_reserved_before_the_call_and_actual_cost_is_reconciled(
     connection = connect_database(database)
     schedule_probe(connection, "8" * 64)
 
-    def execute(work_item, ordinal: int) -> TaskOutcome:
-        row = connection.execute(
-            "SELECT budget_reserved_nano_usd FROM run ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        # The call runs on a worker thread, so it must not use the engine's
+        # connection. A second read-only handle observes only what is
+        # COMMITTED, which is the stronger claim anyway: the reservation was
+        # durable before the call, not merely pending in the caller's
+        # transaction.
+        reader = connect_database(database, readonly=True)
+        try:
+            row = reader.execute(
+                "SELECT budget_reserved_nano_usd FROM run ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            reader.close()
         assert row["budget_reserved_nano_usd"] == 400
         return TaskOutcome(state=WorkState.SUCCEEDED, reason=None, actual_nano_usd=120)
 
@@ -309,6 +322,48 @@ def test_budget_is_reserved_before_the_call_and_actual_cost_is_reconciled(
     connection.close()
 
 
+def test_a_failure_before_any_request_left_the_machine_releases_its_reservation(
+    database: Path,
+) -> None:
+    """A `ProviderFailure` that HttpTransport raises before `client.send` --
+    an unsafe-URL rejection or a request-construction failure -- carries
+    `FailureCategory.CONFIGURATION` with no `status_code`, because no HTTP
+    response was ever obtained. Such an attempt cannot have been charged, so
+    the engine must record `actual_nano_usd = 0` for it and release the
+    reservation, rather than retaining it the way an ordinary failure does.
+    """
+    connection = connect_database(database)
+    schedule_probe(connection, "e" * 64)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        raise ProviderFailure(
+            FailureCategory.CONFIGURATION,
+            provider="feeds",
+            operation="fetch_feed",
+            detail="unsafe request destination",
+        )
+
+    handler = TaskHandler(
+        task_type="probe",
+        provider="feeds",
+        operation="fetch_feed",
+        execute=execute,
+        reserved_nano_usd=50,
+    )
+    report = build_engine(connection, FakeClock(), budget_limit_nano_usd=1000).execute(
+        {handler.task_type: handler}
+    )
+    row = connection.execute(
+        "SELECT budget_reserved_nano_usd, budget_actual_nano_usd FROM run WHERE id = ?",
+        (report.run_id,),
+    ).fetchone()
+    assert (row["budget_reserved_nano_usd"], row["budget_actual_nano_usd"]) == (0, 0)
+    attempts = repository.attempts_for_run(connection, run_id=report.run_id)
+    assert len(attempts) == 1
+    assert attempts[0]["actual_nano_usd"] == 0
+    connection.close()
+
+
 def test_refused_budget_reservation_makes_no_external_call(database: Path) -> None:
     connection = connect_database(database)
     work_id = schedule_probe(connection, "9" * 64)
@@ -317,7 +372,7 @@ def test_refused_budget_reservation_makes_no_external_call(database: Path) -> No
         task_type="probe",
         provider="openrouter",
         operation="generate_structured",
-        execute=lambda work, ordinal: (
+        execute=lambda work, ordinal, prepared: (
             calls.append(ordinal) or TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
         ),
         reserved_nano_usd=200,
@@ -343,7 +398,7 @@ def test_a_transient_failure_is_retried_and_both_attempts_persist(
     connection = connect_database(database)
     schedule_probe(connection, "d" * 64)
 
-    def execute(work_item, ordinal: int) -> TaskOutcome:
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
         if ordinal == 1:
             raise ProviderFailure(
                 FailureCategory.TRANSIENT_SERVER_ERROR,
@@ -384,7 +439,7 @@ def test_attempt_ordinals_continue_across_runs_for_re_attempted_work(
     connection = connect_database(database)
     work_id = schedule_probe(connection, "a" * 64)
 
-    def execute(work_item, ordinal: int) -> TaskOutcome:
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
         raise ProviderFailure(
             FailureCategory.TIMEOUT, provider="probe_provider", operation="probe_call"
         )
@@ -396,8 +451,16 @@ def test_attempt_ordinals_continue_across_runs_for_re_attempted_work(
         execute=execute,
     )
     # max_attempts=2, so each run burns two ordinals and defers the item.
+    # The second run's clock starts after the first run finished, because the
+    # first run's retry backoff pushes the item's `eligible_at` past its own
+    # start instant: an intra-run backoff means "do not call this provider
+    # again for N seconds", and that deadline outlives the run that set it.
+    # Two runs cannot share one instant, and pretending they do would make the
+    # second run unable to claim anything at all.
     first = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
-    second = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+    second = build_engine(
+        connection, FakeClock(start=datetime(2026, 7, 25, 6, 0, 30, tzinfo=UTC))
+    ).execute({handler.task_type: handler})
 
     rows = connection.execute(
         "SELECT ordinal, run_id FROM attempt WHERE work_item_id = ? ORDER BY id",
@@ -420,7 +483,7 @@ def test_exhausted_transient_work_is_deferred_and_the_run_is_partial(
     connection = connect_database(database)
     work_id = schedule_probe(connection, "e" * 64)
 
-    def execute(work_item, ordinal: int) -> TaskOutcome:
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
         raise ProviderFailure(
             FailureCategory.TIMEOUT, provider="probe_provider", operation="probe_call"
         )
@@ -449,7 +512,7 @@ def test_a_permanent_failure_without_useful_results_fails_the_run(
     connection = connect_database(database)
     work_id = schedule_probe(connection, "f" * 64)
 
-    def execute(work_item, ordinal: int) -> TaskOutcome:
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
         raise ProviderFailure(
             FailureCategory.AUTHENTICATION,
             provider="probe_provider",
@@ -481,7 +544,7 @@ def test_one_item_failure_does_not_stop_unrelated_work(database: Path) -> None:
     good = schedule_probe(connection, "1" * 64)
     bad = schedule_probe(connection, "2" * 64)
 
-    def execute(work_item, ordinal: int) -> TaskOutcome:
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
         if work_item.id == bad:
             raise ProviderFailure(
                 FailureCategory.ACCESS_DENIED,
@@ -513,7 +576,7 @@ def test_work_for_a_paused_provider_is_deferred(database: Path) -> None:
     for index in range(3):
         schedule_probe(connection, str(index) * 64)
 
-    def execute(work_item, ordinal: int) -> TaskOutcome:
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
         raise ProviderFailure(
             FailureCategory.PROVIDER_UNAVAILABLE,
             provider="probe_provider",
@@ -530,7 +593,7 @@ def test_work_for_a_paused_provider_is_deferred(database: Path) -> None:
     clock = FakeClock()
     engine = RunEngine(
         connection,
-        retry=RetryCoordinator(
+        retry=RetryPolicy(
             RetryConfig(
                 max_attempts=1,
                 jitter_ratio=0.0,
@@ -588,7 +651,7 @@ def test_no_transaction_is_open_while_a_handler_runs(database: Path) -> None:
     schedule_probe(connection, "3" * 64)
     observed: list[bool] = []
 
-    def execute(work_item, ordinal: int) -> TaskOutcome:
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
         observed.append(connection.in_transaction)
         return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
 
@@ -638,12 +701,12 @@ def test_the_reporter_receives_the_run_report_and_its_artifact_is_recorded(
     carried for the CLI to render, not for the database.
     """
     connection = connect_database(database)
-    seen: list[object] = []
+    seen: list[RunReport] = []
     markdown = "# run\n\nnothing to report\n"
 
     produced: list[ReportArtifact] = []
 
-    def reporter(report) -> ReportArtifact:
+    def reporter(report: RunReport) -> ReportArtifact:
         seen.append(report)
         artifact = ReportArtifact(
             path="/digests/2026-07-25.md", sha256="c" * 64, markdown=markdown
@@ -654,7 +717,7 @@ def test_the_reporter_receives_the_run_report_and_its_artifact_is_recorded(
     clock = FakeClock()
     engine = RunEngine(
         connection,
-        retry=RetryCoordinator(RetryConfig(max_attempts=1), clock=clock),
+        retry=RetryPolicy(RetryConfig(max_attempts=1), clock=clock),
         scheduler=BoundedScheduler(max_workers=1),
         clock=clock,
         timezone="Europe/Paris",
@@ -695,7 +758,7 @@ def test_reporting_failure_is_the_only_terminal_transition(database: Path) -> No
     clock = FakeClock()
     engine = RunEngine(
         connection,
-        retry=RetryCoordinator(RetryConfig(max_attempts=1), clock=clock),
+        retry=RetryPolicy(RetryConfig(max_attempts=1), clock=clock),
         scheduler=BoundedScheduler(max_workers=1),
         clock=clock,
         timezone="Europe/Paris",
@@ -740,7 +803,7 @@ def test_a_failed_attempt_keeps_its_reservation_and_can_refuse_the_retry(
     work_id = schedule_probe(connection, "5" * 64)
     ordinals: list[int] = []
 
-    def execute(work_item, ordinal: int) -> TaskOutcome:
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
         ordinals.append(ordinal)
         raise ProviderFailure(
             FailureCategory.TIMEOUT,
@@ -779,24 +842,181 @@ def test_a_failed_attempt_keeps_its_reservation_and_can_refuse_the_retry(
     connection.close()
 
 
-def test_a_handler_that_returns_a_non_settling_state_is_rejected(
+def test_budget_exhaustion_is_reported_by_cap_reserved_and_deferral_reason(
     database: Path,
 ) -> None:
-    """A handler may not hand back a state that would leave the item claimable.
+    """Reproduces the milestone-2 review gap with the real engine, cap, and
+    digest inputs: three required items at 1 USD each against a 1.5 USD cap.
+    Two must defer for budget, and `RunReport` must be able to say why --
+    not just that "required work deferred: 2" happened, but the reason and
+    the cap/reserved/actual figures that explain it.
+    """
+    connection = connect_database(database)
+    one_usd = 1_000_000_000
+    for fingerprint in ("1" * 64, "2" * 64, "3" * 64):
+        schedule_probe(connection, fingerprint)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        return TaskOutcome(
+            state=WorkState.SUCCEEDED, reason=None, actual_nano_usd=one_usd
+        )
+
+    handler = TaskHandler(
+        task_type="probe",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=execute,
+        reserved_nano_usd=one_usd,
+    )
+    report = build_engine(
+        connection, FakeClock(), budget_limit_nano_usd=int(1.5 * one_usd)
+    ).execute({handler.task_type: handler})
+
+    assert report.counters.required_succeeded == 1
+    assert report.counters.required_deferred == 2
+    assert report.deferred_reasons == {"not_evaluated_budget": 2}
+    assert report.budget_limit_nano_usd == int(1.5 * one_usd)
+    assert report.budget_reserved_nano_usd == one_usd
+    assert report.budget_actual_nano_usd == one_usd
+    connection.close()
+
+
+def test_deferred_reasons_match_the_whole_queue_headline_across_two_runs(
+    database: Path,
+) -> None:
+    """`required_deferred` is a deliberately whole-queue count (see
+    `run_counters`'s docstring), so the reason breakdown must describe that
+    same population -- not just the reasons the most recent run itself
+    recorded.
+
+    Run A defers 5 required items (3 of task type `probe_a`, 2 of
+    `probe_b`) for budget. Run B only registers a handler for `probe_b`, so
+    it reclaims and re-defers only those 2 -- the 3 `probe_a` items are still
+    eligible-and-deferred, but were last settled by run A, not run B. If the
+    breakdown were scoped to `completed_by_run_id = run B`, it would report
+    only the 2 items run B touched, while `required_deferred` (whole-queue)
+    still reports all 5 -- a total that does not sum to its own breakdown.
+    """
+    connection = connect_database(database)
+    for fingerprint in ("a1" * 32, "a2" * 32, "a3" * 32):
+        repository.schedule_work(
+            connection,
+            task_type="probe_a",
+            subject_kind="synthetic",
+            subject_id=None,
+            fingerprint=fingerprint,
+            required=True,
+            priority=100,
+            eligible_at=NOW,
+            run_id=None,
+            now=NOW,
+        )
+    for fingerprint in ("b1" * 32, "b2" * 32):
+        repository.schedule_work(
+            connection,
+            task_type="probe_b",
+            subject_kind="synthetic",
+            subject_id=None,
+            fingerprint=fingerprint,
+            required=True,
+            priority=100,
+            eligible_at=NOW,
+            run_id=None,
+            now=NOW,
+        )
+
+    def always_refused(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    handler_a = TaskHandler(
+        task_type="probe_a",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=always_refused,
+        reserved_nano_usd=1,
+    )
+    handler_b = TaskHandler(
+        task_type="probe_b",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=always_refused,
+        reserved_nano_usd=1,
+    )
+    # A zero-USD cap refuses every reservation, so both task types defer all
+    # five items in run A with the same "not_evaluated_budget" reason.
+    run_a = build_engine(connection, FakeClock(), budget_limit_nano_usd=0).execute(
+        {handler_a.task_type: handler_a, handler_b.task_type: handler_b}
+    )
+    assert run_a.counters.required_deferred == 5
+    assert run_a.deferred_reasons == {"not_evaluated_budget": 5}
+
+    # Run B only has a handler for probe_b, so claim_batch's task_types
+    # filter means it can reclaim and re-defer only the 2 probe_b items --
+    # the 3 probe_a items stay deferred, still attributed to run A.
+    run_b = build_engine(
+        connection,
+        FakeClock(start=datetime(2026, 7, 25, 6, 0, 30, tzinfo=UTC)),
+        budget_limit_nano_usd=0,
+    ).execute({handler_b.task_type: handler_b})
+
+    assert run_b.counters.required_deferred == 5
+    # The whole-queue breakdown must sum to the whole-queue headline: 3
+    # probe_a items still carrying run A's reason, plus the 2 probe_b items
+    # run B just re-recorded under the same reason string.
+    assert run_b.deferred_reasons == {"not_evaluated_budget": 5}
+    rows = connection.execute(
+        "SELECT task_type, completed_by_run_id FROM work_item "
+        "WHERE state = 'deferred' ORDER BY task_type"
+    ).fetchall()
+    assert [row["task_type"] for row in rows] == [
+        "probe_a",
+        "probe_a",
+        "probe_a",
+        "probe_b",
+        "probe_b",
+    ]
+    assert [row["completed_by_run_id"] for row in rows] == [
+        run_a.run_id,
+        run_a.run_id,
+        run_a.run_id,
+        run_b.run_id,
+        run_b.run_id,
+    ]
+    connection.close()
+
+
+def test_a_handler_that_returns_a_non_settling_state_settles_as_failed_permanent(
+    database: Path,
+) -> None:
+    """A handler may hand back a state that would otherwise leave the item
+    claimable forever. The engine no longer lets that escape as a process
+    crash: it settles just that item as `failed_permanent` with a diagnostic
+    reason and lets the run finish normally.
 
     Without this guard the engine's peek-and-settle loop would re-select the
     same item forever instead of terminating.
     """
     connection = connect_database(database)
-    schedule_probe(connection, "6" * 64)
+    work_id = schedule_probe(connection, "6" * 64)
     handler = TaskHandler(
         task_type="probe",
         provider="probe_provider",
         operation="probe_call",
-        execute=lambda work, ordinal: TaskOutcome(state=WorkState.PENDING, reason=None),
+        execute=lambda work, ordinal, prepared: TaskOutcome(
+            state=WorkState.PENDING, reason=None
+        ),
     )
-    with pytest.raises(ValueError, match="settling state"):
-        build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+    report = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    row = connection.execute(
+        "SELECT state, reason, completed_by_run_id FROM work_item WHERE id = ?",
+        (work_id,),
+    ).fetchone()
+    assert row["state"] == WorkState.FAILED_PERMANENT
+    assert row["completed_by_run_id"] == report.run_id
+    assert row["reason"] is not None
+    assert "settling state" in row["reason"]
+    assert report.counters.required_failed_permanent == 1
     connection.close()
 
 
@@ -830,7 +1050,7 @@ def test_the_engine_logs_run_lifecycle_events_and_never_the_snapshot(
         clock = FakeClock()
         engine = RunEngine(
             connection,
-            retry=RetryCoordinator(RetryConfig(max_attempts=1), clock=clock),
+            retry=RetryPolicy(RetryConfig(max_attempts=1), clock=clock),
             scheduler=BoundedScheduler(max_workers=1),
             clock=clock,
             timezone="Europe/Paris",
@@ -855,11 +1075,16 @@ def test_the_engine_logs_run_lifecycle_events_and_never_the_snapshot(
     connection.close()
 
 
-def test_non_settling_handler_state_raises(database: Path) -> None:
+def test_non_settling_handler_state_settles_permanently_and_does_not_raise(
+    database: Path,
+) -> None:
+    """The engine used to raise `NonSettlingStateError` here. It no longer
+    does: the one bad item is settled `failed_permanent` and the run reaches
+    a terminal state instead of aborting."""
     connection = connect_database(database)
-    schedule_probe(connection, "n" * 64)
+    work_id = schedule_probe(connection, "n" * 64)
 
-    def execute(work_item, ordinal: int) -> TaskOutcome:
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
         return TaskOutcome(state=WorkState.PENDING, reason="not settling")
 
     handler = TaskHandler(
@@ -869,16 +1094,678 @@ def test_non_settling_handler_state_raises(database: Path) -> None:
         execute=execute,
     )
     engine = build_engine(connection, FakeClock())
-    with pytest.raises(NonSettlingStateError) as captured:
-        engine.execute({handler.task_type: handler})
-    assert captured.value.task_type == "probe"
-    assert captured.value.state is WorkState.PENDING
+    report = engine.execute({handler.task_type: handler})
+
+    row = connection.execute(
+        "SELECT state, reason FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["state"] == WorkState.FAILED_PERMANENT
+    assert "probe" in row["reason"]
+    assert "pending" in row["reason"].lower()
+    # No other required item succeeded this run, so the failure is not
+    # meaningless-outranked: the run reports FAILED, not PARTIAL.
+    assert report.state is RunState.FAILED
+    connection.close()
+
+
+def test_a_non_settling_item_does_not_stop_a_healthy_item_in_the_same_run(
+    database: Path,
+) -> None:
+    """One bad handler must not abort the whole run: a healthy item scheduled
+    alongside it still succeeds, and the run still finishes and reports,
+    rather than aborting with no digest."""
+    connection = connect_database(database)
+    bad_id = schedule_probe(connection, "bad" * 21 + "1")
+    good_id = schedule_probe(connection, "good" * 16)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        if work_item.id == bad_id:
+            return TaskOutcome(state=WorkState.PENDING, reason=None)
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    handler = TaskHandler(
+        task_type="probe",
+        provider="probe_provider",
+        operation="probe_call",
+        execute=execute,
+    )
+    reported: list[RunReport] = []
+
+    def spy_reporter(report: RunReport) -> ReportArtifact:
+        reported.append(report)
+        return ReportArtifact(path="fake-digest.md", sha256="d" * 64, markdown="x")
+
+    clock = FakeClock()
+    engine = RunEngine(
+        connection,
+        retry=RetryPolicy(RetryConfig(max_attempts=2, jitter_ratio=0.0), clock=clock),
+        scheduler=BoundedScheduler(max_workers=2),
+        clock=clock,
+        timezone="Europe/Paris",
+        window_start="2026-07-24T06:00:00Z",
+        budget_limit_nano_usd=None,
+        snapshot_fingerprint="a" * 64,
+        snapshot_json="{}",
+        reporter=spy_reporter,
+    )
+    report = engine.execute({handler.task_type: handler})
+
+    assert len(reported) == 1
+    bad_row = connection.execute(
+        "SELECT state FROM work_item WHERE id = ?", (bad_id,)
+    ).fetchone()
+    good_row = connection.execute(
+        "SELECT state FROM work_item WHERE id = ?", (good_id,)
+    ).fetchone()
+    assert bad_row["state"] == WorkState.FAILED_PERMANENT
+    assert good_row["state"] == WorkState.SUCCEEDED
+    assert report.counters.required_succeeded == 1
+    assert report.counters.required_failed_permanent == 1
+    # The good item's success is meaningful, so the failed one is outranked
+    # to PARTIAL rather than FAILED, and -- critically -- a digest was
+    # recorded rather than the run aborting with none.
+    assert report.state is RunState.PARTIAL
+    run_row = connection.execute(
+        "SELECT state, digest_path FROM run WHERE id = ?", (report.run_id,)
+    ).fetchone()
+    assert run_row["state"] == RunState.PARTIAL
+    assert run_row["digest_path"] == "fake-digest.md"
     connection.close()
 
 
 def test_failure_categories_tally_uses_a_threading_lock(database: Path) -> None:
-    """`on_attempt` mutates a shared tally; the engine must hold a lock for it."""
+    """The tally is built on the application thread only; the lock is defensive.
+
+    `on_attempt` no longer exists -- the batch-claim reshape moved tally
+    construction entirely onto the application thread in `persist`, so nothing
+    concurrent mutates it today. The lock is retained anyway, against a future
+    off-thread tally reintroducing exactly the race it guards against, so this
+    test pins its presence rather than asserting it is load-bearing right now.
+    """
     connection = connect_database(database)
     engine = build_engine(connection, FakeClock())
     assert isinstance(engine._failure_categories_lock, threading.Lock)
+    connection.close()
+
+
+# --- batch-claim state machine (task 3) ----------------------------------------
+
+
+def probe_handler(
+    execute,
+    *,
+    provider: str = "probe_provider",
+    **extra,
+) -> TaskHandler:
+    return TaskHandler(
+        task_type="probe",
+        provider=provider,
+        operation="probe_call",
+        execute=execute,
+        **extra,
+    )
+
+
+def test_every_repository_call_happens_on_the_application_thread(
+    database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No worker thread may touch SQLite, asserted at every repository call.
+
+    Wrapping every public repository function is the dynamic half of the
+    proof: if any of the engine's persistence moved onto a worker -- which is
+    exactly the defect this reshape fixes -- the recorded thread set would
+    grow beyond the application thread. `worker_threads` keeps the test
+    honest: it fails if `execute` never actually ran off the main thread, so
+    a fully sequential engine could not pass it vacuously.
+    """
+    connection = connect_database(database)
+    for index in range(4):
+        schedule_probe(connection, f"{index}a" * 32)
+
+    application_thread = threading.get_ident()
+    repository_threads: set[int] = set()
+    repository_calls: list[str] = []
+    guard = threading.Lock()
+
+    def recording(name: str, function):
+        def wrapper(*args: object, **kwargs: object) -> object:
+            with guard:
+                repository_threads.add(threading.get_ident())
+                repository_calls.append(name)
+            return function(*args, **kwargs)
+
+        return wrapper
+
+    for name in dir(repository):
+        if name.startswith("_"):
+            continue
+        candidate = getattr(repository, name)
+        if not inspect.isfunction(candidate):
+            continue
+        if candidate.__module__ != repository.__name__:
+            continue
+        monkeypatch.setattr(repository, name, recording(name, candidate))
+
+    worker_threads: set[int] = set()
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        worker_threads.add(threading.get_ident())
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    handler = probe_handler(execute)
+    build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    assert repository_calls, "no repository call was observed at all"
+    assert repository_threads == {application_thread}
+    assert worker_threads and application_thread not in worker_threads
+    connection.close()
+
+
+class RecordingScheduler(BoundedScheduler):
+    """Captures exactly what the engine hands the pool, before it runs."""
+
+    def __init__(self, max_workers: int) -> None:
+        super().__init__(max_workers)
+        self.workers: list[object] = []
+        self.submitted: list[object] = []
+
+    def run(self, items, worker):  # type: ignore[override]
+        materialized = list(items)
+        self.workers.append(worker)
+        self.submitted.extend(materialized)
+        return super().run(materialized, worker)
+
+
+def test_the_submitted_closure_never_captures_the_connection(database: Path) -> None:
+    """The structural half: the worker cannot reach SQLite even in principle.
+
+    A comment claiming "workers never touch the database" is worth nothing.
+    This asserts the shape that makes it true: the submitted callable is a
+    module-level function with no closure cells, so it cannot see the engine
+    or its connection, and every non-callable field of the value it receives
+    is checked for a connection. `handler` is exempt from that walk on
+    purpose: `prepare` and `persist` are allowed to close over the connection
+    because the engine only ever calls them on the application thread.
+    """
+    connection = connect_database(database)
+    schedule_probe(connection, "1b" * 32)
+    handler = probe_handler(
+        lambda work, ordinal, prepared: TaskOutcome(
+            state=WorkState.SUCCEEDED, reason=None
+        )
+    )
+    scheduler = RecordingScheduler(max_workers=2)
+    build_engine(connection, FakeClock(), scheduler=scheduler).execute(
+        {handler.task_type: handler}
+    )
+
+    assert scheduler.workers, "the engine submitted nothing to the scheduler"
+    assert scheduler.submitted, "the engine submitted no work item"
+    for worker in scheduler.workers:
+        assert inspect.isfunction(worker)
+        assert worker.__closure__ is None
+        assert getattr(worker, "__self__", None) is None
+    for submission in scheduler.submitted:
+        assert dataclasses.is_dataclass(submission)
+        assert not isinstance(submission, type)
+        for field in dataclasses.fields(submission):
+            if field.name == "handler":
+                continue
+            value = getattr(submission, field.name)
+            assert not isinstance(value, sqlite3.Connection)
+            assert not isinstance(value, RunEngine)
+    connection.close()
+
+
+def test_a_paused_provider_defers_its_work_without_writing_an_attempt(
+    database: Path,
+) -> None:
+    """A paused provider means no call was made, so no attempt row may exist.
+
+    An attempt row stands for exactly one external call. The pause check
+    therefore has to happen on the application thread before the attempt row
+    is written, not inside the call path.
+    """
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "2b" * 32)
+    calls: list[int] = []
+    clock = FakeClock()
+    policy = RetryPolicy(
+        RetryConfig(
+            max_attempts=2,
+            jitter_ratio=0.0,
+            provider_pause_after_consecutive_exhaustions=1,
+        ),
+        clock=clock,
+    )
+    policy.record_exhaustion("probe_provider")
+    assert policy.is_paused("probe_provider")
+
+    handler = probe_handler(
+        lambda work, ordinal, prepared: (
+            calls.append(ordinal) or TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+        )
+    )
+    report = build_engine(connection, clock, retry=policy).execute(
+        {handler.task_type: handler}
+    )
+
+    assert calls == []
+    assert repository.attempts_for_run(connection, run_id=report.run_id) == ()
+    row = connection.execute(
+        "SELECT state, reason FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["state"] == WorkState.DEFERRED
+    assert "paused" in row["reason"]
+    connection.close()
+
+
+def test_at_most_http_workers_calls_are_ever_in_flight(database: Path) -> None:
+    """Bounded concurrency, proven with a barrier rather than with timing.
+
+    Four items and two workers. The barrier makes the test fail closed: a
+    serializing engine never gets two closures to the barrier at once and
+    every call times out, while an engine that submitted all four would push
+    `peak` to 4. Only "exactly two in flight, twice" satisfies both
+    assertions, and no assertion depends on how long anything takes.
+
+    The attempt-row samples pin the *claim* as well as the concurrency. A pool
+    of two caps execution however much the engine claims, so `peak` alone
+    cannot tell a batch of two from a batch of ten. Counting committed attempt
+    rows while the first pair is in flight can: an over-large batch authorises
+    -- and budgets for -- calls it has not started, widening the crash window
+    for every item queued behind the pool.
+    """
+    connection = connect_database(database)
+    for index in range(4):
+        schedule_probe(connection, f"{index}c" * 32)
+
+    in_flight = 0
+    peak = 0
+    attempt_rows: list[int] = []
+    guard = threading.Lock()
+    paired = threading.Barrier(2)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        nonlocal in_flight, peak
+        with guard:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        paired.wait(timeout=10)
+        reader = connect_database(database, readonly=True)
+        try:
+            committed = reader.execute("SELECT COUNT(*) AS n FROM attempt").fetchone()
+        finally:
+            reader.close()
+        with guard:
+            attempt_rows.append(int(committed["n"]))
+            in_flight -= 1
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    handler = probe_handler(execute)
+    report = build_engine(
+        connection, FakeClock(), scheduler=BoundedScheduler(max_workers=2)
+    ).execute({handler.task_type: handler})
+
+    assert peak == 2
+    assert sorted(attempt_rows) == [2, 2, 4, 4]
+    assert report.counters.required_succeeded == 4
+    connection.close()
+
+
+def test_backoff_never_sleeps_the_application_thread_while_work_is_ready(
+    database: Path,
+) -> None:
+    """A re-armed item's backoff must not stall an item that is ready now.
+
+    The re-armed item's deadline is 60 virtual seconds away. The second item's
+    call is observed at monotonic 0.0, so it was made before that deadline;
+    the retry is observed at 60.0, so the engine waited exactly once and only
+    when nothing else was runnable. Virtual time makes this deterministic --
+    no assertion reads a wall clock.
+    """
+    connection = connect_database(database)
+    retried = schedule_probe(connection, "3c" * 32)
+    ready = schedule_probe(connection, "4c" * 32)
+    clock = FakeClock()
+    observed: list[tuple[int, float]] = []
+    guard = threading.Lock()
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        with guard:
+            observed.append((work_item.id, clock.monotonic()))
+        if work_item.id == retried and ordinal == 1:
+            raise ProviderFailure(
+                FailureCategory.TIMEOUT,
+                provider="probe_provider",
+                operation="probe_call",
+            )
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    handler = probe_handler(execute)
+    policy = RetryPolicy(
+        RetryConfig(
+            max_attempts=2,
+            jitter_ratio=0.0,
+            initial_backoff_seconds=60.0,
+            max_backoff_seconds=60.0,
+        ),
+        clock=clock,
+    )
+    report = build_engine(connection, clock, retry=policy).execute(
+        {handler.task_type: handler}
+    )
+
+    at_zero = {item for item, elapsed in observed if elapsed == 0.0}
+    assert at_zero == {retried, ready}
+    assert (retried, 60.0) in observed
+    assert clock.slept == [60.0]
+    assert report.state is RunState.COMPLETE
+    connection.close()
+
+
+def test_attempt_ordinals_stay_contiguous_across_re_arms(database: Path) -> None:
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "5c" * 32)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        if ordinal < 3:
+            raise ProviderFailure(
+                FailureCategory.TIMEOUT,
+                provider="probe_provider",
+                operation="probe_call",
+            )
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    handler = probe_handler(execute)
+    clock = FakeClock()
+    policy = RetryPolicy(RetryConfig(max_attempts=3, jitter_ratio=0.0), clock=clock)
+    report = build_engine(connection, clock, retry=policy).execute(
+        {handler.task_type: handler}
+    )
+
+    rows = connection.execute(
+        "SELECT ordinal, outcome FROM attempt WHERE work_item_id = ? ORDER BY id",
+        (work_id,),
+    ).fetchall()
+    assert [row["ordinal"] for row in rows] == [1, 2, 3]
+    assert [row["outcome"] for row in rows] == ["failed", "failed", "succeeded"]
+    assert report.state is RunState.COMPLETE
+    connection.close()
+
+
+def test_a_re_armed_item_is_pending_with_a_future_deadline_never_deferred(
+    database: Path,
+) -> None:
+    """Re-arming to `deferred` would strand the item for the rest of the run.
+
+    `_CLAIMABLE_PREDICATE` admits a `deferred` item only from a *different*
+    run, so a re-arm that used `deferred` would leave the retry unreachable
+    until tomorrow. The item's state is sampled from a second connection
+    while the retry is still waiting, which is the only moment the wrong
+    state would be visible.
+    """
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "6c" * 32)
+    observed: list[tuple[str, str]] = []
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        if ordinal == 1:
+            raise ProviderFailure(
+                FailureCategory.TIMEOUT,
+                provider="probe_provider",
+                operation="probe_call",
+            )
+        reader = connect_database(database, readonly=True)
+        try:
+            row = reader.execute(
+                "SELECT state, eligible_at FROM work_item WHERE id = ?", (work_id,)
+            ).fetchone()
+        finally:
+            reader.close()
+        observed.append((row["state"], row["eligible_at"]))
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    handler = probe_handler(execute)
+    clock = FakeClock()
+    build_engine(
+        connection,
+        clock,
+        retry=RetryPolicy(RetryConfig(max_attempts=2, jitter_ratio=0.0), clock=clock),
+    ).execute({handler.task_type: handler})
+
+    # Sampled during the retry, so the row still carries the re-arm: running
+    # (this run re-claimed it) and a deadline one backoff after the failure.
+    assert observed == [(WorkState.RUNNING, "2026-07-25T06:00:01.000000Z")]
+    connection.close()
+
+
+def test_prepare_runs_on_the_application_thread_and_feeds_execute(
+    database: Path,
+) -> None:
+    """`prepare` is the only place a handler may read SQLite.
+
+    It runs on the application thread before submission, so it can use the
+    engine's own connection -- which is exactly what a stored ETag lookup
+    needs -- and hands its value to the call.
+    """
+    connection = connect_database(database)
+    schedule_probe(connection, "7c" * 32)
+    application_thread = threading.get_ident()
+    prepare_threads: list[int] = []
+    seen: list[object] = []
+
+    def prepare(work_item) -> object:
+        prepare_threads.append(threading.get_ident())
+        row = connection.execute(
+            "SELECT fingerprint FROM work_item WHERE id = ?", (work_item.id,)
+        ).fetchone()
+        return row["fingerprint"]
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        seen.append(prepared)
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    handler = probe_handler(execute, prepare=prepare)
+    build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    assert prepare_threads == [application_thread]
+    assert seen == ["7c" * 32]
+    connection.close()
+
+
+def test_persist_commits_with_the_settlement_and_rolls_back_with_it(
+    database: Path,
+) -> None:
+    """A handler's domain writes and its settlement are one transaction."""
+    connection = connect_database(database)
+    connection.execute("CREATE TABLE probe_note (id INTEGER PRIMARY KEY, note TEXT)")
+    first = schedule_probe(connection, "8c" * 32)
+    application_thread = threading.get_ident()
+    persist_threads: list[int] = []
+
+    def persist(work_item, outcome: TaskOutcome) -> None:
+        persist_threads.append(threading.get_ident())
+        connection.execute(
+            "INSERT INTO probe_note (note) VALUES (?)", (str(outcome.payload),)
+        )
+
+    handler = probe_handler(
+        lambda work, ordinal, prepared: TaskOutcome(
+            state=WorkState.SUCCEEDED, reason=None, payload="carried"
+        ),
+        persist=persist,
+    )
+    build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    assert persist_threads == [application_thread]
+    notes = [row["note"] for row in connection.execute("SELECT note FROM probe_note")]
+    assert notes == ["carried"]
+    assert (
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (first,)
+        ).fetchone()["state"]
+        == WorkState.SUCCEEDED
+    )
+
+    # And the other direction: a failing `persist` must take the settlement
+    # down with it, leaving the item claimed for the sweep to recover.
+    second = schedule_probe(connection, "9c" * 32)
+
+    def failing_persist(work_item, outcome: TaskOutcome) -> None:
+        connection.execute("INSERT INTO probe_note (note) VALUES ('doomed')")
+        raise RuntimeError("domain write failed")
+
+    doomed = probe_handler(
+        lambda work, ordinal, prepared: TaskOutcome(
+            state=WorkState.SUCCEEDED, reason=None
+        ),
+        persist=failing_persist,
+    )
+    with pytest.raises(RuntimeError, match="domain write failed"):
+        build_engine(connection, FakeClock()).execute({doomed.task_type: doomed})
+
+    notes = [row["note"] for row in connection.execute("SELECT note FROM probe_note")]
+    assert notes == ["carried"]
+    assert (
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (second,)
+        ).fetchone()["state"]
+        == WorkState.RUNNING
+    )
+    connection.close()
+
+
+def test_the_handler_supplies_the_attempts_destination_host(database: Path) -> None:
+    connection = connect_database(database)
+    schedule_probe(connection, "ac" * 32)
+    handler = probe_handler(
+        lambda work, ordinal, prepared: TaskOutcome(
+            state=WorkState.SUCCEEDED, reason=None
+        ),
+        destination_host=lambda work: "feeds.example.com",
+    )
+    report = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+    attempts = repository.attempts_for_run(connection, run_id=report.run_id)
+    assert [row["destination_host"] for row in attempts] == ["feeds.example.com"]
+    connection.close()
+
+
+def test_the_seed_callback_runs_after_run_creation_and_before_any_claim(
+    database: Path,
+) -> None:
+    """Seeding is what gives an ingestion run work to claim at all."""
+    connection = connect_database(database)
+    seeded: list[int] = []
+
+    def seed(run_id: int) -> None:
+        seeded.append(run_id)
+        schedule_probe(connection, "bc" * 32)
+
+    handler = probe_handler(
+        lambda work, ordinal, prepared: TaskOutcome(
+            state=WorkState.SUCCEEDED, reason=None
+        )
+    )
+    report = build_engine(connection, FakeClock()).execute(
+        {handler.task_type: handler}, seed=seed
+    )
+
+    assert seeded == [report.run_id]
+    assert report.counters.required_succeeded == 1
+    connection.close()
+
+
+def malformed(retryable: bool = True) -> ProviderFailure:
+    return ProviderFailure(
+        FailureCategory.MALFORMED_RESPONSE,
+        provider="probe_provider",
+        operation="probe_call",
+        retryable=retryable,
+    )
+
+
+def test_a_second_malformed_response_fails_permanently_and_is_never_retried(
+    database: Path,
+) -> None:
+    """The foreclosed second malformed response is PERMANENT, not EXHAUSTED.
+
+    `RetryPolicy` forecloses a second malformed retry regardless of remaining
+    attempt budget, and reports it as `PERMANENT` because it is a real answer
+    from the provider. Settling that as `DEFERRED` would leave the item
+    claimable by tomorrow's run and repeat a paid generation for content the
+    provider has already served twice. There is still attempt budget left
+    here (max_attempts=3, two calls made), so nothing but the malformed rule
+    can explain the outcome.
+    """
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "cc" * 32)
+    ordinals: list[int] = []
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        ordinals.append(ordinal)
+        raise malformed()
+
+    handler = probe_handler(execute)
+    clock = FakeClock()
+    policy = RetryPolicy(RetryConfig(max_attempts=3, jitter_ratio=0.0), clock=clock)
+    report = build_engine(connection, clock, retry=policy).execute(
+        {handler.task_type: handler}
+    )
+
+    assert ordinals == [1, 2]
+    row = connection.execute(
+        "SELECT state, reason FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["state"] == WorkState.FAILED_PERMANENT
+    assert row["reason"] == str(FailureCategory.MALFORMED_RESPONSE)
+    # A permanent answer never counts towards pausing the provider.
+    assert report.paused_providers == frozenset()
+    connection.close()
+
+
+def test_a_first_malformed_response_that_runs_out_of_budget_is_deferred(
+    database: Path,
+) -> None:
+    """The sibling case, which must NOT collapse into the one above.
+
+    One attempt of budget, one malformed response: the retry budget is what
+    stops this, not the malformed rule, so the policy reports `EXHAUSTED` and
+    the item defers for a later run to try again. Collapsing the two branches
+    in either direction is wrong -- this one must not fail permanently, and
+    the second malformed response must not defer.
+    """
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "dc" * 32)
+    ordinals: list[int] = []
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        ordinals.append(ordinal)
+        raise malformed()
+
+    handler = probe_handler(execute)
+    clock = FakeClock()
+    policy = RetryPolicy(
+        RetryConfig(
+            max_attempts=1,
+            jitter_ratio=0.0,
+            provider_pause_after_consecutive_exhaustions=1,
+        ),
+        clock=clock,
+    )
+    report = build_engine(connection, clock, retry=policy).execute(
+        {handler.task_type: handler}
+    )
+
+    assert ordinals == [1]
+    row = connection.execute(
+        "SELECT state, reason FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["state"] == WorkState.DEFERRED
+    assert row["reason"] == (
+        f"exhausted transient failure: {FailureCategory.MALFORMED_RESPONSE}"
+    )
+    # Exhausted, but on a real answer, so the provider is still not paused
+    # even though one exhaustion would be enough to pause it.
+    assert report.paused_providers == frozenset()
     connection.close()

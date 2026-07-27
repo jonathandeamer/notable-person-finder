@@ -38,6 +38,10 @@ def report(state: RunState = RunState.COMPLETE, **overrides: object) -> RunRepor
         "paused_providers": frozenset(),
         "interrupted_runs": (),
         "failure_categories": {},
+        "budget_limit_nano_usd": None,
+        "budget_reserved_nano_usd": 0,
+        "budget_actual_nano_usd": 0,
+        "deferred_reasons": {},
     }
     defaults.update(overrides)
     return RunReport(**defaults)  # type: ignore[arg-type]
@@ -91,6 +95,58 @@ def test_failure_categories_are_summarized_by_safe_category() -> None:
     )
     assert "rate_limit" in markdown
     assert "timeout" in markdown
+
+
+def test_deferred_reasons_are_broken_out_with_counts() -> None:
+    counters = RunCounters(1, 0, 2, 0, 0, 0, 0)
+    markdown = render_digest(
+        report(
+            RunState.PARTIAL,
+            counters=counters,
+            deferred_reasons={"not_evaluated_budget": 2},
+        ),
+        local_date="2026-07-25",
+    )
+    assert "Required work deferred: 2" in markdown
+    assert "not_evaluated_budget: 2" in markdown
+
+
+def test_several_distinct_deferral_reasons_each_get_their_own_line() -> None:
+    counters = RunCounters(0, 0, 3, 0, 0, 0, 0)
+    markdown = render_digest(
+        report(
+            RunState.PARTIAL,
+            counters=counters,
+            deferred_reasons={
+                "not_evaluated_budget": 2,
+                "exhausted transient failure: timeout": 1,
+            },
+        ),
+        local_date="2026-07-25",
+    )
+    assert "not_evaluated_budget: 2" in markdown
+    assert "exhausted transient failure: timeout: 1" in markdown
+
+
+def test_the_budget_cap_reserved_and_spent_are_reported_in_usd() -> None:
+    one_usd = 1_000_000_000
+    markdown = render_digest(
+        report(
+            RunState.PARTIAL,
+            budget_limit_nano_usd=int(1.5 * one_usd),
+            budget_reserved_nano_usd=one_usd,
+            budget_actual_nano_usd=one_usd,
+        ),
+        local_date="2026-07-25",
+    )
+    assert "$1.50" in markdown
+    assert "$1.00" in markdown
+
+
+def test_no_budget_or_deferral_lines_appear_when_there_is_nothing_to_report() -> None:
+    markdown = render_digest(report(), local_date="2026-07-25")
+    assert "Budget" not in markdown
+    assert "not_evaluated_budget" not in markdown
 
 
 def test_an_interrupted_predecessor_is_reported() -> None:
@@ -257,7 +313,9 @@ def test_write_digest_fsyncs_the_digest_directory_after_replace(
     opened_dirs: list[tuple[str, int]] = []
     real_open = os.open
 
-    def spy_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+    def spy_open(
+        path: str | os.PathLike[str], flags: int, *args: object, **kwargs: object
+    ) -> int:
         opened_dirs.append((os.fspath(path), flags))
         return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
 
@@ -365,7 +423,9 @@ def test_a_failed_latest_copy_does_not_orphan_the_already_durable_dated_digest(
 
     real_replace = os.replace
 
-    def failing_latest_replace(src: object, dst: object) -> None:
+    def failing_latest_replace(
+        src: str | os.PathLike[str], dst: str | os.PathLike[str]
+    ) -> None:
         # Both writes now move a temp file into place, so fail only the
         # convenience copy; the dated digest must still land durably.
         if Path(os.fspath(dst)).name == "latest.md":

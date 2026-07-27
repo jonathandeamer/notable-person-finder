@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,7 @@ WINDOW = ("2026-07-24T06:00:00Z", "2026-07-25T06:00:00Z")
 
 
 @pytest.fixture
-def connection(tmp_path: Path) -> sqlite3.Connection:
+def connection(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     database = tmp_path / "notable.sqlite3"
     connection = connect_database(database)
     apply_migrations(connection, database, tmp_path / "backups")
@@ -53,7 +54,8 @@ def add_pending_work(
         (fingerprint, run_id),
     )
     connection.commit()
-    return int(cursor.lastrowid)
+    assert cursor.lastrowid is not None
+    return cursor.lastrowid
 
 
 def test_snapshot_is_stored_once_per_fingerprint(
@@ -197,7 +199,9 @@ def test_sweep_leaves_completed_runs_alone(connection: sqlite3.Connection) -> No
 def test_latest_run_returns_the_most_recent(connection: sqlite3.Connection) -> None:
     new_run(connection)
     second = new_run(connection)
-    assert repository.latest_run(connection).id == second
+    latest = repository.latest_run(connection)
+    assert latest is not None
+    assert latest.id == second
 
 
 def test_latest_run_is_none_on_an_empty_database(
