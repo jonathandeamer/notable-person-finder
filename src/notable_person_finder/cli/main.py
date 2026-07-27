@@ -163,7 +163,7 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                         config=loaded.main.digest,
                     )
                 except DigestWriteError:
-                    log_event(logger, "run_reporting_failed", run_id=report.run_id)
+                    log_event(logger, "run.reporting_failed", run_id=report.run_id)
                     raise
                 return ReportArtifact(
                     path=str(written.path),
@@ -183,7 +183,7 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                 snapshot_json=loaded.snapshot_json,
                 reporter=report_run,
             )
-            log_event(logger, "run_started", fingerprint=loaded.fingerprint)
+            log_event(logger, "run.started", fingerprint=loaded.fingerprint)
             # No provider adapters exist in this milestone, so no task
             # handlers are registered. Milestones 3-6 supply them. A handler
             # returning a non-settling state is now handled inside the
@@ -202,7 +202,7 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
 
             log_event(
                 logger,
-                "run_finished",
+                "run.finished",
                 run_id=report.run_id,
                 state=str(report.state),
                 required_succeeded=report.counters.required_succeeded,

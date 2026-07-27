@@ -132,6 +132,29 @@ def _elapsed_ms(clock: Clock, started: float) -> int:
     return max(int((clock.monotonic() - started) * 1000), 0)
 
 
+def _never_left_the_machine(record: AttemptRecord) -> bool:
+    """True only for a failure that cannot have reached the provider at all.
+
+    `HttpTransport` raises `FailureCategory.CONFIGURATION` with no
+    `status_code` in exactly two places, both strictly before
+    `httpx.Client.send` is ever invoked: the pre-flight safety check
+    (`assert_safe_url`) and `build_request` itself (a malformed URL, a
+    header-encoding failure). No request left the machine in either case, so
+    an attempt with this signature cannot have been charged.
+
+    Every other transport failure sets a `status_code` (a real HTTP
+    response, including the 4xx statuses this same category also covers) or
+    uses a different category (a redirect chain exhausted after real round
+    trips, a `client.send` failure that may have reached the provider before
+    it raised) -- and this check correctly excludes all of them, because
+    those attempts may have been billed even though they failed.
+    """
+    return (
+        record.failure_category is FailureCategory.CONFIGURATION
+        and record.status_code is None
+    )
+
+
 def _domain_writes(
     handler: TaskHandler, work_item: WorkItem, outcome: TaskOutcome | None
 ) -> Callable[[sqlite3.Connection], None] | None:
@@ -730,8 +753,8 @@ class RunEngine:
             else outcome.provider_request_id,
             detail_json=None if outcome is None else outcome.detail_json,
             now=self._now(),
-            # A failed attempt reports no actual cost, and passing None
-            # deliberately RETAINS its reservation for the rest of the
+            # A failed attempt normally reports no actual cost, and passing
+            # None deliberately RETAINS its reservation for the rest of the
             # run rather than releasing it. A failed call is not
             # necessarily a free call: tokens generated before a
             # malformed or truncated response, and a request billed
@@ -742,7 +765,33 @@ class RunEngine:
             # mode is a run that stops early, not one that overspends.
             # `budget_actual_nano_usd` is untouched, so reported spend
             # never overstates real money; only headroom shrinks.
-            actual_nano_usd=None if outcome is None else outcome.actual_nano_usd,
+            #
+            # `_never_left_the_machine` is the one deliberate exception to
+            # that default: an attempt HttpTransport rejected before
+            # `client.send` -- an unsafe destination, a malformed URL, a
+            # request-construction failure -- never put a byte on the wire,
+            # so retaining its reservation would only ever shrink headroom
+            # for a call that could not possibly have spent anything. This
+            # is narrowly about "no bytes left the machine", not about
+            # "the provider didn't answer" or "the call failed": a
+            # `client.send` failure, a redirect-loop exhaustion, and a real
+            # HTTP status all involve at least one real round trip and keep
+            # the conservative `None` above.
+            #
+            # A future LLM path MUST NOT copy the `0` here by reflex. An LLM
+            # provider can accept and start billing a request before it
+            # ever produces a usable response -- a stream that dies
+            # mid-generation, a timeout after tokens were already emitted --
+            # so "the call failed" tells you nothing about whether it was
+            # free for that kind of provider. Whether an LLM failure
+            # qualifies for `0` is a decision that adapter must make for
+            # itself, based on what it actually knows was sent, not by
+            # reusing this HTTP-specific rule.
+            actual_nano_usd=(
+                0
+                if outcome is None and _never_left_the_machine(record)
+                else (None if outcome is None else outcome.actual_nano_usd)
+            ),
         )
 
     def _rearm(

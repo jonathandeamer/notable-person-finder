@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -251,7 +252,29 @@ def test_run_writes_structured_logs(config_file: Path, tmp_path: Path) -> None:
     run_notable(config_file, "run")
     log_file = tmp_path / "portable" / "logs" / "notable.jsonl"
     assert log_file.is_file()
-    assert "run_started" in log_file.read_text(encoding="utf-8")
+    assert "run.started" in log_file.read_text(encoding="utf-8")
+
+
+def test_every_emitted_event_name_uses_the_dotted_taxonomy(
+    config_file: Path, tmp_path: Path
+) -> None:
+    """One taxonomy, one style: every event name is dotted (`run.started`),
+
+    never underscored (`run_started`). This scans the whole log rather than
+    checking for the two specific names the CLI used to emit underscored, so
+    it also catches any other underscored name nobody thought to look for --
+    including ones added after this test was written.
+    """
+    run_notable(config_file, "run")
+    log_file = tmp_path / "portable" / "logs" / "notable.jsonl"
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert lines, "expected at least one log line from a real run"
+    event_names = [json.loads(line)["event"] for line in lines]
+    assert event_names
+    violations = [name for name in event_names if "." not in name]
+    assert violations == [], (
+        f"found underscored event name(s) outside the dotted taxonomy: {violations}"
+    )
 
 
 # --- Supplementary coverage -------------------------------------------------

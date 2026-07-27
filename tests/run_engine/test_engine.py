@@ -322,6 +322,48 @@ def test_budget_is_reserved_before_the_call_and_actual_cost_is_reconciled(
     connection.close()
 
 
+def test_a_failure_before_any_request_left_the_machine_releases_its_reservation(
+    database: Path,
+) -> None:
+    """A `ProviderFailure` that HttpTransport raises before `client.send` --
+    an unsafe-URL rejection or a request-construction failure -- carries
+    `FailureCategory.CONFIGURATION` with no `status_code`, because no HTTP
+    response was ever obtained. Such an attempt cannot have been charged, so
+    the engine must record `actual_nano_usd = 0` for it and release the
+    reservation, rather than retaining it the way an ordinary failure does.
+    """
+    connection = connect_database(database)
+    schedule_probe(connection, "e" * 64)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        raise ProviderFailure(
+            FailureCategory.CONFIGURATION,
+            provider="feeds",
+            operation="fetch_feed",
+            detail="unsafe request destination",
+        )
+
+    handler = TaskHandler(
+        task_type="probe",
+        provider="feeds",
+        operation="fetch_feed",
+        execute=execute,
+        reserved_nano_usd=50,
+    )
+    report = build_engine(connection, FakeClock(), budget_limit_nano_usd=1000).execute(
+        {handler.task_type: handler}
+    )
+    row = connection.execute(
+        "SELECT budget_reserved_nano_usd, budget_actual_nano_usd FROM run WHERE id = ?",
+        (report.run_id,),
+    ).fetchone()
+    assert (row["budget_reserved_nano_usd"], row["budget_actual_nano_usd"]) == (0, 0)
+    attempts = repository.attempts_for_run(connection, run_id=report.run_id)
+    assert len(attempts) == 1
+    assert attempts[0]["actual_nano_usd"] == 0
+    connection.close()
+
+
 def test_refused_budget_reservation_makes_no_external_call(database: Path) -> None:
     connection = connect_database(database)
     work_id = schedule_probe(connection, "9" * 64)

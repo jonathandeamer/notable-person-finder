@@ -385,3 +385,36 @@ def test_unicode_encode_error_in_build_request_is_translated() -> None:
     detail = captured.value.detail
     assert detail is not None
     assert "non-ASCII" in detail
+
+
+def test_a_non_unicode_build_request_failure_is_also_translated() -> None:
+    """`build_request` can raise more than `UnicodeEncodeError` -- a
+    non-printable ASCII character in the URL raises `httpx.InvalidURL`, which
+    the guard at `transport.py:284` (before this fix) let escape untranslated
+    across the `providers/` boundary. It must be caught alongside the
+    encoding case and translated the same way
+    (`FailureCategory.CONFIGURATION`), with a sanitized detail rather than the
+    raw httpx exception text (which could otherwise carry the full requested
+    URL, including any query string).
+
+    `_origin()` and `assert_safe_url()` must both tolerate this URL (the stray
+    byte sits in the path, after the host), so `build_request` itself is
+    genuinely the first thing that rejects it.
+    """
+    with (
+        transport_for(lambda request: httpx.Response(200)) as transport,
+        pytest.raises(ProviderFailure) as captured,
+    ):
+        transport.request(
+            "GET",
+            "https://example.com/a\x00b?token=secret",
+            provider="feeds",
+            operation="fetch_feed",
+        )
+    assert captured.value.category is FailureCategory.CONFIGURATION
+    detail = captured.value.detail
+    assert detail is not None
+    assert "token" not in detail
+    assert "secret" not in detail
+    assert "token" not in str(captured.value)
+    assert "secret" not in str(captured.value)
