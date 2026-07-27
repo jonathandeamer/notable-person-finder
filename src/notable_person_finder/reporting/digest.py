@@ -18,6 +18,15 @@ _PROMINENT_STATES = {
     RunState.INTERRUPTED: "INTERRUPTED RUN — the process ended before finishing.",
 }
 
+# `RunEngine._settle` bounds each reason's length, but not how many distinct
+# reasons a handler's classification can produce -- a legitimate handler may
+# have many legitimate values along its own dimension. This caps only how
+# many of those get their own rendered line, so the digest itself cannot grow
+# unbounded the way the reason strings already cannot. The operator must never
+# lose the total, so the rows folded past this cap are accounted for by one
+# final summary row rather than silently dropped.
+_MAX_RENDERED_DEFERRAL_REASONS = 12
+
 
 class DigestWriteError(Exception):
     """The digest could not be persisted atomically."""
@@ -75,8 +84,20 @@ def render_digest(report: RunReport, *, local_date: str) -> str:
         f"- Required work still pending: {counters.required_pending}",
         f"- Required work deferred: {counters.required_deferred}",
     ]
-    for reason, count in sorted(report.deferred_reasons.items()):
+    # Highest count first, then reason ascending as a stable tie-break: the
+    # rows most worth an operator's attention lead, and a cap that then
+    # truncates alphabetically-early-but-low-count reasons would be the wrong
+    # ones to keep.
+    ordered_reasons = sorted(
+        report.deferred_reasons.items(), key=lambda item: (-item[1], item[0])
+    )
+    shown_reasons = ordered_reasons[:_MAX_RENDERED_DEFERRAL_REASONS]
+    folded_reasons = ordered_reasons[_MAX_RENDERED_DEFERRAL_REASONS:]
+    for reason, count in shown_reasons:
         lines.append(f"  - {reason}: {count}")
+    if folded_reasons:
+        folded_count = sum(count for _, count in folded_reasons)
+        lines.append(f"  - ({len(folded_reasons)} more reasons folded): {folded_count}")
     if (
         report.budget_limit_nano_usd is not None
         or report.budget_reserved_nano_usd

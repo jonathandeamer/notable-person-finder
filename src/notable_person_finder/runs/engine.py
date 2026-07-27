@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import threading
 from collections.abc import Callable, Mapping
@@ -38,6 +39,16 @@ SETTLING_WORK_STATES = frozenset(
 @dataclass(frozen=True, slots=True)
 class TaskOutcome:
     state: WorkState
+    # A low-cardinality classification token, not a message. This becomes a
+    # `GROUP BY` key in `repository.deferred_reasons` and a rendered line in
+    # the digest's deferral breakdown (`reporting/digest.py`), so it must
+    # never interpolate remote text, a URL, or anything else derived from a
+    # provider response: each distinct string mints its own row in both
+    # places, and unbounded text turns one deferral into an unbounded digest.
+    # `RunEngine._settle` sanitises whatever reaches it (collapsing
+    # whitespace, dropping control characters, truncating to 120 characters)
+    # as a backstop against a length or formatting accident -- that is not
+    # permission to hand this field free-form or attacker-influenced text.
     reason: str | None
     response_bytes: int | None = None
     provider_request_id: str | None = None
@@ -146,6 +157,47 @@ def _call_provider(submission: _Submission) -> _CallResult:
 
 def _elapsed_ms(clock: Clock, started: float) -> int:
     return max(int((clock.monotonic() - started) * 1000), 0)
+
+
+# `_settle` is the one place a settled reason is written, so this is the one
+# place it is bounded. `\t`, `\n`, `\r`, `\v`, and `\f` are whitespace and are
+# handled by the collapse below; everything else in C0 plus DEL is dropped
+# outright, because a control character has no legitimate place in a digest
+# bullet or a `GROUP BY` key.
+_REASON_CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_REASON_WHITESPACE_RUN = re.compile(r"\s+")
+_REASON_MAX_LENGTH = 120
+_REASON_TRUNCATION_SUFFIX = "..."
+_UNSPECIFIED_REASON = "unspecified"
+
+
+def _sanitize_reason(reason: str | None) -> str | None:
+    """Bound a settled reason to what a digest line and a `GROUP BY` key can trust.
+
+    Module-level and pure on purpose, so it can run identically over a
+    handler's `TaskOutcome.reason` and the engine's own literals -- see the
+    comment on `TaskOutcome.reason` and the pause-reason comment in
+    `RunEngine._prepare` for why an engine-authored reason must also stay a
+    stable, low-cardinality token.
+
+    `None` is passed through unchanged: it means "no reason to record", which
+    is different from an empty or whitespace-only string a handler handed
+    back. The latter becomes the stable literal `"unspecified"` rather than
+    `None`, because `repository.deferred_reasons` filters `reason IS NOT
+    NULL` while the `required_deferred` headline does not -- a `NULL` reason
+    on a deferred item would make the breakdown stop summing to its own
+    headline.
+    """
+    if reason is None:
+        return None
+    without_control_characters = _REASON_CONTROL_CHARACTERS.sub("", reason)
+    collapsed = _REASON_WHITESPACE_RUN.sub(" ", without_control_characters).strip()
+    if not collapsed:
+        return _UNSPECIFIED_REASON
+    if len(collapsed) > _REASON_MAX_LENGTH:
+        keep = _REASON_MAX_LENGTH - len(_REASON_TRUNCATION_SUFFIX)
+        collapsed = collapsed[:keep] + _REASON_TRUNCATION_SUFFIX
+    return collapsed
 
 
 def _never_left_the_machine(record: AttemptRecord) -> bool:
@@ -925,7 +977,14 @@ class RunEngine:
         which is proof this run owns the item. `handler.persist` runs inside
         that same transaction, so a handler's domain writes and the settlement
         that justifies them commit or roll back together.
+
+        `reason` is sanitised here, once, whether it came from a handler or
+        from the engine's own literals: this is the single choke point every
+        settled reason passes through on its way to `complete_work`, to the
+        `_PersistFailed` path's second settlement, and to the closing
+        `run.work_settled` log event below.
         """
+        reason = _sanitize_reason(reason)
         try:
             repository.complete_work(
                 self._connection,
@@ -954,7 +1013,7 @@ class RunEngine:
                 error_type=error.error_type,
             )
             state = WorkState.FAILED_PERMANENT
-            reason = f"persist raised {error.error_type}"
+            reason = _sanitize_reason(f"persist raised {error.error_type}")
             repository.complete_work(
                 self._connection,
                 work_item_id=work_item.id,

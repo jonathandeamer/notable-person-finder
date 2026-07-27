@@ -128,6 +128,53 @@ def test_several_distinct_deferral_reasons_each_get_their_own_line() -> None:
     assert "exhausted transient failure: timeout: 1" in markdown
 
 
+def test_more_than_twelve_deferral_reasons_are_capped_with_a_remainder_row() -> None:
+    """A legitimate handler may classify along a dimension with many
+    distinct values -- sanitisation bounds each reason's length, not how many
+    distinct reasons exist. Rendering all of them would let the digest grow
+    unbounded, but folding them away silently would lose the total the
+    operator needs, so the sum of every rendered count (the twelve shown
+    plus the one folded-remainder row) must still equal the true total.
+    """
+    deferred_reasons = {f"reason_{index:02d}": index + 1 for index in range(15)}
+    true_total = sum(deferred_reasons.values())
+    counters = RunCounters(0, 0, true_total, 0, 0, 0, 0)
+    markdown = render_digest(
+        report(RunState.PARTIAL, counters=counters, deferred_reasons=deferred_reasons),
+        local_date="2026-07-25",
+    )
+    breakdown_lines = [
+        line
+        for line in markdown.splitlines()
+        if line.startswith("  - ") and ":" in line
+    ]
+    assert len(breakdown_lines) == 13  # 12 shown rows plus 1 remainder row
+    remainder_line = breakdown_lines[-1]
+    assert "3 more reasons folded" in remainder_line
+    rendered_total = 0
+    for line in breakdown_lines:
+        rendered_total += int(line.rsplit(":", 1)[1].strip())
+    assert rendered_total == true_total
+
+
+def test_the_twelve_highest_count_reasons_are_the_ones_shown() -> None:
+    """The cap must keep the rows most worth an operator's attention -- the
+    highest counts -- rather than an arbitrary or alphabetical subset."""
+    deferred_reasons = {f"reason_{index:02d}": index + 1 for index in range(15)}
+    counters = RunCounters(0, 0, sum(deferred_reasons.values()), 0, 0, 0, 0)
+    markdown = render_digest(
+        report(RunState.PARTIAL, counters=counters, deferred_reasons=deferred_reasons),
+        local_date="2026-07-25",
+    )
+    # Counts run 1..15 for reason_00..reason_14; the 12 highest counts are
+    # reasons 03..14 (counts 4..15). The 3 lowest (reason_00..reason_02,
+    # counts 1..3) must be the ones folded away.
+    for index in range(3, 15):
+        assert f"reason_{index:02d}: {index + 1}" in markdown
+    for index in range(3):
+        assert f"reason_{index:02d}:" not in markdown
+
+
 def test_the_budget_cap_reserved_and_spent_are_reported_in_usd() -> None:
     one_usd = 1_000_000_000
     markdown = render_digest(

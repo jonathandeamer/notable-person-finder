@@ -1923,3 +1923,169 @@ def test_a_first_malformed_response_that_runs_out_of_budget_is_deferred(
     # even though one exhaustion would be enough to pause it.
     assert report.paused_providers == frozenset()
     connection.close()
+
+
+# --- constraining handler-supplied reason (pre-6b) ------------------------------
+
+
+def test_a_handler_supplied_reason_with_embedded_newlines_is_collapsed(
+    database: Path,
+) -> None:
+    """A newline in a settled reason is not cosmetic: the digest renders the
+    reason inside a Markdown list item, so an embedded newline breaks the
+    list structure and would let remote text inject its own lines. Every run
+    of whitespace -- including tabs -- collapses to one space.
+    """
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "10" * 32)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        return TaskOutcome(
+            state=WorkState.DEFERRED,
+            reason="line one\nline two\ttab   three",
+        )
+
+    handler = probe_handler(execute)
+    build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    row = connection.execute(
+        "SELECT reason FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["reason"] == "line one line two tab three"
+    connection.close()
+
+
+def test_a_handler_supplied_reason_with_non_whitespace_control_characters_is_stripped(
+    database: Path,
+) -> None:
+    """Control characters that are not whitespace (a bell, an escape) are
+    dropped outright rather than collapsed into a space: neither has a
+    legitimate place in a digest bullet or a `GROUP BY` key, and unlike a
+    newline or tab they carry no argument for being rendered as a space
+    either.
+    """
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "14" * 32)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        return TaskOutcome(state=WorkState.DEFERRED, reason="bad\x07bell\x1bescape")
+
+    handler = probe_handler(execute)
+    build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    row = connection.execute(
+        "SELECT reason FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["reason"] == "badbellescape"
+    connection.close()
+
+
+def test_a_handler_supplied_reason_far_over_120_characters_is_truncated_visibly(
+    database: Path,
+) -> None:
+    """The stored reason is at most 120 characters, with the truncation
+    itself visible -- a trailing `...` inside the 120, not appended past it --
+    so an operator reading the digest can tell the value was cut rather than
+    reading a suspiciously round classification token.
+    """
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "11" * 32)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        return TaskOutcome(state=WorkState.DEFERRED, reason="x" * 200)
+
+    handler = probe_handler(execute)
+    build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    row = connection.execute(
+        "SELECT reason FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["reason"] == "x" * 117 + "..."
+    assert len(row["reason"]) == 120
+    connection.close()
+
+
+def test_a_whitespace_only_reason_becomes_unspecified_and_still_counts_in_the_breakdown(
+    database: Path,
+) -> None:
+    """An empty result after sanitisation must become the stable literal
+    `"unspecified"`, never `None`: `repository.deferred_reasons` filters
+    `reason IS NOT NULL` while the `required_deferred` headline does not, so a
+    `NULL` reason on a deferred item would make the breakdown stop summing to
+    its own headline -- the exact mismatch Task 4's fix round closed.
+    """
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "12" * 32)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        return TaskOutcome(state=WorkState.DEFERRED, reason="   ")
+
+    handler = probe_handler(execute)
+    report = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    row = connection.execute(
+        "SELECT reason FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["reason"] == "unspecified"
+    assert report.deferred_reasons == {"unspecified": 1}
+    connection.close()
+
+
+def test_the_engines_own_pause_and_exhaustion_literals_round_trip_byte_identical(
+    database: Path,
+) -> None:
+    """The sanitiser must not mangle the stable grouping keys the engine
+    authors for itself. This exercises two of them in one run: the pause
+    token `_prepare` deliberately keeps stable across providers, and the
+    `"exhausted transient failure: {category}"` token `_resolve` produces --
+    both must reach `work_item.reason` exactly as written.
+    """
+    connection = connect_database(database)
+    for index in range(3):
+        schedule_probe(connection, str(index) * 64)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        raise ProviderFailure(
+            FailureCategory.PROVIDER_UNAVAILABLE,
+            provider="probe_provider",
+            operation="probe_call",
+            status_code=503,
+        )
+
+    handler = TaskHandler(
+        task_type="probe",
+        provider="probe_provider",
+        operation="probe_call",
+        execute=execute,
+    )
+    clock = FakeClock()
+    engine = RunEngine(
+        connection,
+        retry=RetryPolicy(
+            RetryConfig(
+                max_attempts=1,
+                jitter_ratio=0.0,
+                provider_pause_after_consecutive_exhaustions=1,
+            ),
+            clock=clock,
+        ),
+        scheduler=BoundedScheduler(max_workers=1),
+        clock=clock,
+        timezone="Europe/Paris",
+        window_start="2026-07-24T06:00:00Z",
+        budget_limit_nano_usd=None,
+        snapshot_fingerprint="a" * 64,
+        snapshot_json="{}",
+        reporter=lambda report: ReportArtifact(path=None, sha256=None, markdown=""),
+    )
+    engine.execute({handler.task_type: handler})
+
+    reasons = {
+        row["reason"]
+        for row in connection.execute("SELECT DISTINCT reason FROM work_item")
+    }
+    assert reasons == {
+        f"exhausted transient failure: {FailureCategory.PROVIDER_UNAVAILABLE}",
+        "provider paused for this run",
+    }
+    connection.close()
