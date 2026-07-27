@@ -252,7 +252,13 @@ def test_run_writes_structured_logs(config_file: Path, tmp_path: Path) -> None:
     run_notable(config_file, "run")
     log_file = tmp_path / "portable" / "logs" / "notable.jsonl"
     assert log_file.is_file()
-    assert "run.started" in log_file.read_text(encoding="utf-8")
+    # `cli.run_started`, not `run.started`: the engine also emits
+    # `run.started` (with a disjoint field set), so that literal was
+    # already present before the CLI ever logged anything, and would not
+    # discriminate a regression in the CLI's own emission. `cli.run_started`
+    # is emitted only here, so it does discriminate -- see the demonstration
+    # in the task-5 report.
+    assert "cli.run_started" in log_file.read_text(encoding="utf-8")
 
 
 def test_every_emitted_event_name_uses_the_dotted_taxonomy(

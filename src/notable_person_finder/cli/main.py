@@ -163,7 +163,15 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                         config=loaded.main.digest,
                     )
                 except DigestWriteError:
-                    log_event(logger, "run.reporting_failed", run_id=report.run_id)
+                    # `cli.` prefix, not `run.`: the engine already emits
+                    # `run.reporting_failed` for the same failure, with a
+                    # different field set (error_type, no run_id-only
+                    # shape). Two emitters sharing one dotted name would
+                    # make the name insufficient to know which schema
+                    # applies without inspecting the payload -- so every
+                    # CLI-originated event in this function is under its
+                    # own `cli.` namespace instead.
+                    log_event(logger, "cli.run_reporting_failed", run_id=report.run_id)
                     raise
                 return ReportArtifact(
                     path=str(written.path),
@@ -183,7 +191,13 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                 snapshot_json=loaded.snapshot_json,
                 reporter=report_run,
             )
-            log_event(logger, "run.started", fingerprint=loaded.fingerprint)
+            # `cli.run_started`, not `run.started`: the engine emits its own
+            # `run.started` with a disjoint field set (run_id, window_start,
+            # window_end, swept_runs, task_types). Reusing that name here
+            # would give one dotted event name two schemas in the same log,
+            # which is the defect the dotted rename was meant to remove, not
+            # reintroduce in a different shape.
+            log_event(logger, "cli.run_started", fingerprint=loaded.fingerprint)
             # No provider adapters exist in this milestone, so no task
             # handlers are registered. Milestones 3-6 supply them. A handler
             # returning a non-settling state is now handled inside the
@@ -200,9 +214,12 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                 # next line instead of a handled reporting failure.
                 raise DigestWriteError("the run finished without writing a digest")
 
+            # `cli.run_finished`, not `run.finished`: same reasoning as
+            # `cli.run_started` above -- the engine already emits
+            # `run.finished` with its own field set for the same moment.
             log_event(
                 logger,
-                "run.finished",
+                "cli.run_finished",
                 run_id=report.run_id,
                 state=str(report.state),
                 required_succeeded=report.counters.required_succeeded,
