@@ -23,7 +23,9 @@ def test_transient_categories_are_retryable_by_default() -> None:
         FailureCategory.TRANSIENT_SERVER_ERROR,
         FailureCategory.PROVIDER_UNAVAILABLE,
     ):
-        assert ProviderFailure(category, provider="brave", operation="search_web").retryable
+        assert ProviderFailure(
+            category, provider="brave", operation="search_web"
+        ).retryable
 
 
 def test_permanent_categories_are_not_retryable_by_default() -> None:
@@ -39,17 +41,19 @@ def test_permanent_categories_are_not_retryable_by_default() -> None:
         FailureCategory.STORAGE,
         FailureCategory.INTERNAL,
     ):
-        assert not ProviderFailure(category, provider="brave", operation="search_web").retryable
+        assert not ProviderFailure(
+            category, provider="brave", operation="search_web"
+        ).retryable
 
 
 def test_retryable_set_matches_the_default_dispositions() -> None:
-    assert RETRYABLE_CATEGORIES == {
+    assert {
         FailureCategory.NETWORK,
         FailureCategory.TIMEOUT,
         FailureCategory.RATE_LIMIT,
         FailureCategory.TRANSIENT_SERVER_ERROR,
         FailureCategory.PROVIDER_UNAVAILABLE,
-    }
+    } == RETRYABLE_CATEGORIES
 
 
 def test_malformed_response_can_be_marked_retryable_once_at_raise_time() -> None:

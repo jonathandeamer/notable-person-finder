@@ -21,7 +21,12 @@ class SystemHostResolver:
             answers = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
         except OSError:
             return ()
-        return tuple(dict.fromkeys(answer[4][0] for answer in answers))
+        # typeshed types sockaddr[0] as `str | int`. For the AF_INET and
+        # AF_INET6 answers this call can return it is always the address
+        # string; coercing rather than filtering keeps the check fail-closed,
+        # because anything `ipaddress` cannot parse is treated as not publicly
+        # routable and rejected.
+        return tuple(dict.fromkeys(str(answer[4][0]) for answer in answers))
 
 
 class StaticHostResolver:
@@ -76,5 +81,7 @@ def assert_safe_url(url: str, *, resolver: HostResolver) -> str:
         raise UnsafeUrl(f"{url}: host could not be resolved")
     for address in addresses:
         if not _is_public_address(address):
-            raise UnsafeUrl(f"{url}: host resolves to an address that is not publicly routable")
+            raise UnsafeUrl(
+                f"{url}: host resolves to an address that is not publicly routable"
+            )
     return host

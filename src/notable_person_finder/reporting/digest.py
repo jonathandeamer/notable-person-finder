@@ -80,7 +80,9 @@ def render_digest(report: RunReport, *, local_date: str) -> str:
         )
         lines.append(f"- Failures by category: {rendered}")
     if report.paused_providers:
-        lines.append(f"- Providers paused this run: {', '.join(sorted(report.paused_providers))}")
+        lines.append(
+            f"- Providers paused this run: {', '.join(sorted(report.paused_providers))}"
+        )
     if report.interrupted_runs:
         rendered = ", ".join(f"run-{run_id}" for run_id in report.interrupted_runs)
         lines.append(f"- Interrupted predecessor runs recorded: {rendered}")

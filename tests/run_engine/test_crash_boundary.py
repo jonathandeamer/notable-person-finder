@@ -47,7 +47,9 @@ def engine_for(connection: sqlite3.Connection) -> RunEngine:
     clock = FakeClock()
     return RunEngine(
         connection,
-        retry=RetryCoordinator(RetryConfig(max_attempts=1, jitter_ratio=0.0), clock=clock),
+        retry=RetryCoordinator(
+            RetryConfig(max_attempts=1, jitter_ratio=0.0), clock=clock
+        ),
         scheduler=BoundedScheduler(max_workers=1),
         clock=clock,
         timezone="Europe/Paris",
@@ -109,7 +111,12 @@ def shape(database: Path) -> dict[str, list[tuple[object, ...]]]:
                 for row in inspect.execute("SELECT * FROM run ORDER BY id")
             ],
             "work_item": [
-                (row["id"], row["state"], row["claimed_by_run_id"], row["completed_by_run_id"])
+                (
+                    row["id"],
+                    row["state"],
+                    row["claimed_by_run_id"],
+                    row["completed_by_run_id"],
+                )
                 for row in inspect.execute("SELECT * FROM work_item ORDER BY id")
             ],
             "attempt": [
@@ -130,7 +137,10 @@ def crash_in_flight(database: Path) -> None:
         raise SimulatedCrash
 
     handler = TaskHandler(
-        task_type="probe", provider="probe_provider", operation="probe_call", execute=crashing
+        task_type="probe",
+        provider="probe_provider",
+        operation="probe_call",
+        execute=crashing,
     )
     with pytest.raises(SimulatedCrash):
         engine_for(connection).execute({handler.task_type: handler})
@@ -159,7 +169,10 @@ def crash_before_settle(database: Path) -> None:
         raise SimulatedCrash
 
     handler = TaskHandler(
-        task_type="probe", provider="probe_provider", operation="probe_call", execute=succeeding
+        task_type="probe",
+        provider="probe_provider",
+        operation="probe_call",
+        execute=succeeding,
     )
     original = repository.complete_work
     repository.complete_work = dying  # type: ignore[assignment]
@@ -176,7 +189,7 @@ def crash_before_settle(database: Path) -> None:
 # selects the kill point: "provider" kills inside the external call, "settle"
 # kills between the two transactions of step 3. Nothing unwinds: no `finally`,
 # no `__del__`, no implicit rollback, no buffered write flushed on the way out.
-_SIGKILL_CHILD = '''
+_SIGKILL_CHILD = """
 import os
 import signal
 import sys
@@ -240,7 +253,7 @@ RunEngine(
     snapshot_json="{}",
     reporter=lambda report: ReportArtifact(path=None, sha256=None, markdown=""),
 ).execute({handler.task_type: handler})
-'''
+"""
 
 
 def sigkill_at(database: Path, workspace: Path, kill_point: str) -> None:
@@ -276,7 +289,10 @@ def test_a_crash_after_the_provider_accepted_leaves_an_in_flight_attempt(
         raise SimulatedCrash
 
     handler = TaskHandler(
-        task_type="probe", provider="probe_provider", operation="probe_call", execute=execute
+        task_type="probe",
+        provider="probe_provider",
+        operation="probe_call",
+        execute=execute,
     )
     with pytest.raises(SimulatedCrash):
         engine_for(connection).execute({handler.task_type: handler})
@@ -353,7 +369,10 @@ def test_the_next_run_after_a_real_sigkill_recovers_the_work(tmp_path: Path) -> 
         return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
 
     handler = TaskHandler(
-        task_type="probe", provider="probe_provider", operation="probe_call", execute=succeeding
+        task_type="probe",
+        provider="probe_provider",
+        operation="probe_call",
+        execute=succeeding,
     )
     report = engine_for(connection).execute({handler.task_type: handler})
 
@@ -361,7 +380,8 @@ def test_the_next_run_after_a_real_sigkill_recovers_the_work(tmp_path: Path) -> 
     assert report.interrupted_runs == (1,)
     assert report.state is RunState.COMPLETE
     outcomes = [
-        row["outcome"] for row in connection.execute("SELECT outcome FROM attempt ORDER BY id")
+        row["outcome"]
+        for row in connection.execute("SELECT outcome FROM attempt ORDER BY id")
     ]
     assert outcomes == ["interrupted", "succeeded"]
     connection.close()
@@ -384,7 +404,10 @@ def test_the_next_run_records_the_interruption_and_repeats_the_call(
         return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
 
     handler = TaskHandler(
-        task_type="probe", provider="probe_provider", operation="probe_call", execute=succeeding
+        task_type="probe",
+        provider="probe_provider",
+        operation="probe_call",
+        execute=succeeding,
     )
     report = engine_for(connection).execute({handler.task_type: handler})
 
@@ -394,7 +417,8 @@ def test_the_next_run_records_the_interruption_and_repeats_the_call(
     assert report.interrupted_runs == (1,)
 
     outcomes = [
-        row["outcome"] for row in connection.execute("SELECT outcome FROM attempt ORDER BY id")
+        row["outcome"]
+        for row in connection.execute("SELECT outcome FROM attempt ORDER BY id")
     ]
     assert outcomes == ["interrupted", "succeeded"]
     # The observed transition sequence matches the one seen empirically for a
@@ -418,7 +442,10 @@ def test_a_persisted_result_is_never_repeated(database: Path) -> None:
         return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
 
     handler = TaskHandler(
-        task_type="probe", provider="probe_provider", operation="probe_call", execute=execute
+        task_type="probe",
+        provider="probe_provider",
+        operation="probe_call",
+        execute=execute,
     )
     engine_for(connection).execute({handler.task_type: handler})
     engine_for(connection).execute({handler.task_type: handler})
@@ -427,7 +454,9 @@ def test_a_persisted_result_is_never_repeated(database: Path) -> None:
     # One call means exactly one attempt row; a repeat would add a second.
     assert [
         (row["ordinal"], row["outcome"])
-        for row in connection.execute("SELECT ordinal, outcome FROM attempt ORDER BY id")
+        for row in connection.execute(
+            "SELECT ordinal, outcome FROM attempt ORDER BY id"
+        )
     ] == [(1, "succeeded")]
     connection.close()
 
@@ -504,7 +533,9 @@ def test_an_interrupted_run_is_not_reported_as_complete(database: Path) -> None:
 
     connection = connect_database(database)
     engine_for(connection).execute({})
-    states = [row["state"] for row in connection.execute("SELECT state FROM run ORDER BY id")]
+    states = [
+        row["state"] for row in connection.execute("SELECT state FROM run ORDER BY id")
+    ]
     assert states[0] == RunState.INTERRUPTED
     connection.close()
 
@@ -521,7 +552,8 @@ def test_abandoned_work_returns_to_pending_not_to_deferred(database: Path) -> No
     assert swept.work_items == 1
     assert swept.attempts == 1
     row = connection.execute(
-        "SELECT state, claimed_by_run_id, completed_by_run_id FROM work_item WHERE id = ?",
+        "SELECT state, claimed_by_run_id, completed_by_run_id FROM work_item "
+        "WHERE id = ?",
         (work_id,),
     ).fetchone()
     assert row["state"] == WorkState.PENDING
@@ -606,7 +638,10 @@ def test_the_next_run_repeats_a_call_whose_attempt_was_already_settled(
         return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
 
     handler = TaskHandler(
-        task_type="probe", provider="probe_provider", operation="probe_call", execute=succeeding
+        task_type="probe",
+        provider="probe_provider",
+        operation="probe_call",
+        execute=succeeding,
     )
     report = engine_for(connection).execute({handler.task_type: handler})
 

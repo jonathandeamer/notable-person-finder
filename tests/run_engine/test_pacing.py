@@ -97,6 +97,5 @@ def test_different_origins_do_not_share_a_slot() -> None:
     gate = build_pacing_gate(
         PacingConfig(), ConcurrencyConfig(per_origin=1), clock=FakeClock()
     )
-    with gate.acquire("feeds", "a.example"):
-        with gate.acquire("feeds", "b.example"):
-            pass
+    with gate.acquire("feeds", "a.example"), gate.acquire("feeds", "b.example"):
+        pass

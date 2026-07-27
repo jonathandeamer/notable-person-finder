@@ -81,8 +81,12 @@ def test_user_agent_is_sent_on_every_request() -> None:
         return httpx.Response(200, content=streaming_body(b"ok"))
 
     with transport_for(handler) as transport:
-        transport.request("GET", "https://example.com/a", provider="feeds", operation="fetch_feed")
-    assert seen == ["notable-person-finder/0.1.0 (+https://github.com/jonathandeamer/notable-person-finder)"]
+        transport.request(
+            "GET", "https://example.com/a", provider="feeds", operation="fetch_feed"
+        )
+    assert seen == [
+        "notable-person-finder/0.1.0 (+https://github.com/jonathandeamer/notable-person-finder)"
+    ]
 
 
 def test_adapter_headers_are_merged_without_replacing_the_user_agent() -> None:
@@ -180,13 +184,14 @@ def test_same_origin_redirect_keeps_credential_headers() -> None:
 
 def test_redirect_to_a_private_address_is_refused() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(302, headers={"location": "https://internal.example/secrets"})
+        return httpx.Response(
+            302, headers={"location": "https://internal.example/secrets"}
+        )
 
-    with transport_for(handler) as transport:
-        with pytest.raises(ProviderFailure) as raised:
-            transport.request(
-                "GET", "https://example.com/a", provider="feeds", operation="fetch_feed"
-            )
+    with transport_for(handler) as transport, pytest.raises(ProviderFailure) as raised:
+        transport.request(
+            "GET", "https://example.com/a", provider="feeds", operation="fetch_feed"
+        )
     assert raised.value.category is FailureCategory.CONFIGURATION
     assert "internal.example" not in str(raised.value)
 
@@ -195,11 +200,13 @@ def test_redirect_limit_is_enforced() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(302, headers={"location": "https://example.com/loop"})
 
-    with transport_for(handler, TransportConfig(max_redirects=2)) as transport:
-        with pytest.raises(ProviderFailure) as raised:
-            transport.request(
-                "GET", "https://example.com/a", provider="feeds", operation="fetch_feed"
-            )
+    with (
+        transport_for(handler, TransportConfig(max_redirects=2)) as transport,
+        pytest.raises(ProviderFailure) as raised,
+    ):
+        transport.request(
+            "GET", "https://example.com/a", provider="feeds", operation="fetch_feed"
+        )
     assert raised.value.category is FailureCategory.MALFORMED_RESPONSE
     assert not raised.value.retryable
 
@@ -209,15 +216,17 @@ def test_decoded_body_over_the_limit_is_refused() -> None:
         return httpx.Response(200, content=streaming_body(b"x" * 5000))
 
     config = TransportConfig(max_api_response_bytes=1000)
-    with transport_for(handler, config) as transport:
-        with pytest.raises(ProviderFailure) as raised:
-            transport.request(
-                "GET",
-                "https://example.com/a",
-                provider="feeds",
-                operation="fetch_feed",
-                limit=ResponseLimit.API,
-            )
+    with (
+        transport_for(handler, config) as transport,
+        pytest.raises(ProviderFailure) as raised,
+    ):
+        transport.request(
+            "GET",
+            "https://example.com/a",
+            provider="feeds",
+            operation="fetch_feed",
+            limit=ResponseLimit.API,
+        )
     assert raised.value.category is FailureCategory.RESPONSE_TOO_LARGE
 
 
@@ -232,15 +241,17 @@ def test_compression_cannot_smuggle_a_body_past_the_decoded_limit() -> None:
         )
 
     config = TransportConfig(max_api_response_bytes=1000)
-    with transport_for(handler, config) as transport:
-        with pytest.raises(ProviderFailure) as raised:
-            transport.request(
-                "GET",
-                "https://example.com/a",
-                provider="feeds",
-                operation="fetch_feed",
-                limit=ResponseLimit.API,
-            )
+    with (
+        transport_for(handler, config) as transport,
+        pytest.raises(ProviderFailure) as raised,
+    ):
+        transport.request(
+            "GET",
+            "https://example.com/a",
+            provider="feeds",
+            operation="fetch_feed",
+            limit=ResponseLimit.API,
+        )
     assert raised.value.category is FailureCategory.RESPONSE_TOO_LARGE
 
 
@@ -248,7 +259,9 @@ def test_article_limit_is_larger_than_the_api_limit() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=streaming_body(b"x" * 4000))
 
-    config = TransportConfig(max_api_response_bytes=1000, max_article_response_bytes=8000)
+    config = TransportConfig(
+        max_api_response_bytes=1000, max_article_response_bytes=8000
+    )
     with transport_for(handler, config) as transport:
         response = transport.request(
             "GET",
@@ -279,11 +292,10 @@ def test_http_statuses_map_to_typed_failures(
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(status, text="body text")
 
-    with transport_for(handler) as transport:
-        with pytest.raises(ProviderFailure) as raised:
-            transport.request(
-                "GET", "https://example.com/a", provider="brave", operation="search_web"
-            )
+    with transport_for(handler) as transport, pytest.raises(ProviderFailure) as raised:
+        transport.request(
+            "GET", "https://example.com/a", provider="brave", operation="search_web"
+        )
     assert raised.value.category is category
     assert raised.value.retryable is retryable
     assert raised.value.status_code == status
@@ -294,11 +306,10 @@ def test_retry_after_is_captured_from_a_rate_limited_response() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(429, headers={"retry-after": "7"})
 
-    with transport_for(handler) as transport:
-        with pytest.raises(ProviderFailure) as raised:
-            transport.request(
-                "GET", "https://example.com/a", provider="brave", operation="search_web"
-            )
+    with transport_for(handler) as transport, pytest.raises(ProviderFailure) as raised:
+        transport.request(
+            "GET", "https://example.com/a", provider="brave", operation="search_web"
+        )
     assert raised.value.retry_after_ms == 7000
 
 
@@ -311,15 +322,16 @@ def test_retry_after_is_captured_from_a_rate_limited_response() -> None:
         (httpx.RemoteProtocolError("garbage"), FailureCategory.MALFORMED_RESPONSE),
     ],
 )
-def test_httpx_errors_are_translated(error: Exception, category: FailureCategory) -> None:
+def test_httpx_errors_are_translated(
+    error: Exception, category: FailureCategory
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise error
 
-    with transport_for(handler) as transport:
-        with pytest.raises(ProviderFailure) as raised:
-            transport.request(
-                "GET", "https://example.com/a", provider="feeds", operation="fetch_feed"
-            )
+    with transport_for(handler) as transport, pytest.raises(ProviderFailure) as raised:
+        transport.request(
+            "GET", "https://example.com/a", provider="feeds", operation="fetch_feed"
+        )
     assert raised.value.category is category
 
 
@@ -327,16 +339,17 @@ def test_no_httpx_exception_escapes_the_boundary() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ProxyError("proxy exploded")
 
-    with transport_for(handler) as transport:
-        with pytest.raises(ProviderFailure):
-            transport.request(
-                "GET", "https://example.com/a", provider="feeds", operation="fetch_feed"
-            )
+    with transport_for(handler) as transport, pytest.raises(ProviderFailure):
+        transport.request(
+            "GET", "https://example.com/a", provider="feeds", operation="fetch_feed"
+        )
 
 
 def test_llm_profile_uses_the_longer_read_timeout() -> None:
     config = TransportConfig(read_timeout_seconds=30.0, llm_read_timeout_seconds=300.0)
-    with transport_for(lambda request: httpx.Response(200, text="ok"), config) as transport:
+    with transport_for(
+        lambda request: httpx.Response(200, text="ok"), config
+    ) as transport:
         assert transport._timeout_for(profile="llm").read == 300.0
         assert transport._timeout_for(profile="ordinary").read == 30.0
         assert transport._timeout_for(profile="ordinary").connect == 10.0
@@ -349,14 +362,14 @@ def test_client_level_automatic_retries_are_disabled() -> None:
 
 class _BuildRequestRaisesUnicode(httpx.Client):
     def build_request(self, *args, **kwargs):
-        raise UnicodeEncodeError(
-            "ascii", "café", 0, 1, "ordinal not in range(128)"
-        )
+        raise UnicodeEncodeError("ascii", "café", 0, 1, "ordinal not in range(128)")
 
 
 def test_unicode_encode_error_in_build_request_is_translated() -> None:
     """A non-ASCII header/value must not leak as a raw UnicodeEncodeError."""
-    client = _BuildRequestRaisesUnicode(transport=httpx.MockTransport(lambda request: httpx.Response(200)))
+    client = _BuildRequestRaisesUnicode(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200))
+    )
     transport = HttpTransport(
         client,
         config=TransportConfig(),

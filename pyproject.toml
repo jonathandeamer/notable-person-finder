@@ -39,6 +39,12 @@ markers = ["live: explicitly invoked tests that contact external providers"]
 [tool.ruff]
 line-length = 88
 target-version = "py313"
+# The legacy prototype is historical evidence and the operational fallback
+# until product cutover; it is never linted or formatted. These patterns match
+# by path segment at any depth, so a future rewrite package must not reuse one
+# of these bare names -- `src/notable_person_finder/ingestion/` is safe, a
+# package literally named `ingest` or `state` would not be. Verify with
+# `uv run ruff check . --show-files` after adding a package.
 extend-exclude = [
     "run_pipeline.py",
     "name_utils.py",
@@ -49,6 +55,10 @@ extend-exclude = [
     "state",
     "tests/test_*",
     "tests/conftest.py",
+    # `ruff format` rewrites Python code blocks inside Markdown. Specs and plans
+    # are authorities, not source: their code blocks are illustrative by policy
+    # and must not be silently reformatted into looking canonical.
+    "docs",
 ]
 
 [tool.ruff.lint]

@@ -153,9 +153,7 @@ class RetryCoordinator:
             # `notable run`. Provider-controlled input must never override an
             # operator-configured bound, so honour the hint only up to
             # `max_backoff_seconds`.
-            return min(
-                failure.retry_after_ms / 1000, self._config.max_backoff_seconds
-            )
+            return min(failure.retry_after_ms / 1000, self._config.max_backoff_seconds)
         base = self._config.initial_backoff_seconds * (
             self._config.backoff_multiplier ** (retry_number - 1)
         )

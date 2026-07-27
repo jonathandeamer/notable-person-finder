@@ -19,7 +19,14 @@ def run_notable(
 ) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, **ENVIRONMENT, **(environment or {})}
     return subprocess.run(
-        [sys.executable, "-m", "notable_person_finder", "--config", str(config_file), *arguments],
+        [
+            sys.executable,
+            "-m",
+            "notable_person_finder",
+            "--config",
+            str(config_file),
+            *arguments,
+        ],
         capture_output=True,
         text=True,
         env=env,
@@ -78,7 +85,14 @@ def test_invalid_configuration_fails_with_status_one_and_no_traceback(
 def test_a_missing_secret_names_the_variable_but_not_its_value(tmp_path: Path) -> None:
     config_file = write_graph(tmp_path)
     completed = subprocess.run(
-        [sys.executable, "-m", "notable_person_finder", "--config", str(config_file), "run"],
+        [
+            sys.executable,
+            "-m",
+            "notable_person_finder",
+            "--config",
+            str(config_file),
+            "run",
+        ],
         capture_output=True,
         text=True,
         env={
@@ -161,6 +175,7 @@ def test_sigint_during_a_run_returns_one_hundred_thirty(
     assert completed.returncode == 130
     assert "Traceback" not in completed.stderr
 
+
 # Recording an interrupted run in durable state is covered directly by
 # tests/run_engine/test_crash_boundary.py; this case owns the exit status only.
 
@@ -192,9 +207,10 @@ def test_reporting_failure_exits_one_and_persists_failed_state(
     database = tmp_path / "portable" / "data" / "notable.sqlite3"
     connection = connect_database(database)
     assert connection.execute("SELECT state FROM run").fetchone()[0] == "failed"
-    assert [row[0] for row in connection.execute(
-        "SELECT state FROM run_transition ORDER BY id"
-    )] == ["running", "failed"]
+    assert [
+        row[0]
+        for row in connection.execute("SELECT state FROM run_transition ORDER BY id")
+    ] == ["running", "failed"]
     connection.close()
 
 
@@ -322,7 +338,14 @@ def test_a_secret_that_is_present_is_not_echoed_when_another_is_missing(
     """
     config_file = write_graph(tmp_path)
     completed = subprocess.run(
-        [sys.executable, "-m", "notable_person_finder", "--config", str(config_file), "run"],
+        [
+            sys.executable,
+            "-m",
+            "notable_person_finder",
+            "--config",
+            str(config_file),
+            "run",
+        ],
         capture_output=True,
         text=True,
         env={

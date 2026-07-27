@@ -337,7 +337,9 @@ class RunEngine:
                 attempt_id=attempt_ids[record.ordinal],
                 record=record,
                 response_bytes=None if outcome is None else outcome.response_bytes,
-                provider_request_id=None if outcome is None else outcome.provider_request_id,
+                provider_request_id=None
+                if outcome is None
+                else outcome.provider_request_id,
                 detail_json=None if outcome is None else outcome.detail_json,
                 now=self._now(),
                 # A failed attempt reports no actual cost, and passing None
@@ -380,7 +382,9 @@ class RunEngine:
                 handler,
                 claimed=bool(attempt_ids),
                 state=WorkState.DEFERRED,
-                reason=f"exhausted transient failure: {exhausted.last_failure.category}",
+                reason=(
+                    f"exhausted transient failure: {exhausted.last_failure.category}"
+                ),
             )
             return
         except BudgetExhausted:

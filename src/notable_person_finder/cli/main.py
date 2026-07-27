@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import NoReturn
 from zoneinfo import ZoneInfo
 
-from notable_person_finder.config.loader import ConfigLoadError, ResolvedConfig, load_config
+from notable_person_finder.config.loader import (
+    ConfigLoadError,
+    ResolvedConfig,
+    load_config,
+)
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.db.migrate import MigrationError, apply_migrations
 from notable_person_finder.obs.logging import configure_logging, log_event
@@ -142,7 +146,9 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
             # under the following day, and the digest file name is immutable.
             now = clock.now()
             window_start = _window_start(loaded, now)
-            local_date = now.astimezone(ZoneInfo(loaded.main.timezone)).date().isoformat()
+            local_date = (
+                now.astimezone(ZoneInfo(loaded.main.timezone)).date().isoformat()
+            )
             # The transport and pacing gate will be built by the first adapter
             # milestone that has a provider to pace; nothing in this milestone
             # makes requests, so no transport is constructed yet.
@@ -261,9 +267,7 @@ def command_status(config_file: Path | None) -> int:
         if record is None:
             print("no run has been recorded yet")
             return EXIT_OK
-        failures = repository.operational_failures_for_run(
-            connection, run_id=record.id
-        )
+        failures = repository.operational_failures_for_run(connection, run_id=record.id)
         print(f"latest run: {record.human_id} ({record.state})")
         print(f"started: {record.started_at}")
         print(f"finished: {record.finished_at or '-'}")

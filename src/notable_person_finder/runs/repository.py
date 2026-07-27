@@ -19,6 +19,20 @@ from notable_person_finder.runs.models import (
 from notable_person_finder.runs.retry import AttemptRecord
 
 
+def _last_row_id(cursor: sqlite3.Cursor) -> int:
+    """The row id of a just-completed INSERT.
+
+    `sqlite3` types `lastrowid` as optional because it is None before any
+    INSERT on the cursor. Every call site here has just inserted exactly one
+    row, so None means the statement did not do what the caller assumed and
+    must fail loudly rather than propagate a bad id.
+    """
+    row_id = cursor.lastrowid
+    if row_id is None:
+        raise RuntimeError("INSERT did not produce a row id")
+    return row_id
+
+
 def store_snapshot(
     connection: sqlite3.Connection, *, fingerprint: str, canonical_json: str, now: str
 ) -> int:
@@ -58,10 +72,19 @@ def create_run(
             )
             VALUES ('running', ?, ?, ?, ?, ?, ?)
             """,
-            (snapshot_id, timezone, window_start, window_end, now, budget_limit_nano_usd),
+            (
+                snapshot_id,
+                timezone,
+                window_start,
+                window_end,
+                now,
+                budget_limit_nano_usd,
+            ),
         )
-        run_id = int(cursor.lastrowid)
-        _insert_transition(connection, run_id=run_id, state=RunState.RUNNING, reason=None, now=now)
+        run_id = _last_row_id(cursor)
+        _insert_transition(
+            connection, run_id=run_id, state=RunState.RUNNING, reason=None, now=now
+        )
     except BaseException:
         connection.rollback()
         raise
@@ -109,7 +132,9 @@ def finish_run(
         ).rowcount
         if changed != 1:
             raise RuntimeError(f"run-{run_id} is already terminal or does not exist")
-        _insert_transition(connection, run_id=run_id, state=state, reason=reason, now=now)
+        _insert_transition(
+            connection, run_id=run_id, state=state, reason=reason, now=now
+        )
     except BaseException:
         connection.rollback()
         raise
@@ -151,7 +176,8 @@ def sweep_interrupted(connection: sqlite3.Connection, *, now: str) -> SweepResul
             (now, *abandoned),
         ).rowcount
         connection.execute(
-            f"UPDATE run SET state = 'interrupted', finished_at = ? WHERE id IN ({placeholders})",
+            "UPDATE run SET state = 'interrupted', finished_at = ? "
+            f"WHERE id IN ({placeholders})",
             (now, *abandoned),
         )
         for run_id in abandoned:
@@ -252,7 +278,7 @@ def schedule_work(
                     now,
                 ),
             )
-            work_id = int(cursor.lastrowid)
+            work_id = _last_row_id(cursor)
     except BaseException:
         connection.rollback()
         raise
@@ -353,9 +379,7 @@ def claim_next(
     """Claim deterministic work; external calls use claim_and_start_attempt."""
     connection.execute("BEGIN IMMEDIATE")
     try:
-        item = next_eligible(
-            connection, run_id=run_id, now=now, task_types=task_types
-        )
+        item = next_eligible(connection, run_id=run_id, now=now, task_types=task_types)
         if item is None:
             connection.rollback()
             return None
@@ -464,9 +488,7 @@ def defer_unclaimed(
         connection.commit()
 
 
-def pending_required(
-    connection: sqlite3.Connection, *, now: str | None = None
-) -> int:
+def pending_required(connection: sqlite3.Connection, *, now: str | None = None) -> int:
     eligibility = "" if now is None else " AND eligible_at <= ?"
     parameters = () if now is None else (now,)
     return int(
@@ -483,14 +505,13 @@ def pending_required(
 def deferred_required(connection: sqlite3.Connection) -> int:
     return int(
         connection.execute(
-            "SELECT COUNT(*) AS n FROM work_item WHERE required = 1 AND state = 'deferred'"
+            "SELECT COUNT(*) AS n FROM work_item "
+            "WHERE required = 1 AND state = 'deferred'"
         ).fetchone()["n"]
     )
 
 
-def operational_failures_for_run(
-    connection: sqlite3.Connection, *, run_id: int
-) -> int:
+def operational_failures_for_run(connection: sqlite3.Connection, *, run_id: int) -> int:
     return int(
         connection.execute(
             "SELECT COUNT(*) AS n FROM attempt WHERE run_id = ? AND outcome = 'failed'",
@@ -542,9 +563,7 @@ def run_counters(
     )
 
 
-def next_attempt_ordinal(
-    connection: sqlite3.Connection, *, work_item_id: int
-) -> int:
+def next_attempt_ordinal(connection: sqlite3.Connection, *, work_item_id: int) -> int:
     """Advisory next ordinal for a work item.
 
     Computed outside the transaction that will consume it, so it is a hint,
@@ -553,7 +572,8 @@ def next_attempt_ordinal(
     rather than a silently overwritten attempt.
     """
     row = connection.execute(
-        "SELECT COALESCE(MAX(ordinal), 0) + 1 AS ordinal FROM attempt WHERE work_item_id = ?",
+        "SELECT COALESCE(MAX(ordinal), 0) + 1 AS ordinal FROM attempt "
+        "WHERE work_item_id = ?",
         (work_item_id,),
     ).fetchone()
     return int(row["ordinal"])
@@ -581,11 +601,18 @@ def _insert_attempt(
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            run_id, work_item_id, provider, operation, ordinal, now,
-            request_fingerprint, destination_host, reserved_nano_usd,
+            run_id,
+            work_item_id,
+            provider,
+            operation,
+            ordinal,
+            now,
+            request_fingerprint,
+            destination_host,
+            reserved_nano_usd,
         ),
     )
-    return int(cursor.lastrowid)
+    return _last_row_id(cursor)
 
 
 def claim_and_start_attempt(
@@ -613,7 +640,9 @@ def claim_and_start_attempt(
             (run_id, now, work_item_id, run_id, now),
         ).rowcount
         if changed != 1:
-            raise RuntimeError(f"work item {work_item_id} is not claimable by run-{run_id}")
+            raise RuntimeError(
+                f"work item {work_item_id} is not claimable by run-{run_id}"
+            )
         reserve_in_transaction(
             connection,
             run_id=run_id,
@@ -656,12 +685,14 @@ def start_attempt(
     connection.execute("BEGIN IMMEDIATE")
     try:
         owner = connection.execute(
-            "SELECT claimed_by_run_id FROM work_item WHERE id = ? AND state = 'running'",
+            "SELECT claimed_by_run_id FROM work_item "
+            "WHERE id = ? AND state = 'running'",
             (work_item_id,),
         ).fetchone()
         if owner is None or owner["claimed_by_run_id"] != run_id:
             raise RuntimeError(
-                f"work item {work_item_id} is not a running attempt claimed by run-{run_id}"
+                f"work item {work_item_id} is not a running attempt "
+                f"claimed by run-{run_id}"
             )
         reserve_in_transaction(
             connection,
@@ -703,11 +734,14 @@ def finish_attempt(
     connection.execute("BEGIN IMMEDIATE")
     try:
         attempt = connection.execute(
-            "SELECT run_id, reserved_nano_usd, ordinal FROM attempt WHERE id = ? AND outcome IS NULL",
+            "SELECT run_id, reserved_nano_usd, ordinal FROM attempt "
+            "WHERE id = ? AND outcome IS NULL",
             (attempt_id,),
         ).fetchone()
         if attempt is None:
-            raise RuntimeError(f"attempt {attempt_id} is already finished or does not exist")
+            raise RuntimeError(
+                f"attempt {attempt_id} is already finished or does not exist"
+            )
         if int(attempt["ordinal"]) != record.ordinal:
             raise RuntimeError(
                 f"attempt {attempt_id} has ordinal {attempt['ordinal']}, "
@@ -730,7 +764,9 @@ def finish_attempt(
             """,
             (
                 record.outcome,
-                None if record.failure_category is None else str(record.failure_category),
+                None
+                if record.failure_category is None
+                else str(record.failure_category),
                 record.status_code,
                 record.retry_after_ms,
                 record.latency_ms,

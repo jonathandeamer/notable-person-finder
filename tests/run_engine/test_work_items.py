@@ -63,7 +63,9 @@ def schedule(
     )
 
 
-def test_scheduling_returns_a_new_work_item(connection: sqlite3.Connection, run_id: int) -> None:
+def test_scheduling_returns_a_new_work_item(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
     work_id = schedule(connection, run_id, priority=42, required=True)
     row = connection.execute(
         "SELECT state, priority, required FROM work_item WHERE id = ?", (work_id,)
@@ -99,7 +101,9 @@ def test_a_changed_fingerprint_supersedes_the_old_active_row(
     fresh = schedule(connection, run_id, fingerprint="d" * 64)
     assert fresh != stale
     assert (
-        connection.execute("SELECT state FROM work_item WHERE id = ?", (stale,)).fetchone()["state"]
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (stale,)
+        ).fetchone()["state"]
         == WorkState.SUPERSEDED
     )
 
@@ -188,13 +192,21 @@ def test_deferred_work_becomes_eligible_in_the_next_run(
 def test_claiming_can_be_restricted_to_registered_task_types(
     connection: sqlite3.Connection, run_id: int
 ) -> None:
-    unknown = schedule(connection, run_id, fingerprint="9" * 64, task_type="future_task")
-    assert repository.claim_next(
-        connection, run_id=run_id, now=NOW, task_types={"detect_people"}
-    ) is None
-    assert connection.execute(
-        "SELECT state FROM work_item WHERE id = ?", (unknown,)
-    ).fetchone()["state"] == WorkState.PENDING
+    unknown = schedule(
+        connection, run_id, fingerprint="9" * 64, task_type="future_task"
+    )
+    assert (
+        repository.claim_next(
+            connection, run_id=run_id, now=NOW, task_types={"detect_people"}
+        )
+        is None
+    )
+    assert (
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (unknown,)
+        ).fetchone()["state"]
+        == WorkState.PENDING
+    )
 
 
 def test_permanently_failed_work_is_never_reclaimed(
@@ -247,7 +259,12 @@ def test_counters_separate_required_from_optional_work(
     done = schedule(connection, run_id, fingerprint="1" * 64, required=True)
     repository.claim_next(connection, run_id=run_id, now=NOW)
     repository.complete_work(
-        connection, work_item_id=done, run_id=run_id, state=WorkState.SUCCEEDED, reason=None, now=NOW
+        connection,
+        work_item_id=done,
+        run_id=run_id,
+        state=WorkState.SUCCEEDED,
+        reason=None,
+        now=NOW,
     )
     schedule(connection, run_id, fingerprint="2" * 64, required=True)
     optional = schedule(connection, run_id, fingerprint="3" * 64, required=False)
@@ -404,7 +421,8 @@ def test_counters_cover_deferred_failed_permanent_skipped_and_operational_failur
 ) -> None:
     deferred_item = schedule(connection, run_id, fingerprint="7" * 64, required=True)
     failed_item = schedule(connection, run_id, fingerprint="8" * 64, required=True)
-    skipped_item = schedule(connection, run_id, fingerprint="a1" * 32, required=False)
+    # Superseded below by fingerprint, so the returned id is deliberately unused.
+    schedule(connection, run_id, fingerprint="a1" * 32, required=False)
 
     repository.claim_next(connection, run_id=run_id, now=NOW)
     repository.claim_next(connection, run_id=run_id, now=NOW)

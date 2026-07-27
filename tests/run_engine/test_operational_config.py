@@ -31,7 +31,11 @@ def test_operational_sections_have_conservative_defaults() -> None:
     assert retry.provider_pause_after_consecutive_exhaustions == 3
 
     concurrency = ConcurrencyConfig()
-    assert (concurrency.http_workers, concurrency.llm_workers, concurrency.per_origin) == (4, 2, 2)
+    assert (
+        concurrency.http_workers,
+        concurrency.llm_workers,
+        concurrency.per_origin,
+    ) == (4, 2, 2)
 
 
 def test_default_user_agent_identifies_the_application() -> None:
@@ -41,10 +45,14 @@ def test_default_user_agent_identifies_the_application() -> None:
 
 
 def test_contact_url_is_appended_and_override_replaces_completely() -> None:
-    appended = TransportConfig(contact_url="https://example.com/contact").resolved_user_agent("0.1.0")
+    appended = TransportConfig(
+        contact_url="https://example.com/contact"
+    ).resolved_user_agent("0.1.0")
     assert appended.endswith("; https://example.com/contact)")
 
-    replaced = TransportConfig(user_agent_override="custom-agent/9").resolved_user_agent("0.1.0")
+    replaced = TransportConfig(
+        user_agent_override="custom-agent/9"
+    ).resolved_user_agent("0.1.0")
     assert replaced == "custom-agent/9"
 
 
@@ -69,7 +77,10 @@ def test_unknown_operational_field_is_rejected() -> None:
 
 def test_budget_is_optional_and_parsed_as_exact_nano_usd() -> None:
     assert BudgetConfig().openrouter_nano_usd_per_run() is None
-    assert BudgetConfig(openrouter_usd_per_run="2.50").openrouter_nano_usd_per_run() == 2_500_000_000
+    assert (
+        BudgetConfig(openrouter_usd_per_run="2.50").openrouter_nano_usd_per_run()
+        == 2_500_000_000
+    )
 
 
 @pytest.mark.parametrize("value", ["-1.00", "1.0000000001", "abc", "1e3", "NaN", ""])
@@ -91,7 +102,9 @@ def test_loaded_graph_exposes_operational_settings(tmp_path: Path) -> None:
     assert loaded.main.pacing.mediawiki_min_interval_ms == 900
 
 
-def test_snapshot_records_operational_bounds_but_no_secret_value(tmp_path: Path) -> None:
+def test_snapshot_records_operational_bounds_but_no_secret_value(
+    tmp_path: Path,
+) -> None:
     config_file = write_graph(tmp_path)
     loaded = load_config(config_file, environ=ENVIRONMENT)
     assert '"max_redirects":5' in loaded.snapshot_json
@@ -106,7 +119,9 @@ def test_invalid_operational_bound_fails_before_any_run(tmp_path: Path) -> None:
     assert any("concurrency.http_workers" in error for error in raised.value.errors)
 
 
-def test_main_config_still_validates_without_operational_sections(tmp_path: Path) -> None:
+def test_main_config_still_validates_without_operational_sections(
+    tmp_path: Path,
+) -> None:
     config_file = write_graph(tmp_path, operational="")
     loaded = load_config(config_file, environ=ENVIRONMENT)
     assert isinstance(loaded.main, MainConfig)

@@ -52,7 +52,8 @@ def add_work(connection: sqlite3.Connection, *, state: str, fingerprint: str) ->
             priority, eligible_at, state, created_at, updated_at
         )
         VALUES ('detect_people', 'source_item', 1, ?, 1,
-                100, '2026-07-25T06:00:00Z', ?, '2026-07-25T06:00:00Z', '2026-07-25T06:00:00Z')
+                100, '2026-07-25T06:00:00Z', ?,
+                '2026-07-25T06:00:00Z', '2026-07-25T06:00:00Z')
         """,
         (fingerprint, state),
     )
@@ -61,7 +62,8 @@ def add_work(connection: sqlite3.Connection, *, state: str, fingerprint: str) ->
 
 def test_migration_0002_is_applied(connection: sqlite3.Connection) -> None:
     versions = {
-        row["version"] for row in connection.execute("SELECT version FROM schema_migration")
+        row["version"]
+        for row in connection.execute("SELECT version FROM schema_migration")
     }
     assert {1, 2} <= versions
 
@@ -69,7 +71,9 @@ def test_migration_0002_is_applied(connection: sqlite3.Connection) -> None:
 def test_operations_tables_exist(connection: sqlite3.Connection) -> None:
     names = {
         row["name"]
-        for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
     }
     assert {"run", "run_transition", "work_item", "attempt"} <= names
 
@@ -80,11 +84,14 @@ def test_run_state_vocabulary_is_constrained(connection: sqlite3.Connection) -> 
         connection.execute("UPDATE run SET state = 'succeeded' WHERE id = ?", (run_id,))
 
 
-def test_running_run_must_not_have_a_finish_time(connection: sqlite3.Connection) -> None:
+def test_running_run_must_not_have_a_finish_time(
+    connection: sqlite3.Connection,
+) -> None:
     run_id = start_run(connection)
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
-            "UPDATE run SET finished_at = '2026-07-25T07:00:00Z' WHERE id = ?", (run_id,)
+            "UPDATE run SET finished_at = '2026-07-25T07:00:00Z' WHERE id = ?",
+            (run_id,),
         )
 
 
@@ -93,24 +100,33 @@ def test_terminal_run_requires_a_finish_time(connection: sqlite3.Connection) -> 
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute("UPDATE run SET state = 'complete' WHERE id = ?", (run_id,))
     connection.execute(
-        "UPDATE run SET state = 'complete', finished_at = '2026-07-25T07:00:00Z' WHERE id = ?",
+        "UPDATE run SET state = 'complete', "
+        "finished_at = '2026-07-25T07:00:00Z' WHERE id = ?",
         (run_id,),
     )
 
 
-def test_one_active_work_item_per_task_and_fingerprint(connection: sqlite3.Connection) -> None:
+def test_one_active_work_item_per_task_and_fingerprint(
+    connection: sqlite3.Connection,
+) -> None:
     add_work(connection, state="pending", fingerprint="b" * 64)
     with pytest.raises(sqlite3.IntegrityError):
         add_work(connection, state="running", fingerprint="b" * 64)
 
 
-def test_completed_work_does_not_block_a_new_active_item(connection: sqlite3.Connection) -> None:
+def test_completed_work_does_not_block_a_new_active_item(
+    connection: sqlite3.Connection,
+) -> None:
     first = add_work(connection, state="pending", fingerprint="c" * 64)
-    connection.execute("UPDATE work_item SET state = 'superseded' WHERE id = ?", (first,))
+    connection.execute(
+        "UPDATE work_item SET state = 'superseded' WHERE id = ?", (first,)
+    )
     add_work(connection, state="pending", fingerprint="c" * 64)
 
 
-def test_attempt_ordinal_is_unique_within_a_work_item(connection: sqlite3.Connection) -> None:
+def test_attempt_ordinal_is_unique_within_a_work_item(
+    connection: sqlite3.Connection,
+) -> None:
     run_id = start_run(connection)
     work_id = add_work(connection, state="running", fingerprint="d" * 64)
     for ordinal in (1, 2):
@@ -137,7 +153,9 @@ def test_attempt_ordinal_is_unique_within_a_work_item(connection: sqlite3.Connec
         )
 
 
-def test_failed_attempt_requires_a_failure_category(connection: sqlite3.Connection) -> None:
+def test_failed_attempt_requires_a_failure_category(
+    connection: sqlite3.Connection,
+) -> None:
     run_id = start_run(connection)
     work_id = add_work(connection, state="running", fingerprint="f" * 64)
     cursor = connection.execute(
@@ -153,7 +171,8 @@ def test_failed_attempt_requires_a_failure_category(connection: sqlite3.Connecti
     attempt_id = int(cursor.lastrowid)
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
-            "UPDATE attempt SET outcome = 'failed', finished_at = '2026-07-25T06:00:01Z' WHERE id = ?",
+            "UPDATE attempt SET outcome = 'failed', "
+            "finished_at = '2026-07-25T06:00:01Z' WHERE id = ?",
             (attempt_id,),
         )
     connection.execute(
@@ -196,7 +215,9 @@ def test_money_columns_reject_negative_values(connection: sqlite3.Connection) ->
         )
 
 
-def test_work_item_requires_an_existing_run_reference(connection: sqlite3.Connection) -> None:
+def test_work_item_requires_an_existing_run_reference(
+    connection: sqlite3.Connection,
+) -> None:
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
             """

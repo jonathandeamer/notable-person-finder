@@ -101,7 +101,9 @@ def _redact_deep(
                 )
                 for key, item in value.items()
             }
-        return [_redact_deep(item, secrets, _seen=seen, _depth=_depth + 1) for item in value]
+        return [
+            _redact_deep(item, secrets, _seen=seen, _depth=_depth + 1) for item in value
+        ]
 
     if value is None or isinstance(value, (int, float, bool)):
         return value
@@ -222,7 +224,9 @@ class _RedactionFilter(logging.Filter):
                         for key, value in record.args.items()
                     }
                 else:
-                    record.args = tuple(_redact_arg(arg, self._secrets) for arg in record.args)
+                    record.args = tuple(
+                        _redact_arg(arg, self._secrets) for arg in record.args
+                    )
 
             if hasattr(record, "event"):
                 record.event = _redact_deep(record.event, self._secrets)  # type: ignore[attr-defined]
@@ -283,7 +287,9 @@ class _RedactingJsonFormatter(logging.Formatter):
         if exception_text:
             payload["exception"] = exception_text
 
-        rendered = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        rendered = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), default=str
+        )
         return redact(rendered, self._secrets)
 
 

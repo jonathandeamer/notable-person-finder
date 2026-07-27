@@ -87,7 +87,9 @@ def test_no_cap_means_unlimited_reservations(database: Path) -> None:
     connection.close()
 
 
-def test_reconciliation_replaces_the_reservation_with_the_actual_cost(database: Path) -> None:
+def test_reconciliation_replaces_the_reservation_with_the_actual_cost(
+    database: Path,
+) -> None:
     connection = connect_database(database)
     run_id = make_run(connection, 1_000_000_000)
     work_id = add_work(connection, state="running", fingerprint="a" * 64)
@@ -243,7 +245,9 @@ def test_reconciling_with_no_prior_reserve_is_refused(database: Path) -> None:
     connection.close()
 
 
-def test_reserve_in_transaction_refuses_a_connection_without_one(database: Path) -> None:
+def test_reserve_in_transaction_refuses_a_connection_without_one(
+    database: Path,
+) -> None:
     connection = connect_database(database)
     run_id = make_run(connection, 1_000_000_000)
     assert not connection.in_transaction
@@ -264,7 +268,9 @@ def test_reserve_in_transaction_succeeds_inside_a_caller_owned_transaction(
     connection.close()
 
 
-def test_reconcile_in_transaction_refuses_a_connection_without_one(database: Path) -> None:
+def test_reconcile_in_transaction_refuses_a_connection_without_one(
+    database: Path,
+) -> None:
     connection = connect_database(database)
     run_id = make_run(connection, 1_000_000_000)
     assert not connection.in_transaction
@@ -343,9 +349,12 @@ def test_concurrent_reservations_cannot_oversubscribe(database: Path) -> None:
     assert all(isinstance(outcome, BudgetExhausted) for outcome in refused), refused
 
     verify = connect_database(database, readonly=True)
-    assert verify.execute(
-        "SELECT budget_reserved_nano_usd FROM run WHERE id = ?", (run_id,)
-    ).fetchone()["budget_reserved_nano_usd"] == 900_000_000
+    assert (
+        verify.execute(
+            "SELECT budget_reserved_nano_usd FROM run WHERE id = ?", (run_id,)
+        ).fetchone()["budget_reserved_nano_usd"]
+        == 900_000_000
+    )
     verify.close()
 
 
@@ -370,7 +379,9 @@ def test_reserve_refuses_to_reuse_a_connection_already_mid_transaction(
     """
     connection = connect_database(database)
     run_id = make_run(connection, 1_000_000_000)
-    connection.execute("UPDATE run SET budget_reserved_nano_usd = 0 WHERE id = ?", (run_id,))
+    connection.execute(
+        "UPDATE run SET budget_reserved_nano_usd = 0 WHERE id = ?", (run_id,)
+    )
     assert connection.in_transaction
     with pytest.raises(sqlite3.OperationalError, match="within a transaction"):
         reserve(connection, run_id=run_id, nano_usd=100_000_000)

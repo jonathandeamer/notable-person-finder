@@ -149,7 +149,7 @@ def test_results_are_yielded_on_the_calling_thread() -> None:
     observed: list[int] = []
 
     with BoundedScheduler(max_workers=3) as scheduler:
-        for completion in scheduler.run(range(6), lambda value: value):
+        for _completion in scheduler.run(range(6), lambda value: value):
             observed.append(threading.get_ident())
     assert set(observed) == {caller}
 

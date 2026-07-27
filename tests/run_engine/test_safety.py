@@ -12,11 +12,16 @@ PUBLIC = StaticHostResolver({"example.com": ("93.184.216.34",)})
 
 
 def test_public_https_url_is_accepted() -> None:
-    assert assert_safe_url("https://example.com/feed.xml", resolver=PUBLIC) == "example.com"
+    assert (
+        assert_safe_url("https://example.com/feed.xml", resolver=PUBLIC)
+        == "example.com"
+    )
 
 
 def test_public_http_url_is_accepted() -> None:
-    assert assert_safe_url("http://example.com/feed.xml", resolver=PUBLIC) == "example.com"
+    assert (
+        assert_safe_url("http://example.com/feed.xml", resolver=PUBLIC) == "example.com"
+    )
 
 
 @pytest.mark.parametrize(
@@ -42,14 +47,14 @@ def test_embedded_credentials_are_rejected() -> None:
 @pytest.mark.parametrize(
     "address",
     [
-        "127.0.0.1",       # loopback
-        "10.0.0.5",        # private
-        "192.168.1.10",    # private
-        "169.254.169.254", # link-local metadata endpoint
-        "224.0.0.1",       # multicast
-        "0.0.0.0",         # reserved
-        "::1",             # IPv6 loopback
-        "fd00::1",         # IPv6 unique local
+        "127.0.0.1",  # loopback
+        "10.0.0.5",  # private
+        "192.168.1.10",  # private
+        "169.254.169.254",  # link-local metadata endpoint
+        "224.0.0.1",  # multicast
+        "0.0.0.0",  # reserved
+        "::1",  # IPv6 loopback
+        "fd00::1",  # IPv6 unique local
     ],
 )
 def test_non_public_resolved_addresses_are_rejected(address: str) -> None:
@@ -78,4 +83,6 @@ def test_unresolvable_host_is_rejected() -> None:
 
 
 def test_ordinary_public_ports_are_permitted() -> None:
-    assert assert_safe_url("https://example.com:8443/x", resolver=PUBLIC) == "example.com"
+    assert (
+        assert_safe_url("https://example.com:8443/x", resolver=PUBLIC) == "example.com"
+    )

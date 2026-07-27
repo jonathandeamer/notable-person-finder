@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import zlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from types import TracebackType
 from typing import Any, Literal
 from urllib.parse import urlsplit
-import zlib
 
 import httpx
 
@@ -16,7 +16,11 @@ from notable_person_finder.providers.failures import (
     ProviderFailure,
     parse_retry_after,
 )
-from notable_person_finder.providers.safety import HostResolver, UnsafeUrl, assert_safe_url
+from notable_person_finder.providers.safety import (
+    HostResolver,
+    UnsafeUrl,
+    assert_safe_url,
+)
 from notable_person_finder.runs.clock import Clock
 
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -64,7 +68,9 @@ def _origin(url: str) -> tuple[str, str, int]:
     parsed = urlsplit(url)
     scheme = parsed.scheme.lower()
     host = (parsed.hostname or "").lower()
-    port = parsed.port if parsed.port is not None else (443 if scheme == "https" else 80)
+    port = (
+        parsed.port if parsed.port is not None else (443 if scheme == "https" else 80)
+    )
     return (scheme, host, port)
 
 
@@ -285,7 +291,9 @@ class HttpTransport:
         try:
             response = self._client.send(request, stream=True)
         except Exception as error:  # translated below; no httpx type escapes
-            raise self._translate(error, provider=provider, operation=operation) from error
+            raise self._translate(
+                error, provider=provider, operation=operation
+            ) from error
 
         try:
             if response.status_code in _REDIRECT_STATUSES:
@@ -300,7 +308,9 @@ class HttpTransport:
                 return str(httpx.URL(url).join(location))
 
             if response.status_code >= 400:
-                raise self._status_failure(response, provider=provider, operation=operation)
+                raise self._status_failure(
+                    response, provider=provider, operation=operation
+                )
 
             try:
                 content, encoded_bytes = _bounded_body(response, byte_limit=byte_limit)
@@ -330,7 +340,9 @@ class HttpTransport:
         except ProviderFailure:
             raise
         except Exception as error:
-            raise self._translate(error, provider=provider, operation=operation) from error
+            raise self._translate(
+                error, provider=provider, operation=operation
+            ) from error
         finally:
             response.close()
 

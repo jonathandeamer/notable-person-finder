@@ -37,7 +37,9 @@ def new_run(connection: sqlite3.Connection, *, at: str = "2026-07-25T06:00:00Z")
     )
 
 
-def add_pending_work(connection: sqlite3.Connection, *, run_id: int, fingerprint: str) -> int:
+def add_pending_work(
+    connection: sqlite3.Connection, *, run_id: int, fingerprint: str
+) -> int:
     cursor = connection.execute(
         """
         INSERT INTO work_item (
@@ -54,17 +56,27 @@ def add_pending_work(connection: sqlite3.Connection, *, run_id: int, fingerprint
     return int(cursor.lastrowid)
 
 
-def test_snapshot_is_stored_once_per_fingerprint(connection: sqlite3.Connection) -> None:
+def test_snapshot_is_stored_once_per_fingerprint(
+    connection: sqlite3.Connection,
+) -> None:
     first = repository.store_snapshot(
-        connection, fingerprint="b" * 64, canonical_json="{}", now="2026-07-25T06:00:00Z"
+        connection,
+        fingerprint="b" * 64,
+        canonical_json="{}",
+        now="2026-07-25T06:00:00Z",
     )
     second = repository.store_snapshot(
-        connection, fingerprint="b" * 64, canonical_json="{}", now="2026-07-25T07:00:00Z"
+        connection,
+        fingerprint="b" * 64,
+        canonical_json="{}",
+        now="2026-07-25T07:00:00Z",
     )
     assert first == second
 
 
-def test_creating_a_run_records_the_running_transition(connection: sqlite3.Connection) -> None:
+def test_creating_a_run_records_the_running_transition(
+    connection: sqlite3.Connection,
+) -> None:
     run_id = new_run(connection)
     record = repository.load_run(connection, run_id=run_id)
     assert record.state is RunState.RUNNING
@@ -79,13 +91,17 @@ def test_creating_a_run_records_the_running_transition(connection: sqlite3.Conne
     assert states == ["running"]
 
 
-def test_every_invocation_creates_a_new_run_on_the_same_day(connection: sqlite3.Connection) -> None:
+def test_every_invocation_creates_a_new_run_on_the_same_day(
+    connection: sqlite3.Connection,
+) -> None:
     first = new_run(connection)
     second = new_run(connection)
     assert first != second
 
 
-def test_finishing_a_run_sets_state_time_and_transition(connection: sqlite3.Connection) -> None:
+def test_finishing_a_run_sets_state_time_and_transition(
+    connection: sqlite3.Connection,
+) -> None:
     run_id = new_run(connection)
     repository.finish_run(
         connection,
@@ -109,7 +125,9 @@ def test_finishing_a_run_sets_state_time_and_transition(connection: sqlite3.Conn
     assert states == ["running", "complete"]
 
 
-def test_sweep_marks_an_abandoned_run_interrupted(connection: sqlite3.Connection) -> None:
+def test_sweep_marks_an_abandoned_run_interrupted(
+    connection: sqlite3.Connection,
+) -> None:
     abandoned = new_run(connection)
     result = repository.sweep_interrupted(connection, now="2026-07-25T07:00:00Z")
     assert result.runs == (abandoned,)
@@ -118,7 +136,9 @@ def test_sweep_marks_an_abandoned_run_interrupted(connection: sqlite3.Connection
     assert record.finished_at == "2026-07-25T07:00:00Z"
 
 
-def test_sweep_returns_abandoned_running_work_to_pending(connection: sqlite3.Connection) -> None:
+def test_sweep_returns_abandoned_running_work_to_pending(
+    connection: sqlite3.Connection,
+) -> None:
     abandoned = new_run(connection)
     work_id = add_pending_work(connection, run_id=abandoned, fingerprint="d" * 64)
     connection.execute(
@@ -136,7 +156,9 @@ def test_sweep_returns_abandoned_running_work_to_pending(connection: sqlite3.Con
     assert row["claimed_by_run_id"] is None
 
 
-def test_sweep_marks_in_flight_attempts_interrupted(connection: sqlite3.Connection) -> None:
+def test_sweep_marks_in_flight_attempts_interrupted(
+    connection: sqlite3.Connection,
+) -> None:
     abandoned = new_run(connection)
     work_id = add_pending_work(connection, run_id=abandoned, fingerprint="e" * 64)
     connection.execute(
@@ -178,7 +200,9 @@ def test_latest_run_returns_the_most_recent(connection: sqlite3.Connection) -> N
     assert repository.latest_run(connection).id == second
 
 
-def test_latest_run_is_none_on_an_empty_database(connection: sqlite3.Connection) -> None:
+def test_latest_run_is_none_on_an_empty_database(
+    connection: sqlite3.Connection,
+) -> None:
     assert repository.latest_run(connection) is None
 
 

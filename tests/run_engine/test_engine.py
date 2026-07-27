@@ -30,67 +30,123 @@ NOW = "2026-07-25T06:00:00Z"
 
 # --- pure terminal-state rules -------------------------------------------------
 
+
 def test_no_outstanding_required_work_is_complete() -> None:
-    assert derive_run_state(
-        required_pending=0, required_deferred=0, required_failed_permanent=0,
-        meaningful_results=False, reporting_failed=False
-    ) is RunState.COMPLETE
+    assert (
+        derive_run_state(
+            required_pending=0,
+            required_deferred=0,
+            required_failed_permanent=0,
+            meaningful_results=False,
+            reporting_failed=False,
+        )
+        is RunState.COMPLETE
+    )
 
 
 def test_an_empty_run_is_complete_not_failed() -> None:
-    assert derive_run_state(
-        required_pending=0, required_deferred=0, required_failed_permanent=0,
-        meaningful_results=False, reporting_failed=False
-    ) is RunState.COMPLETE
+    assert (
+        derive_run_state(
+            required_pending=0,
+            required_deferred=0,
+            required_failed_permanent=0,
+            meaningful_results=False,
+            reporting_failed=False,
+        )
+        is RunState.COMPLETE
+    )
 
 
 def test_deferred_required_work_makes_the_run_partial() -> None:
-    assert derive_run_state(
-        required_pending=0, required_deferred=2, required_failed_permanent=0,
-        meaningful_results=True, reporting_failed=False
-    ) is RunState.PARTIAL
+    assert (
+        derive_run_state(
+            required_pending=0,
+            required_deferred=2,
+            required_failed_permanent=0,
+            meaningful_results=True,
+            reporting_failed=False,
+        )
+        is RunState.PARTIAL
+    )
 
 
 def test_unevaluated_required_work_makes_the_run_partial() -> None:
-    assert derive_run_state(
-        required_pending=3, required_deferred=0, required_failed_permanent=0,
-        meaningful_results=True, reporting_failed=False
-    ) is RunState.PARTIAL
+    assert (
+        derive_run_state(
+            required_pending=3,
+            required_deferred=0,
+            required_failed_permanent=0,
+            meaningful_results=True,
+            reporting_failed=False,
+        )
+        is RunState.PARTIAL
+    )
 
 
 def test_a_reporting_failure_makes_the_run_failed() -> None:
-    assert derive_run_state(
-        required_pending=0, required_deferred=0, required_failed_permanent=0,
-        meaningful_results=True, reporting_failed=True
-    ) is RunState.FAILED
-    assert derive_run_state(
-        required_pending=1, required_deferred=1, required_failed_permanent=0,
-        meaningful_results=True, reporting_failed=True
-    ) is RunState.FAILED
+    assert (
+        derive_run_state(
+            required_pending=0,
+            required_deferred=0,
+            required_failed_permanent=0,
+            meaningful_results=True,
+            reporting_failed=True,
+        )
+        is RunState.FAILED
+    )
+    assert (
+        derive_run_state(
+            required_pending=1,
+            required_deferred=1,
+            required_failed_permanent=0,
+            meaningful_results=True,
+            reporting_failed=True,
+        )
+        is RunState.FAILED
+    )
 
 
 def test_required_permanent_failure_is_never_complete() -> None:
-    assert derive_run_state(
-        required_pending=0, required_deferred=0, required_failed_permanent=1,
-        meaningful_results=True, reporting_failed=False
-    ) is RunState.PARTIAL
-    assert derive_run_state(
-        required_pending=0, required_deferred=0, required_failed_permanent=1,
-        meaningful_results=False, reporting_failed=False
-    ) is RunState.FAILED
+    assert (
+        derive_run_state(
+            required_pending=0,
+            required_deferred=0,
+            required_failed_permanent=1,
+            meaningful_results=True,
+            reporting_failed=False,
+        )
+        is RunState.PARTIAL
+    )
+    assert (
+        derive_run_state(
+            required_pending=0,
+            required_deferred=0,
+            required_failed_permanent=1,
+            meaningful_results=False,
+            reporting_failed=False,
+        )
+        is RunState.FAILED
+    )
 
 
 def test_a_meaningless_permanent_failure_outranks_outstanding_work() -> None:
     # Outstanding work alone is only PARTIAL, so this pins the precedence:
     # the permanent-failure rule is consulted before the outstanding-work rule
     # and can still reach FAILED when nothing meaningful was produced.
-    assert derive_run_state(
-        required_pending=4, required_deferred=2, required_failed_permanent=1,
-        meaningful_results=False, reporting_failed=False
-    ) is RunState.FAILED
+    assert (
+        derive_run_state(
+            required_pending=4,
+            required_deferred=2,
+            required_failed_permanent=1,
+            meaningful_results=False,
+            reporting_failed=False,
+        )
+        is RunState.FAILED
+    )
 
 
 # --- engine behaviour ----------------------------------------------------------
+
 
 @pytest.fixture
 def database(tmp_path: Path) -> Path:
@@ -140,7 +196,9 @@ def succeeding_handler(calls: list[int]) -> TaskHandler:
     )
 
 
-def schedule_probe(connection: sqlite3.Connection, fingerprint: str, *, required: bool = True) -> int:
+def schedule_probe(
+    connection: sqlite3.Connection, fingerprint: str, *, required: bool = True
+) -> int:
     return repository.schedule_work(
         connection,
         task_type="probe",
@@ -175,15 +233,17 @@ def test_eligible_work_is_executed_and_marked_succeeded(database: Path) -> None:
     assert calls == [work_id]
     assert report.state is RunState.COMPLETE
     assert (
-        connection.execute("SELECT state FROM work_item WHERE id = ?", (work_id,)).fetchone()[
-            "state"
-        ]
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (work_id,)
+        ).fetchone()["state"]
         == WorkState.SUCCEEDED
     )
     connection.close()
 
 
-def test_run_counters_do_not_include_historical_work_or_attempts(database: Path) -> None:
+def test_run_counters_do_not_include_historical_work_or_attempts(
+    database: Path,
+) -> None:
     connection = connect_database(database)
     schedule_probe(connection, "7" * 64)
     handler = succeeding_handler([])
@@ -220,9 +280,7 @@ def test_budget_is_reserved_before_the_call_and_actual_cost_is_reconciled(
             "SELECT budget_reserved_nano_usd FROM run ORDER BY id DESC LIMIT 1"
         ).fetchone()
         assert row["budget_reserved_nano_usd"] == 400
-        return TaskOutcome(
-            state=WorkState.SUCCEEDED, reason=None, actual_nano_usd=120
-        )
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None, actual_nano_usd=120)
 
     handler = TaskHandler(
         task_type="probe",
@@ -231,17 +289,23 @@ def test_budget_is_reserved_before_the_call_and_actual_cost_is_reconciled(
         execute=execute,
         reserved_nano_usd=400,
     )
-    report = build_engine(
-        connection, FakeClock(), budget_limit_nano_usd=1000
-    ).execute({handler.task_type: handler})
+    report = build_engine(connection, FakeClock(), budget_limit_nano_usd=1000).execute(
+        {handler.task_type: handler}
+    )
     row = connection.execute(
         "SELECT budget_reserved_nano_usd, budget_actual_nano_usd FROM run WHERE id = ?",
         (report.run_id,),
     ).fetchone()
-    assert (row["budget_reserved_nano_usd"], row["budget_actual_nano_usd"]) == (120, 120)
-    assert connection.execute(
-        "SELECT actual_nano_usd FROM attempt WHERE run_id = ?", (report.run_id,)
-    ).fetchone()["actual_nano_usd"] == 120
+    assert (row["budget_reserved_nano_usd"], row["budget_actual_nano_usd"]) == (
+        120,
+        120,
+    )
+    assert (
+        connection.execute(
+            "SELECT actual_nano_usd FROM attempt WHERE run_id = ?", (report.run_id,)
+        ).fetchone()["actual_nano_usd"]
+        == 120
+    )
     connection.close()
 
 
@@ -253,24 +317,29 @@ def test_refused_budget_reservation_makes_no_external_call(database: Path) -> No
         task_type="probe",
         provider="openrouter",
         operation="generate_structured",
-        execute=lambda work, ordinal: calls.append(ordinal) or TaskOutcome(
-            state=WorkState.SUCCEEDED, reason=None
+        execute=lambda work, ordinal: (
+            calls.append(ordinal) or TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
         ),
         reserved_nano_usd=200,
     )
-    report = build_engine(
-        connection, FakeClock(), budget_limit_nano_usd=100
-    ).execute({handler.task_type: handler})
+    report = build_engine(connection, FakeClock(), budget_limit_nano_usd=100).execute(
+        {handler.task_type: handler}
+    )
     assert calls == []
     assert report.state is RunState.PARTIAL
-    assert connection.execute(
-        "SELECT state FROM work_item WHERE id = ?", (work_id,)
-    ).fetchone()["state"] == WorkState.DEFERRED
+    assert (
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (work_id,)
+        ).fetchone()["state"]
+        == WorkState.DEFERRED
+    )
     assert repository.attempts_for_run(connection, run_id=report.run_id) == ()
     connection.close()
 
 
-def test_a_transient_failure_is_retried_and_both_attempts_persist(database: Path) -> None:
+def test_a_transient_failure_is_retried_and_both_attempts_persist(
+    database: Path,
+) -> None:
     connection = connect_database(database)
     schedule_probe(connection, "d" * 64)
 
@@ -285,11 +354,17 @@ def test_a_transient_failure_is_retried_and_both_attempts_persist(database: Path
         return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
 
     handler = TaskHandler(
-        task_type="probe", provider="probe_provider", operation="probe_call", execute=execute
+        task_type="probe",
+        provider="probe_provider",
+        operation="probe_call",
+        execute=execute,
     )
     report = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
 
-    outcomes = [row["outcome"] for row in repository.attempts_for_run(connection, run_id=report.run_id)]
+    outcomes = [
+        row["outcome"]
+        for row in repository.attempts_for_run(connection, run_id=report.run_id)
+    ]
     assert outcomes == ["failed", "succeeded"]
     assert report.state is RunState.COMPLETE
     assert report.failure_categories == {"transient_server_error": 1}
@@ -315,7 +390,10 @@ def test_attempt_ordinals_continue_across_runs_for_re_attempted_work(
         )
 
     handler = TaskHandler(
-        task_type="probe", provider="probe_provider", operation="probe_call", execute=execute
+        task_type="probe",
+        provider="probe_provider",
+        operation="probe_call",
+        execute=execute,
     )
     # max_attempts=2, so each run burns two ordinals and defers the item.
     first = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
@@ -336,7 +414,9 @@ def test_attempt_ordinals_continue_across_runs_for_re_attempted_work(
     connection.close()
 
 
-def test_exhausted_transient_work_is_deferred_and_the_run_is_partial(database: Path) -> None:
+def test_exhausted_transient_work_is_deferred_and_the_run_is_partial(
+    database: Path,
+) -> None:
     connection = connect_database(database)
     work_id = schedule_probe(connection, "e" * 64)
 
@@ -346,15 +426,18 @@ def test_exhausted_transient_work_is_deferred_and_the_run_is_partial(database: P
         )
 
     handler = TaskHandler(
-        task_type="probe", provider="probe_provider", operation="probe_call", execute=execute
+        task_type="probe",
+        provider="probe_provider",
+        operation="probe_call",
+        execute=execute,
     )
     report = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
 
     assert report.state is RunState.PARTIAL
     assert (
-        connection.execute("SELECT state FROM work_item WHERE id = ?", (work_id,)).fetchone()[
-            "state"
-        ]
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (work_id,)
+        ).fetchone()["state"]
         == WorkState.DEFERRED
     )
     connection.close()
@@ -375,14 +458,17 @@ def test_a_permanent_failure_without_useful_results_fails_the_run(
         )
 
     handler = TaskHandler(
-        task_type="probe", provider="probe_provider", operation="probe_call", execute=execute
+        task_type="probe",
+        provider="probe_provider",
+        operation="probe_call",
+        execute=execute,
     )
     report = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
 
     assert (
-        connection.execute("SELECT state FROM work_item WHERE id = ?", (work_id,)).fetchone()[
-            "state"
-        ]
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (work_id,)
+        ).fetchone()["state"]
         == WorkState.FAILED_PERMANENT
     )
     assert report.state is RunState.FAILED
@@ -406,7 +492,10 @@ def test_one_item_failure_does_not_stop_unrelated_work(database: Path) -> None:
         return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
 
     handler = TaskHandler(
-        task_type="probe", provider="probe_provider", operation="probe_call", execute=execute
+        task_type="probe",
+        provider="probe_provider",
+        operation="probe_call",
+        execute=execute,
     )
     build_engine(connection, FakeClock()).execute({handler.task_type: handler})
 
@@ -433,7 +522,10 @@ def test_work_for_a_paused_provider_is_deferred(database: Path) -> None:
         )
 
     handler = TaskHandler(
-        task_type="probe", provider="probe_provider", operation="probe_call", execute=execute
+        task_type="probe",
+        provider="probe_provider",
+        operation="probe_call",
+        execute=execute,
     )
     clock = FakeClock()
     engine = RunEngine(
@@ -484,7 +576,9 @@ def test_the_engine_sweeps_an_abandoned_predecessor_first(database: Path) -> Non
     report = build_engine(connection, FakeClock()).execute({})
 
     assert report.interrupted_runs == (abandoned,)
-    assert repository.load_run(connection, run_id=abandoned).state is RunState.INTERRUPTED
+    assert (
+        repository.load_run(connection, run_id=abandoned).state is RunState.INTERRUPTED
+    )
     assert report.run_id != abandoned
     connection.close()
 
@@ -499,7 +593,10 @@ def test_no_transaction_is_open_while_a_handler_runs(database: Path) -> None:
         return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
 
     handler = TaskHandler(
-        task_type="probe", provider="probe_provider", operation="probe_call", execute=execute
+        task_type="probe",
+        provider="probe_provider",
+        operation="probe_call",
+        execute=execute,
     )
     build_engine(connection, FakeClock()).execute({handler.task_type: handler})
     assert observed == [False]
@@ -523,9 +620,9 @@ def test_work_without_a_registered_handler_stays_pending(database: Path) -> None
     report = build_engine(connection, FakeClock()).execute({})
     assert report.state is RunState.PARTIAL
     assert (
-        connection.execute("SELECT state FROM work_item WHERE id = ?", (work_id,)).fetchone()[
-            "state"
-        ]
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (work_id,)
+        ).fetchone()["state"]
         == WorkState.PENDING
     )
     connection.close()
@@ -615,7 +712,8 @@ def test_reporting_failure_is_the_only_terminal_transition(database: Path) -> No
     transitions = [
         row["state"]
         for row in connection.execute(
-            "SELECT state FROM run_transition WHERE run_id = ? ORDER BY id", (latest.id,)
+            "SELECT state FROM run_transition WHERE run_id = ? ORDER BY id",
+            (latest.id,),
         )
     ]
     assert transitions == ["running", "failed"]
@@ -657,9 +755,9 @@ def test_a_failed_attempt_keeps_its_reservation_and_can_refuse_the_retry(
         execute=execute,
         reserved_nano_usd=60,
     )
-    report = build_engine(
-        connection, FakeClock(), budget_limit_nano_usd=100
-    ).execute({handler.task_type: handler})
+    report = build_engine(connection, FakeClock(), budget_limit_nano_usd=100).execute(
+        {handler.task_type: handler}
+    )
 
     assert ordinals == [1]
     row = connection.execute(
@@ -681,7 +779,9 @@ def test_a_failed_attempt_keeps_its_reservation_and_can_refuse_the_retry(
     connection.close()
 
 
-def test_a_handler_that_returns_a_non_settling_state_is_rejected(database: Path) -> None:
+def test_a_handler_that_returns_a_non_settling_state_is_rejected(
+    database: Path,
+) -> None:
     """A handler may not hand back a state that would leave the item claimable.
 
     Without this guard the engine's peek-and-settle loop would re-select the

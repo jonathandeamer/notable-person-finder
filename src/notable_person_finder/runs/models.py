@@ -26,7 +26,9 @@ class WorkState(StrEnum):
     SUPERSEDED = "superseded"
 
 
-ACTIVE_WORK_STATES = frozenset({WorkState.PENDING, WorkState.RUNNING, WorkState.DEFERRED})
+ACTIVE_WORK_STATES = frozenset(
+    {WorkState.PENDING, WorkState.RUNNING, WorkState.DEFERRED}
+)
 
 
 class AttemptOutcome(StrEnum):

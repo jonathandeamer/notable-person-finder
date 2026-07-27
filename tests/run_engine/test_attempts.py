@@ -53,12 +53,12 @@ def context(connection: sqlite3.Connection) -> tuple[int, int]:
     return run_id, work_id
 
 
-def start(connection: sqlite3.Connection, context: tuple[int, int], ordinal: int) -> int:
+def start(
+    connection: sqlite3.Connection, context: tuple[int, int], ordinal: int
+) -> int:
     run_id, work_id = context
     function = (
-        repository.claim_and_start_attempt
-        if ordinal == 1
-        else repository.start_attempt
+        repository.claim_and_start_attempt if ordinal == 1 else repository.start_attempt
     )
     return function(
         connection,
@@ -78,7 +78,9 @@ def test_attempt_is_created_in_flight_with_no_outcome(
     connection: sqlite3.Connection, context: tuple[int, int]
 ) -> None:
     attempt_id = start(connection, context, 1)
-    row = connection.execute("SELECT * FROM attempt WHERE id = ?", (attempt_id,)).fetchone()
+    row = connection.execute(
+        "SELECT * FROM attempt WHERE id = ?", (attempt_id,)
+    ).fetchone()
     assert row["outcome"] is None
     assert row["finished_at"] is None
     assert row["destination_host"] == "api.search.brave.com"
@@ -97,7 +99,9 @@ def test_finishing_a_successful_attempt_records_latency_and_bytes(
         detail_json=None,
         now=DONE,
     )
-    row = connection.execute("SELECT * FROM attempt WHERE id = ?", (attempt_id,)).fetchone()
+    row = connection.execute(
+        "SELECT * FROM attempt WHERE id = ?", (attempt_id,)
+    ).fetchone()
     assert row["outcome"] == "succeeded"
     assert row["latency_ms"] == 250
     assert row["response_bytes"] == 4096
@@ -127,7 +131,9 @@ def test_finishing_a_failed_attempt_records_the_typed_category(
         detail_json=None,
         now=DONE,
     )
-    row = connection.execute("SELECT * FROM attempt WHERE id = ?", (attempt_id,)).fetchone()
+    row = connection.execute(
+        "SELECT * FROM attempt WHERE id = ?", (attempt_id,)
+    ).fetchone()
     assert row["outcome"] == "failed"
     assert row["failure_category"] == "rate_limit"
     assert row["provider_status"] == 429
@@ -196,7 +202,9 @@ def test_detail_json_round_trips_through_finish_attempt(
         detail_json='{"resolved_provider":"anthropic"}',
         now=DONE,
     )
-    row = connection.execute("SELECT detail_json FROM attempt WHERE id = ?", (attempt_id,)).fetchone()
+    row = connection.execute(
+        "SELECT detail_json FROM attempt WHERE id = ?", (attempt_id,)
+    ).fetchone()
     assert row["detail_json"] == '{"resolved_provider":"anthropic"}'
 
 
@@ -207,7 +215,8 @@ def test_an_unfinished_attempt_survives_for_the_sweep(
     result = repository.sweep_interrupted(connection, now="2026-07-25T08:00:00Z")
     assert result.attempts == 1
     assert (
-        connection.execute("SELECT outcome FROM attempt").fetchone()["outcome"] == "interrupted"
+        connection.execute("SELECT outcome FROM attempt").fetchone()["outcome"]
+        == "interrupted"
     )
 
 
@@ -243,12 +252,18 @@ def test_first_attempt_updates_work_item_and_budget_columns(
         reserved_nano_usd=400,
         now=NOW,
     )
-    assert connection.execute(
-        "SELECT state FROM work_item WHERE id = ?", (work_id,)
-    ).fetchone()["state"] == "running"
-    assert connection.execute(
-        "SELECT budget_reserved_nano_usd FROM run WHERE id = ?", (run_id,)
-    ).fetchone()["budget_reserved_nano_usd"] == 400
+    assert (
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (work_id,)
+        ).fetchone()["state"]
+        == "running"
+    )
+    assert (
+        connection.execute(
+            "SELECT budget_reserved_nano_usd FROM run WHERE id = ?", (run_id,)
+        ).fetchone()["budget_reserved_nano_usd"]
+        == 400
+    )
 
 
 def test_refused_first_reservation_leaves_work_pending_and_no_attempt(
@@ -274,13 +289,19 @@ def test_refused_first_reservation_leaves_work_pending_and_no_attempt(
             reserved_nano_usd=400,
             now=NOW,
         )
-    assert connection.execute(
-        "SELECT state FROM work_item WHERE id = ?", (work_id,)
-    ).fetchone()["state"] == "pending"
+    assert (
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (work_id,)
+        ).fetchone()["state"]
+        == "pending"
+    )
     assert connection.execute("SELECT COUNT(*) AS n FROM attempt").fetchone()["n"] == 0
-    assert connection.execute(
-        "SELECT budget_reserved_nano_usd FROM run WHERE id = ?", (run_id,)
-    ).fetchone()["budget_reserved_nano_usd"] == 0
+    assert (
+        connection.execute(
+            "SELECT budget_reserved_nano_usd FROM run WHERE id = ?", (run_id,)
+        ).fetchone()["budget_reserved_nano_usd"]
+        == 0
+    )
 
 
 def test_reservation_is_rolled_back_when_the_attempt_insert_fails(
@@ -363,9 +384,12 @@ def test_claim_and_start_attempt_refuses_a_work_item_still_in_backoff(
             reserved_nano_usd=0,
             now=NOW,  # 06:00, before the 09:00 backoff window ends
         )
-    assert connection.execute(
-        "SELECT state FROM work_item WHERE id = ?", (work_id,)
-    ).fetchone()["state"] == "deferred"
+    assert (
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (work_id,)
+        ).fetchone()["state"]
+        == "deferred"
+    )
     assert connection.execute("SELECT COUNT(*) AS n FROM attempt").fetchone()["n"] == 0
 
 
@@ -410,12 +434,18 @@ def test_start_attempt_refuses_a_work_item_owned_by_another_run(
             reserved_nano_usd=0,
             now=NOW,
         )
-    assert connection.execute(
-        "SELECT budget_reserved_nano_usd FROM run WHERE id = ?", (other_run_id,)
-    ).fetchone()["budget_reserved_nano_usd"] == 0
-    assert connection.execute(
-        "SELECT COUNT(*) AS n FROM attempt WHERE ordinal = 2"
-    ).fetchone()["n"] == 0
+    assert (
+        connection.execute(
+            "SELECT budget_reserved_nano_usd FROM run WHERE id = ?", (other_run_id,)
+        ).fetchone()["budget_reserved_nano_usd"]
+        == 0
+    )
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) AS n FROM attempt WHERE ordinal = 2"
+        ).fetchone()["n"]
+        == 0
+    )
 
 
 def test_finish_attempt_refuses_a_mismatched_ordinal(

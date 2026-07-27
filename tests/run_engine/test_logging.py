@@ -10,7 +10,12 @@ from pathlib import Path
 import pytest
 
 from notable_person_finder.config.models import LoggingConfig
-from notable_person_finder.obs.logging import EVENT_LOGGER_NAME, configure_logging, log_event, redact
+from notable_person_finder.obs.logging import (
+    EVENT_LOGGER_NAME,
+    configure_logging,
+    log_event,
+    redact,
+)
 
 
 @pytest.fixture
@@ -60,7 +65,9 @@ def assert_secret_absent(events: object, secret: str) -> None:
 def test_events_are_json_lines_with_the_required_envelope(
     tmp_path: Path, logger: logging.Logger
 ) -> None:
-    log_event(logger, "provider_attempt_finished", run_id=1, attempt_id=9, outcome="succeeded")
+    log_event(
+        logger, "provider_attempt_finished", run_id=1, attempt_id=9, outcome="succeeded"
+    )
     event = read_events(tmp_path)[0]
     assert event["event"] == "provider_attempt_finished"
     assert event["severity"] == "INFO"
@@ -108,7 +115,9 @@ def test_a_secret_value_is_redacted_from_any_field(
     assert "[redacted]" in event["detail"]
 
 
-def test_secrets_with_non_ascii_or_quote_characters_are_redacted(tmp_path: Path) -> None:
+def test_secrets_with_non_ascii_or_quote_characters_are_redacted(
+    tmp_path: Path,
+) -> None:
     # json.dumps escapes non-ASCII characters and quotes by default. If
     # redaction only ran on the rendered JSON text, the escaped form of
     # these secrets would no longer match a plain str.replace and they would
@@ -185,7 +194,10 @@ def test_a_circular_reference_field_does_not_abort_the_run(
     log_event(logger, "run_progress", run_id=1)
 
     events = read_events(tmp_path)
-    assert [event["event"] for event in events] == ["provider_attempt_failed", "run_progress"]
+    assert [event["event"] for event in events] == [
+        "provider_attempt_failed",
+        "run_progress",
+    ]
 
 
 class _RaisesOnStr:
@@ -200,7 +212,10 @@ def test_a_field_whose_str_raises_does_not_abort_the_run(
     log_event(logger, "run_progress", run_id=1)
 
     events = read_events(tmp_path)
-    assert [event["event"] for event in events] == ["provider_attempt_failed", "run_progress"]
+    assert [event["event"] for event in events] == [
+        "provider_attempt_failed",
+        "run_progress",
+    ]
 
 
 def test_percent_style_args_with_non_string_values_still_format(
@@ -217,7 +232,9 @@ def test_percent_style_args_with_non_string_values_still_format(
     assert events[-1]["event"] == "took 5 ms"
 
 
-def test_non_string_percent_args_containing_secrets_are_redacted(tmp_path: Path) -> None:
+def test_non_string_percent_args_containing_secrets_are_redacted(
+    tmp_path: Path,
+) -> None:
     # `record.args` entries that are not already `str` are deliberately left
     # untouched by the filter so %-formatting for numeric specifiers keeps
     # working. Their secret only materialises when `record.getMessage()`
@@ -376,7 +393,9 @@ def test_a_record_the_filter_cannot_fully_scrub_is_dropped(tmp_path: Path) -> No
     assert all("authorization" not in event for event in events)
 
 
-def test_forbidden_fields_are_dropped_even_with_no_secrets_configured(tmp_path: Path) -> None:
+def test_forbidden_fields_are_dropped_even_with_no_secrets_configured(
+    tmp_path: Path,
+) -> None:
     created = configure_logging(
         tmp_path / "logs" / "notable.jsonl",
         LoggingConfig(max_bytes=2048, backup_count=2),
@@ -438,7 +457,9 @@ def test_a_second_handler_on_the_logger_also_receives_redacted_records(
     second_handler.setFormatter(_FieldsFormatter())
     logger.addHandler(second_handler)
     try:
-        log_event(logger, "provider_attempt_failed", detail="key=or-secret-value rejected")
+        log_event(
+            logger, "provider_attempt_failed", detail="key=or-secret-value rejected"
+        )
     finally:
         second_handler.close()
         logger.removeHandler(second_handler)
@@ -496,7 +517,9 @@ def test_third_party_loggers_reaching_root_are_redacted(tmp_path: Path) -> None:
     assert "brave-secret-value" not in stream.getvalue()
 
 
-def test_non_string_percent_args_are_redacted_on_the_root_path_too(tmp_path: Path) -> None:
+def test_non_string_percent_args_are_redacted_on_the_root_path_too(
+    tmp_path: Path,
+) -> None:
     # Handlers we do not own (every pre-existing root handler, and the root
     # safety net) render with their own formatter, so the rendered-message
     # redaction inside _RedactingJsonFormatter cannot protect them. A non-str
@@ -552,7 +575,10 @@ def test_rotation_keeps_the_configured_number_of_files(
 
 
 def test_redact_replaces_every_occurrence() -> None:
-    assert redact("a secret and secret again", ("secret",)) == "a [redacted] and [redacted] again"
+    assert (
+        redact("a secret and secret again", ("secret",))
+        == "a [redacted] and [redacted] again"
+    )
 
 
 def test_redact_ignores_empty_secrets() -> None:

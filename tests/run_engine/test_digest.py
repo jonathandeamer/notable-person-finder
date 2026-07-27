@@ -59,9 +59,13 @@ def test_a_complete_empty_run_is_unambiguously_successful() -> None:
     assert "fail" not in markdown.lower()
 
 
-def test_a_partial_run_warns_prominently_and_names_a_command_that_exists_today() -> None:
+def test_a_partial_run_warns_prominently_and_names_a_command_that_exists_today() -> (
+    None
+):
     counters = RunCounters(2, 1, 3, 0, 0, 0, 5)
-    markdown = render_digest(report(RunState.PARTIAL, counters=counters), local_date="2026-07-25")
+    markdown = render_digest(
+        report(RunState.PARTIAL, counters=counters), local_date="2026-07-25"
+    )
     warning_line = markdown.splitlines()[2]
     assert "PARTIAL" in warning_line
     assert "notable status" in warning_line
@@ -74,14 +78,16 @@ def test_a_failed_run_says_so_prominently() -> None:
 
 def test_paused_providers_appear_in_the_summary() -> None:
     markdown = render_digest(
-        report(RunState.PARTIAL, paused_providers=frozenset({"brave"})), local_date="2026-07-25"
+        report(RunState.PARTIAL, paused_providers=frozenset({"brave"})),
+        local_date="2026-07-25",
     )
     assert "brave" in markdown
 
 
 def test_failure_categories_are_summarized_by_safe_category() -> None:
     markdown = render_digest(
-        report(failure_categories={"rate_limit": 3, "timeout": 1}), local_date="2026-07-25"
+        report(failure_categories={"rate_limit": 3, "timeout": 1}),
+        local_date="2026-07-25",
     )
     assert "rate_limit" in markdown
     assert "timeout" in markdown
@@ -99,18 +105,24 @@ def test_digest_ends_with_exactly_one_trailing_newline() -> None:
 
 
 def test_digest_is_written_with_the_dated_run_filename(tmp_path: Path) -> None:
-    record = write_digest(tmp_path, report(), local_date="2026-07-25", config=DigestConfig())
+    record = write_digest(
+        tmp_path, report(), local_date="2026-07-25", config=DigestConfig()
+    )
     assert record.path == tmp_path / "2026-07-25-run-42.md"
     assert record.path.read_text(encoding="utf-8") == record.markdown
 
 
 def test_content_hash_matches_the_written_bytes(tmp_path: Path) -> None:
-    record = write_digest(tmp_path, report(), local_date="2026-07-25", config=DigestConfig())
+    record = write_digest(
+        tmp_path, report(), local_date="2026-07-25", config=DigestConfig()
+    )
     assert record.sha256 == hashlib.sha256(record.path.read_bytes()).hexdigest()
 
 
 def test_latest_copy_is_written_by_default(tmp_path: Path) -> None:
-    record = write_digest(tmp_path, report(), local_date="2026-07-25", config=DigestConfig())
+    record = write_digest(
+        tmp_path, report(), local_date="2026-07-25", config=DigestConfig()
+    )
     latest = tmp_path / "latest.md"
     assert latest.is_file()
     assert not latest.is_symlink()
@@ -119,13 +131,21 @@ def test_latest_copy_is_written_by_default(tmp_path: Path) -> None:
 
 def test_latest_copy_can_be_disabled(tmp_path: Path) -> None:
     write_digest(
-        tmp_path, report(), local_date="2026-07-25", config=DigestConfig(write_latest_copy=False)
+        tmp_path,
+        report(),
+        local_date="2026-07-25",
+        config=DigestConfig(write_latest_copy=False),
     )
     assert not (tmp_path / "latest.md").exists()
 
 
 def test_latest_always_represents_the_newest_attempt(tmp_path: Path) -> None:
-    write_digest(tmp_path, report(RunState.COMPLETE), local_date="2026-07-25", config=DigestConfig())
+    write_digest(
+        tmp_path,
+        report(RunState.COMPLETE),
+        local_date="2026-07-25",
+        config=DigestConfig(),
+    )
     write_digest(
         tmp_path,
         report(RunState.FAILED, run_id=43),
@@ -136,7 +156,9 @@ def test_latest_always_represents_the_newest_attempt(tmp_path: Path) -> None:
 
 
 def test_dated_digests_are_immutable_across_runs(tmp_path: Path) -> None:
-    first = write_digest(tmp_path, report(), local_date="2026-07-25", config=DigestConfig())
+    first = write_digest(
+        tmp_path, report(), local_date="2026-07-25", config=DigestConfig()
+    )
     write_digest(
         tmp_path, report(run_id=43), local_date="2026-07-25", config=DigestConfig()
     )
@@ -156,7 +178,9 @@ def test_an_unwritable_digest_root_raises_a_typed_error(tmp_path: Path) -> None:
         write_digest(blocked, report(), local_date="2026-07-25", config=DigestConfig())
 
 
-def test_no_partial_file_remains_after_a_failed_write(tmp_path: Path, monkeypatch) -> None:
+def test_no_partial_file_remains_after_a_failed_write(
+    tmp_path: Path, monkeypatch
+) -> None:
     import os
 
     # The dated digest -- the authoritative artifact -- claims its final path
@@ -196,19 +220,33 @@ def test_the_dated_digest_does_not_require_hard_link_support(
     assert (tmp_path / "latest.md").read_text(encoding="utf-8") == record.markdown
 
 
-def test_a_dated_digest_collision_is_refused_and_does_not_overwrite(tmp_path: Path) -> None:
+def test_a_dated_digest_collision_is_refused_and_does_not_overwrite(
+    tmp_path: Path,
+) -> None:
     """The dated digest is documented as immutable. A second write attempt
     for the same run_id and local_date must not silently replace it -- if it
     did, a previously-recorded sha256 would stop matching its own file.
     """
-    first = write_digest(tmp_path, report(RunState.COMPLETE), local_date="2026-07-25", config=DigestConfig())
+    first = write_digest(
+        tmp_path,
+        report(RunState.COMPLETE),
+        local_date="2026-07-25",
+        config=DigestConfig(),
+    )
     with pytest.raises(DigestWriteError):
-        write_digest(tmp_path, report(RunState.FAILED), local_date="2026-07-25", config=DigestConfig())
+        write_digest(
+            tmp_path,
+            report(RunState.FAILED),
+            local_date="2026-07-25",
+            config=DigestConfig(),
+        )
     assert first.path.read_text(encoding="utf-8") == first.markdown
     assert "FAILED" not in first.path.read_text(encoding="utf-8")
 
 
-def test_write_digest_fsyncs_the_digest_directory_after_replace(tmp_path: Path, monkeypatch) -> None:
+def test_write_digest_fsyncs_the_digest_directory_after_replace(
+    tmp_path: Path, monkeypatch
+) -> None:
     """os.replace/os.link are atomic but not durable on their own: without an
     fsync of the directory entry, a crash between write_digest returning and
     the next disk flush can lose the rename even though the caller believes
@@ -335,7 +373,9 @@ def test_a_failed_latest_copy_does_not_orphan_the_already_durable_dated_digest(
         real_replace(src, dst)  # type: ignore[arg-type]
 
     monkeypatch.setattr(os, "replace", failing_latest_replace)
-    record = write_digest(tmp_path, report(), local_date="2026-07-25", config=DigestConfig())
+    record = write_digest(
+        tmp_path, report(), local_date="2026-07-25", config=DigestConfig()
+    )
     assert record.path.is_file()
     assert record.path.read_text(encoding="utf-8") == record.markdown
     assert not (tmp_path / "latest.md").exists()

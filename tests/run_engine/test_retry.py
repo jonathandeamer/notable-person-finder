@@ -24,7 +24,9 @@ NO_JITTER = RetryConfig(
 )
 
 
-def coordinator(config: RetryConfig = NO_JITTER, clock: FakeClock | None = None) -> RetryCoordinator:
+def coordinator(
+    config: RetryConfig = NO_JITTER, clock: FakeClock | None = None
+) -> RetryCoordinator:
     return RetryCoordinator(config, clock=clock or FakeClock())
 
 
@@ -52,9 +54,12 @@ def test_transient_failure_is_retried_until_success() -> None:
 
     records: list[AttemptRecord] = []
     clock = FakeClock()
-    assert coordinator(clock=clock).call(
-        "brave", "search_web", action, on_attempt=records.append
-    ) == "page"
+    assert (
+        coordinator(clock=clock).call(
+            "brave", "search_web", action, on_attempt=records.append
+        )
+        == "page"
+    )
     assert calls == [1, 2, 3]
     assert [r.outcome for r in records] == ["failed", "failed", "succeeded"]
     assert clock.slept == [1.0, 2.0]
@@ -74,7 +79,9 @@ def test_backoff_is_capped() -> None:
         raise failure(FailureCategory.TIMEOUT)
 
     with pytest.raises(RetryExhausted):
-        coordinator(config, clock).call("brave", "search_web", action, on_attempt=lambda _: None)
+        coordinator(config, clock).call(
+            "brave", "search_web", action, on_attempt=lambda _: None
+        )
     assert clock.slept == [10.0, 15.0, 15.0, 15.0]
 
 
@@ -83,10 +90,14 @@ def test_retry_after_overrides_computed_backoff() -> None:
 
     def action(ordinal: int) -> str:
         if ordinal == 1:
-            raise failure(FailureCategory.RATE_LIMIT, status_code=429, retry_after_ms=7000)
+            raise failure(
+                FailureCategory.RATE_LIMIT, status_code=429, retry_after_ms=7000
+            )
         return "page"
 
-    coordinator(clock=clock).call("brave", "search_web", action, on_attempt=lambda _: None)
+    coordinator(clock=clock).call(
+        "brave", "search_web", action, on_attempt=lambda _: None
+    )
     assert clock.slept == [7.0]
 
 
@@ -142,7 +153,9 @@ def test_permanent_failures_are_not_retried(category: FailureCategory) -> None:
 
     clock = FakeClock()
     with pytest.raises(ProviderFailure) as raised:
-        coordinator(clock=clock).call("brave", "search_web", action, on_attempt=lambda _: None)
+        coordinator(clock=clock).call(
+            "brave", "search_web", action, on_attempt=lambda _: None
+        )
     assert raised.value.category is category
     assert calls == [1]
     assert clock.slept == []
@@ -195,7 +208,9 @@ def test_provider_pauses_after_consecutive_exhaustions() -> None:
     assert coordination.is_paused("brave")
     assert coordination.paused_providers() == frozenset({"brave"})
     with pytest.raises(ProviderPaused):
-        coordination.call("brave", "search_web", lambda ordinal: "page", on_attempt=lambda _: None)
+        coordination.call(
+            "brave", "search_web", lambda ordinal: "page", on_attempt=lambda _: None
+        )
 
 
 def test_a_success_resets_the_consecutive_exhaustion_counter() -> None:
@@ -213,7 +228,9 @@ def test_a_success_resets_the_consecutive_exhaustion_counter() -> None:
             lambda ordinal: (_ for _ in ()).throw(failure(FailureCategory.TIMEOUT)),
             on_attempt=lambda _: None,
         )
-    coordination.call("brave", "search_web", lambda ordinal: "ok", on_attempt=lambda _: None)
+    coordination.call(
+        "brave", "search_web", lambda ordinal: "ok", on_attempt=lambda _: None
+    )
     with pytest.raises(RetryExhausted):
         coordination.call(
             "brave",
@@ -238,9 +255,12 @@ def test_pausing_one_provider_does_not_pause_another() -> None:
         )
     assert coordination.is_paused("brave")
     assert not coordination.is_paused("mediawiki")
-    assert coordination.call(
-        "mediawiki", "search_pages", lambda ordinal: "ok", on_attempt=lambda _: None
-    ) == "ok"
+    assert (
+        coordination.call(
+            "mediawiki", "search_pages", lambda ordinal: "ok", on_attempt=lambda _: None
+        )
+        == "ok"
+    )
 
 
 def test_jitter_stays_within_the_configured_ratio() -> None:
