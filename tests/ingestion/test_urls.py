@@ -132,6 +132,16 @@ from notable_person_finder.ingestion.urls import (
             "https://example.com/a?z=1&a=2",
         ),
         (
+            # Only `utm_` prefix-matches. Widening any of the exact-match names
+            # to a prefix would silently strip a real parameter and merge two
+            # distinct articles onto one canonical URL -- the unrecoverable
+            # direction. Nothing else in this table would fail if that
+            # happened, so this row is the guard.
+            "params_merely_sharing_a_prefix_with_a_tracking_param_survive",
+            "https://example.com/a?refx=1&ssn=2&cmpx=3&reflection=4",
+            "https://example.com/a?refx=1&ssn=2&cmpx=3&reflection=4",
+        ),
+        (
             "valueless_tracking_param_is_stripped",
             "https://example.com/a?ref&keep=1",
             "https://example.com/a?keep=1",
