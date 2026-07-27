@@ -34,19 +34,6 @@ SETTLING_WORK_STATES = frozenset(
 )
 
 
-class NonSettlingStateError(ValueError):
-    """A handler returned a work state that does not settle the item."""
-
-    def __init__(self, run_id: int, task_type: str, state: WorkState) -> None:
-        self.run_id = run_id
-        self.task_type = task_type
-        self.state = state
-        super().__init__(
-            f"handler for {task_type!r} returned {state!r}, "
-            "which is not a settling state"
-        )
-
-
 @dataclass(frozen=True, slots=True)
 class TaskOutcome:
     state: WorkState
@@ -351,8 +338,8 @@ class RunEngine:
             reporting_failed=False,
         )
         record = repository.load_run(self._connection, run_id=run_id)
-        deferred_reasons = repository.deferred_reasons_for_run(
-            self._connection, run_id=run_id
+        deferred_reasons = repository.deferred_reasons(
+            self._connection, now=finished_at
         )
         report = RunReport(
             run_id=run_id,

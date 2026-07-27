@@ -839,6 +839,110 @@ def test_budget_exhaustion_is_reported_by_cap_reserved_and_deferral_reason(
     connection.close()
 
 
+def test_deferred_reasons_match_the_whole_queue_headline_across_two_runs(
+    database: Path,
+) -> None:
+    """`required_deferred` is a deliberately whole-queue count (see
+    `run_counters`'s docstring), so the reason breakdown must describe that
+    same population -- not just the reasons the most recent run itself
+    recorded.
+
+    Run A defers 5 required items (3 of task type `probe_a`, 2 of
+    `probe_b`) for budget. Run B only registers a handler for `probe_b`, so
+    it reclaims and re-defers only those 2 -- the 3 `probe_a` items are still
+    eligible-and-deferred, but were last settled by run A, not run B. If the
+    breakdown were scoped to `completed_by_run_id = run B`, it would report
+    only the 2 items run B touched, while `required_deferred` (whole-queue)
+    still reports all 5 -- a total that does not sum to its own breakdown.
+    """
+    connection = connect_database(database)
+    for fingerprint in ("a1" * 32, "a2" * 32, "a3" * 32):
+        repository.schedule_work(
+            connection,
+            task_type="probe_a",
+            subject_kind="synthetic",
+            subject_id=None,
+            fingerprint=fingerprint,
+            required=True,
+            priority=100,
+            eligible_at=NOW,
+            run_id=None,
+            now=NOW,
+        )
+    for fingerprint in ("b1" * 32, "b2" * 32):
+        repository.schedule_work(
+            connection,
+            task_type="probe_b",
+            subject_kind="synthetic",
+            subject_id=None,
+            fingerprint=fingerprint,
+            required=True,
+            priority=100,
+            eligible_at=NOW,
+            run_id=None,
+            now=NOW,
+        )
+
+    def always_refused(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    handler_a = TaskHandler(
+        task_type="probe_a",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=always_refused,
+        reserved_nano_usd=1,
+    )
+    handler_b = TaskHandler(
+        task_type="probe_b",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=always_refused,
+        reserved_nano_usd=1,
+    )
+    # A zero-USD cap refuses every reservation, so both task types defer all
+    # five items in run A with the same "not_evaluated_budget" reason.
+    run_a = build_engine(connection, FakeClock(), budget_limit_nano_usd=0).execute(
+        {handler_a.task_type: handler_a, handler_b.task_type: handler_b}
+    )
+    assert run_a.counters.required_deferred == 5
+    assert run_a.deferred_reasons == {"not_evaluated_budget": 5}
+
+    # Run B only has a handler for probe_b, so claim_batch's task_types
+    # filter means it can reclaim and re-defer only the 2 probe_b items --
+    # the 3 probe_a items stay deferred, still attributed to run A.
+    run_b = build_engine(
+        connection,
+        FakeClock(start=datetime(2026, 7, 25, 6, 0, 30, tzinfo=UTC)),
+        budget_limit_nano_usd=0,
+    ).execute({handler_b.task_type: handler_b})
+
+    assert run_b.counters.required_deferred == 5
+    # The whole-queue breakdown must sum to the whole-queue headline: 3
+    # probe_a items still carrying run A's reason, plus the 2 probe_b items
+    # run B just re-recorded under the same reason string.
+    assert run_b.deferred_reasons == {"not_evaluated_budget": 5}
+    rows = connection.execute(
+        "SELECT task_type, completed_by_run_id FROM work_item "
+        "WHERE state = 'deferred' ORDER BY task_type"
+    ).fetchall()
+    assert [row["task_type"] for row in rows] == [
+        "probe_a",
+        "probe_a",
+        "probe_a",
+        "probe_b",
+        "probe_b",
+    ]
+    assert [row["completed_by_run_id"] for row in rows] == [
+        run_a.run_id,
+        run_a.run_id,
+        run_a.run_id,
+        run_b.run_id,
+        run_b.run_id,
+    ]
+    connection.close()
+
+
 def test_a_handler_that_returns_a_non_settling_state_settles_as_failed_permanent(
     database: Path,
 ) -> None:

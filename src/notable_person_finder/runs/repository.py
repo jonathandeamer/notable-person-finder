@@ -624,15 +624,17 @@ def run_counters(
     )
 
 
-def deferred_reasons_for_run(
-    connection: sqlite3.Connection, *, run_id: int
-) -> Mapping[str, int]:
-    """Count this run's own deferred settlements, grouped by reason.
+def deferred_reasons(connection: sqlite3.Connection, *, now: str) -> Mapping[str, int]:
+    """Count all outstanding due-and-deferred required work, grouped by reason.
 
-    Scoped to `completed_by_run_id = run_id`, the same run-attribution
-    `run_counters` uses for outcomes it owns: a reason belongs to the run that
-    recorded it, not to the whole queue, so a re-armed retry or a prior run's
-    deferral never inflates this run's breakdown.
+    Matches `run_counters`'s `required_deferred` exactly: whole-queue and
+    `eligible_at <= now`, not `completed_by_run_id`-scoped. `required_deferred`
+    is a deliberately whole-queue count -- it includes carryover a previous
+    run deferred and this run never re-touched -- so the reason breakdown must
+    describe that same population, or the two numbers disagree the moment a
+    later run only reclaims and re-defers part of an earlier run's backlog.
+    The reason text a prior run recorded persists on those older rows, so a
+    whole-queue breakdown can still explain them.
     """
     return {
         str(row["reason"]): int(row["n"])
@@ -640,10 +642,11 @@ def deferred_reasons_for_run(
             """
             SELECT reason, COUNT(*) AS n
               FROM work_item
-             WHERE completed_by_run_id = ? AND state = 'deferred' AND reason IS NOT NULL
+             WHERE required = 1 AND state = 'deferred' AND eligible_at <= ?
+               AND reason IS NOT NULL
              GROUP BY reason
             """,
-            (run_id,),
+            (now,),
         )
     }
 
