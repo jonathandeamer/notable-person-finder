@@ -95,6 +95,21 @@ class _Submission:
     clock: Clock
 
 
+class _PersistFailed(Exception):
+    """Carries a raising `persist` out of `complete_work`'s rolled-back transaction.
+
+    `_domain_writes` raises this instead of letting the handler's exception
+    propagate bare, so `_settle` can recognise -- by type, not by inspecting
+    the settlement it just attempted -- that the rollback was caused by the
+    handler's own local write rather than by SQLite or the settlement update
+    itself, and route only that case into a second, writeless settlement.
+    """
+
+    def __init__(self, error_type: str) -> None:
+        super().__init__(error_type)
+        self.error_type = error_type
+
+
 @dataclass(frozen=True, slots=True)
 class _CallResult:
     """One call's answer, as observed on the worker thread.
@@ -172,7 +187,22 @@ def _domain_writes(
     def write(_connection: sqlite3.Connection) -> None:
         # The connection is handed over for symmetry with the repository's
         # other in-transaction helpers; the handler already holds its own.
-        persist(work_item, outcome)
+        try:
+            persist(work_item, outcome)
+        except ProviderFailure:
+            # Not this task's concern: a handler should not raise this from
+            # `persist` in the first place, and nothing here claims to make
+            # sense of it. Let it propagate exactly as any other exception
+            # from this call used to.
+            raise
+        except Exception as error:
+            # The call already succeeded; only this local write failed. That
+            # is unambiguous in a way an `execute` failure is not, so it is
+            # translated into `_PersistFailed` rather than left to propagate:
+            # `_settle` catches that type and re-settles this one item
+            # `failed_permanent` with no domain writes, instead of stranding
+            # it `running` over a bug in the handler's own persistence code.
+            raise _PersistFailed(type(error).__name__) from error
 
     return write
 
@@ -538,7 +568,38 @@ class RunEngine:
                 reason="provider paused for this run",
             )
             return None
-        prepared = handler.prepare(work_item) if handler.prepare is not None else None
+        if handler.prepare is None:
+            prepared = None
+        else:
+            try:
+                prepared = handler.prepare(work_item)
+            except ProviderFailure:
+                # Not this task's concern -- see the matching comment in
+                # `_domain_writes`.
+                raise
+            except Exception as error:
+                # No call has been made yet, so nothing is ambiguous about
+                # money: settle just this item and let the batch's other
+                # already-prepared siblings still run, rather than abandoning
+                # them along with their committed attempt rows and budget
+                # reservations for calls that will now never happen.
+                log_event(
+                    self._logger,
+                    "run.prepare_failed",
+                    severity=logging.ERROR,
+                    run_id=run_id,
+                    work_item_id=work_item.id,
+                    task_type=handler.task_type,
+                    error_type=type(error).__name__,
+                )
+                self._settle(
+                    run_id,
+                    work_item,
+                    handler,
+                    state=WorkState.FAILED_PERMANENT,
+                    reason=f"prepare raised {type(error).__name__}",
+                )
+                return None
         fingerprint = (
             handler.request_fingerprint(work_item)
             if handler.request_fingerprint is not None
@@ -865,15 +926,44 @@ class RunEngine:
         that same transaction, so a handler's domain writes and the settlement
         that justifies them commit or roll back together.
         """
-        repository.complete_work(
-            self._connection,
-            work_item_id=work_item.id,
-            run_id=run_id,
-            state=state,
-            reason=reason,
-            now=self._now(),
-            domain_writes=_domain_writes(handler, work_item, outcome),
-        )
+        try:
+            repository.complete_work(
+                self._connection,
+                work_item_id=work_item.id,
+                run_id=run_id,
+                state=state,
+                reason=reason,
+                now=self._now(),
+                domain_writes=_domain_writes(handler, work_item, outcome),
+            )
+        except _PersistFailed as error:
+            # The call already succeeded, so unlike `execute` there is no
+            # ambiguity about spend here -- only the handler's local write
+            # failed, and that failure rolled the settlement back with it,
+            # leaving the item `running` and still claimed by this run. A
+            # second settlement with no domain writes takes it out of the
+            # claimable set instead of stranding it there for every future
+            # run to reclaim and fail the same way.
+            log_event(
+                self._logger,
+                "run.persist_failed",
+                severity=logging.ERROR,
+                run_id=run_id,
+                work_item_id=work_item.id,
+                task_type=work_item.task_type,
+                error_type=error.error_type,
+            )
+            state = WorkState.FAILED_PERMANENT
+            reason = f"persist raised {error.error_type}"
+            repository.complete_work(
+                self._connection,
+                work_item_id=work_item.id,
+                run_id=run_id,
+                state=state,
+                reason=reason,
+                now=self._now(),
+                domain_writes=None,
+            )
         log_event(
             self._logger,
             "run.work_settled",

@@ -1608,8 +1608,10 @@ def test_persist_commits_with_the_settlement_and_rolls_back_with_it(
         == WorkState.SUCCEEDED
     )
 
-    # And the other direction: a failing `persist` must take the settlement
-    # down with it, leaving the item claimed for the sweep to recover.
+    # And the other direction: a failing `persist` rolls its own settlement
+    # back (the domain write never lands), but the item is isolated rather
+    # than left stranded -- it is settled a second time as
+    # `failed_permanent` with no domain writes, and the run still finishes.
     second = schedule_probe(connection, "9c" * 32)
 
     def failing_persist(work_item, outcome: TaskOutcome) -> None:
@@ -1622,17 +1624,158 @@ def test_persist_commits_with_the_settlement_and_rolls_back_with_it(
         ),
         persist=failing_persist,
     )
-    with pytest.raises(RuntimeError, match="domain write failed"):
-        build_engine(connection, FakeClock()).execute({doomed.task_type: doomed})
+    build_engine(connection, FakeClock()).execute({doomed.task_type: doomed})
 
     notes = [row["note"] for row in connection.execute("SELECT note FROM probe_note")]
     assert notes == ["carried"]
-    assert (
-        connection.execute(
-            "SELECT state FROM work_item WHERE id = ?", (second,)
-        ).fetchone()["state"]
-        == WorkState.RUNNING
+    second_row = connection.execute(
+        "SELECT state, reason FROM work_item WHERE id = ?", (second,)
+    ).fetchone()
+    assert second_row["state"] == WorkState.FAILED_PERMANENT
+    assert "RuntimeError" in second_row["reason"]
+    connection.close()
+
+
+def test_a_handler_whose_prepare_raises_settles_that_item_and_lets_siblings_run(
+    database: Path,
+) -> None:
+    """`prepare` runs before any call is made, so a raising `prepare` is
+    unambiguous: nothing has been charged. The engine isolates it to the one
+    item -- settled `failed_permanent` with a diagnostic reason naming the
+    exception type -- rather than abandoning the whole batch, so a sibling
+    item that already committed an attempt row and a budget reservation still
+    gets its call made."""
+    connection = connect_database(database)
+    bad_id = schedule_probe(connection, "p1" * 32)
+    good_id = schedule_probe(connection, "p2" * 32)
+
+    def prepare(work_item) -> object:
+        if work_item.id == bad_id:
+            raise ValueError("prepare blew up")
+        return None
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    handler = probe_handler(execute, prepare=prepare)
+    reported: list[RunReport] = []
+
+    def spy_reporter(report: RunReport) -> ReportArtifact:
+        reported.append(report)
+        return ReportArtifact(path="fake-digest.md", sha256="e" * 64, markdown="x")
+
+    clock = FakeClock()
+    engine = RunEngine(
+        connection,
+        retry=RetryPolicy(RetryConfig(max_attempts=2, jitter_ratio=0.0), clock=clock),
+        scheduler=BoundedScheduler(max_workers=2),
+        clock=clock,
+        timezone="Europe/Paris",
+        window_start="2026-07-24T06:00:00Z",
+        budget_limit_nano_usd=None,
+        snapshot_fingerprint="a" * 64,
+        snapshot_json="{}",
+        reporter=spy_reporter,
     )
+    report = engine.execute({handler.task_type: handler})
+
+    bad_row = connection.execute(
+        "SELECT state, reason FROM work_item WHERE id = ?", (bad_id,)
+    ).fetchone()
+    good_row = connection.execute(
+        "SELECT state FROM work_item WHERE id = ?", (good_id,)
+    ).fetchone()
+    assert bad_row["state"] == WorkState.FAILED_PERMANENT
+    assert "ValueError" in bad_row["reason"]
+    assert good_row["state"] == WorkState.SUCCEEDED
+    assert report.counters.required_succeeded == 1
+    assert len(reported) == 1
+    connection.close()
+
+
+def test_a_handler_whose_persist_raises_settles_that_item_without_its_domain_writes(
+    database: Path,
+) -> None:
+    """`persist` runs inside the settlement transaction, so a raising
+    `persist` rolls that settlement back too -- but the call already
+    happened, so leaving the item `running` forever would be wrong. The
+    engine settles it a second time as `failed_permanent` with no domain
+    writes, and a sibling item still succeeds and the run still reports."""
+    connection = connect_database(database)
+    connection.execute("CREATE TABLE probe_note2 (id INTEGER PRIMARY KEY, note TEXT)")
+    bad_id = schedule_probe(connection, "p3" * 32)
+    good_id = schedule_probe(connection, "p4" * 32)
+
+    def persist(work_item, outcome: TaskOutcome) -> None:
+        if work_item.id == bad_id:
+            connection.execute(
+                "INSERT INTO probe_note2 (note) VALUES ('should not land')"
+            )
+            raise RuntimeError("persist blew up")
+        connection.execute("INSERT INTO probe_note2 (note) VALUES ('good')")
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    handler = probe_handler(execute, persist=persist)
+    reported: list[RunReport] = []
+
+    def spy_reporter(report: RunReport) -> ReportArtifact:
+        reported.append(report)
+        return ReportArtifact(path="fake-digest.md", sha256="f" * 64, markdown="x")
+
+    clock = FakeClock()
+    engine = RunEngine(
+        connection,
+        retry=RetryPolicy(RetryConfig(max_attempts=2, jitter_ratio=0.0), clock=clock),
+        scheduler=BoundedScheduler(max_workers=2),
+        clock=clock,
+        timezone="Europe/Paris",
+        window_start="2026-07-24T06:00:00Z",
+        budget_limit_nano_usd=None,
+        snapshot_fingerprint="a" * 64,
+        snapshot_json="{}",
+        reporter=spy_reporter,
+    )
+    report = engine.execute({handler.task_type: handler})
+
+    bad_row = connection.execute(
+        "SELECT state, reason FROM work_item WHERE id = ?", (bad_id,)
+    ).fetchone()
+    good_row = connection.execute(
+        "SELECT state FROM work_item WHERE id = ?", (good_id,)
+    ).fetchone()
+    notes = [row["note"] for row in connection.execute("SELECT note FROM probe_note2")]
+    assert bad_row["state"] == WorkState.FAILED_PERMANENT
+    assert "RuntimeError" in bad_row["reason"]
+    assert good_row["state"] == WorkState.SUCCEEDED
+    assert notes == ["good"]
+    assert report.counters.required_succeeded == 1
+    assert len(reported) == 1
+    connection.close()
+
+
+def test_a_raising_execute_still_propagates_uncaught(database: Path) -> None:
+    """Pins the ruling: unlike `prepare` and `persist`, `execute` is NOT
+    isolated. A call that raised may already have left the machine and
+    succeeded, so settling it here would risk recording a possibly-successful
+    paid call as `failed_permanent` and never retrying it. The exception must
+    propagate uncaught, leaving the item `running` for the next run's sweep
+    to recover as `interrupted`."""
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "ex" * 32)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        raise ValueError("execute blew up")
+
+    handler = probe_handler(execute)
+    with pytest.raises(ValueError, match="execute blew up"):
+        build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    row = connection.execute(
+        "SELECT state FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["state"] == WorkState.RUNNING
     connection.close()
 
 
