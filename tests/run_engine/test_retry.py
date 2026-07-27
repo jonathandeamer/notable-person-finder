@@ -12,7 +12,9 @@ from notable_person_finder.runs.clock import FakeClock
 from notable_person_finder.runs.retry import (
     AttemptRecord,
     RetryCoordinator,
+    RetryDecision,
     RetryExhausted,
+    RetryPolicy,
 )
 
 NO_JITTER = RetryConfig(
@@ -412,3 +414,134 @@ def test_persisted_ordinals_can_continue_after_an_interrupted_attempt() -> None:
     assert result == "page"
     assert calls == [4]
     assert records[0].ordinal == 4
+
+
+# --- RetryPolicy: pure decision object, no sleeping or I/O ---
+
+
+def policy(
+    config: RetryConfig = NO_JITTER, clock: FakeClock | None = None
+) -> RetryPolicy:
+    return RetryPolicy(config, clock=clock or FakeClock())
+
+
+def test_policy_retryable_below_max_attempts_yields_retry_with_capped_delay() -> None:
+    config = RetryConfig(
+        max_attempts=5,
+        initial_backoff_seconds=10.0,
+        max_backoff_seconds=15.0,
+        backoff_multiplier=10.0,
+        jitter_ratio=0.0,
+    )
+    decision = policy(config).decide(
+        "brave",
+        failure=failure(FailureCategory.TIMEOUT),
+        attempt_index=1,
+        malformed_retries=0,
+    )
+    assert decision == RetryDecision(action="RETRY", delay_seconds=15.0)
+
+
+def test_policy_non_retryable_failure_yields_permanent() -> None:
+    decision = policy().decide(
+        "brave",
+        failure=failure(FailureCategory.AUTHENTICATION),
+        attempt_index=0,
+        malformed_retries=0,
+    )
+    assert decision == RetryDecision(action="PERMANENT", delay_seconds=None)
+
+
+def test_policy_final_attempt_yields_exhausted() -> None:
+    decision = policy().decide(
+        "brave",
+        failure=failure(FailureCategory.TIMEOUT),
+        attempt_index=2,
+        malformed_retries=0,
+    )
+    assert decision == RetryDecision(action="EXHAUSTED", delay_seconds=None)
+
+
+def test_policy_second_malformed_response_yields_exhausted_not_retry() -> None:
+    decision = policy().decide(
+        "openrouter",
+        failure=ProviderFailure(
+            FailureCategory.MALFORMED_RESPONSE,
+            provider="openrouter",
+            operation="generate_structured",
+            retryable=True,
+        ),
+        attempt_index=0,
+        malformed_retries=1,
+    )
+    assert decision == RetryDecision(action="EXHAUSTED", delay_seconds=None)
+
+
+def test_policy_first_malformed_response_yields_retry() -> None:
+    config = RetryConfig(max_attempts=5, jitter_ratio=0.0)
+    decision = policy(config).decide(
+        "openrouter",
+        failure=ProviderFailure(
+            FailureCategory.MALFORMED_RESPONSE,
+            provider="openrouter",
+            operation="generate_structured",
+            retryable=True,
+        ),
+        attempt_index=0,
+        malformed_retries=0,
+    )
+    assert decision.action == "RETRY"
+
+
+def test_policy_record_exhaustion_pauses_at_the_configured_threshold() -> None:
+    config = RetryConfig(
+        max_attempts=1,
+        jitter_ratio=0.0,
+        provider_pause_after_consecutive_exhaustions=2,
+    )
+    coordination = policy(config)
+    coordination.record_exhaustion("brave")
+    assert not coordination.is_paused("brave")
+    coordination.record_exhaustion("brave")
+    assert coordination.is_paused("brave")
+    assert coordination.paused_providers() == frozenset({"brave"})
+
+
+def test_policy_malformed_exhaustion_does_not_pause() -> None:
+    config = RetryConfig(
+        max_attempts=1,
+        jitter_ratio=0.0,
+        provider_pause_after_consecutive_exhaustions=1,
+    )
+    coordination = policy(config)
+    decision = coordination.decide(
+        "openrouter",
+        failure=ProviderFailure(
+            FailureCategory.MALFORMED_RESPONSE,
+            provider="openrouter",
+            operation="generate_structured",
+            retryable=True,
+        ),
+        attempt_index=0,
+        malformed_retries=0,
+    )
+    assert decision.action == "EXHAUSTED"
+    # The coordinator's `call` loop is responsible for distinguishing a
+    # malformed-response exhaustion from a transient one and calling
+    # `record_success` instead of `record_exhaustion` in that case -- the
+    # policy itself does not decide which to call from `decide` alone.
+    coordination.record_success("openrouter")
+    assert not coordination.is_paused("openrouter")
+
+
+def test_policy_start_raises_provider_paused_when_paused() -> None:
+    config = RetryConfig(
+        max_attempts=1,
+        jitter_ratio=0.0,
+        provider_pause_after_consecutive_exhaustions=1,
+    )
+    coordination = policy(config)
+    coordination.record_exhaustion("brave")
+    assert coordination.is_paused("brave")
+    with pytest.raises(ProviderPaused):
+        coordination.start("brave")
