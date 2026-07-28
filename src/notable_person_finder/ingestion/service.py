@@ -419,12 +419,16 @@ def build_fetch_handler(
 
         Deliberately swallows a resolution failure and returns `None`. The engine
         calls this *outside* the try/except that isolates `prepare`
-        (`engine.py:664-673`), so an exception here would propagate out of the
+        (`engine.py:667-671`), so an exception here would propagate out of the
         run, leave it `running`, and write no digest -- discarding every sibling
         feed's results to fail at labelling one attempt row. A diagnostic column
-        must never be able to do that. The item's real problem still surfaces,
-        moments later and in isolation, when `prepare` raises for the same
-        reason.
+        must never be able to do that.
+
+        Nothing is lost by staying quiet: the item's real problem has *already*
+        surfaced, in isolation, because `prepare` runs first and settles the item
+        `failed_permanent` for the same reason (`engine.py:635-660`), so on the
+        engine's path this branch is unreachable. It exists so that a future
+        reordering cannot turn a diagnostic into a run-aborting fault.
         """
         try:
             _, feed = resolve(work_item)
