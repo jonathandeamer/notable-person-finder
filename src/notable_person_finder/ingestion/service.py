@@ -18,10 +18,15 @@ wrong.** The run engine runs a handler's phases on two different threads:
   engine's connection belongs to the application thread and is not opened with
   `check_same_thread=False`, so using it from a worker is a fault, not a race
   to be tolerated. `execute` is built by `_execute_for`, a module-level
-  factory, so that it *structurally* cannot close over a connection: a nested
+  factory, so that no connection is *in scope* where it is defined: a nested
   definition inside `build_fetch_handler` would sit in a scope where one is in
   reach, and only a comment would stand between a later edit and a
-  cross-thread write.
+  cross-thread write. To be precise about how much that buys, since the test
+  pinning it can only see what the closure actually captured: CPython creates a
+  cell only for a name a nested function *references*, so a nested `execute`
+  that never mentioned the connection would look identical from the outside.
+  The factory is what stops the next edit from mentioning it, not a proof about
+  the code as it stands today.
 * `persist` (added by the next task) runs on the application thread inside the
   transaction that settles the work item.
 """
@@ -33,6 +38,7 @@ import json
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from notable_person_finder.config.models import FeedConfig, FeedsConfig
 from notable_person_finder.ingestion.repository import (
@@ -132,7 +138,19 @@ class NotInspected:
 
     requested_url: str
     category: FailureCategory
+    # Frequently `None`, and that is not a bug to route around: the transport
+    # raises `response_too_large` from its streaming read
+    # (`transport.py:333-338`) with no status code, because the refusal is about
+    # the body rather than the response line. A caller must treat this as
+    # "unknown", never as "no HTTP exchange happened".
     status_code: int | None
+    # The raising adapter's sanitized detail -- for `response_too_large`, the
+    # byte cap that was exceeded. Carried because it is the only quantitative
+    # fact about a response nobody read, and because `status_code` is usually
+    # absent. Safe to store: `ProviderFailure` requires `detail` to be free of
+    # bodies, credentials, and query text. Must never be folded into a
+    # `TaskOutcome.reason`, which is a `GROUP BY` key.
+    detail: str | None
 
 
 def _fingerprint(*, feed_key: str, url: str) -> str:
@@ -301,6 +319,25 @@ def _execute_for(
             return TaskOutcome(
                 state=WorkState.DEFERRED,
                 reason=reason,
+                # The one place this failure survives on the attempt row. The
+                # engine records any non-None outcome as an attempt that
+                # `succeeded` with a NULL `failure_category`
+                # (`engine.py:736-748`), and migration `0002`'s CHECK on
+                # `attempt` forbids a `failure_category` unless `outcome =
+                # 'failed'`, so the category cannot be stored in its own column
+                # on this path however the handler behaves. Without this the
+                # only trace of a 40 MB feed anywhere in the run would be a
+                # deferral reason: `operational_failures_for_run` counts
+                # `outcome = 'failed'`, so the digest's operational-failure
+                # count and its failure-category breakdown both omit it.
+                # `failure.detail` is sanitized by the raising adapter per
+                # `ProviderFailure`'s contract -- for `response_too_large` it is
+                # the byte cap, which is the fact worth keeping.
+                detail_json=json.dumps(
+                    {"detail": failure.detail, "not_inspected": str(failure.category)},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
                 payload=NotInspected(
                     # The configured URL, not anything the response said: this
                     # value is stored and rendered, and the response was
@@ -309,6 +346,7 @@ def _execute_for(
                     requested_url=prepared.feed.url,
                     category=failure.category,
                     status_code=failure.status_code,
+                    detail=failure.detail,
                 ),
             )
 
@@ -340,8 +378,15 @@ def build_fetch_handler(
     """The `fetch_feed` handler: one feed fetch, split across the two threads."""
     configured = {feed.key: feed for feed in feeds.feeds}
 
-    def prepare(work_item: WorkItem) -> object:
-        """Application thread. The handler's only access to SQLite."""
+    def resolve(work_item: WorkItem) -> tuple[int, FeedConfig]:
+        """Which feed this work item is for. Application thread; raises if none.
+
+        Seeding supersedes items whose feed has left configuration before the
+        claim loop reaches them, so every failure below is unreachable in an
+        ordinary run. Each still refuses rather than repairs: substituting some
+        other configured feed would attribute one publisher's entries to
+        another, which is unrecoverable once stored.
+        """
         feed_identity_id = work_item.subject_id
         if feed_identity_id is None:
             raise LookupError(
@@ -362,13 +407,34 @@ def build_fetch_handler(
             raise LookupError(f"feed identity {feed_identity_id} is not stored")
         feed = configured.get(identity.key)
         if feed is None or not feed.enabled:
-            # Seeding supersedes such items before the claim loop reaches them,
-            # so this is unreachable in an ordinary run. Raising is still the
-            # only honest answer: there is no configured URL to fetch, and
-            # substituting another feed's would attribute one publisher's
-            # entries to another. The engine settles a raising `prepare` as
-            # `failed_permanent` for this item alone and lets its siblings run.
+            # `not feed.enabled` is not redundant with `feed is None`: a feed
+            # can be present in the file with `enabled = false`, and fetching
+            # one an operator has switched off would ignore the only instruction
+            # they gave about it.
             raise LookupError(f"feed {identity.key!r} is not enabled in configuration")
+        return (feed_identity_id, feed)
+
+    def destination_host(work_item: WorkItem) -> str | None:
+        """The host this attempt will contact, for the attempt row's diagnostics.
+
+        Deliberately swallows a resolution failure and returns `None`. The engine
+        calls this *outside* the try/except that isolates `prepare`
+        (`engine.py:664-673`), so an exception here would propagate out of the
+        run, leave it `running`, and write no digest -- discarding every sibling
+        feed's results to fail at labelling one attempt row. A diagnostic column
+        must never be able to do that. The item's real problem still surfaces,
+        moments later and in isolation, when `prepare` raises for the same
+        reason.
+        """
+        try:
+            _, feed = resolve(work_item)
+        except LookupError:
+            return None
+        return urlsplit(feed.url).hostname
+
+    def prepare(work_item: WorkItem) -> object:
+        """Application thread. The handler's only access to SQLite."""
+        feed_identity_id, feed = resolve(work_item)
         etag, last_modified = latest_validators(
             connection, feed_identity_id=feed_identity_id
         )
@@ -383,6 +449,7 @@ def build_fetch_handler(
         operation=FETCH_FEED_OPERATION,
         execute=_execute_for(client),
         prepare=prepare,
+        destination_host=destination_host,
         # A feed fetch costs no money, so it reserves nothing against the run
         # budget. Reserving zero is not the same as not reserving: the attempt
         # row is still written and still counted.

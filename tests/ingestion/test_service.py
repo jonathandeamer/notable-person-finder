@@ -202,6 +202,11 @@ def test_seeding_schedules_one_required_item_per_enabled_feed(
         assert row["state"] == "pending"
         assert row["created_by_run_id"] == run_id
         assert row["subject_id"] is not None
+        # Literal, not `FETCH_FEED_PRIORITY`: `claim_batch` orders by
+        # `priority ASC`, and required-before-optional exists nowhere except in
+        # the values seeding writes here. A later task type must be placed
+        # relative to a known number, so the number is the contract.
+        assert row["priority"] == 10
 
 
 def test_seeding_touches_no_identity_for_a_disabled_feed(
@@ -357,21 +362,52 @@ def test_superseding_leaves_a_terminal_item_alone(
 def test_the_fingerprint_is_sha256_over_canonical_json(
     connection: sqlite3.Connection,
 ) -> None:
+    """Pinned as a literal digest, deliberately.
+
+    Recomputing it here with the same `json.dumps` call the source uses would
+    make this a change-detector against itself: any edit to the serialization --
+    a separator, a field name, an added key -- would move both sides together
+    and the test would still pass. A literal makes the stored fingerprint a
+    stable value, which is what it has to be, since it is the identity under
+    which a work item is deduplicated across runs. If this assertion fails, ask
+    whether existing rows were just orphaned before changing the constant.
+    """
     run_id = insert_run(connection)
     seed_feeds(connection, feeds=feeds_config(ALPHA), run_id=run_id, now=moment())
 
-    expected = hashlib.sha256(
-        json.dumps(
-            {
-                "feed_key": "alpha",
-                "parser_version": service.PARSER_VERSION,
-                "url": ALPHA[1],
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-    assert work_items(connection)[0]["fingerprint"] == expected
+    assert service.PARSER_VERSION == 1, "the literal below is version-specific"
+    assert (
+        work_items(connection)[0]["fingerprint"]
+        == "c86875c5422895e60099525a82f7e677d607808b00847af4ee4934a6448ced52"
+    )
+
+
+def test_the_canonical_json_is_compact_and_key_sorted(
+    connection: sqlite3.Connection,
+) -> None:
+    """The serialization the digest above commits to, stated independently.
+
+    Kept apart from the literal so a serialization change is legible as such
+    rather than as an opaque hash mismatch. `sort_keys=True` happens to be inert
+    for the current field names, which are already alphabetical -- so this
+    asserts the *contract* rather than pretending the flag is load-bearing
+    today. Add a field out of alphabetical order and it becomes so.
+    """
+    run_id = insert_run(connection)
+    seed_feeds(connection, feeds=feeds_config(ALPHA), run_id=run_id, now=moment())
+
+    canonical = json.dumps(
+        {"feed_key": "alpha", "parser_version": 1, "url": ALPHA[1]},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    # No whitespace, so two writers cannot produce different bytes for one feed.
+    assert ", " not in canonical
+    assert '": ' not in canonical
+    assert (
+        work_items(connection)[0]["fingerprint"]
+        == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    )
 
 
 def test_a_changed_feed_url_produces_a_new_fingerprint(
@@ -569,6 +605,31 @@ def test_prepare_refuses_an_item_that_names_no_feed(
         handler.prepare(subjectless)
 
 
+def test_prepare_refuses_a_feed_that_is_present_but_disabled(
+    connection: sqlite3.Connection,
+) -> None:
+    """`enabled = false` is an instruction, not a comment.
+
+    Distinct from the feed-absent case above: this feed *is* in the file, so a
+    guard that only checked for absence would fetch a feed the operator
+    explicitly switched off. Reachable in a way the absent case is not -- an
+    item seeded while the feed was enabled, then claimed after it was disabled
+    in the same run's configuration.
+    """
+    run_id = insert_run(connection)
+    seed_feeds(connection, feeds=feeds_config(ALPHA), run_id=run_id, now=moment())
+    item = claimed_item(connection, run_id=run_id)
+    handler = build_fetch_handler(
+        connection,
+        client=FakeFeedClient(result=modified_result()),
+        feeds=feeds_config(("alpha", ALPHA[1], False)),
+    )
+    assert handler.prepare is not None
+
+    with pytest.raises(LookupError):
+        handler.prepare(item)
+
+
 def test_prepare_refuses_an_item_whose_identity_is_not_stored(
     connection: sqlite3.Connection,
 ) -> None:
@@ -689,7 +750,11 @@ def test_an_uninspectable_response_defers_without_raising(
     will be exactly as large next time.
     """
     failure = ProviderFailure(
-        category, provider="feeds", operation="fetch_feed", status_code=200
+        category,
+        provider="feeds",
+        operation="fetch_feed",
+        status_code=200,
+        detail="body exceeded 5242880 bytes",
     )
     client = FakeFeedClient(error=failure)
     handler, item = handler_for(client, connection)
@@ -707,6 +772,14 @@ def test_an_uninspectable_response_defers_without_raising(
     assert isinstance(outcome.payload, NotInspected)
     assert outcome.payload.category is category
     assert outcome.payload.requested_url == ALPHA[1]
+    # The sanitized detail travels to `persist`, which is the only quantitative
+    # fact available about a response nobody read -- and the only one available
+    # at all in production, where the transport raises `response_too_large` from
+    # its streaming read with no status code.
+    assert outcome.payload.detail == "body exceeded 5242880 bytes"
+    # It must reach the payload and never the reason, which is a `GROUP BY` key.
+    assert outcome.reason is not None
+    assert "5242880" not in outcome.reason
 
 
 def test_an_uninspectable_response_records_no_entry_count(
@@ -770,6 +843,123 @@ def test_every_other_failure_propagates_for_the_engine_to_adjudicate(
             ),
         )
     assert raised.value is failure
+
+
+def test_execute_translates_a_wrong_prepared_value_into_a_provider_failure(
+    connection: sqlite3.Connection,
+) -> None:
+    """A wiring fault must not escape a worker thread untranslated.
+
+    Unreachable while `prepare` is the only producer of `prepared`. It is
+    translated rather than raised bare because the engine's execute phase
+    deliberately does not isolate a non-`ProviderFailure` (`engine.py` re-raises
+    it out of `unwrap`), so a `TypeError` here would propagate out of the run
+    and discard every sibling feed's results. `INTERNAL` is not retryable, so
+    this settles the one item permanently instead.
+    """
+    client = FakeFeedClient(result=modified_result())
+    handler, item = handler_for(client, connection)
+
+    with pytest.raises(ProviderFailure) as raised:
+        handler.execute(item, 1, object())
+
+    assert raised.value.category is FailureCategory.INTERNAL
+    assert raised.value.retryable is False
+    # No call was attempted with an unusable input.
+    assert client.calls == []
+
+
+# --- the attempt row ------------------------------------------------------------
+
+
+def test_a_not_inspected_deferral_keeps_its_evidence_on_the_attempt_row(
+    connection: sqlite3.Connection,
+) -> None:
+    """The one place a refused response survives in the durable attempt log.
+
+    A `DEFERRED` outcome is still an outcome, so the engine records the attempt
+    as `succeeded` with a NULL `failure_category` -- and migration `0002`'s CHECK
+    on `attempt` forbids a `failure_category` unless `outcome = 'failed'`, so
+    the category cannot go in its own column on this path at all. That means
+    `operational_failures_for_run` (which counts `outcome = 'failed'`) reports
+    zero, and the digest's operational-failure count and failure-category
+    breakdown both omit a feed nobody could read. `detail_json` is what stops
+    the evidence disappearing entirely.
+
+    Asserted, rather than left as a comment, because the reporting consequence
+    is the kind of thing a later task would otherwise rediscover as a bug.
+    """
+    client = FakeFeedClient(
+        error=ProviderFailure(
+            FailureCategory.RESPONSE_TOO_LARGE,
+            provider="feeds",
+            operation="fetch_feed",
+            detail="feeds.fetch_feed body exceeded 5242880 bytes",
+        )
+    )
+
+    report = run_engine_with(connection, client, max_attempts=3)
+
+    attempts = repository.attempts_for_run(connection, run_id=report.run_id)
+    assert len(attempts) == 1
+    row = connection.execute(
+        "SELECT outcome, failure_category, detail_json FROM attempt"
+    ).fetchone()
+    # The shape the engine and the schema force, pinned so it is a known
+    # limitation rather than a surprise.
+    assert row["outcome"] == "succeeded"
+    assert row["failure_category"] is None
+    # ...and the evidence that survives it.
+    stored = json.loads(row["detail_json"])
+    assert stored["not_inspected"] == "response_too_large"
+    assert stored["detail"] == "feeds.fetch_feed body exceeded 5242880 bytes"
+    # The failure category reaches no operational counter, which is exactly why
+    # the assertions above matter.
+    assert report.failure_categories == {}
+    assert report.counters.operational_failures == 0
+
+
+def test_the_attempt_row_records_the_feed_host(
+    connection: sqlite3.Connection,
+) -> None:
+    client = FakeFeedClient(result=modified_result())
+
+    run_engine_with(connection, client, max_attempts=3)
+
+    row = connection.execute("SELECT destination_host FROM attempt").fetchone()
+    assert row["destination_host"] == "alpha.example.com"
+
+
+def test_destination_host_is_none_rather_than_raising_for_an_unroutable_item(
+    connection: sqlite3.Connection,
+) -> None:
+    """A diagnostic column must not be able to abort a run.
+
+    The engine calls `destination_host` *outside* the try/except that isolates
+    `prepare`, so raising here would propagate out of `RunEngine.execute`, leave
+    the run `running`, and write no digest -- losing every sibling feed's
+    results in order to fail at labelling one attempt row.
+    """
+    run_id = insert_run(connection)
+    seed_feeds(connection, feeds=feeds_config(ALPHA), run_id=run_id, now=moment())
+    item = claimed_item(connection, run_id=run_id)
+    handler = build_fetch_handler(
+        connection,
+        client=FakeFeedClient(result=modified_result()),
+        feeds=feeds_config(BETA),
+    )
+    assert handler.destination_host is not None
+    # Positive control: with the feed configured, a host really is produced, so
+    # the None below is the refusal path and not an always-None function.
+    routable = build_fetch_handler(
+        connection,
+        client=FakeFeedClient(result=modified_result()),
+        feeds=feeds_config(ALPHA),
+    )
+    assert routable.destination_host is not None
+    assert routable.destination_host(item) == "alpha.example.com"
+
+    assert handler.destination_host(item) is None
 
 
 # --- the thread split ----------------------------------------------------------

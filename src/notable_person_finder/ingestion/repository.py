@@ -19,10 +19,10 @@ from notable_person_finder.ingestion.models import FeedIdentity, SourceItemCount
 # refuses to run outside a transaction rather than silently writing in
 # autocommit mode.
 #
-# `upsert_feed_identity` owns its own transaction: it is called during seeding
-# and preparation, before any work item is claimed, so there is no caller
-# transaction to join. `latest_validators` and `source_item_counts` are reads
-# and need neither.
+# `upsert_feed_identity` owns its own transaction: it is called during seeding,
+# before any work item is claimed, so there is no caller transaction to join.
+# `feed_identities`, `latest_validators`, and `source_item_counts` are reads and
+# need neither.
 
 
 def _last_row_id(cursor: sqlite3.Cursor) -> int:
