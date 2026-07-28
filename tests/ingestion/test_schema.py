@@ -7,6 +7,7 @@ import pytest
 
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.db.migrate import apply_migrations, load_migrations
+from notable_person_finder.providers.failures import FailureCategory
 from tests.ingestion.helpers import insert_run, moment
 
 # ---------------------------------------------------------------------------
@@ -702,4 +703,107 @@ def test_source_item_rejects_an_unknown_canonical_article(
             VALUES (?, ?, ?, 999999, ?)
             """,
             (feed_id, fetch_id, run_id, moment()),
+        )
+
+
+def test_source_item_rejects_an_unknown_discovering_fetch(
+    connection: sqlite3.Connection,
+) -> None:
+    run_id = insert_run(connection)
+    feed_id = _feed_identity(connection)
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """
+            INSERT INTO source_item (
+                feed_identity_id, discovered_by_fetch_id, discovered_by_run_id,
+                discovered_at
+            )
+            VALUES (?, 999999, ?, ?)
+            """,
+            (feed_id, run_id, moment()),
+        )
+
+
+# ---------------------------------------------------------------------------
+# feed_fetch: timestamp shape, the full failure vocabulary, and the coupling
+# ---------------------------------------------------------------------------
+
+
+def test_feed_fetch_requested_at_rejects_a_non_zulu_timestamp(
+    connection: sqlite3.Connection,
+) -> None:
+    run_id = insert_run(connection)
+    feed_id = _feed_identity(connection)
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """
+            INSERT INTO feed_fetch (
+                feed_identity_id, run_id, requested_at, requested_url, outcome
+            )
+            VALUES (?, ?, '2026-07-25 06:00:00', 'https://example.com/feed',
+                    'modified')
+            """,
+            (feed_id, run_id),
+        )
+
+
+@pytest.mark.parametrize("category", list(FailureCategory))
+def test_feed_fetch_failure_category_accepts_every_failure_category(
+    connection: sqlite3.Connection, category: FailureCategory
+) -> None:
+    """Parametrised over the enum itself, not a copied list: a copied list
+    would drift, and a new `FailureCategory` member absent from the migration's
+    CHECK would then fail for the first time in production rather than here."""
+    run_id = insert_run(connection)
+    feed_id = _feed_identity(connection)
+    connection.execute(
+        """
+        INSERT INTO feed_fetch (
+            feed_identity_id, run_id, requested_at, requested_url, outcome,
+            failure_category
+        )
+        VALUES (?, ?, ?, 'https://example.com/feed', 'failed', ?)
+        """,
+        (feed_id, run_id, moment(), str(category)),
+    )
+
+
+def test_feed_fetch_failed_outcome_requires_a_failure_category(
+    connection: sqlite3.Connection,
+) -> None:
+    """`0002` couples these on `attempt`; `0003` couples them here for the same
+    reason: a failed fetch with no category cannot be explained by the digest.
+    """
+    run_id = insert_run(connection)
+    feed_id = _feed_identity(connection)
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """
+            INSERT INTO feed_fetch (
+                feed_identity_id, run_id, requested_at, requested_url, outcome
+            )
+            VALUES (?, ?, ?, 'https://example.com/feed', 'failed')
+            """,
+            (feed_id, run_id, moment()),
+        )
+
+
+@pytest.mark.parametrize("outcome", ["modified", "not_modified"])
+def test_feed_fetch_a_non_failed_outcome_rejects_a_failure_category(
+    connection: sqlite3.Connection, outcome: str
+) -> None:
+    """The other direction of the same coupling: a successful fetch carrying a
+    category would read as a failure to anything grouping on that column."""
+    run_id = insert_run(connection)
+    feed_id = _feed_identity(connection)
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """
+            INSERT INTO feed_fetch (
+                feed_identity_id, run_id, requested_at, requested_url, outcome,
+                failure_category
+            )
+            VALUES (?, ?, ?, 'https://example.com/feed', ?, 'network')
+            """,
+            (feed_id, run_id, moment(), outcome),
         )

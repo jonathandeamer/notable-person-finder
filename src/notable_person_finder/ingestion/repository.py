@@ -4,6 +4,26 @@ import sqlite3
 
 from notable_person_finder.ingestion.models import SourceItemCounts
 
+# Two deliberate transaction disciplines live in this module.
+#
+# `record_fetch`, `upsert_article`, `record_alias`, and `insert_source_item`
+# are transaction-neutral: they neither begin, commit, nor roll back. They are
+# the domain writes a work-item handler performs, and `runs.repository`'s
+# `complete_work` runs its `domain_writes` callback *inside* its own open
+# BEGIN IMMEDIATE transaction so that a handler's domain rows and the
+# settlement that justifies them commit or roll back together. A function that
+# opened its own transaction there would raise `sqlite3.OperationalError:
+# cannot start a transaction within a transaction`, and one that committed
+# there would commit the settling transaction early -- publishing a settled
+# work item before its domain rows were complete. Each guards its entry and
+# refuses to run outside a transaction rather than silently writing in
+# autocommit mode.
+#
+# `upsert_feed_identity` owns its own transaction: it is called during seeding
+# and preparation, before any work item is claimed, so there is no caller
+# transaction to join. `latest_validators` and `source_item_counts` are reads
+# and need neither.
+
 
 def _last_row_id(cursor: sqlite3.Cursor) -> int:
     """The row id of a just-completed INSERT.
@@ -17,6 +37,17 @@ def _last_row_id(cursor: sqlite3.Cursor) -> int:
     if row_id is None:
         raise RuntimeError("INSERT did not produce a row id")
     return row_id
+
+
+def _require_transaction(connection: sqlite3.Connection, name: str) -> None:
+    """Refuse to write outside a caller-owned transaction.
+
+    Mirrors the guard `runs.budget`'s `reserve_in_transaction` uses, including
+    its message shape: writing in autocommit mode would commit on its own and
+    break the all-or-nothing settlement this module's writers depend on.
+    """
+    if not connection.in_transaction:
+        raise RuntimeError(f"{name} requires an active transaction")
 
 
 def upsert_feed_identity(
@@ -69,11 +100,21 @@ def latest_validators(
     state is deliberately not stored as mutable columns on `feed_identity`:
     deriving it here means a failed fetch can never overwrite the validators
     a previous, successful fetch offered.
+
+    Rows carrying *no* validator at all are skipped rather than treated as the
+    answer. A 304 response normally omits Last-Modified and often omits ETag
+    too, so the latest row is frequently validator-less; returning its empty
+    pair would discard the validators an earlier fetch established and make
+    every subsequent request unconditional -- re-downloading each feed body
+    forever after the first 304. A row with nothing to offer offers nothing,
+    so falling back to the newest row that does have a validator is strictly
+    better and never worse.
     """
     row = connection.execute(
         """
         SELECT etag, last_modified FROM feed_fetch
          WHERE feed_identity_id = ? AND outcome <> 'failed'
+           AND (etag IS NOT NULL OR last_modified IS NOT NULL)
          ORDER BY id DESC
          LIMIT 1
         """,
@@ -104,7 +145,15 @@ def record_fetch(
     entry_count: int | None,
     response_bytes: int | None,
 ) -> int:
-    """Insert one immutable fetch attempt row; fetches are never rewritten."""
+    """Insert one immutable fetch attempt row; fetches are never rewritten.
+
+    **The caller must already hold an open transaction; this function does not
+    begin, commit, or roll back one.** It runs inside the settling transaction
+    `runs.repository.complete_work` opens around its `domain_writes` callback,
+    so a handler's domain rows and the settlement that justifies them commit
+    or roll back together. Raises `RuntimeError` if no transaction is open.
+    """
+    _require_transaction(connection, "record_fetch")
     cursor = connection.execute(
         """
         INSERT INTO feed_fetch (
@@ -134,7 +183,6 @@ def record_fetch(
             response_bytes,
         ),
     )
-    connection.commit()
     return _last_row_id(cursor)
 
 
@@ -145,7 +193,14 @@ def upsert_article(
 
     `first_seen_at` is set only on first insert: `ON CONFLICT DO NOTHING`
     means a rediscovery of the same `canonical_url` never touches it.
+
+    **The caller must already hold an open transaction; this function does not
+    begin, commit, or roll back one.** It runs inside the settling transaction
+    `runs.repository.complete_work` opens around its `domain_writes` callback,
+    so a handler's domain rows and the settlement that justifies them commit
+    or roll back together. Raises `RuntimeError` if no transaction is open.
     """
+    _require_transaction(connection, "upsert_article")
     connection.execute(
         """
         INSERT INTO canonical_article (canonical_url, publisher_key, first_seen_at)
@@ -154,7 +209,6 @@ def upsert_article(
         """,
         (canonical_url, publisher_key, now),
     )
-    connection.commit()
     row = connection.execute(
         "SELECT id FROM canonical_article WHERE canonical_url = ?", (canonical_url,)
     ).fetchone()
@@ -173,7 +227,14 @@ def record_alias(
 
     `ON CONFLICT DO NOTHING` on the unique `url` column makes a rediscovery
     of an already-recorded alias a no-op rather than an error.
+
+    **The caller must already hold an open transaction; this function does not
+    begin, commit, or roll back one.** It runs inside the settling transaction
+    `runs.repository.complete_work` opens around its `domain_writes` callback,
+    so a handler's domain rows and the settlement that justifies them commit
+    or roll back together. Raises `RuntimeError` if no transaction is open.
     """
+    _require_transaction(connection, "record_alias")
     connection.execute(
         """
         INSERT INTO article_url_alias (canonical_article_id, url, kind, first_seen_at)
@@ -182,7 +243,6 @@ def record_alias(
         """,
         (canonical_article_id, url, kind, now),
     )
-    connection.commit()
 
 
 def insert_source_item(
@@ -214,75 +274,81 @@ def insert_source_item(
     `source_entry_id` is. With neither key, there is nothing to dedup on and
     the item is always inserted.
 
-    The duplicate check is an explicit pre-check inside this transaction,
-    not a catch of `sqlite3.IntegrityError` after a failed insert.
-    `IntegrityError` is also raised for a foreign-key violation or a NOT
-    NULL violation on a genuinely malformed call, and catching it broadly
-    would misreport either of those as "already exists" -- turning a real
-    bug into a silent no-op. `BEGIN IMMEDIATE` takes the write lock before
-    the pre-check runs, so it cannot race a concurrent insert of the same
-    item: the two are serialized, not merely both individually correct.
+    **The caller must already hold an open transaction; this function does not
+    begin, commit, or roll back one.** It runs inside the settling transaction
+    `runs.repository.complete_work` opens around its `domain_writes` callback,
+    so a handler's domain rows and the settlement that justifies them commit
+    or roll back together. Raises `RuntimeError` if no transaction is open.
+
+    The duplicate check is an explicit pre-check, not a catch of
+    `sqlite3.IntegrityError` after a failed insert. `IntegrityError` is also
+    raised for a foreign-key violation or a NOT NULL violation on a genuinely
+    malformed call, and catching it broadly would misreport either of those as
+    "already exists" -- turning a real bug into a silent no-op.
+
+    The pre-check is race-free only if the caller's transaction is IMMEDIATE:
+    the write lock must already be held when the check reads, or two
+    concurrent inserts of the same item can both see no duplicate and the
+    second fails on the unique index instead of returning `None`. Every
+    production caller reaches this through `complete_work`, which opens
+    `BEGIN IMMEDIATE`. `sqlite3` exposes no way to tell a deferred transaction
+    from an immediate one at runtime -- `in_transaction` is true for both --
+    so this is a documented contract, not an enforced one, and the guard above
+    deliberately does not pretend otherwise.
     """
-    connection.execute("BEGIN IMMEDIATE")
-    try:
-        if canonical_article_id is not None:
-            duplicate = connection.execute(
-                "SELECT 1 FROM source_item WHERE canonical_article_id = ?",
-                (canonical_article_id,),
-            ).fetchone()
-        elif source_entry_id is not None:
-            duplicate = connection.execute(
-                """
-                SELECT 1 FROM source_item
-                 WHERE feed_identity_id = ? AND source_entry_id = ?
-                   AND canonical_article_id IS NULL
-                """,
-                (feed_identity_id, source_entry_id),
-            ).fetchone()
-        else:
-            duplicate = None
+    _require_transaction(connection, "insert_source_item")
 
-        if duplicate is not None:
-            connection.rollback()
-            return None
-
-        cursor = connection.execute(
+    if canonical_article_id is not None:
+        duplicate = connection.execute(
+            "SELECT 1 FROM source_item WHERE canonical_article_id = ?",
+            (canonical_article_id,),
+        ).fetchone()
+    elif source_entry_id is not None:
+        duplicate = connection.execute(
             """
-            INSERT INTO source_item (
-                feed_identity_id, discovered_by_fetch_id, discovered_by_run_id,
-                canonical_article_id, source_entry_id, original_url,
-                title_raw, title_text, summary_raw, summary_text, author_raw,
-                published_raw, published_at, published_issue, url_issue,
-                discovered_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            SELECT 1 FROM source_item
+             WHERE feed_identity_id = ? AND source_entry_id = ?
+               AND canonical_article_id IS NULL
             """,
-            (
-                feed_identity_id,
-                discovered_by_fetch_id,
-                discovered_by_run_id,
-                canonical_article_id,
-                source_entry_id,
-                original_url,
-                title_raw,
-                title_text,
-                summary_raw,
-                summary_text,
-                author_raw,
-                published_raw,
-                published_at,
-                published_issue,
-                url_issue,
-                now,
-            ),
-        )
-        item_id = _last_row_id(cursor)
-    except BaseException:
-        connection.rollback()
-        raise
+            (feed_identity_id, source_entry_id),
+        ).fetchone()
     else:
-        connection.commit()
-    return item_id
+        duplicate = None
+
+    if duplicate is not None:
+        return None
+
+    cursor = connection.execute(
+        """
+        INSERT INTO source_item (
+            feed_identity_id, discovered_by_fetch_id, discovered_by_run_id,
+            canonical_article_id, source_entry_id, original_url,
+            title_raw, title_text, summary_raw, summary_text, author_raw,
+            published_raw, published_at, published_issue, url_issue,
+            discovered_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            feed_identity_id,
+            discovered_by_fetch_id,
+            discovered_by_run_id,
+            canonical_article_id,
+            source_entry_id,
+            original_url,
+            title_raw,
+            title_text,
+            summary_raw,
+            summary_text,
+            author_raw,
+            published_raw,
+            published_at,
+            published_issue,
+            url_issue,
+            now,
+        ),
+    )
+    return _last_row_id(cursor)
 
 
 def source_item_counts(

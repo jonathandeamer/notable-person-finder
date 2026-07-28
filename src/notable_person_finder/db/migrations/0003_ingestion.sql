@@ -16,8 +16,10 @@ CREATE TABLE feed_identity (
 -- One row per fetch attempt against a feed. Conditional-request state (the
 -- ETag and Last-Modified to send next time) is deliberately not stored as
 -- mutable columns on `feed_identity`: it is derived by the repository from
--- the latest fetch whose `outcome` is not 'failed', so a failed fetch can
--- never poison the validators a later, successful fetch would have offered.
+-- the latest fetch whose `outcome` is not 'failed' *and* which actually
+-- carries a validator, so neither a failed fetch nor a bare 304 (which
+-- usually omits Last-Modified and often ETag) can poison the validators an
+-- earlier successful fetch already established.
 CREATE TABLE feed_fetch (
     id INTEGER PRIMARY KEY,
     feed_identity_id INTEGER NOT NULL REFERENCES feed_identity(id),
@@ -43,7 +45,18 @@ CREATE TABLE feed_fetch (
         )
     ),
     entry_count INTEGER CHECK (entry_count IS NULL OR entry_count >= 0),
-    response_bytes INTEGER CHECK (response_bytes IS NULL OR response_bytes >= 0)
+    response_bytes INTEGER CHECK (response_bytes IS NULL OR response_bytes >= 0),
+    -- The same coupling `0002` enforces on `attempt`: a failure must always
+    -- say why, and a non-failure must never claim a reason. Without this a
+    -- 'failed' row can carry no category (so the digest cannot explain it)
+    -- and a 'modified' row can carry one (so a successful fetch reads as a
+    -- failure to anything grouping on `failure_category`).
+    CHECK (
+        CASE
+            WHEN outcome = 'failed' THEN failure_category IS NOT NULL
+            ELSE failure_category IS NULL
+        END
+    )
 );
 
 CREATE INDEX feed_fetch_by_identity ON feed_fetch(feed_identity_id, id);
