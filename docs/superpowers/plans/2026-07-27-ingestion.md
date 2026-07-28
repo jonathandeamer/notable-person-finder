@@ -23,6 +23,7 @@
 - Default verification is offline. Live tests are opt-in and deselected by default.
 - Do not import, run, reorganize, or repair `run_pipeline.py`, `scripts/`, JSONL state, or `tests/test_*.py`. The prototype suite is not a gate for this milestone.
 - Keep this plan under ~1,500 lines. Reference code blocks are illustrative; shipped code and its tests govern.
+- A test earns its place by discriminating, and the `expect failures` steps below do not demonstrate that — before its module exists a test fails with `ImportError`, which proves only that it runs. For every behaviour a task brief names: mutate the rule in the source, confirm a **specific named** test fails, restore, and record which mutation killed which test. A negative assertion (`X not in output`) additionally needs a positive control proving `X` is reachable at all. If source is written before its tests for any reason, this evidence is required for every named rule rather than a sample.
 
 ---
 

@@ -140,6 +140,29 @@ reviewable and executable.
 Before reporting completion, run the active plan's full completion gate and
 confirm `git diff --check` and `git status --short` are clean as applicable.
 
+## Test Evidence
+
+Tests-first ordering is not evidence that a test discriminates. A test written
+before its module fails with `ImportError`; that proves the test runs, not that
+it detects the rule it is named for. Milestone 3a lost four rules to exactly
+this gap — each test went red for the trivial reason, green once the code
+arrived, and stayed green when the rule it was named for was deleted.
+
+Before reporting a task complete:
+
+- For each behaviour the plan names, mutate that rule in the source, confirm a
+  **specific named** test fails, then restore. Report which mutation killed
+  which test. A rule that survives its own removal is untested.
+- A negative assertion needs a positive control. `assert X not in output`
+  proves nothing unless some input makes `X` appear; otherwise it passes
+  because `X` was never reachable, not because the code excluded it.
+- If source was written before its tests — after an interruption, or because a
+  task was recovered — every named rule needs this evidence, not a sample.
+  That ordering is how the four escapes above were introduced.
+
+Restore mutated source from a `cp` backup and verify with `diff`, never with
+`git stash`: the stash stack is shared across worktrees and other sessions.
+
 ## Foundation Invariants
 
 - The application never edits Wikipedia automatically. Every Wikipedia edit or
