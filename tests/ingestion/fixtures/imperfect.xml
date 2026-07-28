@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Imperfect Desk</title>
+    <link>https://example.com/imperfect</link>
+    <item>
+      <guid>https://example.com/imperfect/one</guid>
+      <title>First, well formed</title>
+      <link>https://example.com/imperfect/one</link>
+    </item>
+    <item>
+      <guid>https://example.com/imperfect/two</guid>
+      <title>Second, with a raw & ampersand</title>
+      <link>https://example.com/imperfect/two</link>
+    </item>
+    <item>
+      <guid>https://example.com/imperfect/three</guid>
+      <title>Third, well formed</title>
+      <link>https://example.com/imperfect/three</link>
+    </item>
+  </channel>
+</rss>

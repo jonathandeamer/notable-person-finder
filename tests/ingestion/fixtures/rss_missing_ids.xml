@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>No Identifiers Desk</title>
+    <link>https://example.com/noids</link>
+    <item>
+      <title>An item with no guid</title>
+      <link>https://example.com/noids/one</link>
+      <description>Still has a link.</description>
+    </item>
+    <item>
+      <title>A second item with no guid</title>
+      <link>https://example.com/noids/two</link>
+    </item>
+  </channel>
+</rss>
