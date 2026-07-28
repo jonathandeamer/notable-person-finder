@@ -76,6 +76,15 @@ class TaskHandler:
     `persist` runs on the application thread inside the same transaction that
     settles the work item, so a handler's domain writes and the settlement
     that justifies them commit or roll back together.
+
+    `persist_failure` is the same seam for the settlements that carry no
+    outcome. A provider failure the handler did not translate settles through
+    `_retry`'s verdict, which produces a state and a reason but no
+    `TaskOutcome`, so `persist` cannot run -- and a handler that owns domain
+    history would record nothing for an attempt that genuinely happened. The
+    two are disjoint: exactly one of them runs per settlement, because a
+    failure the handler translated into a `TaskOutcome` never reaches the
+    failure path at all.
     """
 
     task_type: str
@@ -86,6 +95,7 @@ class TaskHandler:
     reserved_nano_usd: int = 0
     prepare: Callable[[WorkItem], object] | None = None
     persist: Callable[[WorkItem, TaskOutcome], None] | None = None
+    persist_failure: Callable[[WorkItem, ProviderFailure], None] | None = None
     destination_host: Callable[[WorkItem], str | None] | None = None
 
 
@@ -251,9 +261,11 @@ def _domain_writes(
 ) -> Callable[[sqlite3.Connection], None] | None:
     """Bind `handler.persist` for the settling transaction to run, if there is one.
 
-    There is nothing to persist for an item that never produced an outcome --
-    a paused provider, a refused reservation, an exhausted retry -- so those
-    settlements carry no domain writes.
+    There is nothing an *outcome* handler can persist for an item that never
+    produced one -- a paused provider, a refused reservation, an exhausted
+    retry. A settlement driven by a provider failure instead routes to
+    `_failure_writes`, which is the same seam for the information that path
+    does have; the two never both run for one settlement.
     """
     persist = handler.persist
     if persist is None or outcome is None:
@@ -277,6 +289,40 @@ def _domain_writes(
             # `_settle` catches that type and re-settles this one item
             # `failed_permanent` with no domain writes, instead of stranding
             # it `running` over a bug in the handler's own persistence code.
+            raise _PersistFailed(type(error).__name__) from error
+
+    return write
+
+
+def _failure_writes(
+    handler: TaskHandler, work_item: WorkItem, failure: ProviderFailure | None
+) -> Callable[[sqlite3.Connection], None] | None:
+    """Bind `handler.persist_failure` for a settlement driven by a failure.
+
+    The mirror of `_domain_writes` for the paths where the retry policy, not
+    the handler, decided the item's fate. A failed external call is still an
+    event a handler may own history for -- a feed that could not be reached is
+    a gap in that feed's record, and one that leaves no row is indistinguishable
+    from a fetch that never ran.
+
+    Called once per *settlement*, never once per attempt: the engine reaches
+    here only after `_retry` has returned PERMANENT or EXHAUSTED, so a retried
+    call writes one row for its final verdict rather than one per try.
+    """
+    persist_failure = handler.persist_failure
+    if persist_failure is None or failure is None:
+        return None
+
+    def write(_connection: sqlite3.Connection) -> None:
+        # Identical isolation to `_domain_writes`, and for the identical
+        # reason: the call has already finished, so a fault here is
+        # unambiguously local to the handler's own write and must not strand
+        # the item `running`.
+        try:
+            persist_failure(work_item, failure)
+        except ProviderFailure:
+            raise
+        except Exception as error:
             raise _PersistFailed(type(error).__name__) from error
 
     return write
@@ -827,6 +873,7 @@ class RunEngine:
                 handler,
                 state=WorkState.FAILED_PERMANENT,
                 reason=str(failure.category),
+                failure=failure,
             )
             return
         if failure.category is FailureCategory.MALFORMED_RESPONSE:
@@ -845,6 +892,7 @@ class RunEngine:
                 handler,
                 state=WorkState.DEFERRED,
                 reason=f"exhausted transient failure: {failure.category}",
+                failure=failure,
             )
             return
         if decision.delay_seconds is None:
@@ -978,6 +1026,7 @@ class RunEngine:
         state: WorkState,
         reason: str | None,
         outcome: TaskOutcome | None = None,
+        failure: ProviderFailure | None = None,
     ) -> None:
         """Record one item's outcome and take it out of this run's claims.
 
@@ -987,6 +1036,11 @@ class RunEngine:
         that same transaction, so a handler's domain writes and the settlement
         that justifies them commit or roll back together.
 
+        `outcome` and `failure` are mutually exclusive, and the guard below
+        holds both callers to it: an outcome means the handler settled the item
+        itself, a failure means the retry policy did. Were both ever passed,
+        which domain write ran would come down to argument order.
+
         `reason` is sanitised here, once, whether it came from a handler or
         from the engine's own literals: this is where every reason this
         engine settles gets bounded on its way to `complete_work`, to the
@@ -995,6 +1049,10 @@ class RunEngine:
         `_REASON_CONTROL_CHARACTERS` for the other, non-`_settle` writers of
         this column and why they are out of scope here.
         """
+        if outcome is not None and failure is not None:
+            raise RuntimeError(
+                "a settlement cannot carry both an outcome and a provider failure"
+            )
         reason = _sanitize_reason(reason)
         if state is WorkState.DEFERRED and reason is None:
             # `TaskOutcome(state=DEFERRED, reason=None)` type-checks: nothing
@@ -1016,7 +1074,10 @@ class RunEngine:
                 state=state,
                 reason=reason,
                 now=self._now(),
-                domain_writes=_domain_writes(handler, work_item, outcome),
+                domain_writes=(
+                    _domain_writes(handler, work_item, outcome)
+                    or _failure_writes(handler, work_item, failure)
+                ),
             )
         except _PersistFailed as error:
             # The call already succeeded, so unlike `execute` there is no

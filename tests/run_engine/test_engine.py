@@ -24,7 +24,7 @@ from notable_person_finder.runs.engine import (
     TaskOutcome,
     derive_run_state,
 )
-from notable_person_finder.runs.models import RunState, WorkState
+from notable_person_finder.runs.models import RunState, WorkItem, WorkState
 from notable_person_finder.runs.retry import RetryPolicy
 from notable_person_finder.runs.scheduler import BoundedScheduler
 
@@ -2211,4 +2211,286 @@ def test_the_engines_own_pause_and_exhaustion_literals_round_trip_byte_identical
         f"exhausted transient failure: {FailureCategory.PROVIDER_UNAVAILABLE}",
         "provider paused for this run",
     }
+    connection.close()
+
+
+# --- persist_failure: domain writes for a settlement with no outcome ----------
+
+
+def test_persist_failure_runs_for_a_permanent_failure_inside_its_settlement(
+    database: Path,
+) -> None:
+    """A non-retryable failure settles with no `TaskOutcome`, so `persist`
+    cannot run -- yet the attempt genuinely happened and a handler owning
+    domain history needs to record it. `persist_failure` is that seam, and it
+    runs inside the settling transaction exactly as `persist` does.
+
+    `access_denied` is not in `RETRYABLE_CATEGORIES`, so the retry policy
+    forecloses it as PERMANENT on the first attempt.
+    """
+    connection = connect_database(database)
+    connection.execute("CREATE TABLE probe_note (id INTEGER PRIMARY KEY, note TEXT)")
+    item = schedule_probe(connection, "d1" * 32)
+    application_thread = threading.get_ident()
+    seen: list[tuple[int, str, str | None]] = []
+
+    def persist_failure(work_item, failure: ProviderFailure) -> None:
+        seen.append((threading.get_ident(), str(failure.category), failure.detail))
+        connection.execute(
+            "INSERT INTO probe_note (note) VALUES (?)", (str(failure.category),)
+        )
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        raise ProviderFailure(
+            FailureCategory.ACCESS_DENIED,
+            provider="probe_provider",
+            operation="probe_call",
+            detail="forbidden",
+        )
+
+    handler = probe_handler(execute, persist_failure=persist_failure)
+    build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    assert seen == [
+        (application_thread, str(FailureCategory.ACCESS_DENIED), "forbidden")
+    ]
+    notes = [row["note"] for row in connection.execute("SELECT note FROM probe_note")]
+    assert notes == [str(FailureCategory.ACCESS_DENIED)]
+    assert (
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (item,)
+        ).fetchone()["state"]
+        == WorkState.FAILED_PERMANENT
+    )
+    connection.close()
+
+
+def test_persist_failure_runs_once_when_a_transient_failure_exhausts(
+    database: Path,
+) -> None:
+    """The EXHAUSTED settlement is the other outcome-less path, and it is the
+    one that matters operationally: a feed down all week defers every day and
+    would otherwise leave no domain trace at all.
+
+    Called once per *settlement*, not once per attempt -- `max_attempts=2`
+    makes two calls here and the hook must still fire exactly once, or a
+    caller counting rows would double-count every retry.
+    """
+    connection = connect_database(database)
+    item = schedule_probe(connection, "d2" * 32)
+    calls: list[int] = []
+    failures: list[str] = []
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        calls.append(ordinal)
+        raise ProviderFailure(
+            FailureCategory.NETWORK,
+            provider="probe_provider",
+            operation="probe_call",
+            detail="connection reset",
+        )
+
+    handler = probe_handler(
+        execute,
+        persist_failure=lambda work_item, failure: failures.append(
+            str(failure.category)
+        ),
+    )
+    build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    assert calls == [1, 2]
+    assert failures == [str(FailureCategory.NETWORK)]
+    assert (
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (item,)
+        ).fetchone()["state"]
+        == WorkState.DEFERRED
+    )
+    connection.close()
+
+
+def test_persist_failure_rolls_back_with_its_settlement_and_isolates_the_item(
+    database: Path,
+) -> None:
+    """Same transactional contract as `persist`, and the same isolation when it
+    raises: the domain write never lands, and the item is settled a second time
+    as `failed_permanent` rather than stranded `running` for every future run
+    to reclaim and fail identically."""
+    connection = connect_database(database)
+    connection.execute("CREATE TABLE probe_note (id INTEGER PRIMARY KEY, note TEXT)")
+    item = schedule_probe(connection, "d3" * 32)
+
+    def failing_persist_failure(work_item, failure: ProviderFailure) -> None:
+        connection.execute("INSERT INTO probe_note (note) VALUES ('doomed')")
+        raise RuntimeError("domain write failed")
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        raise ProviderFailure(
+            FailureCategory.ACCESS_DENIED,
+            provider="probe_provider",
+            operation="probe_call",
+            detail="forbidden",
+        )
+
+    handler = probe_handler(execute, persist_failure=failing_persist_failure)
+    build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    notes = [row["note"] for row in connection.execute("SELECT note FROM probe_note")]
+    assert notes == []
+    row = connection.execute(
+        "SELECT state, reason FROM work_item WHERE id = ?", (item,)
+    ).fetchone()
+    assert row["state"] == WorkState.FAILED_PERMANENT
+    assert "RuntimeError" in row["reason"]
+    connection.close()
+
+
+def test_persist_failure_does_not_run_when_the_handler_returned_an_outcome(
+    database: Path,
+) -> None:
+    """The two hooks are disjoint by construction. A handler that translates a
+    failure into a settling `TaskOutcome` itself -- which is exactly what the
+    feed handler does for `response_too_large` -- must get `persist`, not
+    `persist_failure`, or its refusal would be recorded twice under two
+    different shapes.
+
+    Both items run through one engine pass on one handler that has *both*
+    hooks bound, so the routing is decided per settlement rather than per
+    handler. Each list is the other's positive control: neither empty
+    assertion can pass vacuously, because the same run makes the other fire.
+    """
+    connection = connect_database(database)
+    translated = schedule_probe(connection, "d4" * 32)
+    raising = schedule_probe(connection, "d5" * 32)
+    persisted: list[str] = []
+    failed: list[str] = []
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        if work_item.id == translated:
+            return TaskOutcome(
+                state=WorkState.DEFERRED, reason="translated", payload="carried"
+            )
+        raise ProviderFailure(
+            FailureCategory.ACCESS_DENIED,
+            provider="probe_provider",
+            operation="probe_call",
+            detail="forbidden",
+        )
+
+    handler = probe_handler(
+        execute,
+        persist=lambda work_item, outcome: persisted.append(str(outcome.payload)),
+        persist_failure=lambda work_item, failure: failed.append(str(failure.category)),
+    )
+    build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    # The translated deferral took `persist` and nothing else; the untranslated
+    # failure took `persist_failure` and nothing else.
+    assert persisted == ["carried"]
+    assert failed == [str(FailureCategory.ACCESS_DENIED)]
+    states = {
+        row["id"]: row["state"]
+        for row in connection.execute("SELECT id, state FROM work_item")
+    }
+    assert states[translated] == WorkState.DEFERRED
+    assert states[raising] == WorkState.FAILED_PERMANENT
+    connection.close()
+
+
+def test_persist_failure_does_not_run_for_a_settlement_with_no_failure(
+    database: Path,
+) -> None:
+    """Three settlements carry neither an outcome nor a provider failure: a
+    paused provider, a raising `prepare`, and a refused budget reservation. In
+    all three no call was made, so there is no failed attempt to record -- and
+    a handler told otherwise would write a fetch row for a request that never
+    left the machine, which is worse than the gap it was added to close.
+
+    Budget refusal is the case exercised here (`reserved_nano_usd` exceeds the
+    run's limit, so `start_attempt` raises `BudgetExhausted` before any call).
+    The second half is the positive control: the identical handler, given a
+    budget, reaches its provider and fires the hook -- so the empty assertion
+    cannot pass merely because the hook was never wired up.
+    """
+    connection = connect_database(database)
+    refused = schedule_probe(connection, "e1" * 32)
+    failed: list[str] = []
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        raise ProviderFailure(
+            FailureCategory.ACCESS_DENIED,
+            provider="probe_provider",
+            operation="probe_call",
+            detail="forbidden",
+        )
+
+    handler = probe_handler(
+        execute,
+        reserved_nano_usd=500,
+        persist_failure=lambda work_item, failure: failed.append(str(failure.category)),
+    )
+    build_engine(connection, FakeClock(), budget_limit_nano_usd=0).execute(
+        {handler.task_type: handler}
+    )
+
+    row = connection.execute(
+        "SELECT state, reason FROM work_item WHERE id = ?", (refused,)
+    ).fetchone()
+    assert row["state"] == WorkState.DEFERRED
+    assert row["reason"] == "not_evaluated_budget"
+    assert failed == []
+
+    # Positive control: same handler, same hook, a budget that permits the call.
+    build_engine(connection, FakeClock(), budget_limit_nano_usd=10_000).execute(
+        {handler.task_type: handler}
+    )
+    assert failed == [str(FailureCategory.ACCESS_DENIED)]
+    connection.close()
+
+
+def test_a_settlement_may_not_carry_both_an_outcome_and_a_failure(
+    database: Path,
+) -> None:
+    """`_settle` picks the domain write from whichever of the two it was given.
+    Passing both would make that choice depend on argument order, so it is
+    refused outright rather than silently resolved. No engine path does this
+    today; the guard exists so that a future one cannot introduce it quietly.
+
+    The guard is checked before any database access, so this needs no run and
+    no claimed item -- which is the point: it isolates the rule from every
+    other reason a settlement can fail.
+    """
+    connection = connect_database(database)
+    handler = probe_handler(
+        lambda work, ordinal, prepared: TaskOutcome(
+            state=WorkState.SUCCEEDED, reason=None
+        )
+    )
+    engine = build_engine(connection, FakeClock())
+    work_item = WorkItem(
+        id=1,
+        task_type="probe",
+        subject_kind="synthetic",
+        subject_id=None,
+        fingerprint="e2" * 32,
+        required=True,
+        priority=100,
+        state=WorkState.RUNNING,
+    )
+
+    with pytest.raises(RuntimeError, match="both an outcome and a provider failure"):
+        engine._settle(  # pyright: ignore[reportPrivateUsage]
+            1,
+            work_item,
+            handler,
+            state=WorkState.FAILED_PERMANENT,
+            reason="both",
+            outcome=TaskOutcome(state=WorkState.SUCCEEDED, reason=None),
+            failure=ProviderFailure(
+                FailureCategory.ACCESS_DENIED,
+                provider="probe_provider",
+                operation="probe_call",
+                detail="forbidden",
+            ),
+        )
     connection.close()
