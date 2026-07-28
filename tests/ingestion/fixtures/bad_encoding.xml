@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="x-leaky-charset-4f3a2b"?>
+<rss version="2.0">
+  <channel>
+    <title>Bad Encoding Desk</title>
+    <link>https://example.com/encoding</link>
+    <item>
+      <guid isPermaLink="false">tag:example.com,2026:encoding/1</guid>
+      <title>An item in a feed with a bogus charset declaration</title>
+      <link>https://example.com/encoding/one</link>
+    </item>
+  </channel>
+</rss>

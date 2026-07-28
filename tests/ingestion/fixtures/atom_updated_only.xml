@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Updated Only Desk</title>
+  <id>urn:uuid:feed-0002</id>
+  <updated>2026-07-20T10:00:00Z</updated>
+  <entry>
+    <id>urn:uuid:entry-0003</id>
+    <title>An entry with only the mandatory updated date</title>
+    <link rel="alternate" href="https://example.com/updated-only/one"/>
+    <summary>RFC 4287 makes atom:updated mandatory and atom:published optional.</summary>
+    <updated>2026-07-19T08:00:00Z</updated>
+  </entry>
+</feed>

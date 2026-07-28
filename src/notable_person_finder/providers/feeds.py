@@ -1,13 +1,24 @@
 """The RSS and Atom feed adapter: the first concrete provider in the rewrite.
 
 This module is a *translator*, not a judge. It converts what a publisher
-actually wrote -- external field names, external optionality -- into frozen
+published -- external field names, external optionality -- into frozen
 application values, and it decides nothing about whether any of it is usable.
 It never validates a URL, never normalizes text, never parses a date, and
 never assigns a skip reason. Ingestion owns every one of those decisions, so
 that the rule for "is this article worth looking at" lives in exactly one
 place rather than being partly pre-applied here where it cannot be reviewed
 alongside the rest of the policy.
+
+One caveat on "what the publisher published", because the module cannot
+honestly claim byte-for-byte fidelity: feedparser sanitises HTML in `summary`
+and `content` by default, stripping `<script>` elements and event-handler
+attributes. That behaviour is kept deliberately -- these strings are later
+rendered to an operator and fed to a model -- but it is a library default
+rather than something this module requests, so
+`test_feedparsers_html_sanitiser_is_active` pins it. If a feedparser upgrade
+ever turns it off, that test is what makes the change visible instead of
+silent. Nothing else is altered: text is not normalized, entities beyond the
+sanitiser's work are not rewritten, and no field is dropped.
 
 Two boundaries in here are load-bearing and are easy to mistake for
 defensive habit:
@@ -30,7 +41,7 @@ defensive habit:
 from __future__ import annotations
 
 import io
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 from xml.sax import SAXParseException
@@ -52,9 +63,18 @@ OPERATION = "fetch_feed"
 # "atom10", "atom03", and so on, with "" for "parsed something, but it was not
 # a feed" and None for "nothing to parse". Matching by prefix rather than
 # against an exhaustive set keeps a future feedparser release's new RSS or
-# Atom revision working. "cdf" and "json1" are deliberately not accepted: the
-# milestone is scoped to RSS and Atom, and silently accepting a third syntax
-# would mean shipping an untested translation path.
+# Atom revision working.
+#
+# This is a positive allowlist, and that is the whole rule: any other syntax
+# is rejected because the milestone is scoped to RSS and Atom, and accepting a
+# third one would ship a translation path no test covers. Do not read the
+# allowlist as excluding some specific rival format -- in feedparser 6.0.12
+# there is nothing else to exclude. "cdf" survives only in its
+# `SUPPORTED_VERSIONS` table with no code path that sets it, and "json1" does
+# not exist in feedparser 6 at all; a CDF document and a JSON Feed both parse
+# to `version == ""`. Because no payload can express a widened allowlist,
+# `test_only_rss_and_atom_version_strings_are_accepted` pins the rule against
+# a fabricated parse result instead.
 _RECOGNIZED_FEED_PREFIXES = ("rss", "atom")
 
 _NOT_MODIFIED = 304
@@ -87,11 +107,25 @@ class FeedValidators:
 
 @dataclass(frozen=True, slots=True)
 class FeedEntry:
-    """One feed item, exactly as the publisher wrote it.
+    """One feed item, translated field for field and judged not at all.
 
     Every field is optional because every field is genuinely optional in the
     wild: RSS requires neither `guid` nor `link`, and plenty of real feeds omit
-    one or both. `published_raw` keeps the source's own date string, unparsed.
+    one or both. `summary` and `content` have passed feedparser's HTML
+    sanitiser; see the module docstring.
+
+    Both dates are carried, unparsed, and neither substitutes for the other.
+    RFC 4287 makes `atom:updated` mandatory and `atom:published` optional, so a
+    conforming Atom feed with only `<updated>` is common -- and falling back
+    from one to the other would assert that "when this was published" and "when
+    this document last changed" are the same claim. They are not, and choosing
+    between them is a usability judgement that belongs to ingestion, which
+    cannot recover a distinction this adapter has already collapsed.
+
+    RSS carries no per-item modification date, so an RSS entry reports
+    `published_raw` and leaves `updated_raw` as `None`. Getting that right
+    required reading literally stored keys rather than feedparser's own lookup,
+    which would have echoed `pubDate` into both fields; see `_raw`.
     """
 
     entry_id: str | None
@@ -101,6 +135,7 @@ class FeedEntry:
     content: str | None
     author: str | None
     published_raw: str | None
+    updated_raw: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,7 +177,33 @@ class Modified:
 FeedFetchResult = NotModified | Modified
 
 
-def _text(container: Mapping[str, object] | None, key: str) -> str | None:
+def _raw(container: dict[str, object], key: str) -> object:
+    """Read the key that is literally stored, bypassing feedparser's aliasing.
+
+    `FeedParserDict.__getitem__` is not a plain lookup. For `updated` it
+    silently returns `published` when `updated` is absent -- with a
+    `DeprecationWarning`, and the docstring in feedparser says the fallback
+    "will be removed in a future version". Going through it would be wrong
+    three times over:
+
+    * it collapses `published` into `updated`, which is exactly the conflation
+      `FeedEntry` exists to avoid, merely in the opposite direction, and it
+      would make every RSS entry report a modification date it never carried;
+    * the behaviour is deprecated, so an upgrade would change what this adapter
+      reports with no code change and no failing test; and
+    * it emits a `DeprecationWarning` for every entry read, which is noise in
+      an operator's log for a value we did not want anyway.
+
+    `dict.get` on the instance reaches the stored mapping directly. Every field
+    is read this way, not just the dates: a translator must never resolve one
+    external field name to a different external field's value. feedparser
+    canonicalizes names on *write* (`guid` is stored as `id`), so the literal
+    keys are the right ones to ask for.
+    """
+    return dict.get(container, key)
+
+
+def _text(container: dict[str, object] | None, key: str) -> str | None:
     """Read `key` as a string, or `None` if it is missing or not a string.
 
     feedparser hands back a `dict` subclass with untyped, heterogeneous
@@ -152,15 +213,15 @@ def _text(container: Mapping[str, object] | None, key: str) -> str | None:
     """
     if container is None:
         return None
-    value = container.get(key)
+    value = _raw(container, key)
     return value if isinstance(value, str) else None
 
 
-def _mapping(value: object) -> Mapping[str, object] | None:
-    return value if isinstance(value, Mapping) else None
+def _mapping(value: object) -> dict[str, object] | None:
+    return value if isinstance(value, dict) else None
 
 
-def _first_content(entry: Mapping[str, object]) -> str | None:
+def _first_content(entry: dict[str, object]) -> str | None:
     """The first `content` body a publisher supplied, if any.
 
     feedparser models `content` as a list, because Atom permits several
@@ -169,7 +230,7 @@ def _first_content(entry: Mapping[str, object]) -> str | None:
     among them by type or length would be a usability decision, which belongs
     to ingestion rather than here.
     """
-    values = entry.get("content")
+    values = _raw(entry, "content")
     if not isinstance(values, Sequence) or isinstance(values, str | bytes):
         return None
     for item in values:
@@ -183,11 +244,21 @@ def _describe(error: object) -> str:
     """A warning string that is sanitized by construction.
 
     Only the exception type, and for a SAX error its position, are reported.
-    The exception's own message is deliberately dropped: `getMessage()` can
-    quote remote document text (an undefined entity name, for instance), and a
-    warning is persisted and printed. Position plus type is enough to tell a
-    publisher's feed is broken and roughly where, without carrying a fragment
-    of their document along with it.
+    The exception's own message is deliberately dropped, because a warning is
+    persisted to the database and rendered in the operator's digest, and some
+    of these messages quote remote-controlled text.
+
+    The case that actually demonstrates this is `CharacterEncodingOverride`,
+    whose message is `document declared as <declared>, but parsed as utf-8` --
+    where `<declared>` is whatever charset string the remote document chose to
+    write. Such a payload keeps `version == "rss20"` and its entries, so it
+    becomes a `Modified` result and the warning travels onward.
+
+    A SAX message from CPython's expat, by contrast, is positional and quotes
+    nothing (`<unknown>:13:33: not well-formed (invalid token)`; even an
+    undefined entity is reported as a bare `undefined entity`). Type plus
+    position is enough to tell an operator a feed is broken and roughly where,
+    without carrying any fragment of the document with it.
     """
     if error is None:
         return "unspecified parser warning"
@@ -291,13 +362,22 @@ class FeedparserClient:
             ) from error
 
     def _parse(self, response: HttpResponse) -> Modified:
+        # A stream, not raw bytes: `feedparser._open_resource` returns
+        # immediately for anything with `.read()`, whereas raw bytes fall
+        # through to a `urlopen`/`open()` attempt on the payload itself.
+        # Wrapping the body makes it structurally impossible for a remote
+        # document to be treated as a URL or a filename.
+        #
+        # Built *outside* the try below on purpose. Reading `response.content`
+        # or constructing the stream is our own work on our own object, so a
+        # fault there is an internal fault; inside the try it would be
+        # attributed to the publisher as a retryable malformed payload, which
+        # inverts the exact distinction the two failure boundaries exist to
+        # keep apart. The method-wide backstop in `fetch_feed` catches it as
+        # `INTERNAL` instead.
+        stream = io.BytesIO(response.content)
         try:
-            # A stream, not raw bytes: `feedparser._open_resource` returns
-            # immediately for anything with `.read()`, whereas raw bytes fall
-            # through to a `urlopen`/`open()` attempt on the payload itself.
-            # Wrapping the body makes it structurally impossible for a remote
-            # document to be treated as a URL or a filename.
-            parsed = feedparser.parse(io.BytesIO(response.content))
+            parsed = feedparser.parse(stream)
         except Exception as error:
             # feedparser recovers from bad markup on its own, so an exception
             # escaping it means the payload defeated the parser outright --
@@ -316,13 +396,13 @@ class FeedparserClient:
             # reports. The detail names no part of the payload.
             raise _malformed("payload is not a recognized RSS or Atom feed")
 
-        source = _mapping(document.get("feed"))
-        raw_entries = document.get("entries")
+        source = _mapping(_raw(document, "feed"))
+        raw_entries = _raw(document, "entries")
         entries = raw_entries if isinstance(raw_entries, Sequence) else ()
 
         warnings: tuple[str, ...] = ()
-        if document.get("bozo"):
-            warnings = (_describe(document.get("bozo_exception")),)
+        if _raw(document, "bozo"):
+            warnings = (_describe(_raw(document, "bozo_exception")),)
 
         return Modified(
             requested_url=response.requested_url,
@@ -344,7 +424,7 @@ class FeedparserClient:
         )
 
 
-def _entry(entry: Mapping[str, object]) -> FeedEntry:
+def _entry(entry: dict[str, object]) -> FeedEntry:
     return FeedEntry(
         entry_id=_text(entry, "id"),
         url=_text(entry, "link"),
@@ -353,6 +433,7 @@ def _entry(entry: Mapping[str, object]) -> FeedEntry:
         content=_first_content(entry),
         author=_text(entry, "author"),
         published_raw=_text(entry, "published"),
+        updated_raw=_text(entry, "updated"),
     )
 
 

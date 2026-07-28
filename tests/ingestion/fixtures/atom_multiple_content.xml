@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Multiple Content Desk</title>
+  <id>urn:uuid:feed-0003</id>
+  <updated>2026-07-20T10:00:00Z</updated>
+  <entry>
+    <id>urn:uuid:entry-0004</id>
+    <title>An entry carrying two content representations</title>
+    <link rel="alternate" href="https://example.com/multi/one"/>
+    <content type="text">the first representation</content>
+    <content type="html">&lt;p&gt;the second representation&lt;/p&gt;</content>
+  </entry>
+</feed>

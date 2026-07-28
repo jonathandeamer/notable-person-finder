@@ -17,6 +17,7 @@ different depths:
 from __future__ import annotations
 
 import io
+import warnings
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Literal
@@ -165,8 +166,20 @@ class RecordingTransport(HttpTransport):
 
 
 def http_response(
-    payload: bytes, *, status: int = 200, headers: Mapping[str, str] | None = None
+    payload: bytes,
+    *,
+    status: int = 200,
+    headers: Mapping[str, str] | None = None,
+    encoded_bytes: int | None = None,
 ) -> HttpResponse:
+    """A hand-built response.
+
+    `encoded_bytes` can be set independently of the decoded length so that a
+    compressed response -- where the two genuinely differ -- can be
+    represented. Every fixture served over the wire in these tests is
+    uncompressed, which makes the two values equal and would otherwise hide
+    which one the adapter reports.
+    """
     return HttpResponse(
         requested_url=FEED.url,
         final_url=FEED.url,
@@ -175,7 +188,7 @@ def http_response(
         status_code=status,
         headers=dict(headers or {}),
         content=payload,
-        encoded_bytes=len(payload),
+        encoded_bytes=len(payload) if encoded_bytes is None else encoded_bytes,
         decoded_bytes=len(payload),
     )
 
@@ -242,12 +255,22 @@ def test_adapter_decides_nothing_about_usability() -> None:
     assert result.entries[0].published_raw == "Mon, 20 Jul 2026 09:30:00 GMT"
 
 
-def test_response_bytes_records_the_decoded_payload_size() -> None:
+def test_response_bytes_is_the_decoded_size_not_the_encoded_size() -> None:
+    """The two differ only for a compressed response, so it is pinned here.
+
+    Every fixture served over `httpx.MockTransport` in this module is
+    uncompressed, which makes `encoded_bytes` and `decoded_bytes` equal and
+    hides which of the two `response_bytes` reports. A hand-built response
+    separates them.
+    """
     payload = fixture_bytes("rss20.xml")
-    result = client_for(payload).fetch_feed(FEED, NO_VALIDATORS)
+    transport = RecordingTransport(response=http_response(payload, encoded_bytes=17))
+
+    result = FeedparserClient(transport).fetch_feed(FEED, NO_VALIDATORS)
 
     assert isinstance(result, Modified)
     assert result.response_bytes == len(payload)
+    assert result.response_bytes != 17
 
 
 # --------------------------------------------------------------------------
@@ -269,6 +292,76 @@ def test_entries_without_ids_translate_to_none_rather_than_being_dropped() -> No
     ]
 
 
+def test_atom_published_and_updated_are_kept_as_separate_dates() -> None:
+    """RFC 4287 makes `atom:updated` mandatory and `atom:published` optional.
+
+    A conforming Atom feed carrying only `<updated>` is common, and collapsing
+    the two -- falling back from `published` to `updated` -- would assert they
+    mean the same thing. They do not: one is when the publisher says the piece
+    came out, the other merely when the document last changed. Deciding
+    between them is a usability judgement that belongs to ingestion, and
+    ingestion cannot recover a distinction this adapter has already thrown
+    away. So both are exposed and neither substitutes for the other.
+    """
+    result = client_for(fixture_bytes("atom_updated_only.xml")).fetch_feed(
+        FEED, NO_VALIDATORS
+    )
+
+    assert isinstance(result, Modified)
+    entry = result.entries[0]
+    assert entry.published_raw is None
+    assert entry.updated_raw == "2026-07-19T08:00:00Z"
+
+
+def test_atom_entry_with_both_dates_reports_both() -> None:
+    result = client_for(fixture_bytes("atom.xml")).fetch_feed(FEED, NO_VALIDATORS)
+
+    assert isinstance(result, Modified)
+    assert result.entries[0].published_raw == "2026-07-20T09:00:00Z"
+    assert result.entries[0].updated_raw == "2026-07-20T09:05:00Z"
+
+
+def test_rss_pubdate_populates_only_published_and_never_updated() -> None:
+    """RSS has no per-item modification date, so `updated_raw` stays `None`.
+
+    Reading this through `FeedParserDict`'s own lookup would report the
+    `pubDate` value in *both* fields: for the key `updated`, feedparser falls
+    back to `published` when `updated` is absent. That is the same conflation
+    `FeedEntry` exists to prevent, just running in the opposite direction --
+    it would have every RSS entry claim a modification date the publisher never
+    wrote. It is also deprecated in feedparser and slated for removal, so
+    depending on it would mean an upgrade silently changing what this adapter
+    reports.
+
+    The adapter therefore reads literally stored keys only. This test is what
+    holds that: reinstating the aliasing lookup makes `updated_raw` equal
+    `published_raw` here.
+    """
+    result = client_for(fixture_bytes("rss20.xml")).fetch_feed(FEED, NO_VALIDATORS)
+
+    assert isinstance(result, Modified)
+    assert result.entries[0].published_raw == "Mon, 20 Jul 2026 09:30:00 GMT"
+    assert result.entries[0].updated_raw is None
+
+
+def test_no_deprecated_feedparser_behaviour_is_relied_on() -> None:
+    """Turn feedparser's own `DeprecationWarning` into a failure.
+
+    feedparser warns when its temporary `updated` -> `published` fallback is
+    used. Escalating warnings to errors across a full fetch of both a
+    date-bearing RSS feed and an Atom feed is what keeps this adapter off that
+    path -- reinstating the aliasing lookup raises here rather than merely
+    changing a value.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        for name in ("rss20.xml", "atom.xml", "atom_updated_only.xml"):
+            assert isinstance(
+                client_for(fixture_bytes(name)).fetch_feed(FEED, NO_VALIDATORS),
+                Modified,
+            )
+
+
 def test_entries_without_links_translate_to_none_rather_than_being_dropped() -> None:
     result = client_for(fixture_bytes("rss_missing_links.xml")).fetch_feed(
         FEED, NO_VALIDATORS
@@ -279,6 +372,79 @@ def test_entries_without_links_translate_to_none_rather_than_being_dropped() -> 
     assert [entry.url for entry in result.entries] == [None, None]
     assert result.entries[0].entry_id == "tag:example.com,2026:nolinks/1"
     assert result.entries[1].entry_id is None
+
+
+def test_the_first_content_representation_is_the_one_reported() -> None:
+    """Atom permits several `<content>` elements; feedparser keeps them all.
+
+    The application needs one body candidate, and source order is the
+    publisher's own preference. Choosing by media type or by length would be a
+    usability decision, which belongs to ingestion. This is the only case
+    `_first_content`'s loop exists for, so without a multi-content fixture the
+    ordering is unpinned.
+    """
+    result = client_for(fixture_bytes("atom_multiple_content.xml")).fetch_feed(
+        FEED, NO_VALIDATORS
+    )
+
+    assert isinstance(result, Modified)
+    assert result.entries[0].content == "the first representation"
+
+
+def test_relative_entry_links_pass_through_unresolved() -> None:
+    """A `BytesIO` carries no base URI, so feedparser cannot resolve links.
+
+    This is correct for the boundary -- resolving against the final URL would
+    be a URL decision, and `canonicalize_article_url` in ingestion owns those
+    -- but it means Task 10 will meet a bare path in `url` and must handle it
+    rather than assuming an absolute URL.
+    """
+    payload = b"""<?xml version="1.0"?><rss version="2.0"><channel>
+    <title>Relative Desk</title>
+    <item><guid isPermaLink="false">tag:example.com,2026:rel/1</guid>
+    <link>/relative/path</link></item>
+    </channel></rss>"""
+
+    result = client_for(payload).fetch_feed(FEED, NO_VALIDATORS)
+
+    assert isinstance(result, Modified)
+    assert result.entries[0].url == "/relative/path"
+
+
+def test_feedparsers_html_sanitiser_is_active() -> None:
+    """Pinned so that losing the sanitiser becomes visible rather than silent.
+
+    feedparser sanitises HTML in `summary` and `content` by default, stripping
+    `<script>` elements and event-handler attributes. That is the behaviour to
+    keep -- these strings are later rendered and fed to a model -- but it is a
+    library default rather than something this module asks for, so a feedparser
+    upgrade or a stray `sanitize_html=False` could remove it without any test
+    noticing. It also means the values are not *literally* byte-for-byte what
+    the publisher wrote, which the module docstring now says plainly.
+    """
+    payload = fixture_bytes("atom_unsafe_html.xml")
+
+    # Positive control: the fixture really does carry a script element and an
+    # event handler, so finding them absent below means they were stripped.
+    assert b"script" in payload
+    assert b"onclick" in payload
+
+    result = client_for(payload).fetch_feed(FEED, NO_VALIDATORS)
+
+    assert isinstance(result, Modified)
+    entry = result.entries[0]
+    assert entry.summary is not None
+    assert entry.content is not None
+
+    for markup in (entry.summary, entry.content):
+        assert "<script>" not in markup
+        assert "onclick" not in markup
+        assert "alert(" not in markup
+
+    # The prose itself survives: sanitising removes the dangerous parts, it
+    # does not discard the body.
+    assert "the summary body" in entry.summary
+    assert "the content body" in entry.content
 
 
 # --------------------------------------------------------------------------
@@ -300,21 +466,60 @@ def test_imperfect_feed_yields_modified_with_recovered_entries() -> None:
 
 
 def test_imperfect_feed_retains_its_warning() -> None:
+    """Asserted positively and exactly, so the rendering itself is pinned.
+
+    An earlier version of this test asserted only that the payload's own words
+    were *absent* from the warning. That was vacuous: expat's message for this
+    fixture is positional and quotes nothing from the document, so a naive
+    `f"{type(error).__name__}: {error}"` would have satisfied it. The
+    sanitisation claim is carried by
+    `test_a_bogus_charset_declaration_is_warned_about_without_being_quoted`,
+    which has a payload that can actually leak; this test pins the format.
+    """
     result = client_for(fixture_bytes("imperfect.xml")).fetch_feed(FEED, NO_VALIDATORS)
 
     assert isinstance(result, Modified)
+    assert result.warnings == ("SAXParseException at line 13, column 33",)
+
+
+def test_a_bogus_charset_declaration_is_warned_about_without_being_quoted() -> None:
+    """The reachable warning leak, and the reason `_describe` drops messages.
+
+    A payload declaring a charset feedparser cannot honour produces
+    `CharacterEncodingOverride`, whose message is
+    `document declared as <declared>, but parsed as utf-8` -- and `<declared>`
+    is remote-controlled text. It arrives with `version == "rss20"` and its
+    entries intact, so it becomes a `Modified` result and the warning is
+    persisted to the database and rendered in the operator's digest.
+
+    The `imperfect.xml` SAX case cannot demonstrate this: expat's message is
+    positional (`<unknown>:13:33: not well-formed (invalid token)`) and quotes
+    nothing from the document, so a naive
+    `f"{type(error).__name__}: {error}"` would pass a negative assertion made
+    against it. This fixture is the one that can tell the difference.
+    """
+    payload = fixture_bytes("bad_encoding.xml")
+
+    # Positive control. A negative assertion is worthless unless the string it
+    # looks for is genuinely reachable, so first prove that feedparser's own
+    # exception message for this exact payload *does* quote the declared
+    # charset. Without this, the assertions below could pass simply because
+    # nothing ever put the charset anywhere.
+    leaked = str(feedparser.parse(io.BytesIO(payload)).get("bozo_exception"))
+    assert "x-leaky-charset-4f3a2b" in leaked
+
+    result = client_for(payload).fetch_feed(FEED, NO_VALIDATORS)
+
+    assert isinstance(result, Modified)
+    # The imperfection is reported, not swallowed ...
     assert len(result.warnings) == 1
-    assert "SAXParseException" in result.warnings[0]
-
-
-def test_warning_text_carries_no_payload_content() -> None:
-    """A warning is diagnostic, not a transcript of the remote document."""
-    result = client_for(fixture_bytes("imperfect.xml")).fetch_feed(FEED, NO_VALIDATORS)
-
-    assert isinstance(result, Modified)
-    joined = " ".join(result.warnings)
-    assert "ampersand" not in joined
-    assert "Imperfect Desk" not in joined
+    assert "CharacterEncodingOverride" in result.warnings[0]
+    # ... and the entries are still delivered.
+    assert len(result.entries) == 1
+    # But the declared charset -- the remote-controlled part of the message --
+    # never reaches the warning.
+    assert "x-leaky-charset-4f3a2b" not in result.warnings[0]
+    assert "declared as" not in result.warnings[0]
 
 
 # --------------------------------------------------------------------------
@@ -330,6 +535,62 @@ def test_malformed_response_is_not_retryable_by_category_default() -> None:
     right to remove it. While this assertion holds, removing it is a bug.
     """
     assert FailureCategory.MALFORMED_RESPONSE not in RETRYABLE_CATEGORIES
+
+
+@pytest.mark.parametrize("version", ["cdf", "json1", "html", "", "rdf"])
+def test_only_rss_and_atom_version_strings_are_accepted(
+    version: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recognition is a positive allowlist, and entries do not override it.
+
+    This is asserted against a fabricated parse result rather than a fixture
+    on purpose: feedparser 6.0.12 cannot emit any of these version strings.
+    `cdf` survives only in its `SUPPORTED_VERSIONS` table -- no code path sets
+    it -- and `json1` does not exist in feedparser 6 at all; a CDF document
+    and a JSON Feed both parse to `version == ""`. So no payload can express
+    the rule, and a fixture-only test leaves "widen the accepted prefixes"
+    unkillable. Fabricating the document pins the decision at the level where
+    it is actually made.
+
+    The fabricated document deliberately carries entries, so the rule cannot
+    be satisfied by "it parsed something, so accept it".
+    """
+    document = {
+        "version": version,
+        "bozo": False,
+        "feed": {"title": "Some Document"},
+        "entries": [{"id": "x", "link": "https://example.com/x", "title": "X"}],
+    }
+    monkeypatch.setattr(feeds.feedparser, "parse", lambda source, **kwargs: document)
+
+    with pytest.raises(ProviderFailure) as caught:
+        client_for(fixture_bytes("rss20.xml")).fetch_feed(FEED, NO_VALIDATORS)
+
+    assert caught.value.category is FailureCategory.MALFORMED_RESPONSE
+    assert caught.value.retryable is True
+
+
+@pytest.mark.parametrize("version", ["rss20", "rss091n", "atom10", "atom03"])
+def test_every_rss_and_atom_version_string_is_accepted(
+    version: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the allowlist: prefix matching, not an exact set.
+
+    Matching by prefix is what keeps a future feedparser release's new RSS or
+    Atom revision working without a code change here.
+    """
+    document = {
+        "version": version,
+        "bozo": False,
+        "feed": {"title": "Some Feed"},
+        "entries": [{"id": "x", "link": "https://example.com/x", "title": "X"}],
+    }
+    monkeypatch.setattr(feeds.feedparser, "parse", lambda source, **kwargs: document)
+
+    result = client_for(fixture_bytes("rss20.xml")).fetch_feed(FEED, NO_VALIDATORS)
+
+    assert isinstance(result, Modified)
+    assert result.feed_type == version
 
 
 def test_html_error_page_raises_retryable_malformed_response() -> None:
@@ -355,6 +616,14 @@ def test_malformed_response_detail_leaks_neither_body_nor_query_text() -> None:
         label="Example Culture Desk",
         url="https://example.com/feed.xml?key=s3cret",
     )
+
+    # Positive controls: each string the assertions below look for is really
+    # present in the material the adapter handled, so their absence from the
+    # rendered failure is evidence rather than coincidence.
+    assert "s3cret" in feed.url
+    assert b"Bad Gateway" in payload
+    assert b"8c1f2a" in payload
+
     with pytest.raises(ProviderFailure) as caught:
         client_for(payload).fetch_feed(feed, NO_VALIDATORS)
 
@@ -394,13 +663,24 @@ def test_each_conditional_header_is_omitted_when_its_validator_is_absent() -> No
 
 
 def test_no_conditional_headers_are_sent_without_validators() -> None:
+    """Both requests are made here so the control is inside the test.
+
+    The first fetch proves these two header names do reach the wire when
+    validators are supplied; only then does their absence from the second
+    fetch mean the adapter omitted them, rather than the assertion looking for
+    a header name that never appears under any circumstances.
+    """
     seen: list[httpx.Request] = []
     client = client_for(fixture_bytes("rss20.xml"), seen=seen)
 
+    client.fetch_feed(FEED, FeedValidators(etag='W/"a"', last_modified="Mon, 20 Jul"))
+    assert "if-none-match" in seen[0].headers
+    assert "if-modified-since" in seen[0].headers
+
     client.fetch_feed(FEED, NO_VALIDATORS)
 
-    assert "if-none-match" not in seen[0].headers
-    assert "if-modified-since" not in seen[0].headers
+    assert "if-none-match" not in seen[1].headers
+    assert "if-modified-since" not in seen[1].headers
 
 
 # --------------------------------------------------------------------------
@@ -576,8 +856,14 @@ def test_an_unexpected_parse_error_becomes_a_provider_failure(
     that succeeded. This boundary is where that is stopped.
     """
 
+    message = "https://example.com/feed.xml?key=s3cret is not parseable"
+
     def explode(source: object, **kwargs: object) -> object:
-        raise ValueError("https://example.com/feed.xml?key=s3cret is not parseable")
+        raise ValueError(message)
+
+    # Positive control for the negative assertion at the end: the secret is
+    # genuinely in the exception's own message, so `str(error)` would carry it.
+    assert "s3cret" in message
 
     monkeypatch.setattr(feeds.feedparser, "parse", explode)
 
@@ -594,8 +880,72 @@ def test_an_unexpected_parse_error_becomes_a_provider_failure(
     assert "s3cret" not in str(caught.value)
 
 
+class UnreadableBodyResponse(HttpResponse):
+    """A response whose body cannot be materialised.
+
+    The property shadows the frozen dataclass's `content` slot. A no-op setter
+    is required because the generated `__init__` still assigns the field; the
+    getter is the part under test.
+
+    Replacing a `bytes` field with a property is exactly the kind of
+    substitution Pyright is right to reject in production code, and this is the
+    one place it is the point: the double exists to make a body read fail. The
+    suppression is scoped to this single line and names the one rule, rather
+    than silencing the file.
+    """
+
+    @property
+    def content(self) -> bytes:
+        raise MemoryError("body cannot be materialised")
+
+    @content.setter
+    def content(  # pyright: ignore[reportIncompatibleVariableOverride]
+        self, value: bytes
+    ) -> None:
+        return None
+
+
+def test_a_fault_reading_the_response_body_is_internal_not_the_publishers_fault() -> (
+    None
+):
+    """Why `io.BytesIO(response.content)` sits outside the parse boundary.
+
+    Reading the body off our own response object is our own work. Inside the
+    parse `try` a fault there would be reported as a retryable
+    `MALFORMED_RESPONSE` -- blaming the publisher for a bad payload and
+    quietly deferring the item -- which inverts the exact distinction the two
+    boundaries exist to maintain. Low-reachability, but the attribution is the
+    whole point, so it is pinned rather than argued.
+    """
+    response = UnreadableBodyResponse(
+        requested_url=FEED.url,
+        final_url=FEED.url,
+        redirect_chain=(),
+        destination_host="example.com",
+        status_code=200,
+        headers={},
+        content=b"",
+        encoded_bytes=0,
+        decoded_bytes=0,
+    )
+
+    with pytest.raises(ProviderFailure) as caught:
+        FeedparserClient(RecordingTransport(response=response)).fetch_feed(
+            FEED, NO_VALIDATORS
+        )
+
+    assert caught.value.category is FailureCategory.INTERNAL
+    assert caught.value.retryable is False
+    assert caught.value.detail == "MemoryError"
+
+
 def test_an_unexpected_transport_error_becomes_a_provider_failure() -> None:
-    transport = RecordingTransport(error=TypeError("unexpected keyword"))
+    error = TypeError("unexpected keyword")
+    transport = RecordingTransport(error=error)
+
+    # Positive control: the message really is on the exception, so its absence
+    # from the rendered failure below means `detail` did not interpolate it.
+    assert "unexpected keyword" in str(error)
 
     with pytest.raises(ProviderFailure) as caught:
         FeedparserClient(transport).fetch_feed(FEED, NO_VALIDATORS)
