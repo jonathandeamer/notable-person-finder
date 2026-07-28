@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from notable_person_finder.ingestion.models import SourceItemCounts
+from notable_person_finder.ingestion.models import FeedIdentity, SourceItemCounts
 
 # Two deliberate transaction disciplines live in this module.
 #
@@ -89,6 +89,35 @@ def upsert_feed_identity(
     else:
         connection.commit()
     return int(row["id"])
+
+
+def feed_identities(connection: sqlite3.Connection) -> tuple[FeedIdentity, ...]:
+    """Every feed identity ever seeded, ordered by key.
+
+    A read, so it needs no transaction. Returns the whole table rather than
+    taking a filter: both callers want it whole. Seeding compares it against
+    configuration to find identities that no longer appear there, which cannot
+    be expressed as a query because the configured set lives in a file rather
+    than in SQLite; the handler's `prepare` resolves a work item's subject back
+    to its feed. A deployment's feed list is measured in tens, so a full read
+    once per run and once per fetch is cheaper than the round trips a narrower
+    interface would need.
+    """
+    return tuple(
+        FeedIdentity(
+            id=int(row["id"]),
+            key=row["key"],
+            current_label=row["current_label"],
+            current_url=row["current_url"],
+        )
+        for row in connection.execute(
+            """
+            SELECT id, key, current_label, current_url
+              FROM feed_identity
+             ORDER BY key
+            """
+        )
+    )
 
 
 def latest_validators(

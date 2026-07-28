@@ -4,6 +4,24 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True, slots=True)
+class FeedIdentity:
+    """One stored feed identity: which feed it is, and where it last lived.
+
+    `key` is the configured stable key and never the URL. `current_url` is the
+    URL the feed was last *seeded* with, which is what makes this row usable
+    for retiring outstanding work: seeding refreshes the identity only for
+    feeds that are still enabled, so for a feed that has since been switched
+    off or deleted from configuration this URL is still the one its
+    outstanding work item was fingerprinted from.
+    """
+
+    id: int
+    key: str
+    current_label: str
+    current_url: str
+
+
+@dataclass(frozen=True, slots=True)
 class SourceItemCounts:
     """A summary of `source_item` rows: the whole corpus, plus this run's delta.
 

@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from notable_person_finder.ingestion.repository import (
+    feed_identities,
     insert_source_item,
     latest_validators,
     record_alias,
@@ -318,6 +319,69 @@ def test_item_with_neither_article_nor_entry_id_always_inserts(
     assert first is not None
     assert second is not None
     assert first != second
+
+
+# ---------------------------------------------------------------------------
+# feed_identities
+# ---------------------------------------------------------------------------
+
+
+def test_feed_identities_reads_every_stored_identity_in_key_order(
+    connection: sqlite3.Connection,
+) -> None:
+    """Ordered by key, not by insertion.
+
+    Seeding iterates this list to retire work for feeds that left
+    configuration, and the handler's `prepare` resolves a work item's subject
+    through it. Neither depends on a *particular* order, but both benefit from a
+    stable one: identical configuration must retire identical work in an
+    identical sequence from one run to the next, or a diagnostic log's ordering
+    becomes noise. Insertion order would make that vary with the order feeds
+    were first discovered.
+
+    Three feeds, inserted in an order that matches neither ascending nor
+    descending id. With only two rows, reverse-id order and key order coincide
+    for one of the two possible insertion sequences, so a two-row fixture
+    cannot tell "ordered by key" from "ordered by id" at all -- it passes
+    against both.
+    """
+    zulu = upsert_feed_identity(
+        connection,
+        key="zulu",
+        label="Zulu",
+        url="https://z.example.com/f",
+        now=moment(),
+    )
+    alpha = upsert_feed_identity(
+        connection,
+        key="alpha",
+        label="Alpha",
+        url="https://a.example.com/f",
+        now=moment(1),
+    )
+    mike = upsert_feed_identity(
+        connection,
+        key="mike",
+        label="Mike",
+        url="https://m.example.com/f",
+        now=moment(2),
+    )
+
+    identities = feed_identities(connection)
+
+    assert [identity.key for identity in identities] == ["alpha", "mike", "zulu"]
+    # Neither ascending nor descending insertion order, both of which this
+    # sequence makes distinct from the assertion above.
+    assert [identity.id for identity in identities] == [alpha, mike, zulu]
+    assert [zulu, alpha, mike] != [alpha, mike, zulu]
+    assert identities[0].current_label == "Alpha"
+    assert identities[0].current_url == "https://a.example.com/f"
+
+
+def test_feed_identities_is_empty_before_anything_is_seeded(
+    connection: sqlite3.Connection,
+) -> None:
+    assert feed_identities(connection) == ()
 
 
 # ---------------------------------------------------------------------------
