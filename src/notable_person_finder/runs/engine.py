@@ -262,8 +262,10 @@ def _domain_writes(
     """Bind `handler.persist` for the settling transaction to run, if there is one.
 
     There is nothing an *outcome* handler can persist for an item that never
-    produced one -- a paused provider, a refused reservation, an exhausted
-    retry. A settlement driven by a provider failure instead routes to
+    produced one -- a paused provider, a raising `prepare`, a refused
+    reservation, an exhausted retry -- nor for one whose outcome the engine
+    refused to honour, where the payload is discarded deliberately. A
+    settlement driven by a provider failure instead routes to
     `_failure_writes`, which is the same seam for the information that path
     does have; the two never both run for one settlement.
     """
@@ -308,6 +310,15 @@ def _failure_writes(
     Called once per *settlement*, never once per attempt: the engine reaches
     here only after `_retry` has returned PERMANENT or EXHAUSTED, so a retried
     call writes one row for its final verdict rather than one per try.
+
+    Four settlements deliberately do *not* reach here, because they hold no
+    failure: a paused provider, a raising `prepare`, a refused budget
+    reservation, and a handler state the engine refused to honour. The first
+    three made no call at all. The fourth did, so it is a genuine gap in "every
+    attempt leaves a record" -- as is an item re-armed mid-run that meets a
+    newly paused provider on its re-claim. Both leave their evidence on the
+    `attempt` row rather than in handler-owned domain history. Each is pinned
+    by its own test.
     """
     persist_failure = handler.persist_failure
     if persist_failure is None or failure is None:

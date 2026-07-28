@@ -2400,14 +2400,18 @@ def test_persist_failure_does_not_run_when_the_handler_returned_an_outcome(
 def test_persist_failure_does_not_run_for_a_settlement_with_no_failure(
     database: Path,
 ) -> None:
-    """Three settlements carry neither an outcome nor a provider failure: a
-    paused provider, a raising `prepare`, and a refused budget reservation. In
-    all three no call was made, so there is no failed attempt to record -- and
-    a handler told otherwise would write a fetch row for a request that never
-    left the machine, which is worse than the gap it was added to close.
+    """Budget refusal: `reserved_nano_usd` exceeds the run's limit, so
+    `start_attempt` raises `BudgetExhausted` before any call is made. No call
+    means no failed attempt to record, and a handler told otherwise would write
+    a fetch row for a request that never left the machine -- worse than the gap
+    the hook was added to close.
 
-    Budget refusal is the case exercised here (`reserved_nano_usd` exceeds the
-    run's limit, so `start_attempt` raises `BudgetExhausted` before any call).
+    This is one of *four* outcome-less settlements; the siblings below cover a
+    paused provider, a raising `prepare`, and a non-settling handler state.
+    Each is tested separately rather than in one case, because a single test
+    naming four paths and exercising one is exactly how a rule ends up asserted
+    in prose and unenforced in fact.
+
     The second half is the positive control: the identical handler, given a
     budget, reaches its provider and fires the hook -- so the empty assertion
     cannot pass merely because the hook was never wired up.
@@ -2493,4 +2497,157 @@ def test_a_settlement_may_not_carry_both_an_outcome_and_a_failure(
                 detail="forbidden",
             ),
         )
+    connection.close()
+
+
+def test_persist_failure_does_not_run_when_the_provider_is_paused(
+    database: Path,
+) -> None:
+    """A paused provider is never called, so there is nothing to record.
+
+    The pause check sits ahead of the attempt row for exactly this reason: an
+    attempt row stands for one external call. `provider_pause_after_...=1`
+    means the first item's exhaustion pauses the provider, so the second and
+    third items settle through the pause branch without ever reaching a worker.
+
+    The first item is the positive control -- it *does* fire the hook -- so the
+    count below pins "once, for the one item that was actually called" rather
+    than the weaker "not more than once".
+    """
+    connection = connect_database(database)
+    for index in range(3):
+        schedule_probe(connection, f"{index}f" * 32)
+    calls: list[int] = []
+    failed: list[str] = []
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        calls.append(work_item.id)
+        raise ProviderFailure(
+            FailureCategory.NETWORK,
+            provider="probe_provider",
+            operation="probe_call",
+            detail="connection reset",
+        )
+
+    handler = probe_handler(
+        execute,
+        persist_failure=lambda work_item, failure: failed.append(str(failure.category)),
+    )
+    clock = FakeClock()
+    build_engine(
+        connection,
+        clock,
+        retry=RetryPolicy(
+            RetryConfig(
+                max_attempts=1,
+                jitter_ratio=0.0,
+                provider_pause_after_consecutive_exhaustions=1,
+            ),
+            clock=clock,
+        ),
+        scheduler=BoundedScheduler(max_workers=1),
+    ).execute({handler.task_type: handler})
+
+    # One item was called and recorded; the two the pause caught were not.
+    assert len(calls) == 1
+    assert failed == [str(FailureCategory.NETWORK)]
+    reasons = [
+        row["reason"]
+        for row in connection.execute(
+            "SELECT reason FROM work_item WHERE reason = 'provider paused for this run'"
+        )
+    ]
+    assert len(reasons) == 2
+    connection.close()
+
+
+def test_persist_failure_does_not_run_when_prepare_raises(database: Path) -> None:
+    """A raising `prepare` settles the item before any call is made.
+
+    The sibling item is the positive control: the same handler, same hook, an
+    item whose `prepare` returns normally reaches the provider and records its
+    failure -- so `failed` having exactly one entry distinguishes "the hook
+    skipped the prepare-raised item" from "the hook never ran at all".
+    """
+    connection = connect_database(database)
+    bad = schedule_probe(connection, "g1" * 32)
+    good = schedule_probe(connection, "g2" * 32)
+    failed: list[int] = []
+
+    def prepare(work_item) -> object:
+        if work_item.id == bad:
+            raise ValueError("prepare blew up")
+        return None
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        raise ProviderFailure(
+            FailureCategory.ACCESS_DENIED,
+            provider="probe_provider",
+            operation="probe_call",
+            detail="forbidden",
+        )
+
+    handler = probe_handler(
+        execute,
+        prepare=prepare,
+        persist_failure=lambda work_item, failure: failed.append(work_item.id),
+    )
+    build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    assert failed == [good]
+    states = {
+        row["id"]: row["state"]
+        for row in connection.execute("SELECT id, state FROM work_item")
+    }
+    assert states[bad] == WorkState.FAILED_PERMANENT
+    assert states[good] == WorkState.FAILED_PERMANENT
+    connection.close()
+
+
+def test_persist_failure_does_not_run_for_a_non_settling_handler_state(
+    database: Path,
+) -> None:
+    """A handler returning a non-settling state has an outcome, but the engine
+    refuses to honour it and settles the item `failed_permanent` itself,
+    deliberately discarding the payload (`engine.py:817-827`).
+
+    That settlement therefore carries neither an outcome nor a failure, and it
+    must not fire this hook either: a state the engine refused to trust is not
+    a trustworthy instruction to write domain data. The call *did* happen here,
+    unlike the other three paths, so this is the one case where "no hook" costs
+    a real record -- see the known gap noted for Task 10.
+
+    The sibling is the positive control.
+    """
+    connection = connect_database(database)
+    rogue = schedule_probe(connection, "h1" * 32)
+    honest = schedule_probe(connection, "h2" * 32)
+    failed: list[int] = []
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        if work_item.id == rogue:
+            # `running` is not a settling state.
+            return TaskOutcome(state=WorkState.RUNNING, reason=None, payload="ignored")
+        raise ProviderFailure(
+            FailureCategory.ACCESS_DENIED,
+            provider="probe_provider",
+            operation="probe_call",
+            detail="forbidden",
+        )
+
+    handler = probe_handler(
+        execute,
+        persist=lambda work_item, outcome: failed.append(-work_item.id),
+        persist_failure=lambda work_item, failure: failed.append(work_item.id),
+    )
+    build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    # Neither hook ran for the rogue item; the honest sibling recorded normally.
+    assert failed == [honest]
+    assert (
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (rogue,)
+        ).fetchone()["state"]
+        == WorkState.FAILED_PERMANENT
+    )
     connection.close()
