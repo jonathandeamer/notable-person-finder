@@ -163,6 +163,13 @@ Before reporting a task complete:
 Restore mutated source from a `cp` backup and verify with `diff`, never with
 `git stash`: the stash stack is shared across worktrees and other sessions.
 
+Run mutations with `PYTHONDONTWRITEBYTECODE=1` and clear `__pycache__` between
+iterations. Rewriting one file repeatedly inside the same second produces cache
+entries that CPython's mtime-and-size invalidation accepts, so an iteration can
+silently test the *previous* mutation. This has already produced two false
+`SURVIVED` verdicts in this repository — the direction that matters, because a
+survivor reported as killed is a rule you believe is covered and is not.
+
 ## Foundation Invariants
 
 - The application never edits Wikipedia automatically. Every Wikipedia edit or
