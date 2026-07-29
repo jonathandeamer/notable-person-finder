@@ -6,8 +6,6 @@ import re
 from importlib import resources
 from typing import Any, cast
 
-from pydantic import ValidationError
-
 from notable_person_finder.config.models import (
     DetectPeopleConfig,
     DomainProfileConfig,
@@ -151,6 +149,7 @@ def build_detection_input(
 def detection_schema() -> dict[str, object]:
     schema = DetectionOutput.model_json_schema(mode="validation")
     definitions = schema.get("$defs", {})
+    passage_reference_schema: dict[str, object] = {"enum": ["p1", "p2"]}
 
     def compact(value: object) -> object:
         if isinstance(value, dict):
@@ -161,16 +160,63 @@ def detection_schema() -> dict[str, object]:
                     target = definitions.get(name)
                     if target is not None:
                         return compact(target)
-            return {
+            result = {
                 key: compact(child)
                 for key, child in value.items()
                 if key not in {"$defs", "title"}
             }
+            if result == {
+                "pattern": r"^p[1-9][0-9]{0,5}$",
+                "type": "string",
+            }:
+                return passage_reference_schema
+            if "enum" in result and result.get("type") == "string":
+                del result["type"]
+            branches = result.get("anyOf")
+            if isinstance(branches, list) and all(
+                isinstance(branch, dict) and set(branch) == {"enum"}
+                for branch in branches
+            ):
+                return {
+                    "enum": [
+                        member
+                        for branch in branches
+                        for member in cast(list[object], branch["enum"])
+                    ]
+                }
+            return result
         if isinstance(value, list):
             return [compact(child) for child in value]
         return value
 
-    return cast(dict[str, object], compact(schema))
+    passage_ids_schema: dict[str, object] = {
+        "items": passage_reference_schema,
+        "minItems": 1,
+        "type": "array",
+    }
+    bounded_text_schema: dict[str, object] = {
+        "maxLength": 1000,
+        "minLength": 1,
+        "type": "string",
+    }
+
+    def factor_repeated(value: object) -> object:
+        if value == passage_ids_schema:
+            return {"$ref": "#/$defs/p"}
+        if value == bounded_text_schema:
+            return {"$ref": "#/$defs/t"}
+        if isinstance(value, dict):
+            return {key: factor_repeated(child) for key, child in value.items()}
+        if isinstance(value, list):
+            return [factor_repeated(child) for child in value]
+        return value
+
+    compacted = cast(dict[str, object], factor_repeated(compact(schema)))
+    compacted["$defs"] = {
+        "p": passage_ids_schema,
+        "t": bounded_text_schema,
+    }
+    return compacted
 
 
 def render_detection_request(value: DetectionInput) -> RenderedDetectionRequest:
@@ -221,7 +267,7 @@ def validate_detection_output(raw: str, supplied: DetectionInput) -> DetectionOu
 def _parse_detection_output(raw: str) -> DetectionOutput | None:
     try:
         return DetectionOutput.model_validate_json(raw, strict=True)
-    except (ValidationError, ValueError, TypeError):
+    except Exception:
         return None
 
 

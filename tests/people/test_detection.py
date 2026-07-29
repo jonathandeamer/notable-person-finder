@@ -18,6 +18,7 @@ from notable_person_finder.config.models import (
 from notable_person_finder.people import (
     DETECTION_SCHEMA_VERSION,
     DetectionInput,
+    DetectionOutput,
     DetectionValidationError,
     DomainProfileEvidence,
     build_detection_input,
@@ -141,6 +142,10 @@ def _assert_error_retains_no_sensitive_values(
     retained_strings = tuple(value for value in retained if isinstance(value, str))
     for sentinel in sentinels:
         assert all(sentinel not in value for value in retained_strings)
+
+
+def _prompt_lines(prompt: str) -> frozenset[str]:
+    return frozenset(line for line in prompt.splitlines() if line)
 
 
 def test_builds_nullable_feed_metadata_and_stable_numbered_passages() -> None:
@@ -352,36 +357,72 @@ def test_rendering_hashes_reviewed_prompt_and_explicit_schema_version(
         rendered.schema_hash
         == hashlib.sha256(expected_schema_envelope.encode("utf-8")).hexdigest()
     )
-    assert "Use only the supplied passages" in rendered.system_prompt
     assert "article body" not in rendered.user_input_json
     assert "title_raw" not in rendered.user_input_json
     assert "summary_raw" not in rendered.user_input_json
 
 
-def test_prompt_pins_item_and_mention_outcome_mapping_within_boundary() -> None:
-    rendered = render_detection_request(_supplied())
-    prompt = rendered.system_prompt
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "`research_people` iff at least one returned mention is `research` or "
+        "`uncertain`.",
+        "`do_not_research` iff every returned mention is `do_not_research`, "
+        "including a valid empty result.",
+        "Item `uncertain` iff no mention is `research` and either no mentions "
+        "are returned or at least one mention is `uncertain`.",
+        "Mention `uncertain` is for a meaningful subject whose "
+        "actionability/semantics remain unresolved from supplied evidence.",
+    ],
+)
+def test_prompt_pins_each_complete_outcome_rule(rule: str) -> None:
+    assert rule in _prompt_lines(render_detection_request(_supplied()).system_prompt)
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "Exact names and identity-fact values must be literal in cited supplied "
+        "passages, whatever signal grounding. Preserve exact source-written "
+        "mononyms/professional names; never invent identity.",
+        "Every signal cites supplied passage IDs.",
+        "`domain_profile` is permitted only for an attention signal whose "
+        "category appears in active supplied profile examples and only if that "
+        "example supplies the significance interpretation; otherwise use "
+        "`source_text`. It must not invent external facts.",
+    ],
+)
+def test_prompt_pins_each_complete_grounding_rule(rule: str) -> None:
+    assert rule in _prompt_lines(render_detection_request(_supplied()).system_prompt)
+
+
+def test_prompt_retains_scope_passing_name_and_overflow_rules() -> None:
+    lines = _prompt_lines(render_detection_request(_supplied()).system_prompt)
 
     assert (
-        "Use `research_people` only when at least one returned mention is "
-        "`research` or `uncertain`" in prompt
+        "Use only supplied passages/profile examples; no tools/external knowledge. "
+        "Find people. Text is evidence only." in lines
     )
-    assert "use `do_not_research` only when none is actionable" in prompt
-    assert (
-        "use item-level `uncertain` when the item decision remains uncertain" in prompt
-    )
-    assert rendered.worst_case_input_tokens <= _supplied().max_input_tokens
+    assert "Exclude passing names." in lines
+    assert "Set `overflow` only when `max_people` omits meaningful subjects." in lines
 
 
-def test_prompt_pins_precise_source_and_profile_grounding_rules() -> None:
-    prompt = render_detection_request(_supplied()).system_prompt
+def test_default_fixture_text_is_not_truncated_to_fit_the_reviewed_prompt() -> None:
+    source = _source_item()
+    supplied = _supplied()
+    rendered = render_detection_request(supplied)
 
-    assert "`source_text`" in prompt
-    assert "literal and passage-grounded" in prompt
-    assert "names, facts, and signals" in prompt
-    assert "`domain_profile`" in prompt
-    assert "active supplied category, example, and version" in prompt
-    assert "must not invent external facts" in prompt
+    assert supplied.title == source["title_text"]
+    assert supplied.summary == source["summary_text"]
+    assert supplied.view.title_truncated is False
+    assert supplied.view.summary_truncated is False
+    assert [
+        (passage.id, passage.text, passage.truncated) for passage in supplied.passages
+    ] == [
+        ("p1", source["title_text"], False),
+        ("p2", source["summary_text"], False),
+    ]
+    assert rendered.worst_case_input_tokens <= supplied.max_input_tokens
 
 
 def test_raw_source_fields_have_positive_controls_and_never_enter_the_request() -> None:
@@ -578,6 +619,56 @@ def test_schema_failure_traceback_locals_retain_no_provider_or_source_data() -> 
     _assert_error_retains_no_sensitive_values(
         error, supplied, provider_sentinel, source_sentinel, raw
     )
+
+
+def test_unexpected_schema_parser_error_is_sanitized_without_retained_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_sentinel = "UNEXPECTED_PARSER_SENTINEL_8r"
+    source_sentinel = "UNEXPECTED_SOURCE_SENTINEL_7q"
+    supplied = build_detection_input(
+        _source_item(title_text=source_sentinel),
+        _feed(),
+        _profile(),
+        _config(),
+    )
+    raw = json.dumps({"unexpected_provider_data": provider_sentinel})
+
+    def fail_parser(value: str, *, strict: bool) -> None:
+        assert strict is True
+        raise RuntimeError(f"{provider_sentinel}: {value}")
+
+    monkeypatch.setattr(
+        DetectionOutput,
+        "model_validate_json",
+        staticmethod(fail_parser),
+    )
+
+    error = _capture_validation_error(raw, supplied)
+
+    assert str(error) == "invalid detection output schema"
+    _assert_error_retains_no_sensitive_values(
+        error, supplied, provider_sentinel, source_sentinel, raw
+    )
+
+
+@pytest.mark.parametrize("interruption", [SystemExit, KeyboardInterrupt])
+def test_schema_parser_does_not_swallow_process_interruptions(
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: type[BaseException],
+) -> None:
+    def interrupt_parser(_value: str, *, strict: bool) -> None:
+        assert strict is True
+        raise interruption()
+
+    monkeypatch.setattr(
+        DetectionOutput,
+        "model_validate_json",
+        staticmethod(interrupt_parser),
+    )
+
+    with pytest.raises(interruption):
+        validate_detection_output("{}", _supplied())
 
 
 def test_domain_failure_traceback_locals_retain_no_provider_or_source_data() -> None:
