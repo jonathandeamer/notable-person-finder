@@ -193,9 +193,13 @@ class TriageRunCounts:
 
     observations: int
     completed: int
+    research_people: int
+    do_not_research: int
+    uncertain: int
     insufficient_input: int
     failed: int
     overflow: int
+    research_or_uncertain_mentions: int
     failed_by_category: Mapping[str, int]
 
 
@@ -712,29 +716,54 @@ def triage_run_counts(
     """Observation totals written during one run (digest section)."""
     disposition_rows = connection.execute(
         """
-        SELECT disposition, overflow, COUNT(*) AS n
+        SELECT disposition, semantic_outcome, overflow, COUNT(*) AS n
           FROM triage_observation
          WHERE run_id = ?
-         GROUP BY disposition, overflow
+         GROUP BY disposition, semantic_outcome, overflow
         """,
         (run_id,),
     ).fetchall()
     observations = 0
     completed = 0
+    research_people = 0
+    do_not_research = 0
+    uncertain = 0
     insufficient_input = 0
     failed = 0
     overflow = 0
     for row in disposition_rows:
         count = int(row["n"])
         observations += count
-        if row["disposition"] == "completed":
+        disposition = row["disposition"]
+        if disposition == "completed":
             completed += count
+            if row["semantic_outcome"] == "research_people":
+                research_people += count
+            elif row["semantic_outcome"] == "do_not_research":
+                do_not_research += count
+            elif row["semantic_outcome"] == "uncertain":
+                uncertain += count
             if row["overflow"]:
                 overflow += count
-        elif row["disposition"] == "insufficient_input":
+        elif disposition == "insufficient_input":
             insufficient_input += count
-        elif row["disposition"] == "failed":
+        elif disposition == "failed":
             failed += count
+
+    research_or_uncertain_mentions = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n
+              FROM triage_observation AS t
+              JOIN person_mention AS m
+                ON m.triage_observation_id = t.id
+             WHERE t.run_id = ?
+               AND t.disposition = 'completed'
+               AND m.outcome IN ('research', 'uncertain')
+            """,
+            (run_id,),
+        ).fetchone()["n"]
+    )
 
     failed_by_category = {
         row["failure_category"]: int(row["n"])
@@ -753,9 +782,13 @@ def triage_run_counts(
     return TriageRunCounts(
         observations=observations,
         completed=completed,
+        research_people=research_people,
+        do_not_research=do_not_research,
+        uncertain=uncertain,
         insufficient_input=insufficient_input,
         failed=failed,
         overflow=overflow,
+        research_or_uncertain_mentions=research_or_uncertain_mentions,
         failed_by_category=failed_by_category,
     )
 

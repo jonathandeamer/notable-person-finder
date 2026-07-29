@@ -173,6 +173,11 @@ def _modified(*, entries: tuple[FeedEntry, ...]) -> Modified:
 def command_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TEST_OPENROUTER", ENVIRONMENT["TEST_OPENROUTER"])
     monkeypatch.setenv("TEST_BRAVE", ENVIRONMENT["TEST_BRAVE"])
+    # Person-detection handlers are registered on the real command path; keep
+    # OpenRouter offline so these ingestion seam tests stay network-free.
+    from tests.ingestion.test_run_cli import _offline_openrouter
+
+    monkeypatch.setattr(cli_main, "OpenRouterClient", _offline_openrouter)
 
 
 def test_command_run_seed_hook_creates_and_fetches_feed_work(
@@ -195,7 +200,12 @@ def test_command_run_seed_hook_creates_and_fetches_feed_work(
     ]
     database = connect_database(tmp_path / "portable" / "data" / "notable.sqlite3")
     try:
-        assert database.execute("SELECT COUNT(*) FROM work_item").fetchone()[0] == 1
+        assert (
+            database.execute(
+                "SELECT COUNT(*) FROM work_item WHERE task_type = 'fetch_feed'"
+            ).fetchone()[0]
+            == 1
+        )
         assert database.execute("SELECT COUNT(*) FROM feed_fetch").fetchone()[0] == 1
     finally:
         database.close()

@@ -833,10 +833,14 @@ def test_triage_aggregate_counts(
     run_counts = triage_run_counts(connection, run_id=run_id)
     assert run_counts.observations == 3
     assert run_counts.completed == 1
+    assert run_counts.research_people == 1
+    assert run_counts.do_not_research == 0
+    assert run_counts.uncertain == 0
     assert run_counts.insufficient_input == 1
     assert run_counts.failed == 1
     assert run_counts.failed_by_category == {"unsupported_capability": 1}
     assert run_counts.overflow == 0
+    assert run_counts.research_or_uncertain_mentions == 2
     assert untriaged in list_untriaged_source_item_ids(connection)
 
 

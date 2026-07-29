@@ -2,17 +2,22 @@
 
 Every test is offline: `build_transport` is monkey-patched to return a real
 `HttpTransport` whose network layer is an `httpx.MockTransport`. The resolver is
-replaced with `StaticHostResolver` so no DNS lookup ever happens.
+replaced with `StaticHostResolver` so no DNS lookup ever happens. OpenRouter is
+replaced with a scripted offline client so person-detection handlers never
+reach the network when feed items are triaged.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -22,6 +27,13 @@ from notable_person_finder.config.loader import load_config
 from notable_person_finder.config.models import FeedsConfig, TransportConfig
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.ingestion.service import seed_feeds
+from notable_person_finder.providers.openrouter import (
+    ModelInspectionRequest,
+    ModelInspectionResult,
+    StructuredGenerationRequest,
+    StructuredGenerationResult,
+    TokenUsage,
+)
 from notable_person_finder.providers.pacing import PacingGate
 from notable_person_finder.providers.safety import StaticHostResolver
 from notable_person_finder.providers.transport import HttpTransport, build_transport
@@ -30,6 +42,15 @@ from tests.run_engine.helpers import ENVIRONMENT
 
 FIXTURES = Path(__file__).parent / "fixtures"
 RESOLVER = StaticHostResolver({"example.com": ("93.184.216.34",)})
+
+_ZERO_MENTIONS = json.dumps(
+    {
+        "item_outcome": "do_not_research",
+        "mentions": [],
+        "overflow": False,
+        "rationale": "No person is named in the supplied passages.",
+    }
+)
 
 OPERATIONAL_SECTIONS = """\
 [transport]
@@ -44,10 +65,68 @@ jitter_ratio = 0.0
 
 [concurrency]
 http_workers = 4
+llm_workers = 2
 
 [budget]
 openrouter_usd_per_run = "2.50"
+
+[tasks.detect_people]
+model = "openai/gpt-test"
 """
+
+
+@dataclass
+class _OfflineOpenRouter:
+    """Minimal LlmClient + context manager for offline ingestion CLI runs."""
+
+    entered: bool = False
+    exited: bool = False
+    generate_calls: list[StructuredGenerationRequest] = field(default_factory=list)
+
+    def __enter__(self) -> _OfflineOpenRouter:
+        self.entered = True
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: Any,
+    ) -> None:
+        self.exited = True
+        return None
+
+    def inspect_model(self, request: ModelInspectionRequest) -> ModelInspectionResult:
+        return ModelInspectionResult(
+            configured_model_id=request.model_id,
+            resolved_model_id=f"{request.model_id}-resolved",
+            supported_parameters=("response_format", "structured_outputs"),
+            supports_strict_structured_output=True,
+            prompt_unit_price_nano_usd=150,
+            completion_unit_price_nano_usd=600,
+            latency_ms=1,
+        )
+
+    def generate_structured(
+        self, request: StructuredGenerationRequest
+    ) -> StructuredGenerationResult:
+        self.generate_calls.append(request)
+        return StructuredGenerationResult(
+            raw_text=_ZERO_MENTIONS,
+            configured_model_id=request.model_id,
+            resolved_model_id=f"{request.model_id}-resolved",
+            serving_provider="OpenAI",
+            finish_reason="stop",
+            refusal=None,
+            usage=TokenUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+            latency_ms=1,
+            provider_request_id="gen-ingestion-offline",
+            actual_nano_usd=1_000,
+        )
+
+
+def _offline_openrouter(**kwargs: Any) -> _OfflineOpenRouter:
+    return _OfflineOpenRouter()
 
 
 def streaming_body(payload: bytes) -> list[bytes]:
@@ -165,6 +244,7 @@ url = "https://example.com/feed.xml"
 def monkeypatch_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TEST_OPENROUTER", ENVIRONMENT["TEST_OPENROUTER"])
     monkeypatch.setenv("TEST_BRAVE", ENVIRONMENT["TEST_BRAVE"])
+    monkeypatch.setattr(cli_main, "OpenRouterClient", _offline_openrouter)
 
 
 def test_run_ingests_feed_and_renders_counts(
