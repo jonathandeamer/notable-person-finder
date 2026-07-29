@@ -317,6 +317,42 @@ def supersede_work(
     return changed
 
 
+def supersede_work_for_subject(
+    connection: sqlite3.Connection,
+    *,
+    task_type: str,
+    subject_kind: str,
+    subject_id: int,
+    run_id: int,
+    now: str,
+    reason: str,
+) -> int:
+    """Retire every active item for one subject, across fingerprints.
+
+    Use when the subject itself is no longer wanted (for example a feed that
+    left configuration). A URL move leaves multiple active fingerprints for the
+    same identity; fingerprint-only supersession would miss the orphans.
+    """
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        changed = connection.execute(
+            """
+            UPDATE work_item
+               SET state = 'superseded', reason = ?, completed_by_run_id = ?,
+                   updated_at = ?
+             WHERE task_type = ? AND subject_kind = ? AND subject_id = ?
+               AND state IN ('pending', 'deferred')
+            """,
+            (reason, run_id, now, task_type, subject_kind, subject_id),
+        ).rowcount
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+    return changed
+
+
 # Shared by `claim_batch` -- the engine's production claim path -- and by
 # `next_eligible`, `claim_next`, and `claim_and_start_attempt`, so no claim
 # path can silently diverge on what "claimable" means. Binds two

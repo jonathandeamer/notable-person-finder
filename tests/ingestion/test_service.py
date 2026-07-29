@@ -323,8 +323,8 @@ def test_removing_a_feed_from_configuration_supersedes_its_active_work(
     run_id = insert_run(connection)
     seed_feeds(connection, feeds=feeds_config(ALPHA, BETA), run_id=run_id, now=moment())
 
-    # `alpha` is gone from the file entirely, so its fingerprint cannot be
-    # recomputed from configuration -- only from its stored identity.
+    # `alpha` is gone from the file entirely; retirement finds it via the
+    # stored identity subject, not by recomputing a fingerprint from config.
     seed_feeds(connection, feeds=feeds_config(BETA), run_id=run_id, now=moment(60))
 
     rows = work_items(connection)
@@ -333,13 +333,45 @@ def test_removing_a_feed_from_configuration_supersedes_its_active_work(
     assert superseded[0]["reason"] == "feed disabled"
 
 
+def test_disabling_after_a_url_move_supersedes_every_active_fingerprint(
+    connection: sqlite3.Connection,
+) -> None:
+    """A URL move leaves two active fingerprints; disable must retire both.
+
+    Fingerprint-only retirement against `current_url` would supersede only the
+    post-move item and leave the pre-move orphan to fail later in prepare.
+    """
+    run_id = insert_run(connection)
+    seed_feeds(connection, feeds=feeds_config(ALPHA), run_id=run_id, now=moment())
+    moved = ("alpha", "https://alpha.example.com/feed-v2.xml", True)
+    seed_feeds(connection, feeds=feeds_config(moved), run_id=run_id, now=moment(30))
+
+    active_before = [
+        row for row in work_items(connection) if row["state"] in ("pending", "deferred")
+    ]
+    assert len(active_before) == 2
+
+    seed_feeds(
+        connection,
+        feeds=feeds_config(("alpha", moved[1], False)),
+        run_id=run_id,
+        now=moment(60),
+    )
+
+    rows = work_items(connection)
+    assert len(rows) == 2
+    assert {row["state"] for row in rows} == {"superseded"}
+    assert {row["reason"] for row in rows} == {"feed disabled"}
+
+
 def test_superseding_leaves_a_terminal_item_alone(
     connection: sqlite3.Connection,
 ) -> None:
     """A feed's history is not rewritten when the feed is switched off.
 
-    `supersede_work` only touches `pending` and `deferred`, and this pins that
-    seeding relies on that rather than on a state filter of its own.
+    Subject-scoped supersession only touches `pending` and `deferred`, and
+    this pins that seeding relies on that rather than on a state filter of its
+    own.
     """
     run_id = insert_run(connection)
     seed_feeds(connection, feeds=feeds_config(ALPHA), run_id=run_id, now=moment())

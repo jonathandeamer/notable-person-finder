@@ -46,6 +46,8 @@ def schedule(
     *,
     fingerprint: str = "b" * 64,
     task_type: str = "detect_people",
+    subject_kind: str = "source_item",
+    subject_id: int = 1,
     required: bool = True,
     priority: int = 100,
     eligible_at: str = NOW,
@@ -53,8 +55,8 @@ def schedule(
     return repository.schedule_work(
         connection,
         task_type=task_type,
-        subject_kind="source_item",
-        subject_id=1,
+        subject_kind=subject_kind,
+        subject_id=subject_id,
         fingerprint=fingerprint,
         required=required,
         priority=priority,
@@ -367,6 +369,39 @@ def test_supersede_work_does_not_touch_a_running_item(
         "SELECT state FROM work_item WHERE id = ?", (work_id,)
     ).fetchone()
     assert row["state"] == WorkState.RUNNING
+
+
+def test_supersede_work_for_subject_retires_every_active_fingerprint(
+    connection: sqlite3.Connection, run_id: int
+) -> None:
+    first = schedule(
+        connection, run_id, fingerprint="a1" * 32, subject_id=7, required=True
+    )
+    second = schedule(
+        connection, run_id, fingerprint="a2" * 32, subject_id=7, required=True
+    )
+    other = schedule(
+        connection, run_id, fingerprint="b1" * 32, subject_id=8, required=True
+    )
+
+    changed = repository.supersede_work_for_subject(
+        connection,
+        task_type="detect_people",
+        subject_kind="source_item",
+        subject_id=7,
+        run_id=run_id,
+        now=LATER,
+        reason="subject retired",
+    )
+
+    assert changed == 2
+    states = {
+        row["id"]: (row["state"], row["reason"])
+        for row in connection.execute("SELECT id, state, reason FROM work_item")
+    }
+    assert states[first] == (WorkState.SUPERSEDED, "subject retired")
+    assert states[second] == (WorkState.SUPERSEDED, "subject retired")
+    assert states[other][0] == WorkState.PENDING
 
 
 def test_deferred_required_counts_only_required_deferred_items(

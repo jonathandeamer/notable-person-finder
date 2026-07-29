@@ -26,12 +26,11 @@ class UrlIssue(StrEnum):
 class FeedIdentity:
     """One stored feed identity: which feed it is, and where it last lived.
 
-    `key` is the configured stable key and never the URL. `current_url` is the
-    URL the feed was last *seeded* with, which is what makes this row usable
-    for retiring outstanding work: seeding refreshes the identity only for
-    feeds that are still enabled, so for a feed that has since been switched
-    off or deleted from configuration this URL is still the one its
-    outstanding work item was fingerprinted from.
+    `key` is the configured stable key and never the URL. `id` is the durable
+    subject work items point at; retirement of outstanding feed work is by
+    that subject, so a URL move that left multiple active fingerprints still
+    retires cleanly when the feed is disabled or deleted. `current_url` is the
+    URL the feed was last *seeded* with.
     """
 
     id: int

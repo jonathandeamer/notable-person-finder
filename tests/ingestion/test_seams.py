@@ -20,7 +20,11 @@ from notable_person_finder.cli import main as cli_main
 from notable_person_finder.config.models import FeedConfig, FeedsConfig, TransportConfig
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.ingestion import service
-from notable_person_finder.ingestion.models import FetchPersistResult, UrlIssue
+from notable_person_finder.ingestion.models import (
+    FetchPersistResult,
+    PublishedIssue,
+    UrlIssue,
+)
 from notable_person_finder.ingestion.service import (
     FETCH_FEED_TASK_TYPE,
     build_fetch_handler,
@@ -312,7 +316,10 @@ def test_persist_fetch_keeps_an_entry_with_a_typed_issue_after_resolution_fault(
         1,
         0,
         0,
-        {str(UrlIssue.MISSING): 1, str(UrlIssue.UNUSABLE): 1},
+        {
+            f"url:{UrlIssue.UNUSABLE}": 1,
+            f"published:{PublishedIssue.MISSING}": 1,
+        },
     )
     row = connection.execute(
         "SELECT title_text, canonical_article_id, url_issue FROM source_item"

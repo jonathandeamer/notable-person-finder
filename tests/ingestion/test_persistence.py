@@ -247,7 +247,7 @@ def test_entry_with_no_url_becomes_a_source_item_with_url_issue(
         )
 
     assert counts.source_items_created == 1
-    assert counts.entry_issues == {"missing": 1}
+    assert counts.entry_issues == {"url:missing": 1}
     row = connection.execute(
         "SELECT canonical_article_id, url_issue FROM source_item"
     ).fetchone()
@@ -273,13 +273,34 @@ def test_entry_with_unparseable_date_becomes_a_source_item_with_published_issue(
         )
 
     assert counts.source_items_created == 1
-    assert counts.entry_issues == {"unparseable": 1}
+    assert counts.entry_issues == {"published:unparseable": 1}
     row = connection.execute(
         "SELECT published_raw, published_at, published_issue FROM source_item"
     ).fetchone()
     assert row["published_raw"] == "not a date"
     assert row["published_at"] is None
     assert row["published_issue"] == "unparseable"
+
+
+def test_entry_issues_namespace_url_and_published_keys(
+    connection: sqlite3.Connection,
+) -> None:
+    """UrlIssue.MISSING and PublishedIssue.MISSING must not share a counter key."""
+    run_id, feed_id = _run_and_identity(connection)
+    result = _modified(
+        entries=(_entry(entry_id="both-missing", url=None, published_raw=None),)
+    )
+
+    with immediate(connection):
+        counts = persist_fetch(
+            connection,
+            feed_identity_id=feed_id,
+            run_id=run_id,
+            result=result,
+            now=moment(),
+        )
+
+    assert counts.entry_issues == {"url:missing": 1, "published:missing": 1}
 
 
 def test_naive_rfc_publication_date_is_interpreted_as_utc_in_a_non_utc_process(
@@ -502,4 +523,4 @@ def test_persist_fetch_counts_are_returned_correctly(
 
     assert counts.source_items_created == 3
     assert counts.articles_created == 2  # the no-url entry has no article
-    assert counts.entry_issues == {"missing": 1, "unparseable": 1}
+    assert counts.entry_issues == {"url:missing": 1, "published:unparseable": 1}

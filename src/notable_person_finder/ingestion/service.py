@@ -474,11 +474,11 @@ def _persist_entries(
             source_items_created += 1
 
         if url_issue is not None:
-            entry_issues[str(url_issue)] = entry_issues.get(str(url_issue), 0) + 1
+            key = f"url:{url_issue}"
+            entry_issues[key] = entry_issues.get(key, 0) + 1
         if published_issue is not None:
-            entry_issues[str(published_issue)] = (
-                entry_issues.get(str(published_issue), 0) + 1
-            )
+            key = f"published:{published_issue}"
+            entry_issues[key] = entry_issues.get(key, 0) + 1
 
     return FetchPersistResult(
         source_items_created=source_items_created,
@@ -650,21 +650,24 @@ def _retire_unconfigured_feeds(
 
     Driven from the stored identities rather than from configuration, which is
     what makes a *deleted* feed reachable at all: a feed absent from the file
-    has no configured URL to fingerprint from, and its identity row holds the
-    URL it was last seeded with -- the very URL its outstanding item was
-    fingerprinted from, because the loop above refreshes an identity only while
-    its feed is still enabled.
+    has no configured entry to schedule from, but its identity row still names
+    the subject whose outstanding work must be retired.
 
-    `supersede_work` touches only `pending` and `deferred`, so a feed's
-    completed history is never rewritten by switching the feed off.
+    Retirement is by subject, not by the current-URL fingerprint. A URL move
+    leaves an older active fingerprint for the same feed identity; superseding
+    only the latest fingerprint would leave that orphan to fail later in
+    prepare. `supersede_work_for_subject` touches only `pending` and
+    `deferred`, so a feed's completed history is never rewritten by switching
+    the feed off.
     """
     for identity in feed_identities(connection):
         if identity.key in enabled_keys:
             continue
-        repository.supersede_work(
+        repository.supersede_work_for_subject(
             connection,
             task_type=FETCH_FEED_TASK_TYPE,
-            fingerprint=_fingerprint(feed_key=identity.key, url=identity.current_url),
+            subject_kind=SUBJECT_KIND,
+            subject_id=identity.id,
             run_id=run_id,
             now=now,
             reason=SUPERSEDED_REASON,
