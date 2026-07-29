@@ -810,6 +810,156 @@ def test_source_item_current_observation_must_belong_to_same_source_item(
             )
 
 
+def test_source_item_rowid_replacement_cannot_break_current_observation_ownership(
+    connection: sqlite3.Connection,
+) -> None:
+    run_id, _, source_item_id, observation_id = _valid_graph(connection)
+    connection.execute(
+        "UPDATE source_item SET current_triage_observation_id = ? WHERE id = ?",
+        (observation_id, source_item_id),
+    )
+    provenance = connection.execute(
+        """
+        SELECT feed_identity_id, discovered_by_fetch_id
+        FROM source_item
+        WHERE id = ?
+        """,
+        (source_item_id,),
+    ).fetchone()
+    connection.commit()
+    connection.execute("PRAGMA defer_foreign_keys = ON")
+    assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    assert connection.execute("PRAGMA defer_foreign_keys").fetchone()[0] == 1
+
+    with pytest.raises(sqlite3.IntegrityError), connection:
+        connection.execute(
+            "UPDATE source_item SET rowid = 1000 WHERE id = ?",
+            (source_item_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO source_item (
+                id, feed_identity_id, discovered_by_fetch_id,
+                discovered_by_run_id, source_entry_id, title_text, discovered_at
+            ) VALUES (?, ?, ?, ?, 'replacement-entry', 'Replacement row', ?)
+            """,
+            (
+                source_item_id,
+                provenance["feed_identity_id"],
+                provenance["discovered_by_fetch_id"],
+                run_id,
+                moment(10),
+            ),
+        )
+
+    assert (
+        connection.execute(
+            "SELECT id FROM source_item WHERE id = ?", (source_item_id,)
+        ).fetchone()[0]
+        == source_item_id
+    )
+    assert (
+        connection.execute("SELECT 1 FROM source_item WHERE id = 1000").fetchone()
+        is None
+    )
+
+
+def test_observation_rowid_replacement_cannot_break_current_source_ownership(
+    connection: sqlite3.Connection,
+) -> None:
+    run_id, _, source_item_id, observation_id = _valid_graph(connection)
+    second_source_id = _additional_source_item(
+        connection, run_id=run_id, source_entry_id="entry-b"
+    )
+    connection.execute(
+        "UPDATE source_item SET current_triage_observation_id = ? WHERE id = ?",
+        (observation_id, source_item_id),
+    )
+    connection.commit()
+    connection.execute("PRAGMA defer_foreign_keys = ON")
+    assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    assert connection.execute("PRAGMA defer_foreign_keys").fetchone()[0] == 1
+
+    with pytest.raises(sqlite3.IntegrityError), connection:
+        connection.execute(
+            "UPDATE triage_observation SET rowid = 1000 WHERE id = ?",
+            (observation_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO triage_observation (
+                id, source_item_id, run_id, attempt_id, model_inspection_id,
+                disposition, semantic_outcome, canonical_supplied_input_json,
+                validated_output_json, prompt_hash, schema_hash, schema_version,
+                task_fingerprint, input_truncated, overflow, rationale,
+                failure_category, observed_at
+            )
+            SELECT ?, ?, run_id, attempt_id, model_inspection_id,
+                   disposition, semantic_outcome, canonical_supplied_input_json,
+                   validated_output_json, prompt_hash, schema_hash, schema_version,
+                   ?, input_truncated, overflow, rationale, failure_category,
+                   observed_at
+            FROM triage_observation
+            WHERE id = 1000
+            """,
+            (observation_id, second_source_id, _OTHER_HASH),
+        )
+
+    row = connection.execute(
+        "SELECT id, source_item_id FROM triage_observation WHERE id = ?",
+        (observation_id,),
+    ).fetchone()
+    assert tuple(row) == (observation_id, source_item_id)
+    assert (
+        connection.execute(
+            "SELECT 1 FROM triage_observation WHERE id = 1000"
+        ).fetchone()
+        is None
+    )
+
+
+def test_current_observation_can_move_by_clear_reassign_then_adopt(
+    connection: sqlite3.Connection,
+) -> None:
+    run_id, _, first_source_id, observation_id = _valid_graph(connection)
+    second_source_id = _additional_source_item(
+        connection, run_id=run_id, source_entry_id="entry-b"
+    )
+    connection.execute(
+        "UPDATE source_item SET current_triage_observation_id = ? WHERE id = ?",
+        (observation_id, first_source_id),
+    )
+
+    with connection:
+        connection.execute(
+            "UPDATE source_item SET current_triage_observation_id = NULL WHERE id = ?",
+            (first_source_id,),
+        )
+        connection.execute(
+            "UPDATE triage_observation SET source_item_id = ? WHERE id = ?",
+            (second_source_id, observation_id),
+        )
+        connection.execute(
+            "UPDATE source_item SET current_triage_observation_id = ? WHERE id = ?",
+            (observation_id, second_source_id),
+        )
+
+    assert (
+        connection.execute(
+            "SELECT current_triage_observation_id FROM source_item WHERE id = ?",
+            (first_source_id,),
+        ).fetchone()[0]
+        is None
+    )
+    assert (
+        connection.execute(
+            "SELECT current_triage_observation_id FROM source_item WHERE id = ?",
+            (second_source_id,),
+        ).fetchone()[0]
+        == observation_id
+    )
+
+
 def test_source_item_current_observation_pointer_is_nullable_and_foreign_keyed(
     connection: sqlite3.Connection,
 ) -> None:
@@ -831,6 +981,15 @@ def test_source_item_current_observation_pointer_is_nullable_and_foreign_keyed(
             "UPDATE source_item SET current_triage_observation_id = -1 WHERE id = ?",
             (source_item_id,),
         )
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "DELETE FROM triage_observation WHERE id = ?", (observation_id,)
+        )
+    connection.execute(
+        "UPDATE source_item SET current_triage_observation_id = NULL WHERE id = ?",
+        (source_item_id,),
+    )
+    connection.execute("DELETE FROM triage_observation WHERE id = ?", (observation_id,))
 
 
 def test_observation_history_is_insert_only_in_shape_and_allows_replacement(

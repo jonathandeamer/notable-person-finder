@@ -159,7 +159,7 @@ BEGIN
 END;
 
 CREATE TRIGGER source_item_current_triage_owner_on_update
-BEFORE UPDATE OF id, current_triage_observation_id ON source_item
+BEFORE UPDATE ON source_item
 WHEN NEW.current_triage_observation_id IS NOT NULL
     AND NOT EXISTS (
         SELECT 1
@@ -172,12 +172,12 @@ BEGIN
 END;
 
 CREATE TRIGGER triage_observation_preserves_current_owner
-BEFORE UPDATE OF id, source_item_id ON triage_observation
+BEFORE UPDATE ON triage_observation
 WHEN EXISTS (
     SELECT 1
     FROM source_item
     WHERE current_triage_observation_id = OLD.id
-      AND id != NEW.source_item_id
+      AND (NEW.id != OLD.id OR id != NEW.source_item_id)
 )
 BEGIN
     SELECT RAISE(ABORT, 'current triage observation ownership is immutable');
