@@ -8,6 +8,7 @@ import pytest
 from notable_person_finder.config.models import DigestConfig
 from notable_person_finder.reporting.digest import (
     DigestWriteError,
+    IngestionSummary,
     render_digest,
     write_digest,
 )
@@ -222,6 +223,34 @@ def test_no_budget_or_deferral_lines_appear_when_there_is_nothing_to_report() ->
 def test_an_interrupted_predecessor_is_reported() -> None:
     markdown = render_digest(report(interrupted_runs=(41,)), local_date="2026-07-25")
     assert "run-41" in markdown
+
+
+def test_ingestion_subsection_does_not_capture_run_wide_operational_lines() -> None:
+    """The final ``###`` owns only ingestion counters in Markdown structure."""
+    counters = RunCounters(1, 0, 0, 2, 0, 0, 3)
+    markdown = render_digest(
+        report(
+            RunState.PARTIAL,
+            counters=counters,
+            failure_categories={"timeout": 3},
+            paused_providers=frozenset({"feeds"}),
+            interrupted_runs=(41,),
+        ),
+        local_date="2026-07-25",
+        ingestion=IngestionSummary(1, 0, 2, 3, 3),
+    )
+
+    ingestion_section = markdown.split("### Ingestion\n\n", 1)[1]
+    run_wide_lines = (
+        "Required work permanently failed: 2",
+        "Operational failures: 3",
+        "Failures by category: timeout (3)",
+        "Providers paused this run: feeds",
+        "Interrupted predecessor runs recorded: run-41",
+    )
+    for line in run_wide_lines:
+        assert line in markdown  # positive control: the condition is rendered
+        assert line not in ingestion_section
 
 
 def test_digest_ends_with_exactly_one_trailing_newline() -> None:

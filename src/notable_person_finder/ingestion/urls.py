@@ -77,6 +77,7 @@ class UnusableUrlReason(StrEnum):
     UNSUPPORTED_SCHEME = "unsupported_scheme"
     MISSING_HOST = "missing_host"
     EMBEDDED_CREDENTIALS = "embedded_credentials"
+    INVALID_PORT = "invalid_port"
 
 
 class UnusableArticleUrl(ValueError):
@@ -135,9 +136,9 @@ def canonicalize_article_url(url: str) -> str:
     """Normalize `url` into this application's one article-identity string.
 
     Raises `UnusableArticleUrl` for anything that cannot be an article
-    identity at all: a non-HTTP scheme, a missing host, or embedded
-    credentials. Everything else is normalized conservatively -- see the
-    module docstring for why under-normalizing is preferred to
+    identity at all: a non-HTTP scheme, a missing host, embedded credentials,
+    or an invalid port. Everything else is normalized conservatively -- see
+    the module docstring for why under-normalizing is preferred to
     over-normalizing.
     """
     parsed = urlsplit(url)
@@ -153,11 +154,17 @@ def canonicalize_article_url(url: str) -> str:
     # DNS-root artifact that `urlsplit` leaves alone, so it is stripped here.
     scheme = parsed.scheme
     host = parsed.hostname.rstrip(".")
-    port = parsed.port
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise UnusableArticleUrl(UnusableUrlReason.INVALID_PORT, url=url) from error
+    # `SplitResult.hostname` deliberately removes an IPv6 literal's brackets,
+    # but a colon-bearing host is valid in a URL netloc only with them.
+    netloc_host = f"[{host}]" if ":" in host else host
     if port is not None and port != _DEFAULT_PORTS[scheme]:
-        netloc = f"{host}:{port}"
+        netloc = f"{netloc_host}:{port}"
     else:
-        netloc = host
+        netloc = netloc_host
 
     path = _normalize_percent_encoding(parsed.path)
     query = _filter_query(parsed.query)

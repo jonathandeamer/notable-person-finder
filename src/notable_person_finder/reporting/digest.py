@@ -142,18 +142,6 @@ def render_digest(
         )
     lines.append(f"- Optional work succeeded: {counters.optional_succeeded}")
 
-    if ingestion is not None:
-        lines += [
-            "",
-            "### Ingestion",
-            "",
-            f"- Feeds fetched: {ingestion.feeds_fetched}",
-            f"- Feeds not modified: {ingestion.feeds_not_modified}",
-            f"- Feeds failed: {ingestion.feeds_failed}",
-            f"- Source items created: {ingestion.source_items_created}",
-            f"- Articles created: {ingestion.articles_created}",
-        ]
-
     if counters.required_failed_permanent:
         lines.append(
             f"- Required work permanently failed: {counters.required_failed_permanent}"
@@ -173,6 +161,18 @@ def render_digest(
     if report.interrupted_runs:
         rendered = ", ".join(f"run-{run_id}" for run_id in report.interrupted_runs)
         lines.append(f"- Interrupted predecessor runs recorded: {rendered}")
+
+    if ingestion is not None:
+        lines += [
+            "",
+            "### Ingestion",
+            "",
+            f"- Feeds fetched: {ingestion.feeds_fetched}",
+            f"- Feeds not modified: {ingestion.feeds_not_modified}",
+            f"- Feeds failed: {ingestion.feeds_failed}",
+            f"- Source items created: {ingestion.source_items_created}",
+            f"- Articles created: {ingestion.articles_created}",
+        ]
 
     return "\n".join(lines) + "\n"
 

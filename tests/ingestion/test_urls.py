@@ -4,6 +4,7 @@ import pytest
 
 from notable_person_finder.ingestion.urls import (
     UnusableArticleUrl,
+    UnusableUrlReason,
     canonicalize_article_url,
     publisher_key,
 )
@@ -239,6 +240,39 @@ def test_missing_host_is_rejected() -> None:
 def test_embedded_credentials_are_rejected() -> None:
     with pytest.raises(UnusableArticleUrl):
         canonicalize_article_url("https://user:pass@example.com/x")
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (
+            "https://[2001:db8::1]/article",
+            "https://[2001:db8::1]/article",
+        ),
+        (
+            "https://[2001:db8::1]:8443/article",
+            "https://[2001:db8::1]:8443/article",
+        ),
+    ],
+)
+def test_valid_ipv6_literal_keeps_required_netloc_brackets(
+    url: str, expected: str
+) -> None:
+    assert canonicalize_article_url(url) == expected
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com:not-a-port/article",
+        "https://example.com:65536/article",
+    ],
+)
+def test_invalid_port_is_translated_to_typed_unusable_url(url: str) -> None:
+    with pytest.raises(UnusableArticleUrl) as raised:
+        canonicalize_article_url(url)
+
+    assert raised.value.reason is UnusableUrlReason.INVALID_PORT
 
 
 def test_unusable_article_url_carries_a_reason() -> None:
