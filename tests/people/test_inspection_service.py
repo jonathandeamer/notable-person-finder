@@ -18,6 +18,7 @@ from notable_person_finder.config.models import (
 )
 from notable_person_finder.people.repository import (
     DETECT_PEOPLE_TASK_TYPE,
+    insert_failed_observation,
     load_current_triage_observation,
     load_model_inspection,
 )
@@ -55,10 +56,13 @@ from notable_person_finder.runs.scheduler import (
     SchedulerSet,
     WorkerPool,
 )
-from tests.ingestion.helpers import insert_run, moment
+from tests.ingestion.helpers import immediate, insert_run, moment
 
 MODEL = "openai/gpt-test"
 NOW = moment()
+_PROMPT_HASH = "p" * 64
+_SCHEMA_HASH = "s" * 64
+_TASK_FINGERPRINT = "t" * 64
 
 
 def _main_config(
@@ -297,6 +301,75 @@ def test_no_inspection_when_no_usable_untriaged_item(
         (INSPECT_MODEL_TASK_TYPE,),
     ).fetchone()["n"]
     assert count == 0
+
+
+def test_no_inspection_when_only_triaged_usable_items_exist(
+    connection: sqlite3.Connection,
+) -> None:
+    """Usable text alone must not seed inspection once the item is triaged.
+
+    Kills dropping ``current_triage_observation_id IS NULL`` from the seed
+    predicate: a fully triaged item with non-empty title/summary would then
+    still schedule inspect_model work.
+    """
+    run_id = insert_run(connection)
+    item_id = _seed_source_item(connection, run_id=run_id)
+    work_item_id = connection.execute(
+        """
+        INSERT INTO work_item (
+            task_type, subject_kind, subject_id, fingerprint, required,
+            priority, eligible_at, state, created_by_run_id, created_at, updated_at
+        )
+        VALUES ('inspect_model', 'model', NULL, ?, 1, 20, ?, 'succeeded', ?, ?, ?)
+        """,
+        ("e" * 64, moment(), run_id, moment(), moment()),
+    ).lastrowid
+    assert work_item_id is not None
+    attempt_id = connection.execute(
+        """
+        INSERT INTO attempt (
+            run_id, work_item_id, provider, operation, ordinal, started_at,
+            finished_at, outcome, request_fingerprint
+        )
+        VALUES (?, ?, 'openrouter', 'inspect_model', 1, ?, ?, 'succeeded', ?)
+        """,
+        (run_id, work_item_id, moment(), moment(1), "f" * 64),
+    ).lastrowid
+    assert attempt_id is not None
+    connection.commit()
+    with immediate(connection):
+        insert_failed_observation(
+            connection,
+            source_item_id=item_id,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            model_inspection_id=None,
+            failure_category="authentication",
+            canonical_supplied_input_json="{}",
+            prompt_hash=_PROMPT_HASH,
+            schema_hash=_SCHEMA_HASH,
+            schema_version=1,
+            task_fingerprint=_TASK_FINGERPRINT,
+            input_truncated=False,
+            observed_at=moment(),
+            rationale="Already triaged; no further inspection seed.",
+        )
+
+    current = load_current_triage_observation(connection, source_item_id=item_id)
+    assert current is not None
+    config = _main_config()
+    assert (
+        ensure_model_inspection(connection, run_id=run_id, config=config, now=NOW) == 0
+    )
+    # Only the historical succeeded inspect work may exist; no new pending row.
+    pending = connection.execute(
+        """
+        SELECT COUNT(*) AS n FROM work_item
+         WHERE task_type = ? AND state IN ('pending', 'deferred', 'running')
+        """,
+        (INSPECT_MODEL_TASK_TYPE,),
+    ).fetchone()["n"]
+    assert pending == 0
 
 
 def test_no_cross_run_freshness_reuse(connection: sqlite3.Connection) -> None:
