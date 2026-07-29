@@ -161,7 +161,7 @@ def test_sigint_during_a_run_returns_one_hundred_thirty(
         from notable_person_finder.cli import main as cli
         from notable_person_finder.runs.engine import RunEngine
 
-        def interrupted(self, handlers):
+        def interrupted(self, handlers, *, seed=None):
             raise KeyboardInterrupt
 
         RunEngine.execute = interrupted

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import NoReturn
 from zoneinfo import ZoneInfo
 
+from notable_person_finder import __version__
 from notable_person_finder.config.loader import (
     ConfigLoadError,
     ResolvedConfig,
@@ -17,10 +18,20 @@ from notable_person_finder.config.loader import (
 )
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.db.migrate import MigrationError, apply_migrations
+from notable_person_finder.ingestion.repository import source_item_counts
+from notable_person_finder.ingestion.service import (
+    FETCH_FEED_TASK_TYPE,
+    build_fetch_handler,
+    build_seed_hook,
+)
 from notable_person_finder.obs.logging import configure_logging, log_event
+from notable_person_finder.providers.feeds import FeedparserClient
+from notable_person_finder.providers.safety import SystemHostResolver
+from notable_person_finder.providers.transport import build_transport
 from notable_person_finder.reporting.digest import (
     DigestRecord,
     DigestWriteError,
+    IngestionSummary,
     write_digest,
 )
 from notable_person_finder.runs import repository
@@ -148,19 +159,24 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
             local_date = (
                 now.astimezone(ZoneInfo(loaded.main.timezone)).date().isoformat()
             )
-            # The transport and pacing gate will be built by the first adapter
-            # milestone that has a provider to pace; nothing in this milestone
-            # makes requests, so no transport is constructed yet.
+            # The transport is owned by this command and closes before the
+            # scheduler and database connection leave their scopes.
             written: DigestRecord | None = None
 
             def report_run(report: RunReport) -> ReportArtifact:
                 nonlocal written
+                ingestion = (
+                    _ingestion_summary(connection, report.run_id)
+                    if _ingestion_schema_present(connection)
+                    else None
+                )
                 try:
                     written = write_digest(
                         loaded.paths.digests,
                         report,
                         local_date=local_date,
                         config=loaded.main.digest,
+                        ingestion=ingestion,
                     )
                 except DigestWriteError:
                     # `cli.` prefix, not `run.`: the engine already emits
@@ -186,7 +202,23 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
             # Closing the connection first would let a worker thread still
             # inside an HTTP call outlive the SQLite connection it will need
             # for `persist`.
-            with BoundedScheduler(loaded.main.concurrency.http_workers) as scheduler:
+            with (
+                BoundedScheduler(loaded.main.concurrency.http_workers) as scheduler,
+                build_transport(
+                    loaded.main.transport,
+                    version=__version__,
+                    resolver=SystemHostResolver(),
+                    clock=clock,
+                ) as transport,
+            ):
+                client = FeedparserClient(transport)
+                handlers = {
+                    FETCH_FEED_TASK_TYPE: build_fetch_handler(
+                        connection, client=client, feeds=loaded.feeds
+                    )
+                }
+                seed = build_seed_hook(connection, feeds=loaded.feeds, clock=clock)
+
                 engine = RunEngine(
                     connection,
                     retry=RetryPolicy(loaded.main.retry, clock=clock),
@@ -208,13 +240,7 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                 # which is the defect the dotted rename was meant to remove, not
                 # reintroduce in a different shape.
                 log_event(logger, "cli.run_started", fingerprint=loaded.fingerprint)
-                # No provider adapters exist in this milestone, so no task
-                # handlers are registered. Milestones 3-6 supply them. A handler
-                # returning a non-settling state is now handled inside the
-                # engine -- it settles just that item and the run finishes
-                # normally -- so there is no longer a non-settling failure mode
-                # for this call to catch.
-                report = engine.execute({})
+                report = engine.execute(handlers, seed=seed)
 
             if written is None:
                 # The engine always calls the reporter before returning, so
@@ -253,6 +279,81 @@ def _run_schema_present(connection: sqlite3.Connection) -> bool:
     )
 
 
+def _ingestion_schema_present(connection: sqlite3.Connection) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'feed_identity'"
+        ).fetchone()
+        is not None
+    )
+
+
+def _ingestion_summary(
+    connection: sqlite3.Connection, run_id: int
+) -> IngestionSummary | None:
+    """Counts for the digest's ingestion section, or None before migration 0003."""
+    if not _ingestion_schema_present(connection):
+        return None
+    row = connection.execute(
+        """
+        SELECT
+            COALESCE(SUM(CASE WHEN outcome = 'modified' THEN 1 ELSE 0 END), 0)
+                AS modified,
+            COALESCE(SUM(CASE WHEN outcome = 'not_modified' THEN 1 ELSE 0 END), 0)
+                AS not_modified,
+            COALESCE(SUM(CASE WHEN outcome = 'failed' THEN 1 ELSE 0 END), 0) AS failed
+        FROM feed_fetch
+        WHERE run_id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+    counts = source_item_counts(connection, run_id=run_id)
+    # `canonical_article` has no run column. An article is first associated
+    # with its only source item in the same settlement transaction that
+    # creates it, so this association identifies the current run's creates
+    # without presenting the corpus-wide article count as a delta.
+    articles_created = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM canonical_article article
+            WHERE EXISTS (
+                SELECT 1
+                FROM source_item item
+                WHERE item.canonical_article_id = article.id
+                  AND item.discovered_by_run_id = ?
+            )
+            """,
+            (run_id,),
+        ).fetchone()["n"]
+    )
+    return IngestionSummary(
+        feeds_fetched=int(row["modified"]),
+        feeds_not_modified=int(row["not_modified"]),
+        feeds_failed=int(row["failed"]),
+        source_items_created=counts.created_in_run,
+        articles_created=articles_created,
+    )
+
+
+def _latest_successful_fetches(
+    connection: sqlite3.Connection,
+) -> list[tuple[str, str | None]]:
+    """The latest non-failed fetch time for every configured feed identity."""
+    rows = connection.execute(
+        """
+        SELECT fi.key, MAX(ff.requested_at) AS latest_requested_at
+        FROM feed_identity fi
+        LEFT JOIN feed_fetch ff
+            ON ff.feed_identity_id = fi.id AND ff.outcome <> 'failed'
+        GROUP BY fi.key
+        ORDER BY fi.key
+        """
+    ).fetchall()
+    return [(row["key"], row["latest_requested_at"]) for row in rows]
+
+
 def command_status(config_file: Path | None) -> int:
     loaded = load_config(config_file, require_secrets=False)
     if not loaded.paths.database.exists():
@@ -283,6 +384,20 @@ def command_status(config_file: Path | None) -> int:
         print(f"required work pending: {repository.pending_required(connection)}")
         print(f"required work deferred: {repository.deferred_required(connection)}")
         print(f"operational failures: {failures}")
+        if _ingestion_schema_present(connection):
+            counts = source_item_counts(connection, run_id=record.id)
+            print(f"source items: {counts.total}")
+            articles = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS n FROM canonical_article"
+                ).fetchone()["n"]
+            )
+            print(f"articles: {articles}")
+            fetches = _latest_successful_fetches(connection)
+            if fetches:
+                print("latest successful fetch:")
+                for key, latest in fetches:
+                    print(f"  {key}: {latest or '-'}")
         # Digest backlog, queue tiers, and the oldest pending candidate arrive
         # with the digest queue in the lead-assessment milestone.
         return EXIT_OK

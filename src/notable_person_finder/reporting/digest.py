@@ -51,7 +51,23 @@ class DigestRecord:
     markdown: str
 
 
-def render_digest(report: RunReport, *, local_date: str) -> str:
+@dataclass(frozen=True, slots=True)
+class IngestionSummary:
+    """Counts rendered in the digest's ingestion section."""
+
+    feeds_fetched: int
+    feeds_not_modified: int
+    feeds_failed: int
+    source_items_created: int
+    articles_created: int
+
+
+def render_digest(
+    report: RunReport,
+    *,
+    local_date: str,
+    ingestion: IngestionSummary | None = None,
+) -> str:
     lines = [f"# Notable Person Finder — {local_date}", ""]
 
     warning = _PROMINENT_STATES.get(report.state)
@@ -125,6 +141,18 @@ def render_digest(report: RunReport, *, local_date: str) -> str:
             f"spent {_format_nano_usd(report.budget_actual_nano_usd)}"
         )
     lines.append(f"- Optional work succeeded: {counters.optional_succeeded}")
+
+    if ingestion is not None:
+        lines += [
+            "",
+            "### Ingestion",
+            "",
+            f"- Feeds fetched: {ingestion.feeds_fetched}",
+            f"- Feeds not modified: {ingestion.feeds_not_modified}",
+            f"- Feeds failed: {ingestion.feeds_failed}",
+            f"- Source items created: {ingestion.source_items_created}",
+            f"- Articles created: {ingestion.articles_created}",
+        ]
 
     if counters.required_failed_permanent:
         lines.append(
@@ -250,6 +278,7 @@ def write_digest(
     *,
     local_date: str,
     config: DigestConfig,
+    ingestion: IngestionSummary | None = None,
 ) -> DigestRecord:
     """Atomically persist the immutable dated digest and the latest copy.
 
@@ -260,7 +289,7 @@ def write_digest(
     digest, since a run whose real digest exists must not be reported as
     having no digest at all.
     """
-    markdown = render_digest(report, local_date=local_date)
+    markdown = render_digest(report, local_date=local_date, ingestion=ingestion)
     try:
         digests_dir.mkdir(parents=True, exist_ok=True)
     except OSError as error:
