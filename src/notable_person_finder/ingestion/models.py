@@ -1,6 +1,25 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
+
+
+class PublishedIssue(StrEnum):
+    """Why a feed entry's publication date could not be turned into UTC."""
+
+    MISSING = "missing"
+    UNPARSEABLE = "unparseable"
+    IMPLAUSIBLE = "implausible"
+
+
+class UrlIssue(StrEnum):
+    """Why a feed entry's URL could not become a canonical article identity."""
+
+    MISSING = "missing"
+    NOT_HTTP = "not_http"
+    UNSAFE = "unsafe"
+    UNUSABLE = "unusable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,3 +59,13 @@ class SourceItemCounts:
     total: int
     created_in_run: int
     articles_total: int
+
+
+@dataclass(frozen=True, slots=True)
+class FetchPersistResult:
+    """The result of persisting one feed fetch and the entries it produced."""
+
+    source_items_created: int
+    source_items_existing: int
+    articles_created: int
+    entry_issues: Mapping[str, int]

@@ -34,23 +34,44 @@ wrong.** The run engine runs a handler's phases on two different threads:
 from __future__ import annotations
 
 import hashlib
+import html
 import json
+import re
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
 
 from notable_person_finder.config.models import FeedConfig, FeedsConfig
+from notable_person_finder.ingestion.models import (
+    FetchPersistResult,
+    PublishedIssue,
+    UrlIssue,
+)
 from notable_person_finder.ingestion.repository import (
     feed_identities,
+    insert_source_item,
     latest_validators,
+    record_alias,
+    record_fetch,
+    upsert_article,
     upsert_feed_identity,
+)
+from notable_person_finder.ingestion.urls import (
+    UnusableArticleUrl,
+    UnusableUrlReason,
+    canonicalize_article_url,
+    publisher_key,
 )
 from notable_person_finder.providers.failures import FailureCategory, ProviderFailure
 from notable_person_finder.providers.feeds import (
     PROVIDER,
     FeedClient,
+    FeedEntry,
     FeedValidators,
+    Modified,
     NotModified,
 )
 from notable_person_finder.runs import repository
@@ -151,6 +172,396 @@ class NotInspected:
     # bodies, credentials, and query text. Must never be folded into a
     # `TaskOutcome.reason`, which is a `GROUP BY` key.
     detail: str | None
+
+
+# --- entry normalization and persistence --------------------------------------
+
+
+def _plain_text(raw: str | None) -> str | None:
+    """Turn raw HTML-ish text into plain text for storage and downstream use.
+
+    Strips HTML tags, unescapes entities, and collapses runs of whitespace.
+    `None` and the empty string both become `None` so the database stores a
+    clean NULL rather than an empty column that downstream code has to treat
+    as missing.
+    """
+    if raw is None:
+        return None
+    text = re.sub(r"<[^>]+>", "", raw)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if text else None
+
+
+def _url_issue_for(reason: UnusableUrlReason) -> UrlIssue:
+    """Map a URL usability reason to the stored `url_issue` enum value."""
+    if reason is UnusableUrlReason.UNSUPPORTED_SCHEME:
+        return UrlIssue.NOT_HTTP
+    if reason is UnusableUrlReason.EMBEDDED_CREDENTIALS:
+        return UrlIssue.UNSAFE
+    return UrlIssue.UNUSABLE
+
+
+def _parse_date(raw: str) -> datetime | None:
+    """Parse an RFC 822 or ISO-8601 date string into a UTC datetime, or None."""
+    try:
+        parsed = parsedate_to_datetime(raw)
+        return parsed.astimezone(UTC)
+    except (TypeError, ValueError, IndexError):
+        pass
+    try:
+        normalized = raw.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    except ValueError:
+        return None
+
+
+def _parse_published(
+    raw: str | None,
+    reference: datetime,
+) -> tuple[str | None, PublishedIssue | None]:
+    """Turn a feed entry's raw date into a stored UTC value or a typed issue.
+
+    `reference` is the run's settlement timestamp; dates outside a reasonable
+    window around it are flagged `implausible` rather than accepted. The raw
+    text is always preserved by the caller, so nothing is lost on failure.
+    """
+    if raw is None or raw.strip() == "":
+        return None, PublishedIssue.MISSING
+    parsed = _parse_date(raw)
+    if parsed is None:
+        return None, PublishedIssue.UNPARSEABLE
+    if parsed.year < 1900 or parsed > reference + timedelta(days=1):
+        return None, PublishedIssue.IMPLAUSIBLE
+    return utc_timestamp(parsed), None
+
+
+def _resolve_article(
+    connection: sqlite3.Connection,
+    original_url: str | None,
+    now: str,
+    articles_created: list[int],
+) -> tuple[int | None, str | None, UrlIssue | None]:
+    """Canonicalize an entry URL, upsert the article, and record any alias.
+
+    Returns `(article_id, original_url, url_issue)`. When the URL is unusable
+    the article is `None` and the original URL is still returned so the source
+    item can keep what the feed published. `articles_created` is a mutable
+    counter because the caller tracks several counts at once.
+    """
+    if original_url is None or original_url == "":
+        return None, None, UrlIssue.MISSING
+    try:
+        canonical_url = canonicalize_article_url(original_url)
+    except UnusableArticleUrl as error:
+        return None, original_url, _url_issue_for(error.reason)
+
+    key = publisher_key(canonical_url)
+    existing = connection.execute(
+        "SELECT id FROM canonical_article WHERE canonical_url = ?", (canonical_url,)
+    ).fetchone()
+    if existing is None:
+        upsert_article(
+            connection,
+            canonical_url=canonical_url,
+            publisher_key=key,
+            now=now,
+        )
+        articles_created.append(1)
+    article_id = int(
+        connection.execute(
+            "SELECT id FROM canonical_article WHERE canonical_url = ?", (canonical_url,)
+        ).fetchone()["id"]
+    )
+    # Record the observed URL as an alias even when it already is the canonical
+    # form: a bare feed link is a genuine sighting, and the acceptance criterion
+    # for convergence requires the bare URL to appear alongside a tracked one.
+    record_alias(
+        connection,
+        canonical_article_id=article_id,
+        url=original_url,
+        kind="feed_original",
+        now=now,
+    )
+    return article_id, original_url, None
+
+
+def _record_modified(
+    connection: sqlite3.Connection,
+    *,
+    feed_identity_id: int,
+    run_id: int,
+    result: Modified,
+    now: str,
+) -> int:
+    """Write one `modified` fetch row and return its id."""
+    return record_fetch(
+        connection,
+        feed_identity_id=feed_identity_id,
+        run_id=run_id,
+        requested_at=now,
+        requested_url=result.requested_url,
+        resolved_url=result.final_url,
+        redirect_chain_json=(
+            json.dumps(list(result.redirect_chain)) if result.redirect_chain else None
+        ),
+        http_status=result.status_code,
+        etag=result.validators.etag,
+        last_modified=result.validators.last_modified,
+        outcome="modified",
+        feed_type=result.feed_type,
+        parse_outcome="recovered" if result.warnings else "ok",
+        parser_warnings_json=(
+            json.dumps(list(result.warnings)) if result.warnings else None
+        ),
+        failure_category=None,
+        entry_count=len(result.entries),
+        response_bytes=result.response_bytes,
+    )
+
+
+def _record_not_modified(
+    connection: sqlite3.Connection,
+    *,
+    feed_identity_id: int,
+    run_id: int,
+    result: NotModified,
+    now: str,
+) -> None:
+    """Write one `not_modified` fetch row."""
+    record_fetch(
+        connection,
+        feed_identity_id=feed_identity_id,
+        run_id=run_id,
+        requested_at=now,
+        requested_url=result.requested_url,
+        resolved_url=result.final_url,
+        redirect_chain_json=(
+            json.dumps(list(result.redirect_chain)) if result.redirect_chain else None
+        ),
+        http_status=result.status_code,
+        etag=result.validators.etag,
+        last_modified=result.validators.last_modified,
+        outcome="not_modified",
+        feed_type=None,
+        parse_outcome=None,
+        parser_warnings_json=None,
+        failure_category=None,
+        entry_count=0,
+        response_bytes=0,
+    )
+
+
+def _record_not_inspected(
+    connection: sqlite3.Connection,
+    *,
+    feed_identity_id: int,
+    run_id: int,
+    result: NotInspected,
+    now: str,
+) -> None:
+    """Write one `failed` fetch row for a response that was refused before parsing."""
+    record_fetch(
+        connection,
+        feed_identity_id=feed_identity_id,
+        run_id=run_id,
+        requested_at=now,
+        requested_url=result.requested_url,
+        resolved_url=None,
+        redirect_chain_json=None,
+        http_status=result.status_code,
+        etag=None,
+        last_modified=None,
+        outcome="failed",
+        feed_type=None,
+        parse_outcome=None,
+        parser_warnings_json=None,
+        failure_category=str(result.category),
+        entry_count=None,
+        response_bytes=None,
+    )
+
+
+def _record_failed_fetch(
+    connection: sqlite3.Connection,
+    *,
+    feed_identity_id: int,
+    run_id: int,
+    requested_url: str,
+    failure: ProviderFailure,
+    now: str,
+) -> None:
+    """Write one `failed` fetch row for a provider failure the engine adjudicated."""
+    record_fetch(
+        connection,
+        feed_identity_id=feed_identity_id,
+        run_id=run_id,
+        requested_at=now,
+        requested_url=requested_url,
+        resolved_url=None,
+        redirect_chain_json=None,
+        http_status=failure.status_code,
+        etag=None,
+        last_modified=None,
+        outcome="failed",
+        feed_type=None,
+        parse_outcome=None,
+        parser_warnings_json=None,
+        failure_category=str(failure.category),
+        entry_count=None,
+        response_bytes=None,
+    )
+
+
+def _persist_entries(
+    connection: sqlite3.Connection,
+    *,
+    feed_identity_id: int,
+    fetch_id: int,
+    run_id: int,
+    entries: tuple[FeedEntry, ...],
+    now: str,
+) -> FetchPersistResult:
+    """Persist every entry from a modified feed, counting creates and issues."""
+    reference = datetime.fromisoformat(now.replace("Z", "+00:00"))
+    source_items_created = 0
+    source_items_existing = 0
+    articles_created: list[int] = []
+    entry_issues: dict[str, int] = {}
+
+    for entry in entries:
+        try:
+            article_id, original_url, url_issue = _resolve_article(
+                connection, entry.url, now, articles_created
+            )
+        except Exception:
+            # A per-entry fault must not roll back the whole fetch. Treat it
+            # as an unusable URL and keep the raw text, which may still name
+            # a person.
+            article_id = None
+            original_url = entry.url
+            url_issue = UrlIssue.UNUSABLE
+
+        published_at, published_issue = _parse_published(entry.published_raw, reference)
+
+        item_id = insert_source_item(
+            connection,
+            feed_identity_id=feed_identity_id,
+            discovered_by_fetch_id=fetch_id,
+            discovered_by_run_id=run_id,
+            canonical_article_id=article_id,
+            source_entry_id=entry.entry_id,
+            original_url=original_url,
+            title_raw=entry.title,
+            title_text=_plain_text(entry.title),
+            summary_raw=entry.summary,
+            summary_text=_plain_text(entry.summary),
+            author_raw=entry.author,
+            published_raw=entry.published_raw,
+            published_at=published_at,
+            published_issue=None if published_issue is None else str(published_issue),
+            url_issue=None if url_issue is None else str(url_issue),
+            now=now,
+        )
+        if item_id is None:
+            source_items_existing += 1
+        else:
+            source_items_created += 1
+
+        if url_issue is not None:
+            entry_issues[str(url_issue)] = entry_issues.get(str(url_issue), 0) + 1
+        if published_issue is not None:
+            entry_issues[str(published_issue)] = (
+                entry_issues.get(str(published_issue), 0) + 1
+            )
+
+    return FetchPersistResult(
+        source_items_created=source_items_created,
+        source_items_existing=source_items_existing,
+        articles_created=sum(articles_created),
+        entry_issues=entry_issues,
+    )
+
+
+def persist_fetch(
+    connection: sqlite3.Connection,
+    *,
+    feed_identity_id: int,
+    run_id: int,
+    result: Modified | NotModified | NotInspected,
+    now: str,
+) -> FetchPersistResult:
+    """Persist one feed fetch and its entries inside the settling transaction.
+
+    Always writes a `feed_fetch` row: successes, 304s, and failures all leave
+    durable evidence. For a `Modified` result, every entry is normalized and
+    inserted; duplicates are counted as existing rather than errors.
+    """
+    if isinstance(result, Modified):
+        fetch_id = _record_modified(
+            connection,
+            feed_identity_id=feed_identity_id,
+            run_id=run_id,
+            result=result,
+            now=now,
+        )
+        return _persist_entries(
+            connection,
+            feed_identity_id=feed_identity_id,
+            fetch_id=fetch_id,
+            run_id=run_id,
+            entries=result.entries,
+            now=now,
+        )
+    if isinstance(result, NotModified):
+        _record_not_modified(
+            connection,
+            feed_identity_id=feed_identity_id,
+            run_id=run_id,
+            result=result,
+            now=now,
+        )
+        return FetchPersistResult(0, 0, 0, {})
+    if isinstance(result, NotInspected):
+        _record_not_inspected(
+            connection,
+            feed_identity_id=feed_identity_id,
+            run_id=run_id,
+            result=result,
+            now=now,
+        )
+        return FetchPersistResult(0, 0, 0, {})
+    raise TypeError(f"unexpected fetch result type: {type(result).__name__}")
+
+
+def persist_failed_fetch(
+    connection: sqlite3.Connection,
+    *,
+    feed_identity_id: int,
+    run_id: int,
+    requested_url: str,
+    failure: ProviderFailure,
+    now: str,
+) -> FetchPersistResult:
+    """Persist a fetch that failed before returning a parsed result.
+
+    This is the `persist_failure` seam for the engine-settled failures that
+    never produce a `TaskOutcome` -- exhausted transient failures and
+    non-retryable permanent failures. The fetch row records that the attempt
+    happened and why it failed.
+    """
+    _record_failed_fetch(
+        connection,
+        feed_identity_id=feed_identity_id,
+        run_id=run_id,
+        requested_url=requested_url,
+        failure=failure,
+        now=now,
+    )
+    return FetchPersistResult(0, 0, 0, {})
 
 
 def _fingerprint(*, feed_key: str, url: str) -> str:
@@ -369,6 +780,74 @@ def _execute_for(
     return execute
 
 
+def _attempt_context(
+    connection: sqlite3.Connection, work_item_id: int
+) -> tuple[int, str]:
+    """The run id and started-at timestamp of the latest attempt for an item.
+
+    `persist` and `persist_failure` need the run id and the instant the fetch
+    began, neither of which is in the `TaskHandler` signatures. The attempt row
+    written just before the call was committed by `finish_attempt`, so it is
+    the durable source for both values.
+    """
+    row = connection.execute(
+        "SELECT run_id, started_at FROM attempt "
+        "WHERE work_item_id = ? ORDER BY id DESC LIMIT 1",
+        (work_item_id,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(
+            f"no attempt row for work item {work_item_id}; cannot persist fetch"
+        )
+    return int(row["run_id"]), row["started_at"]
+
+
+def _persist_for(
+    connection: sqlite3.Connection,
+    resolve: Callable[[WorkItem], tuple[int, FeedConfig]],
+) -> Callable[[WorkItem, TaskOutcome], None]:
+    """Build the application-thread `persist` callback for `build_fetch_handler`."""
+
+    def persist(work_item: WorkItem, outcome: TaskOutcome) -> None:
+        feed_identity_id, _feed = resolve(work_item)
+        run_id, requested_at = _attempt_context(connection, work_item.id)
+        result = outcome.payload
+        if not isinstance(result, Modified | NotModified | NotInspected):
+            raise RuntimeError(
+                f"unexpected fetch payload type: {type(result).__name__}"
+            )
+        persist_fetch(
+            connection,
+            feed_identity_id=feed_identity_id,
+            run_id=run_id,
+            result=result,
+            now=requested_at,
+        )
+
+    return persist
+
+
+def _persist_failure_for(
+    connection: sqlite3.Connection,
+    resolve: Callable[[WorkItem], tuple[int, FeedConfig]],
+) -> Callable[[WorkItem, ProviderFailure], None]:
+    """Build the application-thread `persist_failure` callback."""
+
+    def persist_failure(work_item: WorkItem, failure: ProviderFailure) -> None:
+        feed_identity_id, feed = resolve(work_item)
+        run_id, requested_at = _attempt_context(connection, work_item.id)
+        persist_failed_fetch(
+            connection,
+            feed_identity_id=feed_identity_id,
+            run_id=run_id,
+            requested_url=feed.url,
+            failure=failure,
+            now=requested_at,
+        )
+
+    return persist_failure
+
+
 def build_fetch_handler(
     connection: sqlite3.Connection,
     *,
@@ -453,6 +932,8 @@ def build_fetch_handler(
         operation=FETCH_FEED_OPERATION,
         execute=_execute_for(client),
         prepare=prepare,
+        persist=_persist_for(connection, resolve),
+        persist_failure=_persist_failure_for(connection, resolve),
         destination_host=destination_host,
         # A feed fetch costs no money, so it reserves nothing against the run
         # budget. Reserving zero is not the same as not reserving: the attempt
