@@ -12,6 +12,7 @@ license = { file = "LICENSE" }
 dependencies = [
   "feedparser>=6.0,<7",
   "httpx>=0.28,<0.29",
+  "openrouter>=1.0,<2",
   "platformdirs>=4.3,<5",
   "portalocker>=3.1,<4",
   "pydantic>=2.11,<3",
