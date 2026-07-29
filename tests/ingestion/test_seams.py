@@ -21,7 +21,6 @@ from notable_person_finder.config.models import FeedConfig, FeedsConfig, Transpo
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.ingestion import service
 from notable_person_finder.ingestion.models import (
-    FetchPersistResult,
     PublishedIssue,
     UrlIssue,
 )
@@ -312,15 +311,14 @@ def test_persist_fetch_keeps_an_entry_with_a_typed_issue_after_resolution_fault(
             now=moment(),
         )
 
-    assert counts == FetchPersistResult(
-        1,
-        0,
-        0,
-        {
-            f"url:{UrlIssue.UNUSABLE}": 1,
-            f"published:{PublishedIssue.MISSING}": 1,
-        },
-    )
+    assert counts.source_items_created == 1
+    assert counts.source_items_existing == 0
+    assert counts.articles_created == 0
+    assert counts.entry_issues == {
+        f"url:{UrlIssue.UNUSABLE}": 1,
+        f"published:{PublishedIssue.MISSING}": 1,
+    }
+    assert len(counts.created_source_item_ids) == 1
     row = connection.execute(
         "SELECT title_text, canonical_article_id, url_issue FROM source_item"
     ).fetchone()
