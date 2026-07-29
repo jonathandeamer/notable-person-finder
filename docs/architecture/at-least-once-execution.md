@@ -5,25 +5,34 @@
 
 ## The window
 
-External work runs in these steps:
+Batch execution and each external call run in these steps:
 
-1. a brief transaction claims the work item, creates the attempt, and reserves
-   budget;
-2. the external call runs with no database transaction open; then
-3. a brief transaction stores the attempt's outcome and reconciles its cost
+1. `claim_batch` commits up to the worker limit as `running` in one brief
+   transaction;
+2. for each claimed item, the application thread checks provider pause state
+   and runs handler `prepare` with no transaction open;
+3. for each item that will actually be called, `start_attempt` reserves budget
+   and creates the attempt in a second brief transaction;
+4. the external call runs with no database transaction open;
+5. a brief transaction stores the attempt's outcome and reconciles its cost
    (`finish_attempt`); and
-4. a second brief transaction completes or defers the work item
-   (`complete_work`).
+6. a second brief transaction completes or defers the work item, including
+   trusted handler domain persistence (`complete_work`).
 
-Steps 3 and 4 are **two** transactions, not one. There are therefore two
-distinct crash windows, and they leave different things behind. In both, a
-provider may already have accepted — and charged for — a request whose result
-the run never finished recording, and in both the next ordinary `notable run`
-returns the work item to `pending` and performs the request again.
+Steps 5 and 6 are **two** transactions, not one. There are therefore two
+distinct crash windows in which a provider may already have accepted — and
+charged for — a request whose result the run never finished recording. They
+leave different attempt rows behind, but in both the next ordinary
+`notable run` returns the work item to `pending` and performs the request
+again.
 
-Step 1 is one transaction, so a crash cannot leave a claim without an attempt
-row or an attempt row without a claim. There is no separate resume mode and no
-manual recovery step: the sweep at the start of every run is the recovery path.
+Because step 1 commits before steps 2 and 3, a process can also die with a
+claimed work item but no attempt row. That is a no-call recovery window: the
+provider was never contacted, no spend can be duplicated, and the startup
+sweep simply returns the claim to `pending`. Deliberate no-call settlements
+(for example, a paused provider or a preparation failure) likewise create no
+attempt row. There is no separate resume mode and no manual recovery step:
+the sweep at the start of every run is the recovery path.
 
 ## What the application does and does not promise
 
@@ -41,7 +50,7 @@ windows the crashed run row is still `running`, with `finished_at` NULL and no
 digest recorded, and the work item is still `running` and stamped
 `claimed_by_run_id` for that run. The attempt row is what differs.
 
-### Window one: the call was in flight (crash during step 2)
+### Window one: the call was in flight (crash during step 4)
 
 The attempt row exists with `outcome` and `finished_at` NULL.
 
@@ -52,7 +61,7 @@ deliberately — a deferral stamped by the crashed run would keep the item out o
 the recovering run's own selection, silently converting "retry the interrupted
 call" into "skip it".
 
-### Window two: the outcome was stored but the item was never settled (crash between steps 3 and 4)
+### Window two: the outcome was stored but the item was never settled (crash between steps 5 and 6)
 
 The attempt row is already `succeeded`, with a `finished_at`, a reconciled
 cost, and a request fingerprint. Only the work item is unsettled.
@@ -69,14 +78,16 @@ run's `interrupted` state, never through the attempt rows. It is the narrower
 of the two windows but the more operationally dangerous one, because it leaves
 no marker to search for.
 
-The same sweep also covers the aborts that are not process death but leave the
-same in-flight shape. An exception that is not a `ProviderFailure` — raised
-from a handler's `prepare`, `execute`, or `persist` — propagates out of the
-engine before the run is finished, so the run row stays `running` and the next
-sweep marks it `interrupted`. So does an interrupt during the digest write,
-which exits 130. The observed
-run-transition sequence across a crash and its recovery is
-`running, interrupted, running, complete`.
+The same sweep also covers unexpected execute failures that leave the same
+in-flight shape: a non-`ProviderFailure` escaping the worker propagates out of
+the engine, so the run row stays `running` and the next sweep marks it
+`interrupted`. Preparation and persistence faults do not normally abort the
+run now. An ordinary exception from `prepare` settles only that claimed item
+`failed_permanent` before any attempt or call; an exception from handler
+`persist` rolls back its domain writes and first settlement, then settles only
+that item `failed_permanent` without those writes. An interrupt during the
+digest write still exits 130. The observed run-transition sequence across a
+process crash and its recovery is `running, interrupted, running, complete`.
 
 ## Consequences for the operator
 
@@ -119,6 +130,7 @@ two, and the guarantee that a persisted result is never repeated — including
 when the crash happens after some of the run's work has already been
 committed.
 
-Both on-disk shapes in this document are asserted by that file. If a future
-change fuses steps 3 and 4 into one transaction, window two disappears and its
-tests fail; the tests and this document must then be corrected together.
+Both external-call on-disk shapes in this document are asserted by that file.
+If a future change fuses steps 5 and 6 into one transaction, window two
+disappears and its tests fail; the tests and this document must then be
+corrected together.

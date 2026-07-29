@@ -49,10 +49,11 @@ Ingestion alone would not force this (roughly ten feeds), but 3b issues one `det
 
 The shape is a per-item state machine with SQLite exclusively on the application thread:
 
-1. The application thread claims up to `concurrency.http_workers` eligible items and writes the attempt row for each item's next ordinal.
-2. It submits **pure** call closures — one attempt each, no database access, no retry loop, no connection captured.
-3. It drains completions on the application thread, persists each outcome, and either settles the item or re-arms it at its backoff deadline.
-4. A re-armed item is resubmitted when due. Other items keep the pool busy meanwhile, so backoff never sleeps the application thread.
+1. The application thread commits a batch claim of up to `concurrency.http_workers` eligible items.
+2. For each claimed item it checks pause state and runs `prepare`; only an item that will actually be called then gets its attempt row and budget reservation in a separate transaction.
+3. It submits **pure** call closures — one attempt each, no database access, no retry loop, no connection captured.
+4. It drains completions on the application thread, persists each attempt outcome, and then either settles the item with its handler persistence or re-arms it at its backoff deadline.
+5. A re-armed item is resubmitted when due. Other items keep the pool busy meanwhile, so backoff never sleeps the application thread.
 
 The rejected alternative was letting the worker keep its own retry loop and return a list of raw attempt results for the application thread to persist afterwards. It is a much smaller change, but a crash mid-call then leaves no attempt row for a call the provider may already have accepted and charged for. That costs little for feeds and a great deal for OpenRouter in 3b.
 
@@ -267,7 +268,7 @@ Task 0 comes first so the run engine tests are type-checked *before* Task 3 resh
   - `TaskHandler.persist_failure: Callable[[WorkItem, ProviderFailure], None] | None` — the matching application-thread persistence seam for engine-adjudicated provider failures that produce no `TaskOutcome`. It runs inside the item's settlement transaction and is mutually exclusive with `persist` when either hook is eligible; settlements without a trusted outcome or provider failure may invoke neither. Task 10 binds failed-fetch history here.
   - `TaskHandler.destination_host: Callable[[WorkItem], str | None] | None` — lets the engine populate `attempt.destination_host`, which milestone 2 always wrote as `None` because it had no real adapter.
 
-  The three phases together — `prepare` on the application thread, `execute` on a worker, `persist` on the application thread — are exactly the three steps the domain spec's transaction-boundary section describes. Name them that way in the code.
+  The three handler phases are `prepare` on the application thread, `execute` on a worker, and `persist` on the application thread. The engine's persistence phase spans two transactions: attempt outcome first, then handler domain writes and settlement together.
   - `RunEngine.execute(handlers, *, seed=None)` — `seed` is `Callable[[int], None] | None`, invoked with the run id after run creation and before the claim loop. See Task 9.
 
 **The loop:**
@@ -275,7 +276,7 @@ Task 0 comes first so the run engine tests are type-checked *before* Task 3 resh
 1. Claim a batch of up to `concurrency.http_workers` items.
 2. For each claimed item, on the application thread, **check the provider pause first**: if `RetryPolicy.is_paused(handler.provider)`, settle the item as `DEFERRED` with reason `provider paused` and write **no attempt row** — a paused provider means no call was made, and an attempt row must always correspond to exactly one external call. Milestone 2 enforced this inside `RetryCoordinator.call`, which the reshaped engine no longer routes through, so the engine must now own it explicitly. Only for unpaused items: call `handler.prepare` if present, compute the request fingerprint and destination host, and write the attempt row for the item's next ordinal.
 3. Submit one closure per item to the scheduler. The closure captures the handler, the work item, and the prepared value — never the connection.
-4. Drain completions on the application thread. For each, in one transaction: persist the attempt outcome; call `handler.persist` for an accepted `TaskOutcome`, or `handler.persist_failure` for an engine-adjudicated provider failure with no outcome; and either settle the work item or re-arm it. A handler's domain writes and its work-item settlement therefore commit or roll back together. A refused non-settling outcome invokes neither hook.
+4. Drain completions on the application thread. For each, first commit the attempt outcome and cost reconciliation. Then, in the work-item settlement transaction, call `handler.persist` for an accepted `TaskOutcome`, or `handler.persist_failure` for an engine-adjudicated provider failure with no outcome, and either settle or re-arm the work item. A handler's domain writes and its work-item settlement commit or roll back together. An ordinary `prepare` exception is isolated before any attempt is created; a handler-persistence exception rolls back that settlement and is isolated by a second `failed_permanent` settlement with no domain writes. A refused non-settling outcome invokes neither hook.
 5. **Re-arm means `pending` with a future `eligible_at`**, never `deferred`. `_CLAIMABLE_PREDICATE` excludes a `deferred` item from the run that deferred it, so re-arming to `deferred` would silently strand the item for the rest of the run. `deferred` remains the correct *terminal* state for an exhausted item, which should not be retried again until tomorrow.
 6. Re-armed items rejoin the next claim batch when due. When only re-armed items remain and none is yet due, wait until the earliest deadline rather than spinning.
 7. Stop when no eligible items remain.
@@ -403,7 +404,10 @@ Test with an input that makes `build_request` raise something other than `Unicod
 
 `feed_fetch`
 - `id`, `feed_identity_id`, `run_id`, `requested_at`, `requested_url`, `resolved_url`, `redirect_chain_json`, `http_status`, `etag`, `last_modified`, `outcome` CHECK in (`not_modified`, `modified`, `failed`), `feed_type`, `parse_outcome` CHECK in (`ok`, `recovered`, `unusable`), `parser_warnings_json`, `failure_category` CHECK against the `FailureCategory` values, `entry_count`, `response_bytes`.
-- Conditional state for the next fetch is **derived** from the latest fetch whose `outcome` is not `failed`. Do not store mutable validator state on `feed_identity`.
+- Conditional state for the next fetch is **derived** from the latest fetch for
+  the exact configured `requested_url` whose `outcome` is not `failed`. Do not
+  store mutable validator state on `feed_identity`; a configured URL move must
+  not inherit validators learned from the old representation.
 
 `canonical_article`
 - `id`, `canonical_url` UNIQUE, `publisher_key`, `first_seen_at`.
@@ -421,7 +425,7 @@ The second index is deliberately narrow: entry-id dedup applies only where there
 
 **Repository interfaces** (all take `connection` first, all keyword-only after):
 - `upsert_feed_identity(*, key, label, url, now) -> int`
-- `latest_validators(*, feed_identity_id) -> tuple[str | None, str | None]` — ETag and Last-Modified from the latest non-failed fetch
+- `latest_validators(*, feed_identity_id, requested_url) -> tuple[str | None, str | None]` — ETag and Last-Modified from the latest non-failed fetch for that exact requested URL
 - `record_fetch(*, feed_identity_id, run_id, requested_at, requested_url, resolved_url, redirect_chain_json, http_status, etag, last_modified, outcome, feed_type, parse_outcome, parser_warnings_json, failure_category, entry_count, response_bytes) -> int`
 - `upsert_article(*, canonical_url, publisher_key, now) -> int`
 - `record_alias(*, canonical_article_id, url, kind, now) -> None`
@@ -433,7 +437,7 @@ The second index is deliberately narrow: entry-id dedup applies only where there
 **Steps:**
 
 - [ ] Write failing schema tests: migration `0003` applies to a fresh database and to a `0002` database; every table exists with the expected columns; each CHECK rejects an invalid value; each unique index rejects a duplicate; foreign keys are enforced.
-- [ ] Write failing repository tests: insert-once across two runs yields one source item; insert-once across two feeds yields one source item and the second call returns `None`; a URL-less entry dedups on `(feed, entry_id)`; two URL-less entries with different entry ids both insert; `latest_validators` ignores failed fetches.
+- [ ] Write failing repository tests: insert-once across two runs yields one source item; insert-once across two feeds yields one source item and the second call returns `None`; a URL-less entry dedups on `(feed, entry_id)`; two URL-less entries with different entry ids both insert; `latest_validators` ignores failed fetches and fetches made against an earlier configured URL.
 - [ ] Run them; expect failures.
 - [ ] Write the migration and the repository.
 - [ ] Run `uv run pytest tests/foundation tests/ingestion -v`. The foundation migration tests must still pass — `0003` must not break the checksum chain.
@@ -510,7 +514,7 @@ The second index is deliberately narrow: entry-id dedup applies only where there
 
 **The handler is split across the two threads**, and this is the one place the division is easy to get wrong:
 
-- `prepare(work_item)` runs on the **application thread**. It resolves the feed identity to its `FeedConfig` and reads that feed's stored validators via `latest_validators`. This is the handler's only SQLite access. It returns a `FeedCall` frozen dataclass carrying `feed: FeedConfig` and `validators: FeedValidators`.
+- `prepare(work_item)` runs on the **application thread**. It resolves the feed identity to its `FeedConfig` and reads validators stored for that feed's exact configured URL via `latest_validators`. This is the handler's only SQLite access. It returns a `FeedCall` frozen dataclass carrying `feed: FeedConfig` and `validators: FeedValidators`; a configured URL move therefore starts without validators learned from the old representation.
 - `execute(work_item, ordinal, prepared)` runs on a **worker thread**. It performs exactly one `client.fetch_feed(prepared.feed, prepared.validators)` and returns a `TaskOutcome`. No retry, no sleep, and no SQLite — the closure never sees a connection.
 
 State this in the code, not only here. Task 10's persistence likewise runs on the application thread.
@@ -574,7 +578,7 @@ State this in the code, not only here. Task 10's persistence likewise runs on th
 - Modify: `src/notable_person_finder/cli/main.py`, `src/notable_person_finder/reporting/digest.py`
 - Test: `tests/ingestion/test_run_cli.py`
 
-**Wiring.** `command_run` constructs no transport today (`cli/main.py:152-154` notes it is left to the first adapter milestone), so this task builds that lifecycle from scratch: call `build_transport(...)` inside `command_run`, wrap it in a `with` block so it closes on every exit path including failure, build a `FeedparserClient` over it, construct the handler via `build_fetch_handler`, and pass `build_seed_hook(...)` as the engine's `seed` hook. A test must prove the transport is closed when the run raises, not only when it succeeds.
+**Wiring.** `command_run` constructs no transport today (`cli/main.py:152-154` notes it is left to the first adapter milestone), so this task builds that lifecycle from scratch: build one run-scoped `PacingGate` from the configured pacing and per-origin limits, inject it into `build_transport(...)`, and wrap the transport in a `with` block so it closes on every exit path including failure. Enter the transport before the scheduler so exceptional reverse-order exit drains in-flight workers before closing their HTTP client. Build a `FeedparserClient` over the transport, construct the handler via `build_fetch_handler`, and pass `build_seed_hook(...)` as the engine's `seed` hook. Tests must prove configured same-origin concurrency on real request calls and transport closure only after in-flight siblings exit, not merely that the objects were constructed.
 
 **Digest.** The operational summary gains an ingestion section: feeds fetched, feeds not modified, feeds failed, source items created, and articles created. The three feed counters use the final stored settlement per feed identity in the run (the highest `feed_fetch.id`), not raw calls or rows, so duplicate work after a URL change cannot count one feed twice. Milestone 6 still owns the ranked shortlist; this section sits in the operational summary, not in the placeholder shortlist.
 

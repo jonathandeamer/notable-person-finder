@@ -70,10 +70,13 @@ For an ordinary provider failure, the final failed attempt records
 The handler also writes one `feed_fetch.outcome='failed'` row for the final
 settlement, so feed history records that the run tried and failed.
 
-`response_too_large` and `unsupported_content` are the special not-inspected
-path. The handler returns a direct deferred outcome rather than retrying a
-response it deliberately refused to parse. Because the attempt schema permits
-a failure category only on a failed attempt, its attempt row has
+`response_too_large` is the current not-inspected feed path. The handler also
+reserves this mapping for `unsupported_content`, so a future adapter that emits
+that category will behave consistently, but no shipped feed adapter raises
+`unsupported_content` today. For either category, the handler returns a direct
+deferred outcome rather than retrying a response it deliberately refused to
+parse. Because the attempt schema permits a failure category only on a failed
+attempt, its attempt row has
 `outcome='succeeded'` and a null `failure_category`; the sanitized category and
 detail are in `attempt.detail_json`. The corresponding `feed_fetch` row is
 `outcome='failed'` with the real category. Consequently:
