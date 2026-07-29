@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import traceback
+import types
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from notable_person_finder.config.models import (
     DetectPeopleConfig,
@@ -84,6 +86,61 @@ def _supplied(*, max_people: int = 3) -> DetectionInput:
 
 def _fixture(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
+
+
+def _capture_validation_error(raw: str, supplied: DetectionInput) -> BaseException:
+    try:
+        validate_detection_output(raw, supplied)
+    except DetectionValidationError as error:
+        del raw, supplied
+        return error
+    raise AssertionError("expected detection validation to fail")
+
+
+def _retained_exception_values(error: BaseException) -> Iterator[object]:
+    pending: list[object] = [error]
+    seen: set[int] = set()
+    while pending:
+        value = pending.pop()
+        identity = id(value)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        yield value
+        if isinstance(value, BaseException):
+            pending.extend(value.args)
+            pending.extend(value.__dict__.values())
+            if value.__cause__ is not None:
+                pending.append(value.__cause__)
+            if value.__context__ is not None:
+                pending.append(value.__context__)
+            if value.__traceback__ is not None:
+                pending.append(value.__traceback__)
+        elif isinstance(value, types.TracebackType):
+            pending.append(value.tb_frame)
+            if value.tb_next is not None:
+                pending.append(value.tb_next)
+        elif isinstance(value, types.FrameType):
+            pending.extend(value.f_locals.values())
+        elif isinstance(value, BaseModel):
+            pending.extend(value.__dict__.values())
+        elif isinstance(value, dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            pending.extend(value)
+
+
+def _assert_error_retains_no_sensitive_values(
+    error: BaseException,
+    supplied: DetectionInput,
+    *sentinels: str,
+) -> None:
+    retained = tuple(_retained_exception_values(error))
+    assert all(value is not supplied for value in retained)
+    retained_strings = tuple(value for value in retained if isinstance(value, str))
+    for sentinel in sentinels:
+        assert all(sentinel not in value for value in retained_strings)
 
 
 def test_builds_nullable_feed_metadata_and_stable_numbered_passages() -> None:
@@ -301,6 +358,32 @@ def test_rendering_hashes_reviewed_prompt_and_explicit_schema_version(
     assert "summary_raw" not in rendered.user_input_json
 
 
+def test_prompt_pins_item_and_mention_outcome_mapping_within_boundary() -> None:
+    rendered = render_detection_request(_supplied())
+    prompt = rendered.system_prompt
+
+    assert (
+        "Use `research_people` only when at least one returned mention is "
+        "`research` or `uncertain`" in prompt
+    )
+    assert "use `do_not_research` only when none is actionable" in prompt
+    assert (
+        "use item-level `uncertain` when the item decision remains uncertain" in prompt
+    )
+    assert rendered.worst_case_input_tokens <= _supplied().max_input_tokens
+
+
+def test_prompt_pins_precise_source_and_profile_grounding_rules() -> None:
+    prompt = render_detection_request(_supplied()).system_prompt
+
+    assert "`source_text`" in prompt
+    assert "literal and passage-grounded" in prompt
+    assert "names, facts, and signals" in prompt
+    assert "`domain_profile`" in prompt
+    assert "active supplied category, example, and version" in prompt
+    assert "must not invent external facts" in prompt
+
+
 def test_raw_source_fields_have_positive_controls_and_never_enter_the_request() -> None:
     sentinel = "RAW_SOURCE_FIELD_SENTINEL_6w"
     source = _source_item(
@@ -469,6 +552,66 @@ def test_schema_errors_retain_no_raw_provider_or_source_content() -> None:
         assert sentinel not in rendered_traceback
     assert error.__cause__ is None
     assert error.__context__ is None
+
+
+def test_schema_failure_traceback_locals_retain_no_provider_or_source_data() -> None:
+    provider_sentinel = "SCHEMA_PROVIDER_SENTINEL_5v"
+    source_sentinel = "SCHEMA_SOURCE_SENTINEL_4u"
+    supplied = build_detection_input(
+        _source_item(title_text=source_sentinel),
+        _feed(),
+        _profile(),
+        _config(),
+    )
+    raw = json.dumps(
+        {
+            "item_outcome": "do_not_research",
+            "mentions": [],
+            "overflow": False,
+            "rationale": "Safe rationale.",
+            "unknown": provider_sentinel,
+        }
+    )
+
+    error = _capture_validation_error(raw, supplied)
+
+    _assert_error_retains_no_sensitive_values(
+        error, supplied, provider_sentinel, source_sentinel, raw
+    )
+
+
+def test_domain_failure_traceback_locals_retain_no_provider_or_source_data() -> None:
+    provider_sentinel = "DOMAIN_PROVIDER_SENTINEL_3t"
+    source_sentinel = "DOMAIN_SOURCE_SENTINEL_2s"
+    supplied = build_detection_input(
+        _source_item(title_text=source_sentinel),
+        _feed(),
+        _profile(),
+        _config(),
+    )
+    raw = json.dumps(
+        {
+            "item_outcome": "research_people",
+            "mentions": [
+                {
+                    "exact_name": provider_sentinel,
+                    "outcome": "research",
+                    "supporting_passage_ids": ["p1"],
+                    "identity_facts": [],
+                    "signals": [],
+                    "rationale": "Safe rationale.",
+                }
+            ],
+            "overflow": False,
+            "rationale": "Safe rationale.",
+        }
+    )
+
+    error = _capture_validation_error(raw, supplied)
+
+    _assert_error_retains_no_sensitive_values(
+        error, supplied, provider_sentinel, source_sentinel, raw
+    )
 
 
 def test_unseen_passage_ids_are_rejected_with_safe_identifiers() -> None:

@@ -202,10 +202,20 @@ def render_detection_request(value: DetectionInput) -> RenderedDetectionRequest:
 
 
 def validate_detection_output(raw: str, supplied: DetectionInput) -> DetectionOutput:
-    output = _parse_detection_output(raw)
-    if output is None:
-        raise DetectionValidationError("invalid detection output schema")
-    return _validate_detection_output(output, supplied)
+    parsed = _parse_detection_output(raw)
+    if parsed is None:
+        safe_error = DetectionValidationError("invalid detection output schema")
+        del raw, supplied, parsed
+        raise safe_error
+
+    failure = _domain_validation_status(parsed, supplied)
+    if failure is not None:
+        safe_error = DetectionValidationError(failure)
+        del raw, supplied, parsed, failure
+        raise safe_error
+
+    del raw, supplied
+    return parsed
 
 
 def _parse_detection_output(raw: str) -> DetectionOutput | None:
@@ -215,13 +225,20 @@ def _parse_detection_output(raw: str) -> DetectionOutput | None:
         return None
 
 
-def _validate_detection_output(
+def _domain_validation_status(
     output: DetectionOutput, supplied: DetectionInput
-) -> DetectionOutput:
+) -> str | None:
+    try:
+        return _domain_validation_error(output, supplied)
+    except Exception:
+        return "invalid detection output domain"
+
+
+def _domain_validation_error(
+    output: DetectionOutput, supplied: DetectionInput
+) -> str | None:
     if len(output.mentions) > supplied.max_people:
-        raise DetectionValidationError(
-            f"mentions exceed supplied mention cap {supplied.max_people}"
-        )
+        return f"mentions exceed supplied mention cap {supplied.max_people}"
 
     passages = {passage.id: passage.text for passage in supplied.passages}
     profile_categories = {
@@ -229,79 +246,78 @@ def _validate_detection_output(
     }
     for mention_index, mention in enumerate(output.mentions, start=1):
         mention_id = f"mention[{mention_index}]"
-        _validate_references(
+        failure = _reference_error(
             mention.supporting_passage_ids,
             passages,
             owner=mention_id,
         )
+        if failure is not None:
+            return failure
         if not _is_grounded_name(
             mention.exact_name,
             mention.supporting_passage_ids,
             passages,
         ):
-            raise DetectionValidationError(f"{mention_id}: exact_name is not grounded")
+            return f"{mention_id}: exact_name is not grounded"
 
         seen_fact_ids: set[str] = set()
         for fact in mention.identity_facts:
             if fact.local_id in seen_fact_ids:
-                raise DetectionValidationError(
-                    f"{mention_id}: duplicate identity fact id {fact.local_id}"
-                )
+                return f"{mention_id}: duplicate identity fact id {fact.local_id}"
             seen_fact_ids.add(fact.local_id)
             fact_owner = f"{mention_id} {fact.local_id}"
-            _validate_references(
+            failure = _reference_error(
                 fact.supporting_passage_ids,
                 passages,
                 owner=fact_owner,
             )
+            if failure is not None:
+                return failure
             if not _literal_is_grounded(
                 fact.value, fact.supporting_passage_ids, passages
             ):
-                raise DetectionValidationError(f"{fact_owner}: value is not grounded")
+                return f"{fact_owner}: value is not grounded"
 
         for signal_index, signal in enumerate(mention.signals, start=1):
             signal_owner = f"{mention_id} signal[{signal_index}]"
-            _validate_references(
+            failure = _reference_error(
                 signal.supporting_passage_ids,
                 passages,
                 owner=signal_owner,
             )
+            if failure is not None:
+                return failure
             if signal.kind == "attention" and not isinstance(
                 signal.category, AttentionCategory
             ):
-                raise DetectionValidationError(
-                    f"{signal_owner}: category does not match signal kind"
-                )
+                return f"{signal_owner}: category does not match signal kind"
             if signal.kind == "caution" and not isinstance(
                 signal.category, CautionCategory
             ):
-                raise DetectionValidationError(
-                    f"{signal_owner}: category does not match signal kind"
-                )
+                return f"{signal_owner}: category does not match signal kind"
             if signal.grounding == "domain_profile" and (
                 signal.kind != "attention" or signal.category not in profile_categories
             ):
-                raise DetectionValidationError(
-                    f"{signal_owner}: unseen domain_profile category"
-                )
+                return f"{signal_owner}: unseen domain_profile category"
 
-    _validate_outcome_consistency(output)
+    failure = _outcome_consistency_error(output)
+    if failure is not None:
+        return failure
     if output.overflow and len(output.mentions) != supplied.max_people:
-        raise DetectionValidationError(
-            "overflow requires the returned mentions to reach the supplied cap"
-        )
-    return output
+        return "overflow requires the returned mentions to reach the supplied cap"
+    return None
 
 
-def _validate_references(
+def _reference_error(
     references: tuple[str, ...],
     passages: dict[str, str],
     *,
     owner: str,
-) -> None:
+) -> str | None:
     for reference in references:
         if reference not in passages:
-            raise DetectionValidationError(f"{owner}: unseen passage id {reference}")
+            return f"{owner}: unseen passage id {reference}"
+    return None
 
 
 def _is_grounded_name(
@@ -324,7 +340,7 @@ def _literal_is_grounded(
     return any(value in passages[reference] for reference in references)
 
 
-def _validate_outcome_consistency(output: DetectionOutput) -> None:
+def _outcome_consistency_error(output: DetectionOutput) -> str | None:
     outcomes = tuple(mention.outcome for mention in output.mentions)
     if output.item_outcome == ItemOutcome.RESEARCH_PEOPLE:
         valid = any(
@@ -338,9 +354,8 @@ def _validate_outcome_consistency(output: DetectionOutput) -> None:
             not outcomes or MentionOutcome.UNCERTAIN in outcomes
         )
     if not valid:
-        raise DetectionValidationError(
-            "item_outcome contradicts returned mention outcomes"
-        )
+        return "item_outcome contradicts returned mention outcomes"
+    return None
 
 
 def _normal_text(value: object, field: str) -> str | None:
