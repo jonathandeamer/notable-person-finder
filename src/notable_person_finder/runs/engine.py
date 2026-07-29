@@ -20,7 +20,12 @@ from notable_person_finder.runs.models import (
     WorkState,
 )
 from notable_person_finder.runs.retry import AttemptRecord, RetryPolicy
-from notable_person_finder.runs.scheduler import BoundedScheduler, Completion
+from notable_person_finder.runs.scheduler import (
+    BoundedScheduler,
+    Completion,
+    SchedulerSet,
+    WorkerPool,
+)
 
 # A handler must hand back a state that takes the item out of the claimable
 # set. Anything else (pending, running) would leave the item eligible, and the
@@ -82,6 +87,11 @@ class TaskHandler:
     engine's connection belongs to the application thread, and the central
     retry coordination lives in the engine, not in a handler.
 
+    `pool` routes that call to one independently bounded worker pool. `ready`,
+    when present, runs on the application thread before claiming and may use
+    the run id to check a durable prerequisite. An unready required item stays
+    pending and therefore remains visible in the run's partial-state counters.
+
     `persist` runs on the application thread inside the same transaction that
     settles the work item, so a handler's domain writes and the settlement
     that justifies them commit or roll back together.
@@ -106,6 +116,8 @@ class TaskHandler:
     persist: Callable[[WorkItem, TaskOutcome], None] | None = None
     persist_failure: Callable[[WorkItem, ProviderFailure], None] | None = None
     destination_host: Callable[[WorkItem], str | None] | None = None
+    pool: WorkerPool = WorkerPool.HTTP
+    ready: Callable[[int], bool] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,7 +445,8 @@ class RunEngine:
     Work moves through a per-item state machine so that SQLite stays on the
     application thread while external calls run concurrently on the scheduler's
     pool. One pass of the loop claims a batch no larger than the pool's cap,
-    prepares and submits each item, then drains completions as they arrive.
+    prepares and submits each item, then drains the pools' combined completion
+    stream as calls finish.
 
     No transaction is ever open across an item's own external call: `prepare`
     and the attempt insert commit before submission, and the outcome is
@@ -446,7 +459,7 @@ class RunEngine:
         connection: sqlite3.Connection,
         *,
         retry: RetryPolicy,
-        scheduler: BoundedScheduler,
+        scheduler: SchedulerSet | BoundedScheduler,
         clock: Clock,
         timezone: str,
         window_start: str,
@@ -458,9 +471,14 @@ class RunEngine:
     ) -> None:
         self._connection = connection
         self._retry = retry
-        # Sizes every claim batch, and runs the calls. Its pool belongs to
-        # whoever constructed it, so the engine never closes it.
-        self._scheduler = scheduler
+        # Sizes every pool's claim batch, and runs their calls concurrently.
+        # The pools belong to whoever constructed the set, so the engine never
+        # closes them.
+        self._scheduler = (
+            SchedulerSet({WorkerPool.HTTP: scheduler})
+            if isinstance(scheduler, BoundedScheduler)
+            else scheduler
+        )
         self._clock = clock
         self._timezone = timezone
         self._window_start = window_start
@@ -484,6 +502,12 @@ class RunEngine:
         *,
         seed: Callable[[int], None] | None = None,
     ) -> RunReport:
+        # Configuration/wiring errors must not mint an interrupted run. Every
+        # handler has exactly one execution pool, and it has to exist before
+        # any lifecycle mutation begins.
+        for handler in handlers.values():
+            self._scheduler.max_workers(handler.pool)
+
         started_at = self._now()
         sweep = repository.sweep_interrupted(self._connection, now=started_at)
 
@@ -623,22 +647,39 @@ class RunEngine:
         progress: dict[int, _ItemProgress] = {}
         deadlines: dict[int, datetime] = {}
         while True:
-            batch = repository.claim_batch(
-                self._connection,
-                run_id=run_id,
-                now=self._now(),
-                task_types=handlers.keys(),
-                limit=self._scheduler.max_workers,
-            )
-            if batch:
-                submissions: list[_Submission] = []
-                for work_item in batch:
-                    deadlines.pop(work_item.id, None)
-                    submission = self._prepare(
-                        run_id, work_item, handlers[work_item.task_type], progress
-                    )
-                    if submission is not None:
-                        submissions.append(submission)
+            ready_task_types: dict[WorkerPool, list[str]] = {}
+            for task_type, handler in handlers.items():
+                if handler.ready is not None and not handler.ready(run_id):
+                    continue
+                ready_task_types.setdefault(handler.pool, []).append(task_type)
+
+            batches: dict[WorkerPool, tuple[WorkItem, ...]] = {}
+            for pool, task_types in ready_task_types.items():
+                batch = repository.claim_batch(
+                    self._connection,
+                    run_id=run_id,
+                    now=self._now(),
+                    task_types=task_types,
+                    limit=self._scheduler.max_workers(pool),
+                )
+                if batch:
+                    batches[pool] = batch
+
+            if batches:
+                submissions: dict[WorkerPool, list[_Submission]] = {}
+                for pool, batch in batches.items():
+                    pool_submissions: list[_Submission] = []
+                    submissions[pool] = pool_submissions
+                    for work_item in batch:
+                        deadlines.pop(work_item.id, None)
+                        submission = self._prepare(
+                            run_id,
+                            work_item,
+                            handlers[work_item.task_type],
+                            progress,
+                        )
+                        if submission is not None:
+                            pool_submissions.append(submission)
                 for completion in self._scheduler.run(submissions, _call_provider):
                     self._resolve(
                         run_id, completion, progress, deadlines, failure_categories

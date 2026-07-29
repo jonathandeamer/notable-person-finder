@@ -29,7 +29,11 @@ from notable_person_finder.runs.engine import (
 )
 from notable_person_finder.runs.models import RunState, WorkItem, WorkState
 from notable_person_finder.runs.retry import RetryPolicy
-from notable_person_finder.runs.scheduler import BoundedScheduler
+from notable_person_finder.runs.scheduler import (
+    BoundedScheduler,
+    SchedulerSet,
+    WorkerPool,
+)
 
 # Derived from the production renderer rather than written out, so a change to
 # the canonical timestamp format cannot leave the fixture seeding rows in a
@@ -180,7 +184,7 @@ def build_engine(
     *,
     budget_limit_nano_usd: int | None = None,
     retry: RetryPolicy | None = None,
-    scheduler: BoundedScheduler | None = None,
+    scheduler: BoundedScheduler | SchedulerSet | None = None,
 ) -> RunEngine:
     return RunEngine(
         connection,
@@ -221,6 +225,27 @@ def schedule_probe(
         fingerprint=fingerprint,
         required=required,
         priority=100,
+        eligible_at=NOW,
+        run_id=None,
+        now=NOW,
+    )
+
+
+def schedule_typed_probe(
+    connection: sqlite3.Connection,
+    *,
+    task_type: str,
+    fingerprint: str,
+    priority: int = 100,
+) -> int:
+    return repository.schedule_work(
+        connection,
+        task_type=task_type,
+        subject_kind="synthetic",
+        subject_id=None,
+        fingerprint=fingerprint,
+        required=True,
+        priority=priority,
         eligible_at=NOW,
         run_id=None,
         now=NOW,
@@ -1460,11 +1485,10 @@ class RecordingScheduler(BoundedScheduler):
         self.workers: list[object] = []
         self.submitted: list[object] = []
 
-    def run(self, items, worker):  # type: ignore[override]
-        materialized = list(items)
+    def _submit(self, item, worker):  # type: ignore[override]
         self.workers.append(worker)
-        self.submitted.extend(materialized)
-        return super().run(materialized, worker)
+        self.submitted.append(item)
+        return super()._submit(item, worker)
 
 
 def test_the_submitted_closure_never_captures_the_connection(database: Path) -> None:
@@ -1601,6 +1625,268 @@ def test_at_most_http_workers_calls_are_ever_in_flight(database: Path) -> None:
     assert peak == 2
     assert sorted(attempt_rows) == [2, 2, 4, 4]
     assert report.counters.required_succeeded == 4
+    connection.close()
+
+
+def test_handlers_route_to_their_pool_and_claim_only_that_pools_capacity(
+    database: Path,
+) -> None:
+    """Using one batch limit or routing both handlers to one pool must fail."""
+    connection = connect_database(database)
+    for index in range(4):
+        schedule_typed_probe(
+            connection,
+            task_type="http_probe",
+            fingerprint=f"{index + 1:064x}",
+        )
+    for index in range(2):
+        schedule_typed_probe(
+            connection,
+            task_type="llm_probe",
+            fingerprint=f"{index + 101:064x}",
+        )
+
+    in_flight = {WorkerPool.HTTP: 0, WorkerPool.LLM: 0}
+    peak = {WorkerPool.HTTP: 0, WorkerPool.LLM: 0}
+    attempt_rows: list[int] = []
+    guard = threading.Lock()
+    wave = threading.Barrier(3)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        pool = (
+            WorkerPool.HTTP if work_item.task_type == "http_probe" else WorkerPool.LLM
+        )
+        with guard:
+            in_flight[pool] += 1
+            peak[pool] = max(peak[pool], in_flight[pool])
+        wave.wait(timeout=5)
+        reader = connect_database(database, readonly=True)
+        try:
+            row = reader.execute("SELECT COUNT(*) AS n FROM attempt").fetchone()
+        finally:
+            reader.close()
+        with guard:
+            attempt_rows.append(int(row["n"]))
+            in_flight[pool] -= 1
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    handlers = {
+        "http_probe": TaskHandler(
+            task_type="http_probe",
+            provider="http_provider",
+            operation="http_call",
+            execute=execute,
+            pool=WorkerPool.HTTP,
+        ),
+        "llm_probe": TaskHandler(
+            task_type="llm_probe",
+            provider="llm_provider",
+            operation="llm_call",
+            execute=execute,
+            pool=WorkerPool.LLM,
+        ),
+    }
+    with SchedulerSet(
+        {
+            WorkerPool.HTTP: BoundedScheduler(max_workers=2),
+            WorkerPool.LLM: BoundedScheduler(max_workers=1),
+        }
+    ) as schedulers:
+        report = build_engine(connection, FakeClock(), scheduler=schedulers).execute(
+            handlers
+        )
+
+    assert peak == {WorkerPool.HTTP: 2, WorkerPool.LLM: 1}
+    assert sorted(attempt_rows) == [3, 3, 3, 6, 6, 6]
+    assert report.counters.required_succeeded == 6
+    connection.close()
+
+
+def test_ready_false_prevents_claim_and_attempt_creation(database: Path) -> None:
+    """Ignoring readiness must create a second call and attempt."""
+    connection = connect_database(database)
+    runnable_id = schedule_typed_probe(
+        connection,
+        task_type="runnable_probe",
+        fingerprint="71" * 32,
+        priority=10,
+    )
+    gated_id = schedule_typed_probe(
+        connection,
+        task_type="gated_probe",
+        fingerprint="72" * 32,
+        priority=20,
+    )
+    application_thread = threading.get_ident()
+    readiness_threads: list[int] = []
+    calls: list[int] = []
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        calls.append(work_item.id)
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    handlers = {
+        "runnable_probe": TaskHandler(
+            task_type="runnable_probe",
+            provider="http_provider",
+            operation="http_call",
+            execute=execute,
+        ),
+        "gated_probe": TaskHandler(
+            task_type="gated_probe",
+            provider="llm_provider",
+            operation="llm_call",
+            execute=execute,
+            pool=WorkerPool.LLM,
+            ready=lambda run_id: (
+                readiness_threads.append(threading.get_ident()) or False
+            ),
+        ),
+    }
+    with SchedulerSet(
+        {
+            WorkerPool.HTTP: BoundedScheduler(max_workers=1),
+            WorkerPool.LLM: BoundedScheduler(max_workers=1),
+        }
+    ) as schedulers:
+        report = build_engine(connection, FakeClock(), scheduler=schedulers).execute(
+            handlers
+        )
+
+    assert calls == [runnable_id]
+    assert readiness_threads and set(readiness_threads) == {application_thread}
+    attempts = repository.attempts_for_run(connection, run_id=report.run_id)
+    assert [attempt["work_item_id"] for attempt in attempts] == [runnable_id]
+    row = connection.execute(
+        "SELECT state, claimed_by_run_id FROM work_item WHERE id = ?", (gated_id,)
+    ).fetchone()
+    assert tuple(row) == (WorkState.PENDING, None)
+    connection.close()
+
+
+def test_readiness_is_rechecked_after_another_settlement_in_the_same_run(
+    database: Path,
+) -> None:
+    """Evaluating readiness only once must leave the dependent item pending."""
+    connection = connect_database(database)
+    unlock_id = schedule_typed_probe(
+        connection,
+        task_type="unlock_probe",
+        fingerprint="73" * 32,
+        priority=10,
+    )
+    gated_id = schedule_typed_probe(
+        connection,
+        task_type="gated_probe",
+        fingerprint="74" * 32,
+        priority=20,
+    )
+    unlocked = False
+    readiness: list[bool] = []
+    readiness_threads: list[int] = []
+    application_thread = threading.get_ident()
+    calls: list[int] = []
+
+    def ready(run_id: int) -> bool:
+        readiness_threads.append(threading.get_ident())
+        readiness.append(unlocked)
+        return unlocked
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        if work_item.id == gated_id:
+            assert unlocked
+        calls.append(work_item.id)
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    def persist_unlock(work_item: WorkItem, outcome: TaskOutcome) -> None:
+        nonlocal unlocked
+        unlocked = True
+
+    handlers = {
+        "unlock_probe": TaskHandler(
+            task_type="unlock_probe",
+            provider="llm_provider",
+            operation="inspect",
+            execute=execute,
+            persist=persist_unlock,
+            pool=WorkerPool.LLM,
+        ),
+        "gated_probe": TaskHandler(
+            task_type="gated_probe",
+            provider="llm_provider",
+            operation="generate",
+            execute=execute,
+            pool=WorkerPool.LLM,
+            ready=ready,
+        ),
+    }
+    with SchedulerSet({WorkerPool.LLM: BoundedScheduler(max_workers=1)}) as schedulers:
+        report = build_engine(connection, FakeClock(), scheduler=schedulers).execute(
+            handlers
+        )
+
+    assert calls == [unlock_id, gated_id]
+    assert readiness[0] is False
+    assert True in readiness[1:]
+    assert set(readiness_threads) == {application_thread}
+    assert report.state is RunState.COMPLETE
+    connection.close()
+
+
+def test_pending_gated_work_remains_visible_and_makes_the_run_partial(
+    database: Path,
+) -> None:
+    """Dropping unready task types from queue accounting must fail."""
+    connection = connect_database(database)
+    schedule_typed_probe(
+        connection,
+        task_type="gated_probe",
+        fingerprint="75" * 32,
+    )
+    handler = TaskHandler(
+        task_type="gated_probe",
+        provider="llm_provider",
+        operation="generate",
+        execute=lambda work, ordinal, prepared: TaskOutcome(
+            state=WorkState.SUCCEEDED, reason=None
+        ),
+        pool=WorkerPool.LLM,
+        ready=lambda run_id: False,
+    )
+
+    with SchedulerSet({WorkerPool.LLM: BoundedScheduler(max_workers=1)}) as schedulers:
+        report = build_engine(connection, FakeClock(), scheduler=schedulers).execute(
+            {handler.task_type: handler}
+        )
+
+    assert report.state is RunState.PARTIAL
+    assert report.counters.required_pending == 1
+    connection.close()
+
+
+def test_missing_handler_pool_is_rejected_before_run_creation(database: Path) -> None:
+    """Deferring registration validation until drain must leave a run row."""
+    connection = connect_database(database)
+    handler = TaskHandler(
+        task_type="llm_probe",
+        provider="llm_provider",
+        operation="generate",
+        execute=lambda work, ordinal, prepared: TaskOutcome(
+            state=WorkState.SUCCEEDED, reason=None
+        ),
+        pool=WorkerPool.LLM,
+    )
+
+    with (
+        SchedulerSet({WorkerPool.HTTP: BoundedScheduler(max_workers=1)}) as schedulers,
+        pytest.raises(ValueError, match="llm"),
+    ):
+        build_engine(connection, FakeClock(), scheduler=schedulers).execute(
+            {handler.task_type: handler}
+        )
+
+    row = connection.execute("SELECT COUNT(*) AS n FROM run").fetchone()
+    assert row["n"] == 0
     connection.close()
 
 
