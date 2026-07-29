@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import traceback
 from pathlib import Path
 
 import pytest
@@ -149,7 +150,26 @@ def test_character_truncation_is_deterministic_and_marks_each_passage() -> None:
     assert first.view.summary_truncated is True
 
 
-def test_rendering_is_canonical_utf8_and_respects_the_exact_byte_envelope() -> None:
+def test_token_envelope_truncation_marks_the_summary_view_and_passage() -> None:
+    value = build_detection_input(
+        _source_item(summary_text="x" * 5000),
+        _feed(),
+        _profile(),
+        _config(
+            max_input_tokens=4096,
+            max_completion_tokens=128,
+            max_summary_characters=6000,
+        ),
+    )
+
+    summary_passage = next(passage for passage in value.passages if passage.id == "p2")
+    assert len(value.summary or "") < 5000
+    assert value.view.input_truncated is True
+    assert value.view.summary_truncated is True
+    assert summary_passage.truncated is True
+
+
+def test_canonical_utf8_rendering_respects_worst_case_token_ceiling() -> None:
     value = build_detection_input(
         _source_item(
             title_text="Élodie " + ("🎨" * 400),
@@ -158,7 +178,7 @@ def test_rendering_is_canonical_utf8_and_respects_the_exact_byte_envelope() -> N
         _feed(),
         _profile(),
         _config(
-            max_input_tokens=2500,
+            max_input_tokens=6000,
             max_completion_tokens=128,
             max_title_characters=500,
             max_summary_characters=4000,
@@ -180,11 +200,73 @@ def test_rendering_is_canonical_utf8_and_respects_the_exact_byte_envelope() -> N
             rendered.canonical_schema_json,
         )
     )
-    assert rendered.input_utf8_bytes == exact_bytes
-    assert rendered.input_utf8_bytes <= value.max_input_tokens * 4
+    assert rendered.token_bearing_utf8_bytes == exact_bytes
+    assert rendered.chat_framing_token_allowance > 0
+    assert rendered.worst_case_input_tokens == (
+        exact_bytes + rendered.chat_framing_token_allowance
+    )
+    assert rendered.worst_case_input_tokens <= value.max_input_tokens
     assert value.view.input_truncated is True
     assert len(value.title or "") > 0
     assert len(value.summary or "") < 4000
+
+
+def test_dense_ascii_punctuation_cannot_exceed_the_input_token_ceiling() -> None:
+    source_summary = "!,.[]{}:;" * 1000
+    value = build_detection_input(
+        _source_item(title_text="Dense", summary_text=source_summary),
+        _feed(),
+        _profile(),
+        _config(
+            max_input_tokens=4096,
+            max_completion_tokens=128,
+            max_summary_characters=10_000,
+        ),
+    )
+    rendered = render_detection_request(value)
+
+    assert len(value.summary or "") < len(source_summary)
+    assert value.view.summary_truncated is True
+    assert rendered.token_bearing_utf8_bytes == sum(
+        len(part.encode("utf-8"))
+        for part in (
+            rendered.system_prompt,
+            rendered.user_input_json,
+            rendered.canonical_schema_json,
+        )
+    )
+    assert rendered.worst_case_input_tokens <= 4096
+
+
+def test_fixed_prompt_schema_and_framing_must_fit_before_text() -> None:
+    with pytest.raises(ValueError, match="fixed prompt, schema, and chat framing"):
+        build_detection_input(
+            _source_item(title_text=None, summary_text=None),
+            _feed(),
+            _profile(),
+            _config(max_input_tokens=1000, max_completion_tokens=128),
+        )
+
+
+def test_rendering_accepts_the_exact_worst_case_boundary_and_rejects_one_less() -> None:
+    roomy = build_detection_input(
+        _source_item(title_text="Boundary", summary_text=None),
+        _feed(),
+        _profile(),
+        _config(max_input_tokens=20_000, max_completion_tokens=128),
+    )
+    first = render_detection_request(roomy)
+    boundary_input = roomy.model_copy(
+        update={"max_input_tokens": first.worst_case_input_tokens}
+    )
+    at_boundary = render_detection_request(boundary_input)
+
+    assert at_boundary.worst_case_input_tokens <= boundary_input.max_input_tokens
+    too_small = boundary_input.model_copy(
+        update={"max_input_tokens": at_boundary.worst_case_input_tokens - 1}
+    )
+    with pytest.raises(ValueError, match="worst-case input token ceiling"):
+        render_detection_request(too_small)
 
 
 def test_rendering_hashes_reviewed_prompt_and_explicit_schema_version(
@@ -217,6 +299,26 @@ def test_rendering_hashes_reviewed_prompt_and_explicit_schema_version(
     assert "article body" not in rendered.user_input_json
     assert "title_raw" not in rendered.user_input_json
     assert "summary_raw" not in rendered.user_input_json
+
+
+def test_raw_source_fields_have_positive_controls_and_never_enter_the_request() -> None:
+    sentinel = "RAW_SOURCE_FIELD_SENTINEL_6w"
+    source = _source_item(
+        article_body=sentinel,
+        title_raw=sentinel,
+        summary_raw=sentinel,
+    )
+    value = build_detection_input(source, _feed(), _profile(), _config())
+    rendered = render_detection_request(value)
+
+    assert source["article_body"] == sentinel
+    assert source["title_raw"] == sentinel
+    assert source["summary_raw"] == sentinel
+    assert sentinel not in value.model_dump_json()
+    assert sentinel not in rendered.user_input_json
+    for forbidden in ("article_body", "title_raw", "summary_raw"):
+        assert forbidden not in type(value).model_fields
+        assert forbidden not in rendered.user_input_json
 
 
 def test_domain_profile_version_and_examples_participate_exactly() -> None:
@@ -331,6 +433,42 @@ def test_unknown_output_fields_are_rejected() -> None:
 
     with pytest.raises(DetectionValidationError, match="output schema"):
         validate_detection_output(json.dumps(payload), _supplied())
+
+
+def test_schema_errors_retain_no_raw_provider_or_source_content() -> None:
+    raw_sentinel = "RAW9z"
+    provider_sentinel = "PROV8y"
+    source_sentinel = "SRC7x"
+    raw = json.dumps(
+        {
+            "item_outcome": "do_not_research",
+            "mentions": [],
+            "overflow": False,
+            "rationale": "Safe rationale.",
+            "unknown_provider_debug": {
+                "raw": raw_sentinel,
+                "provider": provider_sentinel,
+                "source": source_sentinel,
+            },
+        }
+    )
+
+    with pytest.raises(DetectionValidationError) as caught:
+        validate_detection_output(raw, _supplied())
+
+    error = caught.value
+    retained_exceptions = (error, error.__cause__, error.__context__)
+    rendered_traceback = "".join(
+        line
+        for retained in retained_exceptions
+        if retained is not None
+        for line in traceback.format_exception(retained)
+    )
+    for sentinel in (raw_sentinel, provider_sentinel, source_sentinel, raw):
+        assert sentinel not in str(error)
+        assert sentinel not in rendered_traceback
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 def test_unseen_passage_ids_are_rejected_with_safe_identifiers() -> None:

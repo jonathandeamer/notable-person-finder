@@ -155,7 +155,9 @@ class RenderedDetectionRequest:
     schema_version: int
     prompt_hash: str
     schema_hash: str
-    input_utf8_bytes: int
+    token_bearing_utf8_bytes: int
+    chat_framing_token_allowance: int
+    worst_case_input_tokens: int
 
     @property
     def canonical_input_json(self) -> str:

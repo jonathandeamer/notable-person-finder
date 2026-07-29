@@ -1,4 +1,5 @@
 from notable_person_finder.people.detection import (
+    DETECTION_CHAT_FRAMING_TOKEN_ALLOWANCE,
     DETECTION_SCHEMA_VERSION,
     DetectionValidationError,
     build_detection_input,
@@ -28,6 +29,7 @@ from notable_person_finder.people.models import (
 
 __all__ = [
     "DETECTION_SCHEMA_VERSION",
+    "DETECTION_CHAT_FRAMING_TOKEN_ALLOWANCE",
     "AttentionCategory",
     "CautionCategory",
     "DetectedMention",

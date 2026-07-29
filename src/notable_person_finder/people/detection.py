@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from importlib import resources
-from typing import Any
+from typing import Any, cast
 
 from pydantic import ValidationError
 
@@ -28,6 +28,7 @@ from notable_person_finder.people.models import (
 )
 
 DETECTION_SCHEMA_VERSION = 1
+DETECTION_CHAT_FRAMING_TOKEN_ALLOWANCE = 64
 
 
 class DetectionValidationError(ValueError):
@@ -42,19 +43,19 @@ def build_detection_input(
 ) -> DetectionInput:
     title_original = _normal_text(_item_value(source_item, "title_text"), "title")
     summary_original = _normal_text(_item_value(source_item, "summary_text"), "summary")
-    title = _prefix(title_original, config.max_title_characters)
-    summary = _prefix(summary_original, config.max_summary_characters)
-    title_truncated = title != title_original
-    summary_truncated = summary != summary_original
+    title_bounded = _prefix(title_original, config.max_title_characters)
+    summary_bounded = _prefix(summary_original, config.max_summary_characters)
+    title_truncated = title_bounded != title_original
+    summary_truncated = summary_bounded != summary_original
 
     def make_value(
         current_title: str | None,
         current_summary: str | None,
-        *,
-        byte_truncated: bool,
     ) -> DetectionInput:
-        current_title_truncated = title_truncated or current_title != title
-        current_summary_truncated = summary_truncated or current_summary != summary
+        current_title_truncated = title_truncated or current_title != title_bounded
+        current_summary_truncated = (
+            summary_truncated or current_summary != summary_bounded
+        )
         passages: list[DetectionPassage] = []
         if current_title:
             passages.append(
@@ -100,9 +101,7 @@ def build_detection_input(
                 summary_available=summary_original is not None,
                 title_truncated=current_title_truncated,
                 summary_truncated=current_summary_truncated,
-                input_truncated=(
-                    title_truncated or summary_truncated or byte_truncated
-                ),
+                input_truncated=(current_title_truncated or current_summary_truncated),
             ),
             domain_profile=DomainProfileEvidence(
                 version=profile.schema_version,
@@ -115,49 +114,75 @@ def build_detection_input(
             max_input_tokens=config.max_input_tokens,
         )
 
-    value = make_value(title, summary, byte_truncated=False)
-    byte_limit = config.max_input_tokens * 4
-    if _rendered_size(value) <= byte_limit:
+    title = title_bounded
+    summary = summary_bounded
+    value = make_value(title, summary)
+    if _fixed_request_tokens() > config.max_input_tokens:
+        raise ValueError(
+            "max_input_tokens cannot fit the fixed prompt, schema, and chat framing"
+        )
+    if _worst_case_input_tokens(value) <= config.max_input_tokens:
         return value
 
-    byte_truncated = True
     summary = _largest_fitting_prefix(
         summary,
         lambda candidate: (
-            _rendered_size(make_value(title, candidate, byte_truncated=byte_truncated))
-            <= byte_limit
+            _worst_case_input_tokens(make_value(title, candidate))
+            <= config.max_input_tokens
         ),
     )
-    value = make_value(title, summary, byte_truncated=byte_truncated)
-    if _rendered_size(value) <= byte_limit:
+    value = make_value(title, summary)
+    if _worst_case_input_tokens(value) <= config.max_input_tokens:
         return value
 
     title = _largest_fitting_prefix(
         title,
         lambda candidate: (
-            _rendered_size(
-                make_value(candidate, summary, byte_truncated=byte_truncated)
-            )
-            <= byte_limit
+            _worst_case_input_tokens(make_value(candidate, summary))
+            <= config.max_input_tokens
         ),
     )
-    value = make_value(title, summary, byte_truncated=byte_truncated)
-    if _rendered_size(value) > byte_limit:
-        raise ValueError("max_input_tokens is too small for the detection contract")
+    value = make_value(title, summary)
+    if _worst_case_input_tokens(value) > config.max_input_tokens:
+        raise ValueError("max_input_tokens cannot fit bounded detection metadata")
     return value
 
 
 def detection_schema() -> dict[str, object]:
-    return DetectionOutput.model_json_schema(mode="validation")
+    schema = DetectionOutput.model_json_schema(mode="validation")
+    definitions = schema.get("$defs", {})
+
+    def compact(value: object) -> object:
+        if isinstance(value, dict):
+            if set(value) == {"$ref"}:
+                reference = value["$ref"]
+                if isinstance(reference, str):
+                    name = reference.rsplit("/", maxsplit=1)[-1]
+                    target = definitions.get(name)
+                    if target is not None:
+                        return compact(target)
+            return {
+                key: compact(child)
+                for key, child in value.items()
+                if key not in {"$defs", "title"}
+            }
+        if isinstance(value, list):
+            return [compact(child) for child in value]
+        return value
+
+    return cast(dict[str, object], compact(schema))
 
 
 def render_detection_request(value: DetectionInput) -> RenderedDetectionRequest:
     system_prompt, user_json, schema, schema_json = _render_parts(value)
-    input_utf8_bytes = sum(
+    token_bearing_utf8_bytes = sum(
         len(part.encode("utf-8")) for part in (system_prompt, user_json, schema_json)
     )
-    if input_utf8_bytes > value.max_input_tokens * 4:
-        raise ValueError("detection input exceeds max_input_tokens")
+    worst_case_input_tokens = (
+        token_bearing_utf8_bytes + DETECTION_CHAT_FRAMING_TOKEN_ALLOWANCE
+    )
+    if worst_case_input_tokens > value.max_input_tokens:
+        raise ValueError("detection request exceeds worst-case input token ceiling")
     schema_envelope = _canonical_json(
         {"schema": schema, "schema_version": DETECTION_SCHEMA_VERSION}
     )
@@ -170,16 +195,29 @@ def render_detection_request(value: DetectionInput) -> RenderedDetectionRequest:
         schema_version=DETECTION_SCHEMA_VERSION,
         prompt_hash=_sha256(system_prompt),
         schema_hash=_sha256(schema_envelope),
-        input_utf8_bytes=input_utf8_bytes,
+        token_bearing_utf8_bytes=token_bearing_utf8_bytes,
+        chat_framing_token_allowance=DETECTION_CHAT_FRAMING_TOKEN_ALLOWANCE,
+        worst_case_input_tokens=worst_case_input_tokens,
     )
 
 
 def validate_detection_output(raw: str, supplied: DetectionInput) -> DetectionOutput:
-    try:
-        output = DetectionOutput.model_validate_json(raw, strict=True)
-    except (ValidationError, ValueError, TypeError) as error:
-        raise DetectionValidationError("invalid detection output schema") from error
+    output = _parse_detection_output(raw)
+    if output is None:
+        raise DetectionValidationError("invalid detection output schema")
+    return _validate_detection_output(output, supplied)
 
+
+def _parse_detection_output(raw: str) -> DetectionOutput | None:
+    try:
+        return DetectionOutput.model_validate_json(raw, strict=True)
+    except (ValidationError, ValueError, TypeError):
+        return None
+
+
+def _validate_detection_output(
+    output: DetectionOutput, supplied: DetectionInput
+) -> DetectionOutput:
     if len(output.mentions) > supplied.max_people:
         raise DetectionValidationError(
             f"mentions exceed supplied mention cap {supplied.max_people}"
@@ -363,23 +401,41 @@ def _largest_fitting_prefix(value: str | None, fits: Any) -> str | None:
     return value[:best] or None
 
 
-def _rendered_size(value: DetectionInput) -> int:
+def _token_bearing_utf8_bytes(value: DetectionInput) -> int:
     prompt, user_json, _, schema_json = _render_parts(value)
     return sum(len(part.encode("utf-8")) for part in (prompt, user_json, schema_json))
+
+
+def _worst_case_input_tokens(value: DetectionInput) -> int:
+    return _token_bearing_utf8_bytes(value) + DETECTION_CHAT_FRAMING_TOKEN_ALLOWANCE
+
+
+def _fixed_request_tokens() -> int:
+    prompt = _system_prompt()
+    schema_json = _canonical_json(detection_schema())
+    return (
+        len(prompt.encode("utf-8"))
+        + len(schema_json.encode("utf-8"))
+        + DETECTION_CHAT_FRAMING_TOKEN_ALLOWANCE
+    )
 
 
 def _render_parts(
     value: DetectionInput,
 ) -> tuple[str, str, dict[str, object], str]:
-    prompt = (
-        resources.files("notable_person_finder.people")
-        .joinpath("prompts", "detect_people.md")
-        .read_text(encoding="utf-8")
-    )
+    prompt = _system_prompt()
     user_json = _canonical_json(value.model_dump(mode="json"))
     schema = detection_schema()
     schema_json = _canonical_json(schema)
     return prompt, user_json, schema, schema_json
+
+
+def _system_prompt() -> str:
+    return (
+        resources.files("notable_person_finder.people")
+        .joinpath("prompts", "detect_people.md")
+        .read_text(encoding="utf-8")
+    )
 
 
 def _canonical_json(value: object) -> str:
