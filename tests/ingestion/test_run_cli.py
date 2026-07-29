@@ -8,6 +8,7 @@ replaced with `StaticHostResolver` so no DNS lookup ever happens.
 from __future__ import annotations
 
 import re
+import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 
@@ -15,10 +16,13 @@ import httpx
 import pytest
 
 from notable_person_finder.cli import main as cli_main
-from notable_person_finder.config.models import TransportConfig
+from notable_person_finder.config.loader import load_config
+from notable_person_finder.config.models import FeedsConfig, TransportConfig
+from notable_person_finder.db.connection import connect_database
+from notable_person_finder.ingestion.service import seed_feeds
 from notable_person_finder.providers.safety import StaticHostResolver
 from notable_person_finder.providers.transport import HttpTransport, build_transport
-from notable_person_finder.runs.clock import SystemClock
+from notable_person_finder.runs.clock import SystemClock, utc_timestamp
 from tests.run_engine.helpers import ENVIRONMENT
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -30,6 +34,10 @@ contact_url = "https://example.com/contact"
 
 [retry]
 max_attempts = 3
+initial_backoff_seconds = 0.001
+max_backoff_seconds = 0.001
+backoff_multiplier = 1.0
+jitter_ratio = 0.0
 
 [concurrency]
 http_workers = 4
@@ -258,6 +266,74 @@ url = "https://example.com/also-bad.xml"
     ).read_text(encoding="utf-8")
     assert "Feeds fetched: 1" in latest
     assert "Feeds failed: 2" in latest
+
+
+def test_latest_feed_settlement_controls_duplicate_fetch_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch_env: None,
+) -> None:
+    """A URL move schedules duplicate work for one feed, settled in order."""
+    config_file = write_ingestion_graph(
+        tmp_path,
+        feeds="""\
+schema_version = 1
+[[feeds]]
+key = "art-news"
+label = "Art News"
+url = "https://example.com/feed.xml"
+""",
+        operational=OPERATIONAL_SECTIONS.replace(
+            "http_workers = 4", "http_workers = 1"
+        ),
+    )
+    payload = fixture_bytes("rss20.xml")
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(200, content=streaming_body(payload))
+        return httpx.Response(304, content=streaming_body(b""))
+
+    def duplicate_seed_hook(
+        connection: sqlite3.Connection, *, feeds: FeedsConfig, clock: SystemClock
+    ) -> Callable[[int], None]:
+        moved_feed = feeds.feeds[0].model_copy(
+            update={"url": "https://example.com/moved-feed.xml"}
+        )
+        moved_feeds = FeedsConfig(schema_version=1, feeds=(moved_feed,))
+
+        def seed(run_id: int) -> None:
+            now = utc_timestamp(clock.now())
+            seed_feeds(connection, feeds=feeds, run_id=run_id, now=now)
+            seed_feeds(connection, feeds=moved_feeds, run_id=run_id, now=now)
+
+        return seed
+
+    monkeypatch.setattr(cli_main, "build_transport", _build_transport_patch(handler))
+    monkeypatch.setattr(cli_main, "build_seed_hook", duplicate_seed_hook)
+
+    assert cli_main.command_run(config_file, verbose=False) == cli_main.EXIT_OK
+    assert calls == 2
+
+    latest = (
+        config_file.parent / "portable" / "data" / "digests" / "latest.md"
+    ).read_text(encoding="utf-8")
+    assert "Feeds fetched: 0" in latest
+    assert "Feeds not modified: 1" in latest
+    assert "Feeds failed: 0" in latest
+
+    database = load_config(config_file, require_secrets=False).paths.database
+    connection = connect_database(database, readonly=True)
+    try:
+        outcomes = connection.execute(
+            "SELECT outcome FROM feed_fetch ORDER BY id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert [row["outcome"] for row in outcomes] == ["modified", "not_modified"]
 
 
 def test_status_shows_source_items_and_latest_fetch(

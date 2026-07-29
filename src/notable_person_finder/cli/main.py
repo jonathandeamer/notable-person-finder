@@ -295,6 +295,10 @@ def _ingestion_summary(
     """Counts for the digest's ingestion section, or None before migration 0003."""
     if not _ingestion_schema_present(connection):
         return None
+    # A feed can have more than one work item in a run (for example after a
+    # URL change). The digest is one final outcome per feed identity, so `id`
+    # -- the settlement order -- selects the newest row without relying on
+    # timestamps that may tie.
     row = connection.execute(
         """
         SELECT
@@ -305,8 +309,14 @@ def _ingestion_summary(
             COALESCE(SUM(CASE WHEN outcome = 'failed' THEN 1 ELSE 0 END), 0) AS failed
         FROM feed_fetch
         WHERE run_id = ?
+          AND id IN (
+              SELECT MAX(id)
+              FROM feed_fetch
+              WHERE run_id = ?
+              GROUP BY feed_identity_id
+          )
         """,
-        (run_id,),
+        (run_id, run_id),
     ).fetchone()
     counts = source_item_counts(connection, run_id=run_id)
     # `canonical_article` has no run column. An article is first associated
