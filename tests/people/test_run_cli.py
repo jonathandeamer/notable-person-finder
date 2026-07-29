@@ -631,8 +631,81 @@ def test_budget_partial_exits_two(
     assert exit_code == cli_main.EXIT_PARTIAL
     assert client.instances[-1].generate_calls == []
     digest = _latest_digest(config)
-    assert "Model work deferred: 1" in digest or "Required work deferred:" in digest
+    # People section must attribute deferred model work; the operational
+    # summary's whole-queue deferred line is not a substitute.
+    people_section = digest.split("### Person detection\n\n", 1)[1]
+    assert "Model work deferred: 1" in people_section
     assert "**State:** partial" in digest
+
+
+def test_seed_untriaged_backfills_corpus_without_new_ingestion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """People seed backfill schedules detection for pre-existing untriaged items.
+
+    Same-run ``on_source_items`` is disabled on the ingesting run so the item
+    lands without triage. The next run (304, no new source items) must still
+    schedule and settle via ``seed_untriaged`` in the composed seed hook.
+    """
+    config = write_people_graph(tmp_path, feeds=_single_feed())
+    real_on_source_items = cli_main._on_source_items_callback
+
+    def no_op_callback(
+        connection: object,
+        *,
+        config: object,
+        profile: object,
+    ) -> Callable[[tuple[int, ...], int, str], None]:
+        def on_source_items(
+            source_item_ids: tuple[int, ...], run_id: int, now: str
+        ) -> None:
+            return None
+
+        return on_source_items
+
+    monkeypatch.setattr(cli_main, "_on_source_items_callback", no_op_callback)
+    _wire(
+        monkeypatch,
+        payload=RESEARCH_FEED.encode(),
+        llm=ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,)),
+    )
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
+
+    connection = _open_db(config)
+    try:
+        untriaged = connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM source_item
+             WHERE current_triage_observation_id IS NULL
+            """
+        ).fetchone()["n"]
+        assert untriaged == 1
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) AS n FROM triage_observation"
+            ).fetchone()["n"]
+            == 0
+        )
+    finally:
+        connection.close()
+
+    monkeypatch.setattr(cli_main, "_on_source_items_callback", real_on_source_items)
+
+    def not_modified(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(304, content=streaming_body(b""))
+
+    monkeypatch.setattr(
+        cli_main, "build_transport", _build_transport_patch(not_modified)
+    )
+    second = ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,))
+    monkeypatch.setattr(cli_main, "OpenRouterClient", second.factory)
+
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
+    assert len(second.instances[-1].generate_calls) == 1
+    digest = _latest_digest(config)
+    assert "Source items triaged: 1" in digest
+    assert "Research: 1" in digest
+    assert "Source items created: 0" in digest
 
 
 def test_second_run_reuses_completed_triage(

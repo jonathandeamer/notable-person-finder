@@ -417,7 +417,12 @@ def _people_schema_present(connection: sqlite3.Connection) -> bool:
 def _model_work_counts(
     connection: sqlite3.Connection, *, run_id: int
 ) -> tuple[int, int]:
-    """Deferred and permanently failed LLM work claimed or completed this run."""
+    """Deferred and permanently failed LLM work settled by this run.
+
+    ``complete_work`` always clears ``claimed_by_run_id`` and stamps
+    ``completed_by_run_id`` for every terminal state including deferred, so
+    both arms attribute via ``completed_by_run_id``.
+    """
     deferred = int(
         connection.execute(
             """
@@ -425,7 +430,7 @@ def _model_work_counts(
               FROM work_item
              WHERE task_type IN (?, ?)
                AND state = ?
-               AND claimed_by_run_id = ?
+               AND completed_by_run_id = ?
             """,
             (
                 INSPECT_MODEL_TASK_TYPE,
