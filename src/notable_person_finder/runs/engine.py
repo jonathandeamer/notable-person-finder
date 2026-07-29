@@ -733,6 +733,10 @@ class RunEngine:
                 if preparation.reserved_nano_usd is None
                 else preparation.reserved_nano_usd
             )
+            if not isinstance(reserved_nano_usd, int) or isinstance(
+                reserved_nano_usd, bool
+            ):
+                raise ValueError("a task reservation must be a non-boolean integer")
             if reserved_nano_usd < 0:
                 raise ValueError("a task reservation must not be negative")
         except ProviderFailure:

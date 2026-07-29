@@ -8,6 +8,7 @@ import sqlite3
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -511,6 +512,38 @@ def test_negative_preparation_reservation_is_rejected_before_an_attempt(
             calls.append(ordinal) or TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
         ),
         prepare=lambda work_item: TaskPreparation(reserved_nano_usd=-1),
+    )
+    report = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    assert calls == []
+    assert repository.attempts_for_run(connection, run_id=report.run_id) == ()
+    assert (
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (work_id,)
+        ).fetchone()["state"]
+        == WorkState.FAILED_PERMANENT
+    )
+    connection.close()
+
+
+@pytest.mark.parametrize("reservation", [1.5, True], ids=["float", "boolean"])
+def test_noninteger_preparation_reservation_is_rejected_before_an_attempt(
+    database: Path, reservation: object
+) -> None:
+    """Nano-USD reservations must be integers, excluding bool's int subclass."""
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "6" * 64)
+    calls: list[int] = []
+    handler = TaskHandler(
+        task_type="probe",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=lambda work_item, ordinal, prepared: (
+            calls.append(ordinal) or TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+        ),
+        prepare=lambda work_item: TaskPreparation(
+            reserved_nano_usd=cast(int, reservation)
+        ),
     )
     report = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
 
