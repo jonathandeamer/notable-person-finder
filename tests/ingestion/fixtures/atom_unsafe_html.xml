@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Unsafe Markup Desk</title>
+  <id>urn:uuid:feed-0004</id>
+  <updated>2026-07-20T10:00:00Z</updated>
+  <entry>
+    <id>urn:uuid:entry-0005</id>
+    <title>An entry whose markup carries a script and an event handler</title>
+    <link rel="alternate" href="https://example.com/unsafe/one"/>
+    <summary type="html">&lt;p onclick=&quot;stealTheSummary()&quot;&gt;the summary body&lt;/p&gt;&lt;script&gt;alert('summary')&lt;/script&gt;</summary>
+    <content type="html">&lt;p onclick=&quot;stealTheContent()&quot;&gt;the content body&lt;/p&gt;&lt;script&gt;alert('content')&lt;/script&gt;</content>
+  </entry>
+</feed>

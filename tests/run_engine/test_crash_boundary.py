@@ -12,7 +12,7 @@ from notable_person_finder.config.models import RetryConfig
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.db.migrate import apply_migrations
 from notable_person_finder.runs import repository
-from notable_person_finder.runs.clock import FakeClock
+from notable_person_finder.runs.clock import FakeClock, utc_timestamp
 from notable_person_finder.runs.engine import (
     ReportArtifact,
     RunEngine,
@@ -23,7 +23,10 @@ from notable_person_finder.runs.models import RunState, WorkItem, WorkState
 from notable_person_finder.runs.retry import RetryPolicy
 from notable_person_finder.runs.scheduler import BoundedScheduler
 
-NOW = "2026-07-25T06:00:00Z"
+# Derived from the production renderer; see the note on the same constant in
+# `test_engine.py`. A hard-coded whole-second literal silently stops matching
+# `eligible_at <= now` once the canonical format carries microseconds.
+NOW = utc_timestamp(FakeClock().now())
 
 
 class SimulatedCrash(BaseException):
@@ -150,7 +153,7 @@ def crash_in_flight(database: Path) -> None:
 
 
 def crash_before_settle(database: Path) -> None:
-    """Die between the two transactions of step 3, in this process.
+    """Die between the attempt-outcome and work-settlement transactions.
 
     The provider answered and `finish_attempt` committed the attempt as
     `succeeded`; the process then dies before `complete_work` commits the work
@@ -185,7 +188,8 @@ def crash_before_settle(database: Path) -> None:
 
 # Executed in a real child process that kills itself with SIGKILL. `sys.argv[3]`
 # selects the kill point: "provider" kills inside the external call, "settle"
-# kills between the two transactions of step 3. Nothing unwinds: no `finally`,
+# kills between the attempt-outcome and work-settlement transactions. Nothing
+# unwinds: no `finally`,
 # no `__del__`, no implicit rollback, no buffered write flushed on the way out.
 _SIGKILL_CHILD = """
 import os
@@ -575,10 +579,10 @@ def test_abandoned_work_returns_to_pending_not_to_deferred(database: Path) -> No
     connection.close()
 
 
-def test_a_crash_between_the_two_step_three_transactions_leaves_a_settled_attempt(
+def test_a_crash_between_attempt_outcome_and_settlement_leaves_a_settled_attempt(
     tmp_path: Path,
 ) -> None:
-    """Step 3 is two transactions, and the gap between them is a second window.
+    """Steps 5 and 6 are separate transactions with a second crash window.
 
     `finish_attempt` and `complete_work` each open their own `BEGIN IMMEDIATE`.
     A crash between them commits the attempt as `succeeded` while leaving the
@@ -587,10 +591,11 @@ def test_a_crash_between_the_two_step_three_transactions_leaves_a_settled_attemp
     duplicate call the next run makes is traceable ONLY through the predecessor
     run's `interrupted` state, never through the attempt rows.
 
-    If this test ever fails because step 3 became one transaction, that is a
-    fix, not a regression -- but `docs/architecture/at-least-once-execution.md`
-    must be corrected in the same change, because this test is what makes that
-    document's "what a crash looks like on disk" section true.
+    If this test ever fails because steps 5 and 6 became one transaction, that
+    is a fix, not a regression -- but
+    `docs/architecture/at-least-once-execution.md` must be corrected in the
+    same change, because this test is what makes that document's "what a crash
+    looks like on disk" section true.
     """
     simulated_root = tmp_path / "simulated"
     simulated_root.mkdir()

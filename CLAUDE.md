@@ -22,36 +22,42 @@ tasks already recorded complete.
 
 ## What Is Actually Built
 
-Two milestones are complete: the application foundation, and the run engine and
-shared transport. A cold-starting agent should assume nothing beyond this list.
+Three milestones are complete: the application foundation, the run engine and
+shared transport, and feed ingestion. A cold-starting agent should assume
+nothing beyond this list.
 
 Delivered and usable:
 
 - `notable config validate`, `notable paths`, `notable db migrate`.
 - `notable run` — validates configuration, migrates, takes the mutation lock,
   sweeps interrupted predecessor runs, executes eligible work through the
-  scheduler, writes a dated digest plus `latest.md`, and prints the same
-  Markdown on standard output.
+  scheduler, ingests enabled RSS and Atom feeds, writes a dated digest plus
+  `latest.md`, and prints the same Markdown on standard output.
 - The shared HTTP transport with URL, DNS-preflight, redirect, timeout,
   response-size, concurrency, and pacing bounds; the retry coordinator; the
   per-run budget reservation; and redacting structured logging.
+- The feedparser-backed feed adapter, conditional feed fetching, durable feed
+  identity and fetch history, canonical article and URL-alias identity, and
+  insert-once source items. Source items deliberately carry no triage
+  observation until milestone 3b.
 
 Delivered only in part — do not describe these as finished:
 
 - `notable status` reports the latest run, its digest, required pending and
-  deferred counts, and operational failures. It has no digest backlog, no
-  oldest pending candidate, and no queue tiers; those need the digest queue
-  from the lead-assessment milestone.
+  deferred counts, operational failures, corpus source-item and article totals,
+  and each feed's latest successful fetch. It has no digest backlog, no oldest
+  pending candidate, and no queue tiers; those need the digest queue from the
+  lead-assessment milestone.
 - The digest emits its header, banner, operational summary, per-run budget
-  line, and deferral-reason breakdown. Its shortlist section is a placeholder:
-  there is no ranking and no model synthesis yet.
+  line, deferral-reason breakdown, and ingestion summary. Its shortlist section
+  is a placeholder: there is no ranking and no model synthesis yet.
 
 Not built at all, so do not document, import, or assume any of it:
 
-- Any concrete provider adapter (feeds, MediaWiki, web search, article fetch
-  and extraction, LLM). `providers/` is transport plumbing only.
-- Any domain table — source items, people, Wikipedia observations, articles,
-  assessments, digest queue.
+- Any provider adapter other than feeds: MediaWiki, web search, article fetch
+  and extraction, and LLM adapters remain absent.
+- People, triage observations, person mentions, sourced names, Wikipedia
+  observations, assessments, and the digest queue remain absent.
 - `notable digest show`, `notable audit run`, `notable audit person`.
 
 Known gaps carried forward, recorded so a later change does not mistake them
@@ -60,6 +66,11 @@ for regressions:
 - `notable status` prints bare pending and deferred counts, with no budget
   figures and no deferral-reason breakdown, so it still cannot explain *why*
   work was deferred. The digest now can; `status` has not caught up.
+- If a handler returns a non-settling state after making an external call, the
+  engine settles that item `failed_permanent` and finishes the run, but
+  deliberately discards the untrusted payload. The attempt row is then the
+  only durable call evidence; a handler-owned domain row such as `feed_fetch`
+  is not written.
 - Two crash windows can repeat a paid provider call; see
   `docs/architecture/at-least-once-execution.md`.
 
@@ -72,13 +83,17 @@ for regressions:
   - `runs/` — run engine, clock, repository, work-item scheduling, retry
     coordination, budget reservation, and the mutation lock.
   - `providers/` — the shared HTTP transport, request safety checks, pacing,
-    and provider failure classification. This is the only package that may
-    import `httpx`. It contains no concrete provider adapter yet.
+    provider failure classification, and the feedparser-backed feed adapter.
+    This is the only package that may import `httpx`.
+  - `ingestion/` — feed seeding and handling, URL identity, domain models, and
+    transaction-neutral persistence helpers for ingestion settlements.
   - `obs/` — redacting structured logging.
   - `reporting/` — the daily digest writer.
 - `tests/foundation/` — application-foundation tests.
 - `tests/run_engine/` — run engine and shared transport tests. Later milestones
   add their own rewrite test areas as specified by their plans.
+- `tests/ingestion/` — feed adapter, domain persistence, CLI integration, seam,
+  and opt-in live-smoke tests.
 - `docs/architecture/at-least-once-execution.md` — the operator-facing note on
   the crash windows in which a paid provider call can be repeated. Point at it
   rather than restating it.
@@ -128,9 +143,11 @@ reviewable and executable.
   `uv run pytest tests/foundation`.
 - For the completed run engine and shared transport, use
   `uv run pytest tests/run_engine`.
-- Both completed milestones together gate with
-  `uv run pytest tests/foundation tests/run_engine`. Run it from a real
-  checkout: it needs the tracked `config/` directory.
+- The three completed milestones together gate with
+  `uv run pytest tests/foundation tests/run_engine tests/ingestion`. Run it
+  from a real checkout: it needs the tracked `config/` directory. The ingestion
+  live smoke is the separate opt-in command
+  `uv run pytest tests/ingestion -m live -v`.
 - Exercise the installed interface with `uv run notable ...`.
 - Keep default rewrite verification offline and isolate configuration and
   storage with temporary paths.
@@ -139,6 +156,36 @@ reviewable and executable.
 
 Before reporting completion, run the active plan's full completion gate and
 confirm `git diff --check` and `git status --short` are clean as applicable.
+
+## Test Evidence
+
+Tests-first ordering is not evidence that a test discriminates. A test written
+before its module fails with `ImportError`; that proves the test runs, not that
+it detects the rule it is named for. Milestone 3a lost four rules to exactly
+this gap — each test went red for the trivial reason, green once the code
+arrived, and stayed green when the rule it was named for was deleted.
+
+Before reporting a task complete:
+
+- For each behaviour the plan names, mutate that rule in the source, confirm a
+  **specific named** test fails, then restore. Report which mutation killed
+  which test. A rule that survives its own removal is untested.
+- A negative assertion needs a positive control. `assert X not in output`
+  proves nothing unless some input makes `X` appear; otherwise it passes
+  because `X` was never reachable, not because the code excluded it.
+- If source was written before its tests — after an interruption, or because a
+  task was recovered — every named rule needs this evidence, not a sample.
+  That ordering is how the four escapes above were introduced.
+
+Restore mutated source from a `cp` backup and verify with `diff`, never with
+`git stash`: the stash stack is shared across worktrees and other sessions.
+
+Run mutations with `PYTHONDONTWRITEBYTECODE=1` and clear `__pycache__` between
+iterations. Rewriting one file repeatedly inside the same second produces cache
+entries that CPython's mtime-and-size invalidation accepts, so an iteration can
+silently test the *previous* mutation. This has already produced two false
+`SURVIVED` verdicts in this repository — the direction that matters, because a
+survivor reported as killed is a rule you believe is covered and is not.
 
 ## Foundation Invariants
 
@@ -156,7 +203,9 @@ confirm `git diff --check` and `git status --short` are clean as applicable.
   root. File contents are diagnostic and never determine lock ownership.
 - Every external network call maps to exactly one persisted attempt attributed
   to its run and work item. Only the central retry coordinator starts a repeat
-  request, and no transaction is held across a network call.
+  request. No transaction is held across its own item's network call: sibling
+  calls may still be in flight while the application thread settles another
+  item's short, local SQLite transaction.
 - External execution is at-least-once. See
   `docs/architecture/at-least-once-execution.md`.
 - Preserve these reviewed contracts unless a later approved design explicitly

@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 license = { file = "LICENSE" }
 dependencies = [
+  "feedparser>=6.0,<7",
   "httpx>=0.28,<0.29",
   "platformdirs>=4.3,<5",
   "portalocker>=3.1,<4",
@@ -33,7 +34,7 @@ packages = ["src/notable_person_finder"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra -m 'not live'"
 markers = ["live: explicitly invoked tests that contact external providers"]
 
 [tool.ruff]
@@ -78,6 +79,5 @@ known-first-party = ["notable_person_finder"]
 [tool.pyright]
 pythonVersion = "3.13"
 typeCheckingMode = "standard"
-include = ["src", "tests/foundation", "tests/run_engine"]
+include = ["src", "tests/foundation", "tests/run_engine", "tests/ingestion"]
 exclude = ["**/__pycache__", ".venv", ".worktrees"]
-

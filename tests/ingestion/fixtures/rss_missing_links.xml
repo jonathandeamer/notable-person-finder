@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>No Links Desk</title>
+    <link>https://example.com/nolinks</link>
+    <item>
+      <guid isPermaLink="false">tag:example.com,2026:nolinks/1</guid>
+      <title>An item with an id but no link</title>
+      <description>No link element at all.</description>
+    </item>
+    <item>
+      <title>An item with neither id nor link</title>
+      <description>Nothing to identify it by.</description>
+    </item>
+  </channel>
+</rss>

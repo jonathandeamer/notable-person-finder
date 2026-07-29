@@ -18,6 +18,15 @@ _PROMINENT_STATES = {
     RunState.INTERRUPTED: "INTERRUPTED RUN — the process ended before finishing.",
 }
 
+# `RunEngine._settle` bounds each reason's length, but not how many distinct
+# reasons a handler's classification can produce -- a legitimate handler may
+# have many legitimate values along its own dimension. This caps only how
+# many of those get their own rendered line, so the digest itself cannot grow
+# unbounded the way the reason strings already cannot. The operator must never
+# lose the total, so the rows folded past this cap are accounted for by one
+# final summary row rather than silently dropped.
+_MAX_RENDERED_DEFERRAL_REASONS = 12
+
 
 class DigestWriteError(Exception):
     """The digest could not be persisted atomically."""
@@ -42,7 +51,23 @@ class DigestRecord:
     markdown: str
 
 
-def render_digest(report: RunReport, *, local_date: str) -> str:
+@dataclass(frozen=True, slots=True)
+class IngestionSummary:
+    """Counts rendered in the digest's ingestion section."""
+
+    feeds_fetched: int
+    feeds_not_modified: int
+    feeds_failed: int
+    source_items_created: int
+    articles_created: int
+
+
+def render_digest(
+    report: RunReport,
+    *,
+    local_date: str,
+    ingestion: IngestionSummary | None = None,
+) -> str:
     lines = [f"# Notable Person Finder — {local_date}", ""]
 
     warning = _PROMINENT_STATES.get(report.state)
@@ -75,8 +100,31 @@ def render_digest(report: RunReport, *, local_date: str) -> str:
         f"- Required work still pending: {counters.required_pending}",
         f"- Required work deferred: {counters.required_deferred}",
     ]
-    for reason, count in sorted(report.deferred_reasons.items()):
+    # Highest count first, then reason ascending as a stable tie-break: the
+    # rows most worth an operator's attention lead, and a cap that then
+    # truncates alphabetically-early-but-low-count reasons would be the wrong
+    # ones to keep.
+    ordered_reasons = sorted(
+        report.deferred_reasons.items(), key=lambda item: (-item[1], item[0])
+    )
+    # Folding costs the operator a row of detail; showing it costs nothing
+    # extra when there is only one row to fold. So a lone reason past the cap
+    # is rendered on its own line instead, and folding only ever kicks in for
+    # two or more -- otherwise the remainder row's noun would need to be
+    # singular AND the row it replaces would already have fit within one more
+    # line.
+    if len(ordered_reasons) <= _MAX_RENDERED_DEFERRAL_REASONS + 1:
+        shown_reasons = ordered_reasons
+        folded_reasons: list[tuple[str, int]] = []
+    else:
+        shown_reasons = ordered_reasons[:_MAX_RENDERED_DEFERRAL_REASONS]
+        folded_reasons = ordered_reasons[_MAX_RENDERED_DEFERRAL_REASONS:]
+    for reason, count in shown_reasons:
         lines.append(f"  - {reason}: {count}")
+    if folded_reasons:
+        folded_count = sum(count for _, count in folded_reasons)
+        noun = "reason" if len(folded_reasons) == 1 else "reasons"
+        lines.append(f"  - ({len(folded_reasons)} more {noun} folded): {folded_count}")
     if (
         report.budget_limit_nano_usd is not None
         or report.budget_reserved_nano_usd
@@ -113,6 +161,18 @@ def render_digest(report: RunReport, *, local_date: str) -> str:
     if report.interrupted_runs:
         rendered = ", ".join(f"run-{run_id}" for run_id in report.interrupted_runs)
         lines.append(f"- Interrupted predecessor runs recorded: {rendered}")
+
+    if ingestion is not None:
+        lines += [
+            "",
+            "### Ingestion",
+            "",
+            f"- Feeds fetched: {ingestion.feeds_fetched}",
+            f"- Feeds not modified: {ingestion.feeds_not_modified}",
+            f"- Feeds failed: {ingestion.feeds_failed}",
+            f"- Source items created: {ingestion.source_items_created}",
+            f"- Articles created: {ingestion.articles_created}",
+        ]
 
     return "\n".join(lines) + "\n"
 
@@ -218,6 +278,7 @@ def write_digest(
     *,
     local_date: str,
     config: DigestConfig,
+    ingestion: IngestionSummary | None = None,
 ) -> DigestRecord:
     """Atomically persist the immutable dated digest and the latest copy.
 
@@ -228,7 +289,7 @@ def write_digest(
     digest, since a run whose real digest exists must not be reported as
     having no digest at all.
     """
-    markdown = render_digest(report, local_date=local_date)
+    markdown = render_digest(report, local_date=local_date, ingestion=ingestion)
     try:
         digests_dir.mkdir(parents=True, exist_ok=True)
     except OSError as error:

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>Example Culture Desk</title>
+    <link>https://example.com/culture</link>
+    <description>Reviews and profiles.</description>
+    <lastBuildDate>Mon, 20 Jul 2026 10:00:00 GMT</lastBuildDate>
+    <item>
+      <guid isPermaLink="false">tag:example.com,2026:culture/4711</guid>
+      <title>A composer nobody had written up</title>
+      <link>https://example.com/culture/composer?utm_source=rss</link>
+      <description>A short standfirst.</description>
+      <content:encoded>&lt;p&gt;The full body of the article.&lt;/p&gt;</content:encoded>
+      <dc:creator>Ada Reviewer</dc:creator>
+      <pubDate>Mon, 20 Jul 2026 09:30:00 GMT</pubDate>
+    </item>
+    <item>
+      <guid isPermaLink="false">tag:example.com,2026:culture/4712</guid>
+      <title>A second piece</title>
+      <link>https://example.com/culture/second</link>
+      <description>Another standfirst.</description>
+      <pubDate>Mon, 20 Jul 2026 08:15:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>

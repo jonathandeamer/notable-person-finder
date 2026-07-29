@@ -39,7 +39,10 @@ def test_migrations_apply_once_and_create_backup_before_upgrade(tmp_path: Path) 
     finally:
         connection.close()
 
-    assert first.applied_versions == (1, 2)
+    # Deliberately a hard-coded literal rather than something derived from the
+    # migrations directory: adding a migration must not pass silently. Update
+    # this when you add one, which is the point.
+    assert first.applied_versions == (1, 2, 3)
     assert first.backup_path is not None and first.backup_path.exists()
     assert second.applied_versions == ()
     assert second.backup_path is None

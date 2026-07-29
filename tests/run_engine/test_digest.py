@@ -8,6 +8,7 @@ import pytest
 from notable_person_finder.config.models import DigestConfig
 from notable_person_finder.reporting.digest import (
     DigestWriteError,
+    IngestionSummary,
     render_digest,
     write_digest,
 )
@@ -128,6 +129,76 @@ def test_several_distinct_deferral_reasons_each_get_their_own_line() -> None:
     assert "exhausted transient failure: timeout: 1" in markdown
 
 
+def test_more_than_twelve_deferral_reasons_are_capped_with_a_remainder_row() -> None:
+    """A legitimate handler may classify along a dimension with many
+    distinct values -- sanitisation bounds each reason's length, not how many
+    distinct reasons exist. Rendering all of them would let the digest grow
+    unbounded, but folding them away silently would lose the total the
+    operator needs, so the sum of every rendered count (the twelve shown
+    plus the one folded-remainder row) must still equal the true total.
+    """
+    deferred_reasons = {f"reason_{index:02d}": index + 1 for index in range(15)}
+    true_total = sum(deferred_reasons.values())
+    counters = RunCounters(0, 0, true_total, 0, 0, 0, 0)
+    markdown = render_digest(
+        report(RunState.PARTIAL, counters=counters, deferred_reasons=deferred_reasons),
+        local_date="2026-07-25",
+    )
+    breakdown_lines = [
+        line
+        for line in markdown.splitlines()
+        if line.startswith("  - ") and ":" in line
+    ]
+    assert len(breakdown_lines) == 13  # 12 shown rows plus 1 remainder row
+    remainder_line = breakdown_lines[-1]
+    assert "3 more reasons folded" in remainder_line
+    rendered_total = 0
+    for line in breakdown_lines:
+        rendered_total += int(line.rsplit(":", 1)[1].strip())
+    assert rendered_total == true_total
+
+
+def test_the_twelve_highest_count_reasons_are_the_ones_shown() -> None:
+    """The cap must keep the rows most worth an operator's attention -- the
+    highest counts -- rather than an arbitrary or alphabetical subset."""
+    deferred_reasons = {f"reason_{index:02d}": index + 1 for index in range(15)}
+    counters = RunCounters(0, 0, sum(deferred_reasons.values()), 0, 0, 0, 0)
+    markdown = render_digest(
+        report(RunState.PARTIAL, counters=counters, deferred_reasons=deferred_reasons),
+        local_date="2026-07-25",
+    )
+    # Counts run 1..15 for reason_00..reason_14; the 12 highest counts are
+    # reasons 03..14 (counts 4..15). The 3 lowest (reason_00..reason_02,
+    # counts 1..3) must be the ones folded away.
+    for index in range(3, 15):
+        assert f"reason_{index:02d}: {index + 1}" in markdown
+    for index in range(3):
+        assert f"reason_{index:02d}:" not in markdown
+
+
+def test_exactly_one_reason_past_the_cap_is_shown_not_folded() -> None:
+    """Folding costs the operator a row of detail; showing the one row that
+    would otherwise be folded costs nothing extra when there is only one.
+    Thirteen distinct reasons -- one past the twelve-row cap -- must render
+    as thirteen plain rows, with no remainder row at all.
+    """
+    deferred_reasons = {f"reason_{index:02d}": index + 1 for index in range(13)}
+    counters = RunCounters(0, 0, sum(deferred_reasons.values()), 0, 0, 0, 0)
+    markdown = render_digest(
+        report(RunState.PARTIAL, counters=counters, deferred_reasons=deferred_reasons),
+        local_date="2026-07-25",
+    )
+    breakdown_lines = [
+        line
+        for line in markdown.splitlines()
+        if line.startswith("  - ") and ":" in line
+    ]
+    assert len(breakdown_lines) == 13
+    assert "folded" not in markdown
+    for index in range(13):
+        assert f"reason_{index:02d}: {index + 1}" in markdown
+
+
 def test_the_budget_cap_reserved_and_spent_are_reported_in_usd() -> None:
     one_usd = 1_000_000_000
     markdown = render_digest(
@@ -152,6 +223,34 @@ def test_no_budget_or_deferral_lines_appear_when_there_is_nothing_to_report() ->
 def test_an_interrupted_predecessor_is_reported() -> None:
     markdown = render_digest(report(interrupted_runs=(41,)), local_date="2026-07-25")
     assert "run-41" in markdown
+
+
+def test_ingestion_subsection_does_not_capture_run_wide_operational_lines() -> None:
+    """The final ``###`` owns only ingestion counters in Markdown structure."""
+    counters = RunCounters(1, 0, 0, 2, 0, 0, 3)
+    markdown = render_digest(
+        report(
+            RunState.PARTIAL,
+            counters=counters,
+            failure_categories={"timeout": 3},
+            paused_providers=frozenset({"feeds"}),
+            interrupted_runs=(41,),
+        ),
+        local_date="2026-07-25",
+        ingestion=IngestionSummary(1, 0, 2, 3, 3),
+    )
+
+    ingestion_section = markdown.split("### Ingestion\n\n", 1)[1]
+    run_wide_lines = (
+        "Required work permanently failed: 2",
+        "Operational failures: 3",
+        "Failures by category: timeout (3)",
+        "Providers paused this run: feeds",
+        "Interrupted predecessor runs recorded: run-41",
+    )
+    for line in run_wide_lines:
+        assert line in markdown  # positive control: the condition is rendered
+        assert line not in ingestion_section
 
 
 def test_digest_ends_with_exactly_one_trailing_newline() -> None:

@@ -317,6 +317,42 @@ def supersede_work(
     return changed
 
 
+def supersede_work_for_subject(
+    connection: sqlite3.Connection,
+    *,
+    task_type: str,
+    subject_kind: str,
+    subject_id: int,
+    run_id: int,
+    now: str,
+    reason: str,
+) -> int:
+    """Retire every active item for one subject, across fingerprints.
+
+    Use when the subject itself is no longer wanted (for example a feed that
+    left configuration). A URL move leaves multiple active fingerprints for the
+    same identity; fingerprint-only supersession would miss the orphans.
+    """
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        changed = connection.execute(
+            """
+            UPDATE work_item
+               SET state = 'superseded', reason = ?, completed_by_run_id = ?,
+                   updated_at = ?
+             WHERE task_type = ? AND subject_kind = ? AND subject_id = ?
+               AND state IN ('pending', 'deferred')
+            """,
+            (reason, run_id, now, task_type, subject_kind, subject_id),
+        ).rowcount
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+    return changed
+
+
 # Shared by `claim_batch` -- the engine's production claim path -- and by
 # `next_eligible`, `claim_next`, and `claim_and_start_attempt`, so no claim
 # path can silently diverge on what "claimable" means. Binds two
@@ -481,8 +517,13 @@ def complete_work(
     `domain_writes` runs inside this transaction, after the state change and
     before the commit, so a handler's domain rows and the settlement that
     justifies them commit or roll back together. A handler that raises there
-    leaves the item `running` and claimed, which the next run's sweep
-    recovers -- never a settled item whose domain writes vanished.
+    leaves the item `running` and claimed as far as *this* function is
+    concerned -- the rollback is total, so there is never a settled item whose
+    domain writes vanished by accident. The engine then deliberately settles
+    that item a second time as `failed_permanent` with no domain writes, so
+    the durable end state is a settled item that correctly has none; see
+    `RunEngine._settle`. Only if the engine did not do that would the next
+    run's sweep be what recovers the item.
     """
     connection.execute("BEGIN IMMEDIATE")
     try:

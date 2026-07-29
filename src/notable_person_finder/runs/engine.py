@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 from notable_person_finder.obs.logging import EVENT_LOGGER_NAME, log_event
 from notable_person_finder.providers.failures import FailureCategory, ProviderFailure
@@ -38,6 +39,16 @@ SETTLING_WORK_STATES = frozenset(
 @dataclass(frozen=True, slots=True)
 class TaskOutcome:
     state: WorkState
+    # A low-cardinality classification token, not a message. This becomes a
+    # `GROUP BY` key in `repository.deferred_reasons` and a rendered line in
+    # the digest's deferral breakdown (`reporting/digest.py`), so it must
+    # never interpolate remote text, a URL, or anything else derived from a
+    # provider response: each distinct string mints its own row in both
+    # places, and unbounded text turns one deferral into an unbounded digest.
+    # `RunEngine._settle` sanitises whatever reaches it (collapsing
+    # whitespace, dropping control characters, truncating to 120 characters)
+    # as a backstop against a length or formatting accident -- that is not
+    # permission to hand this field free-form or attacker-influenced text.
     reason: str | None
     response_bytes: int | None = None
     provider_request_id: str | None = None
@@ -65,6 +76,15 @@ class TaskHandler:
     `persist` runs on the application thread inside the same transaction that
     settles the work item, so a handler's domain writes and the settlement
     that justifies them commit or roll back together.
+
+    `persist_failure` is the same seam for the settlements that carry no
+    outcome. A provider failure the handler did not translate settles through
+    `_retry`'s verdict, which produces a state and a reason but no
+    `TaskOutcome`, so `persist` cannot run -- and a handler that owns domain
+    history would record nothing for an attempt that genuinely happened. The
+    two are disjoint: exactly one of them runs per settlement, because a
+    failure the handler translated into a `TaskOutcome` never reaches the
+    failure path at all.
     """
 
     task_type: str
@@ -75,6 +95,7 @@ class TaskHandler:
     reserved_nano_usd: int = 0
     prepare: Callable[[WorkItem], object] | None = None
     persist: Callable[[WorkItem, TaskOutcome], None] | None = None
+    persist_failure: Callable[[WorkItem, ProviderFailure], None] | None = None
     destination_host: Callable[[WorkItem], str | None] | None = None
 
 
@@ -93,6 +114,21 @@ class _Submission:
     attempt_id: int
     prepared: object
     clock: Clock
+
+
+class _PersistFailed(Exception):
+    """Carries a raising `persist` out of `complete_work`'s rolled-back transaction.
+
+    `_domain_writes` raises this instead of letting the handler's exception
+    propagate bare, so `_settle` can recognise -- by type, not by inspecting
+    the settlement it just attempted -- that the rollback was caused by the
+    handler's own local write rather than by SQLite or the settlement update
+    itself, and route only that case into a second, writeless settlement.
+    """
+
+    def __init__(self, error_type: str) -> None:
+        super().__init__(error_type)
+        self.error_type = error_type
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +169,70 @@ def _elapsed_ms(clock: Clock, started: float) -> int:
     return max(int((clock.monotonic() - started) * 1000), 0)
 
 
+# `_settle` is the engine's production settle path, and this bounds what it
+# writes. It is not the only place a `reason` column is ever written, though:
+# `RunEngine._rearm` also writes one directly (state `pending`, always one of
+# the engine's own enum-derived literals, so leaving it unsanitised is
+# benign), and `repository.defer_unclaimed` / `repository.supersede_work`
+# both accept a caller-supplied reason with no sanitisation at all. Neither
+# repository function has a production caller today -- `defer_unclaimed` is
+# a regression harness with its removal already flagged for pull request 2
+# (see its own docstring) -- but that removal decision needs to know
+# `defer_unclaimed` writes `state='deferred'` directly, so reviving it would
+# feed `repository.deferred_reasons`'s `GROUP BY` with unsanitised text,
+# bypassing everything below.
+#
+# `\t`, `\n`, `\r`, `\v`, and `\f` are whitespace and are handled by the
+# collapse below; everything else in C0 plus DEL is dropped outright, because
+# a control character has no legitimate place in a digest bullet or a
+# `GROUP BY` key. The same is true of zero-width and bidi-override
+# characters -- U+200B-U+200F (zero-width space/joiners/directional marks),
+# U+202A-U+202E (bidi embedding/override controls), and U+FEFF (BOM /
+# zero-width no-break space) -- none of which `str.strip()` treats as
+# whitespace, so a reason made of only these would otherwise survive as a
+# blank-looking, non-`"unspecified"` digest bullet and its own distinct
+# `GROUP BY` key. U+0085, U+00A0, U+2028, and U+2029 need no entry here:
+# Python's Unicode-aware `\s` already matches all four, so the whitespace
+# collapse below handles them and they must not be added a second time.
+_REASON_CONTROL_CHARACTERS = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f"
+    r"\u200b-\u200f\u202a-\u202e\ufeff]"
+)
+_REASON_WHITESPACE_RUN = re.compile(r"\s+")
+_REASON_MAX_LENGTH = 120
+_REASON_TRUNCATION_SUFFIX = "..."
+_UNSPECIFIED_REASON = "unspecified"
+
+
+def _sanitize_reason(reason: str | None) -> str | None:
+    """Bound a settled reason to what a digest line and a `GROUP BY` key can trust.
+
+    Module-level and pure on purpose, so it can run identically over a
+    handler's `TaskOutcome.reason` and the engine's own literals -- see the
+    comment on `TaskOutcome.reason` and the pause-reason comment in
+    `RunEngine._prepare` for why an engine-authored reason must also stay a
+    stable, low-cardinality token.
+
+    `None` is passed through unchanged: it means "no reason to record", which
+    is different from an empty or whitespace-only string a handler handed
+    back. The latter becomes the stable literal `"unspecified"` rather than
+    `None`, because `repository.deferred_reasons` filters `reason IS NOT
+    NULL` while the `required_deferred` headline does not -- a `NULL` reason
+    on a deferred item would make the breakdown stop summing to its own
+    headline.
+    """
+    if reason is None:
+        return None
+    without_control_characters = _REASON_CONTROL_CHARACTERS.sub("", reason)
+    collapsed = _REASON_WHITESPACE_RUN.sub(" ", without_control_characters).strip()
+    if not collapsed:
+        return _UNSPECIFIED_REASON
+    if len(collapsed) > _REASON_MAX_LENGTH:
+        keep = _REASON_MAX_LENGTH - len(_REASON_TRUNCATION_SUFFIX)
+        collapsed = collapsed[:keep] + _REASON_TRUNCATION_SUFFIX
+    return collapsed
+
+
 def _never_left_the_machine(record: AttemptRecord) -> bool:
     """True only for a failure that cannot have reached the provider at all.
 
@@ -161,9 +261,13 @@ def _domain_writes(
 ) -> Callable[[sqlite3.Connection], None] | None:
     """Bind `handler.persist` for the settling transaction to run, if there is one.
 
-    There is nothing to persist for an item that never produced an outcome --
-    a paused provider, a refused reservation, an exhausted retry -- so those
-    settlements carry no domain writes.
+    There is nothing an *outcome* handler can persist for an item that never
+    produced one -- a paused provider, a raising `prepare`, a refused
+    reservation, an exhausted retry -- nor for one whose outcome the engine
+    refused to honour, where the payload is discarded deliberately. A
+    settlement driven by a provider failure instead routes to
+    `_failure_writes`, which is the same seam for the information that path
+    does have; the two never both run for one settlement.
     """
     persist = handler.persist
     if persist is None or outcome is None:
@@ -172,23 +276,68 @@ def _domain_writes(
     def write(_connection: sqlite3.Connection) -> None:
         # The connection is handed over for symmetry with the repository's
         # other in-transaction helpers; the handler already holds its own.
-        persist(work_item, outcome)
+        try:
+            persist(work_item, outcome)
+        except ProviderFailure:
+            # Not this task's concern: a handler should not raise this from
+            # `persist` in the first place, and nothing here claims to make
+            # sense of it. Let it propagate exactly as any other exception
+            # from this call used to.
+            raise
+        except Exception as error:
+            # The call already succeeded; only this local write failed. That
+            # is unambiguous in a way an `execute` failure is not, so it is
+            # translated into `_PersistFailed` rather than left to propagate:
+            # `_settle` catches that type and re-settles this one item
+            # `failed_permanent` with no domain writes, instead of stranding
+            # it `running` over a bug in the handler's own persistence code.
+            raise _PersistFailed(type(error).__name__) from error
 
     return write
 
 
-def _rearm_timestamp(moment: datetime) -> str:
-    """Render a re-arm deadline so string comparison cannot strand the item.
+def _failure_writes(
+    handler: TaskHandler, work_item: WorkItem, failure: ProviderFailure | None
+) -> Callable[[sqlite3.Connection], None] | None:
+    """Bind `handler.persist_failure` for a settlement driven by a failure.
 
-    `eligible_at <= now` is a text comparison in SQL, and `utc_timestamp`
-    omits the fractional part on a whole second. `'...:01Z' <= '...:01.5Z'` is
-    false because `'Z' > '.'`, so a whole-second deadline could read as not
-    yet due after its instant had passed -- and the loop would stop with the
-    retry still parked. Always emitting microseconds makes the mismatch fall
-    the safe way: a deadline sorts before any `now` in the same second, so a
-    due item is claimable rather than stranded.
+    The mirror of `_domain_writes` for the paths where the retry policy, not
+    the handler, decided the item's fate. A failed external call is still an
+    event a handler may own history for -- a feed that could not be reached is
+    a gap in that feed's record, and one that leaves no row is indistinguishable
+    from a fetch that never ran.
+
+    Called once per *settlement*, never once per attempt: the engine reaches
+    here only after `_retry` has returned PERMANENT or EXHAUSTED, so a retried
+    call writes one row for its final verdict rather than one per try.
+
+    Three settlements normally carry no failure, because no call was made: a
+    paused provider, a raising `prepare`, and a refused budget reservation. A
+    re-armed item is the exception: it made a call earlier in this run, and
+    the failure that caused the re-arm is carried in `_ItemProgress.last_failure`
+    so these settlements can still reach `persist_failure`. A handler state the
+    engine refused to honour deliberately carries neither an outcome nor a
+    failure: the call happened, but the engine discards the payload, so the
+    evidence stays on the `attempt` row alone. Each case is pinned by its own
+    test.
     """
-    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+    persist_failure = handler.persist_failure
+    if persist_failure is None or failure is None:
+        return None
+
+    def write(_connection: sqlite3.Connection) -> None:
+        # Identical isolation to `_domain_writes`, and for the identical
+        # reason: the call has already finished, so a fault here is
+        # unambiguously local to the handler's own write and must not strand
+        # the item `running`.
+        try:
+            persist_failure(work_item, failure)
+        except ProviderFailure:
+            raise
+        except Exception as error:
+            raise _PersistFailed(type(error).__name__) from error
+
+    return write
 
 
 @dataclass(slots=True)
@@ -198,10 +347,19 @@ class _ItemProgress:
     `max_attempts` bounds the calls a single run makes for one item, so this
     survives a re-arm: the item goes back to the queue, but its attempt count
     does not reset when the run re-claims it.
+
+    `last_failure` is the most recent provider failure that caused a re-arm.
+    It is carried forward so that a re-claimed item that settles without a
+    fresh call -- because the provider was paused, `prepare` raised, or the
+    budget was exhausted -- can still record the failure that actually
+    happened. An item that has never been called has no `_ItemProgress` entry,
+    so the absence of that entry naturally distinguishes "no call yet" from
+    "call happened earlier this run".
     """
 
     attempts: int = 0
     malformed_retries: int = 0
+    last_failure: ProviderFailure | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,7 +626,7 @@ class RunEngine:
                 for work_item in batch:
                     deadlines.pop(work_item.id, None)
                     submission = self._prepare(
-                        run_id, work_item, handlers[work_item.task_type]
+                        run_id, work_item, handlers[work_item.task_type], progress
                     )
                     if submission is not None:
                         submissions.append(submission)
@@ -511,7 +669,11 @@ class RunEngine:
             del deadlines[work_item_id]
 
     def _prepare(
-        self, run_id: int, work_item: WorkItem, handler: TaskHandler
+        self,
+        run_id: int,
+        work_item: WorkItem,
+        handler: TaskHandler,
+        progress: dict[int, _ItemProgress],
     ) -> _Submission | None:
         """Phase one: everything one call needs, read on the application thread.
 
@@ -520,7 +682,19 @@ class RunEngine:
         exactly one external call, and a paused provider is never called. This
         used to be enforced inside `RetryCoordinator.call`, which the batch
         loop no longer routes through, so the engine owns it explicitly.
+
+        The three early-return settlements normally carry no failure, because
+        none of them has made a call. A re-armed item is the exception: it made
+        a call earlier in this run, and the failure that caused the re-arm is
+        preserved in `progress`. When that failure is present it is passed
+        through so a handler's `persist_failure` can still record the last real
+        event.
         """
+        progress_entry = progress.get(work_item.id)
+        last_failure = (
+            progress_entry.last_failure if progress_entry is not None else None
+        )
+
         if self._retry.is_paused(handler.provider):
             # Deliberately NOT `f"{handler.provider} paused for this run"`:
             # `deferred_reasons` groups by this exact string, and
@@ -536,9 +710,42 @@ class RunEngine:
                 handler,
                 state=WorkState.DEFERRED,
                 reason="provider paused for this run",
+                failure=last_failure,
             )
             return None
-        prepared = handler.prepare(work_item) if handler.prepare is not None else None
+        if handler.prepare is None:
+            prepared = None
+        else:
+            try:
+                prepared = handler.prepare(work_item)
+            except ProviderFailure:
+                # Not this task's concern -- see the matching comment in
+                # `_domain_writes`.
+                raise
+            except Exception as error:
+                # No call has been made yet, so nothing is ambiguous about
+                # money: settle just this item and let the batch's other
+                # already-prepared siblings still run, rather than abandoning
+                # them along with their committed attempt rows and budget
+                # reservations for calls that will now never happen.
+                log_event(
+                    self._logger,
+                    "run.prepare_failed",
+                    severity=logging.ERROR,
+                    run_id=run_id,
+                    work_item_id=work_item.id,
+                    task_type=handler.task_type,
+                    error_type=type(error).__name__,
+                )
+                self._settle(
+                    run_id,
+                    work_item,
+                    handler,
+                    state=WorkState.FAILED_PERMANENT,
+                    reason=f"prepare raised {type(error).__name__}",
+                    failure=last_failure,
+                )
+                return None
         fingerprint = (
             handler.request_fingerprint(work_item)
             if handler.request_fingerprint is not None
@@ -576,6 +783,7 @@ class RunEngine:
                 handler,
                 state=WorkState.DEFERRED,
                 reason="not_evaluated_budget",
+                failure=last_failure,
             )
             return None
         # Every repository call above has committed, so no transaction is open
@@ -705,6 +913,7 @@ class RunEngine:
                 handler,
                 state=WorkState.FAILED_PERMANENT,
                 reason=str(failure.category),
+                failure=failure,
             )
             return
         if failure.category is FailureCategory.MALFORMED_RESPONSE:
@@ -723,12 +932,14 @@ class RunEngine:
                 handler,
                 state=WorkState.DEFERRED,
                 reason=f"exhausted transient failure: {failure.category}",
+                failure=failure,
             )
             return
         if decision.delay_seconds is None:
             raise RuntimeError(
                 "RetryPolicy.decide returned action=RETRY with no delay_seconds"
             )
+        state.last_failure = failure
         self._rearm(
             run_id,
             work_item,
@@ -832,7 +1043,7 @@ class RunEngine:
             state=WorkState.PENDING,
             reason=f"retrying after {failure.category}",
             now=self._now(),
-            eligible_at=_rearm_timestamp(deadline),
+            eligible_at=utc_timestamp(deadline),
         )
         deadlines[work_item.id] = deadline
         log_event(
@@ -856,6 +1067,7 @@ class RunEngine:
         state: WorkState,
         reason: str | None,
         outcome: TaskOutcome | None = None,
+        failure: ProviderFailure | None = None,
     ) -> None:
         """Record one item's outcome and take it out of this run's claims.
 
@@ -864,16 +1076,78 @@ class RunEngine:
         which is proof this run owns the item. `handler.persist` runs inside
         that same transaction, so a handler's domain writes and the settlement
         that justifies them commit or roll back together.
+
+        `outcome` and `failure` are mutually exclusive, and the guard below
+        holds both callers to it: an outcome means the handler settled the item
+        itself, a failure means the retry policy did. Were both ever passed,
+        which domain write ran would come down to argument order.
+
+        `reason` is sanitised here, once, whether it came from a handler or
+        from the engine's own literals: this is where every reason this
+        engine settles gets bounded on its way to `complete_work`, to the
+        `_PersistFailed` path's second settlement, and to the closing
+        `run.work_settled` log event below. See the comment above
+        `_REASON_CONTROL_CHARACTERS` for the other, non-`_settle` writers of
+        this column and why they are out of scope here.
         """
-        repository.complete_work(
-            self._connection,
-            work_item_id=work_item.id,
-            run_id=run_id,
-            state=state,
-            reason=reason,
-            now=self._now(),
-            domain_writes=_domain_writes(handler, work_item, outcome),
-        )
+        if outcome is not None and failure is not None:
+            raise RuntimeError(
+                "a settlement cannot carry both an outcome and a provider failure"
+            )
+        reason = _sanitize_reason(reason)
+        if state is WorkState.DEFERRED and reason is None:
+            # `TaskOutcome(state=DEFERRED, reason=None)` type-checks: nothing
+            # stops a handler from returning it. `_sanitize_reason` leaves
+            # `None` as `None` on purpose (it means "nothing to sanitise", not
+            # "empty"), so that door has to be closed here instead, and only
+            # for DEFERRED: `repository.deferred_reasons` filters
+            # `reason IS NOT NULL` while the `required_deferred` headline does
+            # not, so a NULL reason on a deferred item would reopen the exact
+            # sum mismatch Task 4's fix round closed. A succeeded item with no
+            # reason is ordinary and NULL is the right value there, so this
+            # does not touch any other settling state.
+            reason = _UNSPECIFIED_REASON
+        try:
+            repository.complete_work(
+                self._connection,
+                work_item_id=work_item.id,
+                run_id=run_id,
+                state=state,
+                reason=reason,
+                now=self._now(),
+                domain_writes=(
+                    _domain_writes(handler, work_item, outcome)
+                    or _failure_writes(handler, work_item, failure)
+                ),
+            )
+        except _PersistFailed as error:
+            # The call already succeeded, so unlike `execute` there is no
+            # ambiguity about spend here -- only the handler's local write
+            # failed, and that failure rolled the settlement back with it,
+            # leaving the item `running` and still claimed by this run. A
+            # second settlement with no domain writes takes it out of the
+            # claimable set instead of stranding it there for every future
+            # run to reclaim and fail the same way.
+            log_event(
+                self._logger,
+                "run.persist_failed",
+                severity=logging.ERROR,
+                run_id=run_id,
+                work_item_id=work_item.id,
+                task_type=work_item.task_type,
+                error_type=error.error_type,
+            )
+            state = WorkState.FAILED_PERMANENT
+            reason = _sanitize_reason(f"persist raised {error.error_type}")
+            repository.complete_work(
+                self._connection,
+                work_item_id=work_item.id,
+                run_id=run_id,
+                state=state,
+                reason=reason,
+                now=self._now(),
+                domain_writes=None,
+            )
         log_event(
             self._logger,
             "run.work_settled",

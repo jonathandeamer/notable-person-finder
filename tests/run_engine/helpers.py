@@ -42,6 +42,7 @@ schema_version = 1
 key = "art-news"
 label = "Art News"
 url = "https://example.com/feed.xml"
+enabled = false
 """,
         encoding="utf-8",
     )
