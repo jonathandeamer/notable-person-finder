@@ -1,0 +1,15 @@
+{
+  "item_outcome": "research_people",
+  "mentions": [
+    {
+      "exact_name": "Élodie N'Diaye",
+      "outcome": "research",
+      "supporting_passage_ids": ["p99"],
+      "identity_facts": [],
+      "signals": [],
+      "rationale": "This deliberately references an unseen passage."
+    }
+  ],
+  "overflow": false,
+  "rationale": "Invalid fixture."
+}

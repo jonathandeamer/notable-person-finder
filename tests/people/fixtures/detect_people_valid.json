@@ -1,0 +1,52 @@
+{
+  "item_outcome": "research_people",
+  "mentions": [
+    {
+      "exact_name": "Élodie N'Diaye",
+      "outcome": "research",
+      "supporting_passage_ids": ["p1"],
+      "identity_facts": [
+        {
+          "local_id": "fact-1",
+          "kind": "name",
+          "value": "Élodie N'Diaye",
+          "supporting_passage_ids": ["p1"]
+        },
+        {
+          "local_id": "fact-2",
+          "kind": "profession_or_role",
+          "value": "sculptor",
+          "supporting_passage_ids": ["p2"]
+        }
+      ],
+      "signals": [
+        {
+          "kind": "attention",
+          "category": "significant_recognition",
+          "claim": "The supplied title reports a prize.",
+          "supporting_passage_ids": ["p1"],
+          "grounding": "domain_profile"
+        }
+      ],
+      "rationale": "The supplied passages make this person a meaningful subject."
+    },
+    {
+      "exact_name": "sculptor",
+      "outcome": "uncertain",
+      "supporting_passage_ids": ["p2"],
+      "identity_facts": [],
+      "signals": [
+        {
+          "kind": "caution",
+          "category": "significance_unclear",
+          "claim": "The supplied summary does not identify the sculptor clearly.",
+          "supporting_passage_ids": ["p2"],
+          "grounding": "source_text"
+        }
+      ],
+      "rationale": "The exact source wording is a professional reference with uncertain identity."
+    }
+  ],
+  "overflow": false,
+  "rationale": "The item contains one clear subject and one uncertain professional reference."
+}
