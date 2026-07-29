@@ -121,14 +121,19 @@ def feed_identities(connection: sqlite3.Connection) -> tuple[FeedIdentity, ...]:
 
 
 def latest_validators(
-    connection: sqlite3.Connection, *, feed_identity_id: int
+    connection: sqlite3.Connection, *, feed_identity_id: int, requested_url: str
 ) -> tuple[str | None, str | None]:
-    """The ETag and Last-Modified to offer on the next fetch of this feed.
+    """The ETag and Last-Modified to offer for this requested feed URL.
 
     Derived from the latest fetch whose `outcome` is not 'failed'. Validator
     state is deliberately not stored as mutable columns on `feed_identity`:
     deriving it here means a failed fetch can never overwrite the validators
     a previous, successful fetch offered.
+
+    Validators are representation-specific, whereas a feed identity remains
+    stable when its configured URL moves. Restricting history to the exact
+    requested URL prevents a validator learned from the old representation
+    from eliciting an unusable 304 from the new one.
 
     Rows carrying *no* validator at all are skipped rather than treated as the
     answer. A 304 response normally omits Last-Modified and often omits ETag
@@ -142,12 +147,12 @@ def latest_validators(
     row = connection.execute(
         """
         SELECT etag, last_modified FROM feed_fetch
-         WHERE feed_identity_id = ? AND outcome <> 'failed'
+         WHERE feed_identity_id = ? AND requested_url = ? AND outcome <> 'failed'
            AND (etag IS NOT NULL OR last_modified IS NOT NULL)
          ORDER BY id DESC
          LIMIT 1
         """,
-        (feed_identity_id,),
+        (feed_identity_id, requested_url),
     ).fetchone()
     if row is None:
         return (None, None)

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -20,6 +22,7 @@ from notable_person_finder.config.loader import load_config
 from notable_person_finder.config.models import FeedsConfig, TransportConfig
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.ingestion.service import seed_feeds
+from notable_person_finder.providers.pacing import PacingGate
 from notable_person_finder.providers.safety import StaticHostResolver
 from notable_person_finder.providers.transport import HttpTransport, build_transport
 from notable_person_finder.runs.clock import SystemClock, utc_timestamp
@@ -116,6 +119,7 @@ def _build_transport_patch(
         resolver: object,
         clock: SystemClock,
         http_transport: httpx.BaseTransport | None = None,
+        pacing_gate: PacingGate | None = None,
     ) -> HttpTransport:
         return build_transport(
             config,
@@ -123,6 +127,7 @@ def _build_transport_patch(
             resolver=RESOLVER,
             clock=clock,
             http_transport=httpx.MockTransport(handler),
+            pacing_gate=pacing_gate,
         )
 
     return _patch
@@ -185,6 +190,58 @@ def test_run_ingests_feed_and_renders_counts(
     assert "Feeds failed: 0" in latest
     assert "Source items created: 2" in latest
     assert "Articles created: 2" in latest
+
+
+def test_run_enforces_configured_same_origin_concurrency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch_env: None,
+) -> None:
+    """The run's configured per-origin cap bounds actual HTTP calls."""
+    config_file = write_ingestion_graph(
+        tmp_path,
+        feeds="""\
+schema_version = 1
+[[feeds]]
+key = "one"
+label = "One"
+url = "https://example.com/one.xml"
+[[feeds]]
+key = "two"
+label = "Two"
+url = "https://example.com/two.xml"
+[[feeds]]
+key = "three"
+label = "Three"
+url = "https://example.com/three.xml"
+""",
+        operational=OPERATIONAL_SECTIONS.replace(
+            "http_workers = 4", "http_workers = 3\nper_origin = 1"
+        ),
+    )
+    payload = fixture_bytes("rss20.xml")
+    in_flight = 0
+    peak = 0
+    guard = threading.Lock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, peak
+        with guard:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        try:
+            # Long enough for all three scheduler workers to reach the fake
+            # network layer when the configured gate is absent.
+            time.sleep(0.05)
+            return httpx.Response(200, content=streaming_body(payload))
+        finally:
+            with guard:
+                in_flight -= 1
+
+    monkeypatch.setattr(cli_main, "build_transport", _build_transport_patch(handler))
+
+    assert cli_main.command_run(config_file, verbose=False) == cli_main.EXIT_OK
+    assert peak == 1
 
 
 def test_second_run_reports_zero_new_source_items(
@@ -376,6 +433,7 @@ def test_transport_is_closed_when_run_raises(
         resolver: object,
         clock: SystemClock,
         http_transport: httpx.BaseTransport | None = None,
+        pacing_gate: PacingGate | None = None,
     ) -> HttpTransport:
         nonlocal built_transport
         transport = build_transport(
@@ -384,6 +442,7 @@ def test_transport_is_closed_when_run_raises(
             resolver=RESOLVER,
             clock=clock,
             http_transport=httpx.MockTransport(_single_feed_handler(payload)),
+            pacing_gate=pacing_gate,
         )
         built_transport = transport
         transport.closed = False  # type: ignore[attr-defined]
@@ -408,3 +467,96 @@ def test_transport_is_closed_when_run_raises(
 
     assert built_transport is not None
     assert built_transport.closed is True  # type: ignore[attr-defined]
+
+
+class _AbortRun(BaseException):
+    """An unexpected worker failure that crosses both provider boundaries."""
+
+
+class _InFlightTransport(httpx.BaseTransport):
+    """Coordinate two real HTTP calls and observe transport shutdown safety."""
+
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+        self.sibling_started = threading.Event()
+        self.sibling_exited = threading.Event()
+        self._release_sibling = threading.Event()
+        self.closed_after_sibling: bool | None = None
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/fail.xml":
+            if not self.sibling_started.wait(timeout=5):
+                raise RuntimeError("sibling HTTP call did not start")
+            raise _AbortRun("abort while sibling is in HTTP")
+
+        self.sibling_started.set()
+        try:
+            self._release_sibling.wait(timeout=0.25)
+            return httpx.Response(200, content=streaming_body(self._payload))
+        finally:
+            self.sibling_exited.set()
+
+    def close(self) -> None:
+        self.closed_after_sibling = self.sibling_exited.is_set()
+        # Keep a broken exit order from making the regression wait for the
+        # sibling's timeout after it has already observed the unsafe close.
+        self._release_sibling.set()
+
+
+def test_exceptional_unwind_waits_for_in_flight_http_before_closing_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch_env: None,
+) -> None:
+    """Scheduler shutdown drains a sibling call before transport teardown.
+
+    This exercises the real nested context managers, thread pool, engine, feed
+    adapter, and HTTP transport. One HTTP call raises an unexpected
+    ``BaseException`` only after its sibling has entered the network layer;
+    the transport records the sibling's actual exit state when ``close`` runs.
+    """
+    config_file = write_ingestion_graph(
+        tmp_path,
+        feeds="""\
+schema_version = 1
+[[feeds]]
+key = "fail"
+label = "Fail"
+url = "https://example.com/fail.xml"
+[[feeds]]
+key = "sibling"
+label = "Sibling"
+url = "https://example.com/sibling.xml"
+""",
+        operational=OPERATIONAL_SECTIONS.replace(
+            "http_workers = 4", "http_workers = 2"
+        ),
+    )
+    network = _InFlightTransport(fixture_bytes("rss20.xml"))
+
+    def build_coordinated_transport(
+        config: TransportConfig,
+        *,
+        version: str,
+        resolver: object,
+        clock: SystemClock,
+        http_transport: httpx.BaseTransport | None = None,
+        pacing_gate: PacingGate | None = None,
+    ) -> HttpTransport:
+        return build_transport(
+            config,
+            version=version,
+            resolver=RESOLVER,
+            clock=clock,
+            http_transport=network,
+            pacing_gate=pacing_gate,
+        )
+
+    monkeypatch.setattr(cli_main, "build_transport", build_coordinated_transport)
+
+    with pytest.raises(_AbortRun, match="abort while sibling"):
+        cli_main.command_run(config_file, verbose=False)
+
+    assert network.sibling_started.is_set()
+    assert network.sibling_exited.is_set()
+    assert network.closed_after_sibling is True

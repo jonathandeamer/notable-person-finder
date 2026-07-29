@@ -33,6 +33,7 @@ from notable_person_finder.providers.feeds import (
     Modified,
     NotModified,
 )
+from notable_person_finder.providers.pacing import PacingGate
 from notable_person_finder.providers.safety import StaticHostResolver
 from notable_person_finder.providers.transport import HttpTransport, build_transport
 from notable_person_finder.runs import repository
@@ -120,6 +121,7 @@ def _patch_transport(
         resolver: object,
         clock: SystemClock,
         http_transport: httpx.BaseTransport | None = None,
+        pacing_gate: PacingGate | None = None,
     ) -> HttpTransport:
         return build_transport(
             config,
@@ -127,6 +129,7 @@ def _patch_transport(
             resolver=RESOLVER,
             clock=clock,
             http_transport=httpx.MockTransport(handler),
+            pacing_gate=pacing_gate,
         )
 
     return patched

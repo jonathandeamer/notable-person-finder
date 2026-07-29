@@ -6,8 +6,13 @@ from collections.abc import Iterable
 import httpx
 import pytest
 
-from notable_person_finder.config.models import TransportConfig
+from notable_person_finder.config.models import (
+    ConcurrencyConfig,
+    PacingConfig,
+    TransportConfig,
+)
 from notable_person_finder.providers.failures import FailureCategory, ProviderFailure
+from notable_person_finder.providers.pacing import build_pacing_gate
 from notable_person_finder.providers.safety import StaticHostResolver
 from notable_person_finder.providers.transport import (
     HttpTransport,
@@ -127,6 +132,41 @@ def test_redirects_are_followed_and_the_chain_is_recorded() -> None:
     assert response.final_url == "https://other.example/b"
     assert response.destination_host == "other.example"
     assert response.content == b"final"
+
+
+def test_redirect_destination_is_acquired_and_paced_as_an_actual_request_hop() -> None:
+    """A redirect exchange is one attempt but two independently gated starts."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.host)
+        if request.url.host == "example.com":
+            return httpx.Response(302, headers={"location": "https://other.example/b"})
+        return httpx.Response(200, content=streaming_body(b"final"))
+
+    clock = FakeClock()
+    gate = build_pacing_gate(
+        PacingConfig(mediawiki_min_interval_ms=900),
+        ConcurrencyConfig(),
+        clock=clock,
+    )
+    with build_transport(
+        TransportConfig(),
+        version="0.1.0",
+        resolver=RESOLVER,
+        clock=clock,
+        http_transport=httpx.MockTransport(handler),
+        pacing_gate=gate,
+    ) as transport:
+        transport.request(
+            "GET",
+            "https://example.com/a",
+            provider="mediawiki",
+            operation="search_pages",
+        )
+
+    assert seen == ["example.com", "other.example"]
+    assert clock.slept == [pytest.approx(0.9)]
 
 
 def test_cross_origin_redirect_drops_credential_headers() -> None:
@@ -370,12 +410,14 @@ def test_unicode_encode_error_in_build_request_is_translated() -> None:
     client = _BuildRequestRaisesUnicode(
         transport=httpx.MockTransport(lambda request: httpx.Response(200))
     )
+    clock = FakeClock()
     transport = HttpTransport(
         client,
         config=TransportConfig(),
         user_agent="test",
         resolver=RESOLVER,
-        clock=FakeClock(),
+        clock=clock,
+        pacing_gate=build_pacing_gate(PacingConfig(), ConcurrencyConfig(), clock=clock),
     )
     with pytest.raises(ProviderFailure) as captured:
         transport.request(

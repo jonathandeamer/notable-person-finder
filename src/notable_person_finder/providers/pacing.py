@@ -8,9 +8,6 @@ from notable_person_finder.config.models import ConcurrencyConfig, PacingConfig
 from notable_person_finder.runs.clock import Clock
 
 
-# TODO(milestone 3): PacingGate is unit-tested but not yet used by any adapter,
-# because no provider adapters are registered. Wire it into the first adapter
-# milestone that makes live requests.
 class PacingGate:
     """Spaces provider request starts and caps concurrency per origin."""
 

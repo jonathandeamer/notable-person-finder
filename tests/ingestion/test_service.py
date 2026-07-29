@@ -552,6 +552,59 @@ def test_prepare_returns_the_stored_validators_after_a_successful_fetch(
     )
 
 
+def test_prepare_does_not_offer_old_validators_after_the_configured_url_moves(
+    connection: sqlite3.Connection,
+) -> None:
+    """A validator describes one requested representation, not a feed key.
+
+    The stable feed identity survives configuration changes, but validators
+    learned from the old URL cannot make a 304 from the new URL meaningful.
+    This drives the real seed -> repository history -> prepare path so a URL
+    filter added only at a test-facing helper would not satisfy it.
+    """
+    first_run = insert_run(connection)
+    seed_feeds(connection, feeds=feeds_config(ALPHA), run_id=first_run, now=moment())
+    identity_id = connection.execute("SELECT id FROM feed_identity").fetchone()["id"]
+    with immediate(connection):
+        record_fetch(
+            connection,
+            feed_identity_id=identity_id,
+            run_id=first_run,
+            requested_at=moment(),
+            requested_url=ALPHA[1],
+            resolved_url=ALPHA[1],
+            redirect_chain_json=None,
+            http_status=200,
+            etag='"old-url-etag"',
+            last_modified="Wed, 22 Jul 2026 06:00:00 GMT",
+            outcome="modified",
+            feed_type="rss20",
+            parse_outcome="ok",
+            parser_warnings_json=None,
+            failure_category=None,
+            entry_count=3,
+            response_bytes=1024,
+        )
+    connection.execute("UPDATE work_item SET state = 'succeeded'")
+    connection.commit()
+
+    moved = ("alpha", "https://alpha.example.com/feed-v2.xml", True)
+    second_run = insert_run(connection)
+    seed_feeds(connection, feeds=feeds_config(moved), run_id=second_run, now=moment())
+    handler = build_fetch_handler(
+        connection,
+        client=FakeFeedClient(result=modified_result(url=moved[1])),
+        feeds=feeds_config(moved),
+    )
+    assert handler.prepare is not None
+
+    call = handler.prepare(claimed_item(connection, run_id=second_run))
+
+    assert isinstance(call, FeedCall)
+    assert call.feed.url == moved[1]
+    assert call.validators == FeedValidators(etag=None, last_modified=None)
+
+
 def test_prepare_refuses_an_item_whose_feed_left_configuration(
     connection: sqlite3.Connection,
 ) -> None:

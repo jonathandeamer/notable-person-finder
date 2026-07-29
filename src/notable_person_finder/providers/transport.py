@@ -10,12 +10,17 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from notable_person_finder.config.models import TransportConfig
+from notable_person_finder.config.models import (
+    ConcurrencyConfig,
+    PacingConfig,
+    TransportConfig,
+)
 from notable_person_finder.providers.failures import (
     FailureCategory,
     ProviderFailure,
     parse_retry_after,
 )
+from notable_person_finder.providers.pacing import PacingGate, build_pacing_gate
 from notable_person_finder.providers.safety import (
     HostResolver,
     UnsafeUrl,
@@ -142,12 +147,14 @@ class HttpTransport:
         user_agent: str,
         resolver: HostResolver,
         clock: Clock,
+        pacing_gate: PacingGate,
     ) -> None:
         self._client = client
         self._config = config
         self._user_agent = user_agent
         self._resolver = resolver
         self._clock = clock
+        self._pacing_gate = pacing_gate
 
     def __enter__(self) -> HttpTransport:
         return self
@@ -218,19 +225,24 @@ class HttpTransport:
                 # to hand to a different host, not only the named
                 # credential headers.
                 hop_headers = None
-            response = self._send(
-                method,
-                current_url,
-                provider=provider,
-                operation=operation,
-                headers=hop_headers,
-                params=params if not redirect_chain else None,
-                profile=profile,
-                byte_limit=byte_limit,
-                host=host,
-                requested_url=requested_url,
-                redirect_chain=tuple(redirect_chain),
-            )
+            # Every exchange is an actual request start. Redirects remain one
+            # logical provider attempt, but each destination has its own
+            # safety check and origin slot, and provider spacing applies again
+            # before starting that hop.
+            with self._pacing_gate.acquire(provider, host):
+                response = self._send(
+                    method,
+                    current_url,
+                    provider=provider,
+                    operation=operation,
+                    headers=hop_headers,
+                    params=params if not redirect_chain else None,
+                    profile=profile,
+                    byte_limit=byte_limit,
+                    host=host,
+                    requested_url=requested_url,
+                    redirect_chain=tuple(redirect_chain),
+                )
             if response is None:
                 continue
             if isinstance(response, str):
@@ -407,6 +419,7 @@ def build_transport(
     resolver: HostResolver,
     clock: Clock,
     http_transport: httpx.BaseTransport | None = None,
+    pacing_gate: PacingGate | None = None,
 ) -> HttpTransport:
     client = httpx.Client(
         follow_redirects=False,  # each hop is validated by assert_safe_url first
@@ -421,4 +434,9 @@ def build_transport(
         user_agent=config.resolved_user_agent(version),
         resolver=resolver,
         clock=clock,
+        pacing_gate=(
+            pacing_gate
+            if pacing_gate is not None
+            else build_pacing_gate(PacingConfig(), ConcurrencyConfig(), clock=clock)
+        ),
     )

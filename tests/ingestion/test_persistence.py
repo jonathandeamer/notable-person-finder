@@ -7,7 +7,9 @@ rows -- not the engine's scheduling or retry logic.
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import time
 
 from notable_person_finder.ingestion.models import FetchPersistResult
 from notable_person_finder.ingestion.repository import (
@@ -278,6 +280,51 @@ def test_entry_with_unparseable_date_becomes_a_source_item_with_published_issue(
     assert row["published_raw"] == "not a date"
     assert row["published_at"] is None
     assert row["published_issue"] == "unparseable"
+
+
+def test_naive_rfc_publication_date_is_interpreted_as_utc_in_a_non_utc_process(
+    connection: sqlite3.Connection,
+) -> None:
+    """A missing RFC offset has the same explicit UTC policy as naive ISO.
+
+    ``datetime.astimezone`` otherwise borrows the host process timezone for a
+    naive value. The environment change is process-global, so restore both the
+    variable and the C runtime timezone even if persistence raises.
+    """
+    old_tz = os.environ.get("TZ")
+    os.environ["TZ"] = "PST8PDT"
+    time.tzset()
+    try:
+        run_id, feed_id = _run_and_identity(connection)
+        result = _modified(
+            entries=(
+                _entry(
+                    entry_id="naive-rfc-date",
+                    published_raw="Fri, 24 Jul 2026 12:00:00",
+                ),
+            )
+        )
+
+        with immediate(connection):
+            persist_fetch(
+                connection,
+                feed_identity_id=feed_id,
+                run_id=run_id,
+                result=result,
+                now=moment(),
+            )
+
+        row = connection.execute(
+            "SELECT published_at, published_issue FROM source_item"
+        ).fetchone()
+        assert row["published_at"] == "2026-07-24T12:00:00.000000Z"
+        assert row["published_issue"] is None
+    finally:
+        if old_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old_tz
+        time.tzset()
 
 
 def test_html_in_title_is_stripped_in_text_and_preserved_in_raw(

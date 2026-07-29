@@ -26,6 +26,7 @@ from notable_person_finder.ingestion.service import (
 )
 from notable_person_finder.obs.logging import configure_logging, log_event
 from notable_person_finder.providers.feeds import FeedparserClient
+from notable_person_finder.providers.pacing import build_pacing_gate
 from notable_person_finder.providers.safety import SystemHostResolver
 from notable_person_finder.providers.transport import build_transport
 from notable_person_finder.reporting.digest import (
@@ -159,8 +160,9 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
             local_date = (
                 now.astimezone(ZoneInfo(loaded.main.timezone)).date().isoformat()
             )
-            # The transport is owned by this command and closes before the
-            # scheduler and database connection leave their scopes.
+            # The transport is owned by this command. It is entered before the
+            # scheduler so reverse context-manager exit drains every in-flight
+            # worker before closing the shared HTTP client.
             written: DigestRecord | None = None
 
             def report_run(report: RunReport) -> ReportArtifact:
@@ -201,15 +203,22 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
             # outer `finally`, on both the success and the exception path.
             # Closing the connection first would let a worker thread still
             # inside an HTTP call outlive the SQLite connection it will need
-            # for `persist`.
+            # for `persist`; closing the transport first would tear down the
+            # shared client while such a call was still in flight.
+            pacing_gate = build_pacing_gate(
+                loaded.main.pacing,
+                loaded.main.concurrency,
+                clock=clock,
+            )
             with (
-                BoundedScheduler(loaded.main.concurrency.http_workers) as scheduler,
                 build_transport(
                     loaded.main.transport,
                     version=__version__,
                     resolver=SystemHostResolver(),
                     clock=clock,
+                    pacing_gate=pacing_gate,
                 ) as transport,
+                BoundedScheduler(loaded.main.concurrency.http_workers) as scheduler,
             ):
                 client = FeedparserClient(transport)
                 handlers = {

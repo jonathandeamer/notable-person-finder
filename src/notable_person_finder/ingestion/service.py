@@ -206,6 +206,8 @@ def _parse_date(raw: str) -> datetime | None:
     """Parse an RFC 822 or ISO-8601 date string into a UTC datetime, or None."""
     try:
         parsed = parsedate_to_datetime(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
         return parsed.astimezone(UTC)
     except (TypeError, ValueError, IndexError):
         pass
@@ -919,7 +921,9 @@ def build_fetch_handler(
         """Application thread. The handler's only access to SQLite."""
         feed_identity_id, feed = resolve(work_item)
         etag, last_modified = latest_validators(
-            connection, feed_identity_id=feed_identity_id
+            connection,
+            feed_identity_id=feed_identity_id,
+            requested_url=feed.url,
         )
         return FeedCall(
             feed=feed,

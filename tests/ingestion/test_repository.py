@@ -418,7 +418,11 @@ def test_latest_validators_ignores_failed_fetches(
         last_modified="should-be-ignored",
     )
 
-    etag, last_modified = latest_validators(connection, feed_identity_id=feed_id)
+    etag, last_modified = latest_validators(
+        connection,
+        feed_identity_id=feed_id,
+        requested_url="https://example.com/feed",
+    )
     assert etag == "good-etag"
     assert last_modified == "good-last-modified"
 
@@ -443,7 +447,11 @@ def test_latest_validators_returns_none_when_only_failed_fetches_exist(
         last_modified="should-be-ignored",
     )
 
-    etag, last_modified = latest_validators(connection, feed_identity_id=feed_id)
+    etag, last_modified = latest_validators(
+        connection,
+        feed_identity_id=feed_id,
+        requested_url="https://example.com/feed",
+    )
     assert etag is None
     assert last_modified is None
 
@@ -458,7 +466,11 @@ def test_latest_validators_returns_none_with_no_fetch_history(
         url="https://example.com/feed",
         now=moment(),
     )
-    etag, last_modified = latest_validators(connection, feed_identity_id=feed_id)
+    etag, last_modified = latest_validators(
+        connection,
+        feed_identity_id=feed_id,
+        requested_url="https://example.com/feed",
+    )
     assert etag is None
     assert last_modified is None
 
@@ -763,7 +775,11 @@ def test_latest_validators_returns_the_newest_of_two_non_failed_fetches(
         last_modified="newer-last-modified",
     )
 
-    assert latest_validators(connection, feed_identity_id=feed_id) == (
+    assert latest_validators(
+        connection,
+        feed_identity_id=feed_id,
+        requested_url="https://example.com/feed",
+    ) == (
         "newer-etag",
         "newer-last-modified",
     )
@@ -801,7 +817,11 @@ def test_a_bare_304_does_not_erase_the_validators_it_was_conditional_on(
         last_modified=None,
     )
 
-    etag, last_modified = latest_validators(connection, feed_identity_id=feed_id)
+    etag, last_modified = latest_validators(
+        connection,
+        feed_identity_id=feed_id,
+        requested_url="https://example.com/feed",
+    )
     assert etag == "E1"
     assert last_modified == "Fri, 24 Jul 2026 06:00:00 GMT"
 
@@ -836,7 +856,11 @@ def test_a_304_carrying_a_fresh_etag_supersedes_the_older_one(
         last_modified=None,
     )
 
-    etag, _ = latest_validators(connection, feed_identity_id=feed_id)
+    etag, _ = latest_validators(
+        connection,
+        feed_identity_id=feed_id,
+        requested_url="https://example.com/feed",
+    )
     assert etag == "E2"
 
 
