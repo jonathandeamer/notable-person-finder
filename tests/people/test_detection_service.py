@@ -47,6 +47,9 @@ from notable_person_finder.people.repository import (
 from notable_person_finder.people.service import (
     DETECT_PEOPLE_PRIORITY,
     INSPECT_MODEL_TASK_TYPE,
+    MALFORMED_DETECTION_DETAIL,
+    _DetectionCall,
+    _execute_detection_for,
     build_detection_handler,
     build_inspection_handler,
     ensure_model_inspection,
@@ -67,6 +70,7 @@ from notable_person_finder.providers.openrouter import (
 )
 from notable_person_finder.runs.clock import FakeClock
 from notable_person_finder.runs.engine import ReportArtifact, RunEngine
+from notable_person_finder.runs.models import WorkItem, WorkState
 from notable_person_finder.runs.retry import RetryPolicy
 from notable_person_finder.runs.scheduler import (
     BoundedScheduler,
@@ -554,6 +558,91 @@ def test_changed_material_fingerprint_schedules_replacement(
     assert by_state["pending"]["fingerprint"] != original_fp
 
 
+def test_reuse_supersedes_stale_active_fingerprint_after_material_flip_flop(
+    connection: sqlite3.Connection,
+) -> None:
+    """Reuse of material A must retire pending work for material B.
+
+    Sequence: complete A → schedule B (pending) → restore A text and re-schedule.
+    Without supersede on the reuse branch, B stays claimable under a fingerprint
+    that no longer matches the current source text prepare would send.
+    """
+    bootstrap = insert_run(connection)
+    title_a = "Élodie N'Diaye wins the Prix Exemple"
+    summary = "The sculptor was honoured in Paris."
+    item = _seed_source_item(
+        connection,
+        run_id=bootstrap,
+        title_text=title_a,
+        summary_text=summary,
+    )
+    config = _main_config()
+    profile = _profile()
+    client = ScriptedLlmClient(
+        inspection=_compatible_inspection(),
+        generate_results=[
+            _generation_result(_zero_mentions_output().model_dump_json())
+        ],
+    )
+    _run_engine(
+        connection,
+        _handlers(connection, client, config, profile),
+        seed=_people_seed(connection, config, profile, source_item_ids=[item]),
+        snapshot_fingerprint="flip-a" + "0" * 58,
+    )
+    observation_a = load_current_triage_observation(connection, source_item_id=item)
+    assert observation_a is not None
+    assert observation_a.disposition == "completed"
+    fingerprint_a = observation_a.task_fingerprint
+
+    connection.execute(
+        "UPDATE source_item SET title_text = ? WHERE id = ?",
+        ("Completely different subject receives an award", item),
+    )
+    connection.commit()
+    schedule_source_items(
+        connection,
+        source_item_ids=[item],
+        run_id=bootstrap,
+        config=config,
+        profile=profile,
+        now=moment(20),
+    )
+    pending_b = [
+        row
+        for row in _detect_work_rows(connection, source_item_id=item)
+        if row["state"] == "pending"
+    ]
+    assert len(pending_b) == 1
+    fingerprint_b = pending_b[0]["fingerprint"]
+    assert fingerprint_b != fingerprint_a
+
+    connection.execute(
+        "UPDATE source_item SET title_text = ? WHERE id = ?",
+        (title_a, item),
+    )
+    connection.commit()
+    schedule_source_items(
+        connection,
+        source_item_ids=[item],
+        run_id=bootstrap,
+        config=config,
+        profile=profile,
+        now=moment(30),
+    )
+
+    rows = _detect_work_rows(connection, source_item_id=item)
+    b_rows = [row for row in rows if row["fingerprint"] == fingerprint_b]
+    assert len(b_rows) == 1
+    assert b_rows[0]["state"] == "superseded"
+    active = [row for row in rows if row["state"] in ("pending", "deferred", "running")]
+    assert active == []
+    current = load_current_triage_observation(connection, source_item_id=item)
+    assert current is not None
+    assert current.id == observation_a.id
+    assert current.task_fingerprint == fingerprint_a
+
+
 def test_schedule_time_empty_input_writes_insufficient_without_work(
     connection: sqlite3.Connection,
 ) -> None:
@@ -819,6 +908,88 @@ def test_valid_multiple_and_uncertain_results(
     assert unc_obs is not None
     assert unc_obs.semantic_outcome == "uncertain"
     assert unc_obs.disposition == "completed"
+
+
+def test_malformed_validation_failure_detail_excludes_raw_output() -> None:
+    """ProviderFailure.detail must be the safe token, not the model body.
+
+    Engine failed attempts store detail_json=None, so attempt-row checks cannot
+    kill a mutation that sets detail=raw_text. Assert the failure channel
+    directly on the worker execute callback.
+    """
+    config = _main_config()
+    profile = _profile()
+    record_fields = {
+        "id": 1,
+        "feed_identity_id": 1,
+        "feed_key": "arts-news",
+        "feed_label": "Arts News",
+        "title_text": "Élodie N'Diaye wins the Prix Exemple",
+        "summary_text": "The sculptor was honoured in Paris.",
+        "canonical_article_id": None,
+        "original_url": "https://example.com/a",
+        "published_at": moment(),
+        "published_issue": None,
+        "url_issue": None,
+        "current_triage_observation_id": None,
+    }
+    detection_input = build_detection_input(
+        record_fields,
+        FeedConfig(
+            key="arts-news",
+            label="Arts News",
+            url="https://example.com/feed",
+        ),
+        profile,
+        config.tasks.detect_people,
+    )
+    rendered = render_detection_request(detection_input)
+    sentinel = '{"raw":"SECRET_MODEL_BODY_SHOULD_NOT_LEAK"}'
+    client = ScriptedLlmClient(
+        generate_results=[_generation_result(sentinel)],
+    )
+    prepared = _DetectionCall(
+        request=StructuredGenerationRequest(
+            model_id=MODEL,
+            system_prompt=rendered.system_prompt,
+            user_content=rendered.user_input_json,
+            json_schema=rendered.schema,
+            schema_name="detect_people",
+            max_completion_tokens=config.tasks.detect_people.max_completion_tokens,
+            temperature=0.0,
+            top_p=1.0,
+            reasoning_effort=None,
+        ),
+        detection_input=detection_input,
+        source_item_id=1,
+        model_inspection_id=1,
+        canonical_supplied_input_json=rendered.canonical_input_json,
+        prompt_hash=rendered.prompt_hash,
+        schema_hash=rendered.schema_hash,
+        schema_version=rendered.schema_version,
+        task_fingerprint="f" * 64,
+        input_truncated=False,
+    )
+    work_item = WorkItem(
+        id=1,
+        task_type=DETECT_PEOPLE_TASK_TYPE,
+        subject_kind="source_item",
+        subject_id=1,
+        fingerprint="f" * 64,
+        required=True,
+        priority=DETECT_PEOPLE_PRIORITY,
+        state=WorkState.RUNNING,
+    )
+    execute = _execute_detection_for(client)
+    with pytest.raises(ProviderFailure) as raised:
+        execute(work_item, 1, prepared)
+    failure = raised.value
+    assert failure.category is FailureCategory.MALFORMED_RESPONSE
+    assert failure.retryable is True
+    assert failure.detail == MALFORMED_DETECTION_DETAIL
+    assert sentinel not in (failure.detail or "")
+    assert "SECRET_MODEL_BODY" not in (failure.detail or "")
+    assert "SECRET_MODEL_BODY" not in str(failure)
 
 
 def test_one_malformed_retry_then_success(connection: sqlite3.Connection) -> None:

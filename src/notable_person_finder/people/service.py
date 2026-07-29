@@ -741,6 +741,18 @@ def _schedule_one_source_item(
         task_fingerprint=fingerprint,
     )
     if existing is not None:
+        # Reuse must still retire other active fingerprints. A material
+        # flip-flop can leave pending/deferred work for a different fingerprint
+        # claimable even when the current material already has a durable
+        # observation; prepare rebuilds from current text but stamps the work
+        # item's (stale) fingerprint.
+        _supersede_stale_detection_work(
+            connection,
+            source_item_id=source_item_id,
+            fingerprint=fingerprint,
+            run_id=run_id,
+            now=now,
+        )
         if record.current_triage_observation_id != existing.id:
             owns_transaction = not connection.in_transaction
             if owns_transaction:
