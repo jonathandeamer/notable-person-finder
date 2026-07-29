@@ -76,7 +76,7 @@ from notable_person_finder.providers.feeds import (
 )
 from notable_person_finder.runs import repository
 from notable_person_finder.runs.clock import Clock, utc_timestamp
-from notable_person_finder.runs.engine import TaskHandler, TaskOutcome
+from notable_person_finder.runs.engine import TaskHandler, TaskOutcome, TaskPreparation
 from notable_person_finder.runs.models import WorkItem, WorkState
 
 FETCH_FEED_TASK_TYPE = "fetch_feed"
@@ -920,7 +920,7 @@ def build_fetch_handler(
             return None
         return urlsplit(feed.url).hostname
 
-    def prepare(work_item: WorkItem) -> object:
+    def prepare(work_item: WorkItem) -> TaskPreparation:
         """Application thread. The handler's only access to SQLite."""
         feed_identity_id, feed = resolve(work_item)
         etag, last_modified = latest_validators(
@@ -928,9 +928,11 @@ def build_fetch_handler(
             feed_identity_id=feed_identity_id,
             requested_url=feed.url,
         )
-        return FeedCall(
-            feed=feed,
-            validators=FeedValidators(etag=etag, last_modified=last_modified),
+        return TaskPreparation(
+            payload=FeedCall(
+                feed=feed,
+                validators=FeedValidators(etag=etag, last_modified=last_modified),
+            )
         )
 
     return TaskHandler(

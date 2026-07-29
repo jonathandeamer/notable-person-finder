@@ -359,10 +359,10 @@ def test_fetch_handler_executes_on_worker_without_sqlite_access(
     client = _NotModifiedClient()
     handler = build_fetch_handler(connection, client=client, feeds=feeds)
     assert handler.prepare is not None
-    prepared = handler.prepare(item)  # positive control: SQLite is valid here.
+    preparation = handler.prepare(item)  # positive control: SQLite is valid here.
 
     with ThreadPoolExecutor(max_workers=1) as workers:
-        outcome = workers.submit(handler.execute, item, 1, prepared).result()
+        outcome = workers.submit(handler.execute, item, 1, preparation.payload).result()
 
     assert outcome.state is WorkState.SUCCEEDED
     assert outcome.reason == "not modified"

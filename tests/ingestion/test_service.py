@@ -55,6 +55,7 @@ from notable_person_finder.runs.engine import (
     RunEngine,
     RunReport,
     TaskHandler,
+    TaskPreparation,
 )
 from notable_person_finder.runs.models import RunState, WorkItem, WorkState
 from notable_person_finder.runs.retry import RetryPolicy
@@ -536,11 +537,15 @@ def test_prepare_returns_empty_validators_for_a_first_fetch(
     )
     assert handler.prepare is not None
 
-    call = handler.prepare(claimed_item(connection, run_id=run_id))
+    preparation = handler.prepare(claimed_item(connection, run_id=run_id))
 
-    assert isinstance(call, FeedCall)
-    assert call.feed.key == "alpha"
-    assert call.validators == FeedValidators(etag=None, last_modified=None)
+    assert isinstance(preparation, TaskPreparation)
+    assert isinstance(preparation.payload, FeedCall)
+    assert preparation.payload.feed.key == "alpha"
+    assert preparation.payload.validators == FeedValidators(
+        etag=None, last_modified=None
+    )
+    assert preparation.reserved_nano_usd is None
 
 
 def test_prepare_returns_the_stored_validators_after_a_successful_fetch(
@@ -576,10 +581,11 @@ def test_prepare_returns_the_stored_validators_after_a_successful_fetch(
     )
     assert handler.prepare is not None
 
-    call = handler.prepare(claimed_item(connection, run_id=run_id))
+    preparation = handler.prepare(claimed_item(connection, run_id=run_id))
 
-    assert isinstance(call, FeedCall)
-    assert call.validators == FeedValidators(
+    assert isinstance(preparation, TaskPreparation)
+    assert isinstance(preparation.payload, FeedCall)
+    assert preparation.payload.validators == FeedValidators(
         etag='"stored-etag"', last_modified="Wed, 22 Jul 2026 06:00:00 GMT"
     )
 
@@ -630,11 +636,15 @@ def test_prepare_does_not_offer_old_validators_after_the_configured_url_moves(
     )
     assert handler.prepare is not None
 
-    call = handler.prepare(claimed_item(connection, run_id=second_run))
+    preparation = handler.prepare(claimed_item(connection, run_id=second_run))
 
-    assert isinstance(call, FeedCall)
-    assert call.feed.url == moved[1]
-    assert call.validators == FeedValidators(etag=None, last_modified=None)
+    assert isinstance(preparation, TaskPreparation)
+    assert isinstance(preparation.payload, FeedCall)
+    assert preparation.payload.feed.url == moved[1]
+    assert preparation.payload.validators == FeedValidators(
+        etag=None, last_modified=None
+    )
+    assert preparation.reserved_nano_usd is None
 
 
 def test_prepare_refuses_an_item_whose_feed_left_configuration(
@@ -684,7 +694,8 @@ def test_prepare_refuses_an_item_that_names_no_feed(
     assert handler.prepare is not None
     # Positive control: the same item with its subject intact resolves, so the
     # refusal below is caused by the missing subject and not by the fixture.
-    assert isinstance(handler.prepare(item), FeedCall)
+    assert isinstance(handler.prepare(item), TaskPreparation)
+    assert isinstance(handler.prepare(item).payload, FeedCall)
 
     with pytest.raises(LookupError):
         handler.prepare(subjectless)

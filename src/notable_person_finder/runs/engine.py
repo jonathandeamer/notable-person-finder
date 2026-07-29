@@ -61,12 +61,21 @@ class TaskOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskPreparation:
+    """The application-thread inputs and reservation for one provider call."""
+
+    payload: object = None
+    reserved_nano_usd: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class TaskHandler:
     """One task type's three phases, split by the thread each may run on.
 
     `prepare` runs on the application thread before submission and is the only
     phase that may read SQLite -- a stored ETag, a validator, an assembled
-    prompt context. Its return value is handed to `execute`.
+    prompt context. Its payload is handed to `execute`; its optional
+    reservation overrides the handler's fixed default for this one attempt.
 
     `execute` runs on a scheduler worker. It performs exactly one external
     call and must never retry, never sleep, and never touch SQLite: the
@@ -93,7 +102,7 @@ class TaskHandler:
     execute: Callable[[WorkItem, int, object], TaskOutcome]
     request_fingerprint: Callable[[WorkItem], str] | None = None
     reserved_nano_usd: int = 0
-    prepare: Callable[[WorkItem], object] | None = None
+    prepare: Callable[[WorkItem], TaskPreparation] | None = None
     persist: Callable[[WorkItem, TaskOutcome], None] | None = None
     persist_failure: Callable[[WorkItem, ProviderFailure], None] | None = None
     destination_host: Callable[[WorkItem], str | None] | None = None
@@ -713,39 +722,47 @@ class RunEngine:
                 failure=last_failure,
             )
             return None
-        if handler.prepare is None:
-            prepared = None
-        else:
-            try:
-                prepared = handler.prepare(work_item)
-            except ProviderFailure:
-                # Not this task's concern -- see the matching comment in
-                # `_domain_writes`.
-                raise
-            except Exception as error:
-                # No call has been made yet, so nothing is ambiguous about
-                # money: settle just this item and let the batch's other
-                # already-prepared siblings still run, rather than abandoning
-                # them along with their committed attempt rows and budget
-                # reservations for calls that will now never happen.
-                log_event(
-                    self._logger,
-                    "run.prepare_failed",
-                    severity=logging.ERROR,
-                    run_id=run_id,
-                    work_item_id=work_item.id,
-                    task_type=handler.task_type,
-                    error_type=type(error).__name__,
-                )
-                self._settle(
-                    run_id,
-                    work_item,
-                    handler,
-                    state=WorkState.FAILED_PERMANENT,
-                    reason=f"prepare raised {type(error).__name__}",
-                    failure=last_failure,
-                )
-                return None
+        try:
+            preparation = (
+                TaskPreparation()
+                if handler.prepare is None
+                else handler.prepare(work_item)
+            )
+            reserved_nano_usd = (
+                handler.reserved_nano_usd
+                if preparation.reserved_nano_usd is None
+                else preparation.reserved_nano_usd
+            )
+            if reserved_nano_usd < 0:
+                raise ValueError("a task reservation must not be negative")
+        except ProviderFailure:
+            # Not this task's concern -- see the matching comment in
+            # `_domain_writes`.
+            raise
+        except Exception as error:
+            # No call has been made yet, so nothing is ambiguous about money:
+            # settle just this item and let the batch's other already-prepared
+            # siblings still run, rather than abandoning them along with their
+            # committed attempt rows and budget reservations for calls that
+            # will now never happen.
+            log_event(
+                self._logger,
+                "run.prepare_failed",
+                severity=logging.ERROR,
+                run_id=run_id,
+                work_item_id=work_item.id,
+                task_type=handler.task_type,
+                error_type=type(error).__name__,
+            )
+            self._settle(
+                run_id,
+                work_item,
+                handler,
+                state=WorkState.FAILED_PERMANENT,
+                reason=f"prepare raised {type(error).__name__}",
+                failure=last_failure,
+            )
+            return None
         fingerprint = (
             handler.request_fingerprint(work_item)
             if handler.request_fingerprint is not None
@@ -771,7 +788,7 @@ class RunEngine:
                 ordinal=ordinal,
                 request_fingerprint=fingerprint,
                 destination_host=destination_host,
-                reserved_nano_usd=handler.reserved_nano_usd,
+                reserved_nano_usd=reserved_nano_usd,
                 now=self._now(),
             )
         except BudgetExhausted:
@@ -793,7 +810,7 @@ class RunEngine:
             handler=handler,
             ordinal=ordinal,
             attempt_id=attempt_id,
-            prepared=prepared,
+            prepared=preparation.payload,
             clock=self._clock,
         )
 

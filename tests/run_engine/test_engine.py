@@ -23,6 +23,7 @@ from notable_person_finder.runs.engine import (
     RunReport,
     TaskHandler,
     TaskOutcome,
+    TaskPreparation,
     derive_run_state,
 )
 from notable_person_finder.runs.models import RunState, WorkItem, WorkState
@@ -396,6 +397,155 @@ def test_refused_budget_reservation_makes_no_external_call(database: Path) -> No
         ).fetchone()["state"]
         == WorkState.DEFERRED
     )
+    assert repository.attempts_for_run(connection, run_id=report.run_id) == ()
+    connection.close()
+
+
+def test_preparation_reservation_reaches_the_attempt_and_run(
+    database: Path,
+) -> None:
+    """A dynamic reservation must be durable before its provider call starts."""
+    connection = connect_database(database)
+    schedule_probe(connection, "1" * 64)
+    seen_payloads: list[object] = []
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        seen_payloads.append(prepared)
+        reader = connect_database(database, readonly=True)
+        try:
+            row = reader.execute(
+                "SELECT budget_reserved_nano_usd FROM run ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            reader.close()
+        assert row["budget_reserved_nano_usd"] == 123
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None, actual_nano_usd=0)
+
+    handler = TaskHandler(
+        task_type="probe",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=execute,
+        reserved_nano_usd=999,
+        prepare=lambda work_item: TaskPreparation(
+            payload="prepared payload", reserved_nano_usd=123
+        ),
+    )
+    report = build_engine(connection, FakeClock(), budget_limit_nano_usd=1_000).execute(
+        {handler.task_type: handler}
+    )
+
+    attempts = repository.attempts_for_run(connection, run_id=report.run_id)
+    assert [attempt["reserved_nano_usd"] for attempt in attempts] == [123]
+    assert seen_payloads == ["prepared payload"]
+    connection.close()
+
+
+def test_preparation_without_a_reservation_uses_the_handler_default(
+    database: Path,
+) -> None:
+    """`None` preserves fixed-cost handler behaviour rather than meaning zero."""
+    connection = connect_database(database)
+    schedule_probe(connection, "2" * 64)
+    handler = TaskHandler(
+        task_type="probe",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=lambda work_item, ordinal, prepared: TaskOutcome(
+            state=WorkState.SUCCEEDED, reason=None, actual_nano_usd=0
+        ),
+        reserved_nano_usd=77,
+        prepare=lambda work_item: TaskPreparation(payload="prepared payload"),
+    )
+    report = build_engine(connection, FakeClock(), budget_limit_nano_usd=100).execute(
+        {handler.task_type: handler}
+    )
+
+    attempts = repository.attempts_for_run(connection, run_id=report.run_id)
+    assert [attempt["reserved_nano_usd"] for attempt in attempts] == [77]
+    connection.close()
+
+
+def test_zero_preparation_reservation_overrides_a_fixed_handler_default(
+    database: Path,
+) -> None:
+    """Zero is an explicit free-call override, not a fallback sentinel."""
+    connection = connect_database(database)
+    schedule_probe(connection, "3" * 64)
+    calls: list[object] = []
+    handler = TaskHandler(
+        task_type="probe",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=lambda work_item, ordinal, prepared: (
+            calls.append(prepared)
+            or TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+        ),
+        reserved_nano_usd=200,
+        prepare=lambda work_item: TaskPreparation(
+            payload="free call", reserved_nano_usd=0
+        ),
+    )
+    report = build_engine(connection, FakeClock(), budget_limit_nano_usd=0).execute(
+        {handler.task_type: handler}
+    )
+
+    assert calls == ["free call"]
+    attempts = repository.attempts_for_run(connection, run_id=report.run_id)
+    assert [attempt["reserved_nano_usd"] for attempt in attempts] == [0]
+    connection.close()
+
+
+def test_negative_preparation_reservation_is_rejected_before_an_attempt(
+    database: Path,
+) -> None:
+    """An invalid preflight amount cannot create paid-call evidence."""
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "4" * 64)
+    calls: list[int] = []
+    handler = TaskHandler(
+        task_type="probe",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=lambda work_item, ordinal, prepared: (
+            calls.append(ordinal) or TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+        ),
+        prepare=lambda work_item: TaskPreparation(reserved_nano_usd=-1),
+    )
+    report = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    assert calls == []
+    assert repository.attempts_for_run(connection, run_id=report.run_id) == ()
+    assert (
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (work_id,)
+        ).fetchone()["state"]
+        == WorkState.FAILED_PERMANENT
+    )
+    connection.close()
+
+
+def test_budget_refusal_for_a_preparation_reservation_makes_no_provider_call(
+    database: Path,
+) -> None:
+    """The dynamic reservation shares the attempt insert's refusal transaction."""
+    connection = connect_database(database)
+    schedule_probe(connection, "5" * 64)
+    calls: list[int] = []
+    handler = TaskHandler(
+        task_type="probe",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=lambda work_item, ordinal, prepared: (
+            calls.append(ordinal) or TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+        ),
+        prepare=lambda work_item: TaskPreparation(reserved_nano_usd=101),
+    )
+    report = build_engine(connection, FakeClock(), budget_limit_nano_usd=100).execute(
+        {handler.task_type: handler}
+    )
+
+    assert calls == []
     assert repository.attempts_for_run(connection, run_id=report.run_id) == ()
     connection.close()
 
@@ -1563,12 +1713,12 @@ def test_prepare_runs_on_the_application_thread_and_feeds_execute(
     prepare_threads: list[int] = []
     seen: list[object] = []
 
-    def prepare(work_item) -> object:
+    def prepare(work_item) -> TaskPreparation:
         prepare_threads.append(threading.get_ident())
         row = connection.execute(
             "SELECT fingerprint FROM work_item WHERE id = ?", (work_item.id,)
         ).fetchone()
-        return row["fingerprint"]
+        return TaskPreparation(payload=row["fingerprint"])
 
     def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
         seen.append(prepared)
@@ -1657,10 +1807,10 @@ def test_a_handler_whose_prepare_raises_settles_that_item_and_lets_siblings_run(
     bad_id = schedule_probe(connection, "p1" * 32)
     good_id = schedule_probe(connection, "p2" * 32)
 
-    def prepare(work_item) -> object:
+    def prepare(work_item) -> TaskPreparation:
         if work_item.id == bad_id:
             raise ValueError("prepare blew up")
-        return None
+        return TaskPreparation()
 
     def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
         return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
@@ -2575,10 +2725,10 @@ def test_persist_failure_does_not_run_when_prepare_raises(database: Path) -> Non
     good = schedule_probe(connection, "g2" * 32)
     failed: list[int] = []
 
-    def prepare(work_item) -> object:
+    def prepare(work_item) -> TaskPreparation:
         if work_item.id == bad:
             raise ValueError("prepare blew up")
-        return None
+        return TaskPreparation()
 
     def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
         raise ProviderFailure(
@@ -2739,12 +2889,12 @@ def test_persist_failure_runs_when_a_rearmed_items_prepare_raises(
     failed: list[str] = []
     prepare_calls = 0
 
-    def prepare(work_item: WorkItem) -> object:
+    def prepare(work_item: WorkItem) -> TaskPreparation:
         nonlocal prepare_calls
         prepare_calls += 1
         if prepare_calls > 1:
             raise ValueError("prepare blew up on re-claim")
-        return None
+        return TaskPreparation()
 
     def execute(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
         raise ProviderFailure(
