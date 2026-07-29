@@ -275,15 +275,14 @@ def _malformed(detail: str) -> ProviderFailure:
 
     `retryable=True` is an explicit override and is not redundant:
     `MALFORMED_RESPONSE` is not in `RETRYABLE_CATEGORIES`, so the default here
-    would be `False` and the engine would settle the work item as
-    `FAILED_PERMANENT`. For a feed that is the wrong disposition -- a
-    malformed payload is nearly always a CDN or origin error page, which is
-    self-healing, so the item should retry within the run and settle
-    `deferred` when exhausted rather than dropping the publisher until its
-    configuration changes. Do not remove this override; the LLM adapter's
-    `malformed_response` (schema-nonconforming generated output) is the case
-    where the non-retryable default is correct, which is exactly why
-    `retryable` is a per-raise field and not a property of the category.
+    would be `False` and the engine would make no fresh attempt. For feeds, a
+    malformed payload is often a self-healing CDN or origin error page, so the
+    override buys one retry. The shared malformed-response ceiling still
+    forecloses a second malformed result as `PERMANENT`: with one configured
+    attempt the first result exhausts to `DEFERRED`; with the shipped default
+    of three attempts, the second result settles `FAILED_PERMANENT` after two
+    calls. A terminal item does not block the next ordinary run from seeding
+    fresh work for the feed.
     """
     return ProviderFailure(
         FailureCategory.MALFORMED_RESPONSE,

@@ -13,13 +13,15 @@ CREATE TABLE feed_identity (
     last_seen_at TEXT NOT NULL CHECK (last_seen_at GLOB '*Z')
 );
 
--- One row per fetch attempt against a feed. Conditional-request state (the
--- ETag and Last-Modified to send next time) is deliberately not stored as
--- mutable columns on `feed_identity`: it is derived by the repository from
--- the latest fetch whose `outcome` is not 'failed' *and* which actually
--- carries a validator, so neither a failed fetch nor a bare 304 (which
--- usually omits Last-Modified and often ETag) can poison the validators an
--- earlier successful fetch already established.
+-- One row per settled feed work item: a successful/not-modified result, a
+-- not-inspected result, or the final failure after retry adjudication. The
+-- `attempt` table remains the one-row-per-external-call record. Conditional-
+-- request state (the ETag and Last-Modified to send next time) is deliberately
+-- not stored as mutable columns on `feed_identity`: it is derived by the
+-- repository from the latest fetch whose `outcome` is not 'failed' *and*
+-- which actually carries a validator, so neither a failed fetch nor a bare
+-- 304 (which usually omits Last-Modified and often ETag) can poison the
+-- validators an earlier successful fetch already established.
 CREATE TABLE feed_fetch (
     id INTEGER PRIMARY KEY,
     feed_identity_id INTEGER NOT NULL REFERENCES feed_identity(id),

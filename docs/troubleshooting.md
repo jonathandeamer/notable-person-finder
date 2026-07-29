@@ -1,99 +1,121 @@
-# Troubleshooting
+# Troubleshooting the Rewrite
 
-## Codex model errors
+Start by locating the active files and checking the latest run:
 
-Error:
-`model is not supported when using Codex with a ChatGPT account`
-
-Fix:
-Use a Codex-supported model or omit `--model` to use the default. The current default in
-`scripts/llm_gate1_runner.py` is `gpt-5.2`.
-
-## Invalid schema error in batch mode
-
-Error:
-`schema must be a JSON Schema of type "object", got "array"`
-
-Fix:
-Batch output must be wrapped in an object with `items`. This is already enforced in
-`scripts/llm_gate1_runner.py`.
-
-## Empty or missing outputs
-
-Possible causes:
-- Codex stream disconnects
-- API key not set (OpenAI API backend)
-
-Fix:
-Retry. The script now retries `codex exec` failures (default 3 attempts).
-
-## MediaWiki candidates returns zero records
-
-Likely cause:
-Input has no usable `subject_name_full`. Ensure your Gate 1 results include a parsed output with
-`subject_name_full`. The script now falls back to `parsed_output` automatically.
-
-## MediaWiki run appears stuck
-
-Likely cause:
-Each record may fetch up to `--search-max-results` page details, and throttling can make a single
-record take minutes.
-
-Checks:
-- Watch progress output (e.g., `progress: 5/30`).
-- Monitor output growth: `wc -l state/wiki_candidates.jsonl`
-- Use the request log: `tail -f state/mw_candidates.log`
-
-Mitigations:
-- Lower `--search-max-results` or `--srlimit`.
-- Reduce `--throttle-ms` carefully if you need faster throughput.
-
-## Too many search results
-
-Fix:
-Use the hard cap `--search-max-results` and/or lower `--srlimit`.
-
-Example:
 ```bash
---search-max-results 10 --srlimit 10
+uv run notable --config /path/to/config/notable.toml paths
+uv run notable --config /path/to/config/notable.toml status
 ```
 
-## HTTP 403 / DNS / bad JSON (MediaWiki)
+The dated digest is the best operator summary. The SQLite database and
+`notable.jsonl` retain lower-level evidence; inspect them read-only and do not
+repair state by hand.
 
-Likely cause:
-Missing or blocked User-Agent, or network/DNS issues.
+## Configuration is invalid
 
-Fix:
-- Set an explicit User-Agent (Wikipedia expects contact info):
-```bash
---user-agent "WikiNotabilityFinder/0.1 (https://en.wikipedia.org/wiki/User:Jonathan_Deamer; bot)"
-```
-- Capture request/response errors with `--log-file`.
+Run `notable config validate`. Configuration is strict: unknown keys, invalid
+bounds, duplicate feed keys, non-public feed URLs, missing referenced TOML
+files, and missing named secret variables all fail before a run is created.
 
-## Gate 2 has-page filter is too aggressive
+The values under `[secrets]` must be uppercase environment-variable names. Put
+the actual values in the process environment or in an adjacent `.env`; a
+nonblank process value takes precedence.
 
-Likely cause:
-Exact title match + biography heuristics flagged a clear page match.
+## Another mutating command holds the lock
 
-Fix:
-Inspect `state/wiki_candidates_skip.jsonl` and adjust similarity thresholds or rules in
-`scripts/det_gate2_has_page.py` if false positives appear.
+Only one mutating command may use a data root at a time. Wait for the active
+`notable run` or `notable db migrate` process to finish. The lock file's text is
+diagnostic only; deleting or editing it does not determine lock ownership.
 
-## Gate 2 has-page filter is too conservative
+## A feed remains `deferred`
 
-Likely cause:
-Strict exact title match and similarity check prevented skipping.
+Read the latest digest's `Required work deferred` reason breakdown. Common feed
+reasons include an exhausted transient provider failure, a paused provider,
+`not inspected: response too large`, and `not inspected: unsupported content`.
+`notable status` currently prints only the aggregate deferred count, not this
+breakdown.
 
-Fix:
-Inspect `state/wiki_candidates_pass.jsonl` and consider adjusting Levenshtein threshold or
-allowing redirects or other signals.
+A terminal deferred item is eligible for a later ordinary run, but not again in
+the run that deferred it. Check that the configured feed is still enabled and
+that a later run has actually occurred. Raising response limits or changing
+retry bounds is an operator policy change: validate why the existing safety
+bound was hit before changing it.
 
-## Gate 4b not marking someone as likely notable?
+## A feed reports `malformed_response`
 
-Gate 4b uses a two-pass approach. `LIKELY_NOTABLE` requires ≥2 distinct domains from the curated Wikipedia-reliable source list (first pass). `POSSIBLY_NOTABLE` is the second-pass outcome: the curated threshold wasn't met, but the LLM judged ≥2 sources in the broader (unfiltered) Brave results to be editorially reliable and about the subject.
+The adapter uses `malformed_response` when bytes are not recognizable RSS or
+Atom, have no trustworthy feed structure, or defeat feedparser. HTML error
+pages, empty bodies, JSON Feed, and a wrongly configured non-feed URL can all
+produce it. The stored detail is sanitized and never includes the response
+body.
 
-If you see `POSSIBLY_NOTABLE` instead of `LIKELY_NOTABLE`:
+Malformed responses get at most one fresh attempt. The exact settlement is
+easy to misread:
 
-- Inspect `state/gate4b_llm_results.jsonl` for `first_pass_domains` and `second_pass_domains` — these show exactly which domains qualified in each pass.
-- Check `state/gate4_reliable_coverage.jsonl` to see how many curated-source results were collected; fewer than 2 distinct domains after deduplication means the curated threshold can't be reached.
-- The digest (`scripts/daily_notability_digest_report.py`) surfaces domain counts at a glance.
+- with `retry.max_attempts = 1`, the first malformed response exhausts and the
+  work is `deferred`;
+- with any value of 2 or more, including the shipped default of 3, a second
+  malformed response is foreclosed as `failed_permanent` after two calls.
+
+That permanent result ends only that work item. It does not blacklist the feed:
+the next ordinary run seeds fresh work for the same enabled feed. Check the
+configured URL in `feed_identity.current_url`, then compare the corresponding
+`feed_fetch` and `attempt` rows to distinguish a persistent non-feed endpoint
+from a temporary publisher error page.
+
+## Evidence for failed and not-inspected fetches
+
+For an ordinary provider failure, the final failed attempt records
+`attempt.outcome='failed'`, its `failure_category`, and sanitized `detail_json`.
+The handler also writes one `feed_fetch.outcome='failed'` row for the final
+settlement, so feed history records that the run tried and failed.
+
+`response_too_large` and `unsupported_content` are the special not-inspected
+path. The handler returns a direct deferred outcome rather than retrying a
+response it deliberately refused to parse. Because the attempt schema permits
+a failure category only on a failed attempt, its attempt row has
+`outcome='succeeded'` and a null `failure_category`; the sanitized category and
+detail are in `attempt.detail_json`. The corresponding `feed_fetch` row is
+`outcome='failed'` with the real category. Consequently:
+
+- the digest's deferral reason and `Feeds failed` count include it; but
+- attempt-based `Operational failures` and `Failures by category` omit it.
+
+If a buggy handler returns a non-settling state after a real call, the engine
+settles the work item `failed_permanent` and discards the untrusted payload.
+That narrower known gap leaves the `attempt` row as the only durable call
+evidence and writes no handler-owned `feed_fetch` row.
+
+## Understanding `url_issue`
+
+An entry is still stored when its link cannot become an article identity:
+
+- `missing` — no link, or an empty link;
+- `not_http` — a scheme other than HTTP or HTTPS;
+- `unsafe` — embedded username or password credentials; and
+- `unusable` — another unusable shape, normally a missing host, or an isolated
+  entry-level normalization fault.
+
+`original_url` retains the publisher's value when one existed.
+`canonical_article_id` remains null. These are recorded source items, not
+silently dropped entries.
+
+## Understanding `published_issue`
+
+The raw publisher value remains in `published_raw` when date parsing cannot
+produce a usable UTC timestamp:
+
+- `missing` — absent, empty, or whitespace-only publication text;
+- `unparseable` — neither an RFC 822 nor ISO-8601 date; and
+- `implausible` — before 1900 or more than one day after the settlement time.
+
+When an issue is present, `published_at` is null. The entry is still ingested.
+The feed adapter also keeps Atom's raw `updated` value distinct from
+`published`; it never silently substitutes one date claim for the other.
+
+## Status shows no successful fetch for a feed
+
+A dash under `latest successful fetch` means that feed identity has no stored
+`modified` or `not_modified` fetch. Failed and not-inspected rows are retained
+as evidence but intentionally do not become conditional-request validators or
+a successful-fetch timestamp.

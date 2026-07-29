@@ -1,122 +1,122 @@
-# Running the Pipeline (Current Stages)
+# Running the Rewrite
 
-All commands execute from the project root (`/home/admin/notable-person-finder` by default).
-
-## 1) RSS Ingest
-
-```bash
-python3 -m ingest.rss_ingest \
-  --feeds config/feeds.md \
-  --state-dir state
-```
-
-## 2) Gate 0 Prefilter (deterministic)
+The supported interface is the installed `notable` command. Run commands from
+a real checkout with dependencies synchronized:
 
 ```bash
-python3 scripts/det_gate0_prefilter.py \
-  --events state/events.jsonl \
-  --pass-output state/prefilter_pass.jsonl \
-  --skip-output state/prefilter_skip.jsonl \
-  --known-pages state/wiki_known_pages.json
+uv sync --frozen
 ```
 
-## 3) Gate 1 (LLM triage)
+## Configure the application
+
+Copy the tracked examples into an operator-owned configuration directory and
+remove or disable feeds you do not want:
 
 ```bash
-python3 scripts/llm_gate1_runner.py \
-  --backend codex-cli \
-  --codex-cwd . \
-  --events state/prefilter_pass.jsonl \
-  --prompt prompts/gate1.md \
-  --output state/gate1_llm_results.jsonl \
-  --sample-size 60
+cp config/notable.example.toml /path/to/config/notable.toml
+cp config/discovery-feeds.example.toml /path/to/config/discovery-feeds.toml
+mkdir -p /path/to/config/discovery_profiles
+cp config/discovery_profiles/art.example.toml \
+  /path/to/config/discovery_profiles/art.toml
 ```
 
-## 4) Gate 1 index update (deterministic)
+Paths in `notable.toml` are resolved relative to that file. Set `[paths].root`
+for a portable data, log, and cache tree; omit it to use the platform's normal
+application directories.
+
+The `[secrets]` values are environment-variable names, not credentials. Export
+the named variables before `config validate` or `run`. An adjacent `.env` may
+fill missing values, but the process environment wins. Secret values are never
+stored in configuration snapshots, the database, digests, or logs.
+
+Use `--config` before the subcommand when the file is not at the platform
+default location:
 
 ```bash
-python3 scripts/det_gate1_index_update.py \
-  --input state/gate1_llm_results.jsonl \
-  --known-pages state/wiki_known_pages.json
+uv run notable --config /path/to/config/notable.toml config validate
+uv run notable --config /path/to/config/notable.toml paths
 ```
 
-## 5) MediaWiki candidate search
+`paths` prints the resolved database, digest, log, backup, cache, and lock
+locations. Migrations normally run automatically, but can be applied alone:
 
 ```bash
-python3 scripts/det_mw_candidates.py \
-  --input state/gate1_llm_results.jsonl \
-  --output state/wiki_candidates.jsonl \
-  --overwrite \
-  --search-max-results 10 \
-  --progress-every 10 \
-  --log-file state/mw_candidates.log
+uv run notable --config /path/to/config/notable.toml db migrate
 ```
 
-## 6) Gate 2 has-page filter
+## Run feed ingestion
 
 ```bash
-python3 scripts/det_gate2_has_page.py \
-  --input state/wiki_candidates.jsonl \
-  --pass-output state/wiki_candidates_pass.jsonl \
-  --skip-output state/wiki_candidates_skip.jsonl \
-  --known-pages state/wiki_known_pages.json \
-  --overwrite
+uv run notable --config /path/to/config/notable.toml run
 ```
 
-## 7) Gate 3 (LLM page match) + index update
+For every enabled feed, a run:
+
+- preserves identity by configured feed `key`, even if its label or URL moves;
+- sends stored ETag and Last-Modified validators when available;
+- parses response bytes as RSS or Atom without letting feedparser fetch URLs;
+- retains parser warnings alongside recovered entries;
+- canonicalizes usable article URLs, strips only the approved tracking parts,
+  records observed URL aliases, and deduplicates source items insert-once;
+- stores entries with missing or unusable URLs and bad dates with typed issues;
+  and
+- isolates each feed's settlement, so one failed feed does not roll back a
+  sibling feed's items.
+
+The ingestion milestone does not detect or resolve people. Its source items
+carry no triage observation; that begins in milestone 3b. The application does
+not draft, edit, or publish Wikipedia content.
+
+The command writes an immutable dated Markdown digest and, when enabled,
+refreshes `latest.md`; it prints the same Markdown to standard output. Exit 0
+means `complete`, 2 means `partial`, 1 means `failed`, and 130 means
+`interrupted`.
+
+Use the status command for the latest stored run and corpus totals:
 
 ```bash
-python3 scripts/llm_gate3_runner.py \
-  --backend codex-cli \
-  --codex-cwd . \
-  --input state/wiki_candidates_pass.jsonl \
-  --prompt prompts/gate3.md \
-  --output state/gate3_llm_results.jsonl
-
-python3 scripts/det_gate3_index_update.py \
-  --input state/gate3_llm_results.jsonl \
-  --known-pages state/wiki_known_pages.json
+uv run notable --config /path/to/config/notable.toml status
 ```
 
-## 8) Brave coverage + Gate 4 reliable filter
+## Reading the ingestion digest fields
+
+The `### Ingestion` section is a per-run summary:
+
+- `Feeds fetched` counts feeds whose final stored settlement for this run was
+  a modified feed.
+- `Feeds not modified` counts final 304 settlements.
+- `Feeds failed` counts final failed or not-inspected settlements.
+- `Source items created` is the number first inserted by this run, after
+  insert-once deduplication across feeds and earlier runs.
+- `Articles created` is the number of canonical article identities first
+  associated with source items created by this run.
+
+The feed counts are deliberately final-per-feed, not raw HTTP calls or
+`feed_fetch` rows. A feed can have duplicate work in one run after a URL change;
+only its highest-id settlement controls these three digest counters. Attempt
+history and all fetch rows remain in SQLite for diagnosis.
+
+`Required work deferred` and its indented reason rows describe outstanding
+required work. Budget fields report the configured cap and the run's reserved
+and spent amounts. The shortlist remains a placeholder until lead assessment.
+
+## Verification and the live smoke
+
+The default completion suite is offline. Pytest's configured `addopts` excludes
+the `live` marker automatically:
 
 ```bash
-python3 scripts/det_brave_coverage.py \
-  --input state/gate3_llm_results.jsonl \
-  --overwrite \
-  --cache-dir state/brave_cache \
-  --api-key "$BRAVE_API_KEY"
-
-python3 scripts/det_gate4_reliable_filter.py \
-  --input state/brave_coverage.jsonl \
-  --output state/gate4_reliable_coverage.jsonl \
-  --overwrite
+uv run pytest tests/foundation tests/run_engine tests/ingestion
 ```
 
-## 9) Gate 4b (LLM coverage verifier counting distinct domains)
+Run the real-network feed smoke explicitly:
 
 ```bash
-python3 scripts/llm_gate4b_runner.py \
-  --backend codex-cli \
-  --codex-cwd . \
-  --prompt prompts/gate4b.md \
-  --unlisted-prompt prompts/gate4b_unlisted.md \
-  --brave-input state/gate4_reliable_coverage.jsonl \
-  --output state/gate4b_llm_results.jsonl \
-  --fresh-output
+uv run pytest tests/ingestion -m live -v
 ```
 
-## 10) Digest + report for OpenClaw
-
-```bash
-python3 scripts/det_openclaw_daily_digest.py \
-  --window-hours 24 \
-  --output output/openclaw/daily_notability_digest.json
-
-python3 scripts/daily_notability_digest_report.py
-```
-
-### Notes
-- Use `run_pipeline.py` (default `--state-dir state --output output`) to chain all stages end-to-end; it writes `state/runs/*.json` and `output/runs/*_summary.json`.
-- Gate 4b now requires two distinct reliable Brave domains (first or second pass) to mark someone `LIKELY_NOTABLE`; otherwise it falls back to `POSSIBLY_NOTABLE` or `NOT_NOTABLE`.
-- The digest report script refreshes `output/openclaw/daily_notability_digest.json` before summarizing.
+The live command uses selected feeds from
+`config/discovery-feeds.example.toml` to exercise conditional requests,
+redirects, the response-size bound, and URL identity. It skips only when the
+environment cannot establish the required connection; TLS, protocol,
+read-timeout, parsing, and provider-contract failures remain failures.

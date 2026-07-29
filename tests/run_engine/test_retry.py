@@ -135,6 +135,7 @@ def test_retry_after_is_capped_by_the_operator_configured_maximum() -> None:
         jitter_ratio=0.0,
     )
     clock = FakeClock()
+    records: list[AttemptRecord] = []
 
     def action(ordinal: int) -> str:
         raise failure(
@@ -145,10 +146,11 @@ def test_retry_after_is_capped_by_the_operator_configured_maximum() -> None:
 
     with pytest.raises(RetryExhausted):
         coordinator(config, clock).call(
-            "brave", "search_web", action, on_attempt=lambda _: None
+            "brave", "search_web", action, on_attempt=records.append
         )
     assert clock.slept == [5.0, 5.0]
     assert max(clock.slept) <= config.max_backoff_seconds
+    assert [record.retry_after_ms for record in records] == [86_400_000] * 3
 
 
 @pytest.mark.parametrize(
@@ -258,6 +260,34 @@ def test_a_success_resets_the_consecutive_exhaustion_counter() -> None:
     assert not coordination.is_paused("brave")
 
 
+def test_a_permanent_failure_resets_the_counter_and_reraises_original() -> None:
+    config = RetryConfig(
+        max_attempts=1,
+        jitter_ratio=0.0,
+        provider_pause_after_consecutive_exhaustions=2,
+    )
+    coordination = coordinator(config)
+
+    def transient(ordinal: int) -> str:
+        raise failure(FailureCategory.TIMEOUT)
+
+    with pytest.raises(RetryExhausted):
+        coordination.call("brave", "search_web", transient, on_attempt=lambda _: None)
+
+    permanent = failure(FailureCategory.AUTHENTICATION)
+
+    def denied(ordinal: int) -> str:
+        raise permanent
+
+    with pytest.raises(ProviderFailure) as raised:
+        coordination.call("brave", "search_web", denied, on_attempt=lambda _: None)
+    assert raised.value is permanent
+
+    with pytest.raises(RetryExhausted):
+        coordination.call("brave", "search_web", transient, on_attempt=lambda _: None)
+    assert not coordination.is_paused("brave")
+
+
 def test_pausing_one_provider_does_not_pause_another() -> None:
     config = RetryConfig(
         max_attempts=1, jitter_ratio=0.0, provider_pause_after_consecutive_exhaustions=1
@@ -300,6 +330,7 @@ def test_jitter_stays_within_the_configured_ratio() -> None:
         coordination.call("brave", "search_web", action, on_attempt=lambda _: None)
     assert len(clock.slept) == 3
     assert all(7.5 <= delay <= 12.5 for delay in clock.slept)
+    assert clock.slept != [10.0, 10.0, 10.0]
 
 
 def test_attempt_records_carry_status_and_latency() -> None:
