@@ -228,6 +228,34 @@ def _observation(
     return cursor.lastrowid
 
 
+def _replace_observation(
+    connection: sqlite3.Connection,
+    *,
+    observation_id: int,
+    source_item_id: int,
+    task_fingerprint: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT OR REPLACE INTO triage_observation (
+            id, source_item_id, run_id, attempt_id, model_inspection_id,
+            disposition, semantic_outcome, canonical_supplied_input_json,
+            validated_output_json, prompt_hash, schema_hash, schema_version,
+            task_fingerprint, input_truncated, overflow, rationale,
+            failure_category, observed_at
+        )
+        SELECT id, ?, run_id, attempt_id, model_inspection_id,
+               disposition, semantic_outcome, canonical_supplied_input_json,
+               validated_output_json, prompt_hash, schema_hash, schema_version,
+               ?, input_truncated, overflow, rationale, failure_category,
+               observed_at
+        FROM triage_observation
+        WHERE id = ?
+        """,
+        (source_item_id, task_fingerprint, observation_id),
+    )
+
+
 def _valid_graph(connection: sqlite3.Connection) -> tuple[int, int, int, int]:
     run_id = insert_run(connection)
     attempt_id = _attempt(connection, run_id=run_id)
@@ -916,6 +944,62 @@ def test_observation_rowid_replacement_cannot_break_current_source_ownership(
         ).fetchone()
         is None
     )
+
+
+def test_observation_replace_cannot_change_current_source_ownership(
+    connection: sqlite3.Connection,
+) -> None:
+    run_id, _, source_item_id, observation_id = _valid_graph(connection)
+    second_source_id = _additional_source_item(
+        connection, run_id=run_id, source_entry_id="entry-b"
+    )
+    connection.execute(
+        "UPDATE source_item SET current_triage_observation_id = ? WHERE id = ?",
+        (observation_id, source_item_id),
+    )
+    connection.commit()
+    connection.execute("PRAGMA defer_foreign_keys = ON")
+    assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    assert connection.execute("PRAGMA defer_foreign_keys").fetchone()[0] == 1
+
+    with pytest.raises(sqlite3.IntegrityError), connection:
+        _replace_observation(
+            connection,
+            observation_id=observation_id,
+            source_item_id=second_source_id,
+            task_fingerprint=_OTHER_HASH,
+        )
+
+    row = connection.execute(
+        "SELECT id, source_item_id FROM triage_observation WHERE id = ?",
+        (observation_id,),
+    ).fetchone()
+    assert tuple(row) == (observation_id, source_item_id)
+
+
+def test_observation_replace_preserves_a_matching_current_owner(
+    connection: sqlite3.Connection,
+) -> None:
+    _, _, source_item_id, observation_id = _valid_graph(connection)
+    connection.execute(
+        "UPDATE source_item SET current_triage_observation_id = ? WHERE id = ?",
+        (observation_id, source_item_id),
+    )
+
+    with connection:
+        _replace_observation(
+            connection,
+            observation_id=observation_id,
+            source_item_id=source_item_id,
+            task_fingerprint=_HASH,
+        )
+
+    row = connection.execute(
+        "SELECT id, source_item_id FROM triage_observation WHERE id = ?",
+        (observation_id,),
+    ).fetchone()
+    assert tuple(row) == (observation_id, source_item_id)
+    assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_current_observation_can_move_by_clear_reassign_then_adopt(

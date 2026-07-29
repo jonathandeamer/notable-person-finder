@@ -171,6 +171,18 @@ BEGIN
     SELECT RAISE(ABORT, 'current triage observation belongs to another source item');
 END;
 
+CREATE TRIGGER triage_observation_preserves_current_owner_on_insert
+BEFORE INSERT ON triage_observation
+WHEN EXISTS (
+    SELECT 1
+    FROM source_item
+    WHERE current_triage_observation_id = NEW.id
+      AND id != NEW.source_item_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'current triage observation ownership is immutable');
+END;
+
 CREATE TRIGGER triage_observation_preserves_current_owner
 BEFORE UPDATE ON triage_observation
 WHEN EXISTS (
