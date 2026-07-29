@@ -38,8 +38,10 @@ Milestone 3b1 must:
   and grounded signals;
 - backfill all existing untriaged source items and schedule newly ingested
   source items idempotently;
-- preserve attempt, budget, retry, concurrency, redaction, and crash-boundary
-  invariants from the run engine; and
+- preserve attempt, budget, retry, redaction, and crash-boundary invariants
+  from the run engine, and extend the engine only where the pinned interfaces
+  below require it (prepare-returned reservation, dual worker pools, and
+  schedule-time no-call terminal dispositions); and
 - expose truthful triage progress, backlog, failure, and cost information to
   the operator.
 
@@ -90,6 +92,30 @@ the run-scoped adapter lifecycle and wiring only. Reporting renders durable
 counts and safe failure summaries; it does not infer semantic state from logs
 or model text.
 
+Milestone 3b1 requires three small, named engine/CLI extensions rather than
+bypassing those owners:
+
+- **Prepare-returned reservation.** Today's `TaskHandler.reserved_nano_usd` is
+  a fixed integer. Generation reservation must use live inspection pricing
+  times configured token bounds, so `prepare` returns (or carries on its
+  prepared value) the integer nano-USD to reserve for that attempt. The engine
+  reads that amount at `start_attempt` instead of the frozen handler field.
+  Handlers that still use a fixed ceiling may keep the field as a default when
+  prepare does not supply an override.
+- **Dual worker pools.** Configuration already separates `http_workers` and
+  `llm_workers`. The CLI today builds one `BoundedScheduler(http_workers)`.
+  3b1 introduces two pools: ordinary HTTP work (feeds, and later MediaWiki or
+  Brave) submits to the HTTP pool; OpenRouter inspection and generation submit
+  to the LLM pool. Claim batch sizes must not exceed the target pool. The same
+  pool-aware claim routing evaluates each handler's application-thread
+  readiness predicate before including its task type in `claim_batch`;
+  `detect_people` is ready only after this run has persisted its exact model
+  inspection. This prevents a claimed item from needing a no-call dependency
+  settlement and keeps readiness out of worker threads.
+- **Schedule-time no-call terminals.** Empty title and summary never enter the
+  generation path as work that must invent a zero-byte attempt. See
+  Scheduling and Data Flow.
+
 ## Detection Contract
 
 The production task is exactly `detect_people`. Its input contains one source
@@ -138,8 +164,9 @@ nullable semantic outcome:
 - `completed` has a validated model outcome, including a valid zero-person
   result;
 - `insufficient_input` is a deterministic terminal observation for an item
-  whose normalized title and summary are both empty; it has no model attempt
-  and is not represented as `do_not_research`;
+  whose normalized title and summary are both empty; it is written at schedule
+  time (backfill and post-ingestion), creates no work item, makes no model
+  attempt, reserves no budget, and is not represented as `do_not_research`;
 - `failed` records a typed permanent failure when no semantic observation can
   be stored.
 
@@ -162,36 +189,70 @@ rewriting history.
 
 ## Scheduling and Data Flow
 
-At run start, code idempotently schedules required `detect_people` work for
-every source item without a reusable triage observation. This includes source
-items ingested before milestone 3b1 was installed. Successful ingestion also
-schedules detection for newly committed source items. The ordinary bounded
-queue, configured priorities, and budget determine how quickly a backlog
-clears; records are never silently omitted to make a run appear complete.
+At run start, code walks every source item without a reusable triage
+observation (including rows ingested before milestone 3b1 was installed). For
+each such item:
 
-Each item follows this sequence:
+- if both normalized title and summary are empty, write a durable
+  `insufficient_input` triage observation and **do not** create a
+  `detect_people` work item;
+- otherwise schedule required `detect_people` work idempotently.
 
-1. On the application thread, prepare bounded source context and determine the
-   configured model, prompt, schema, parameters, routing policy, and material
-   fingerprint.
-2. If both title and summary are empty, persist `insufficient_input` without a
-   provider attempt or budget reservation.
-3. Otherwise require one fresh, successful model inspection shared by every
-   dependent task using that model in the run.
-4. Claim the generation attempt and reserve its configured worst-case cost in
-   a brief transaction.
-5. On a worker thread, execute exactly one SDK generation without SQLite,
-   sleeps, retries, or domain persistence.
-6. On the application thread, persist raw and validated provenance, reconcile
-   actual cost, validate the domain contract, and atomically write the triage
-   observation and its unresolved mentions.
-7. Settle the work item. A successful 3b1 observation creates no identity work
-   until milestone 3b2 exists.
+Successful ingestion applies the same branch when committing new source items.
+The ordinary bounded queue, configured priorities, and budget determine how
+quickly a generation backlog clears; records are never silently omitted to
+make a run appear complete. Because empty-input terminals never become work,
+they do not need a fake attempt row or a new "settle without attempt" engine
+path.
 
-The preflight itself is attributable required work with persisted attempts. A
-fresh successful inspection may be shared within one run by every generation
-using the exact configured model and routing requirements. It is not reused as
-fresh capability evidence in a later run.
+Each generation work item follows the existing engine phases (claim work →
+prepare → start_attempt/reserve → execute → finish_attempt →
+complete_work/persist):
+
+1. **Prepare (application thread, may read SQLite).** Build bounded source
+   context and determine the configured model, prompt, schema, parameters,
+   routing policy, and material fingerprint. Read the run-scoped successful
+   model-inspection observation for that exact model and routing requirements
+   (claim eligibility already requires it; prepare fails permanent if it is
+   unexpectedly absent so a generation attempt is never started without
+   preflight). When a hard OpenRouter budget is enabled, compute the
+   worst-case integer nano-USD reservation from the inspection's usable unit
+   prices and the configured input/output token bounds, and return that amount
+   on the prepared value. Without a hard budget, reserve `0`.
+2. **Start attempt (application thread, brief transaction).** The engine
+   inserts the attempt and reserves the prepare-returned nano-USD amount (not
+   a frozen handler constant). Budget refusal defers without a provider call,
+   as today.
+3. **Execute (LLM worker thread).** Perform exactly one SDK generation
+   without SQLite, sleeps, client retries, or domain persistence. On the same
+   worker, against the prepared context only, validate strict structured
+   output and the full domain contract (passage references, grounded names,
+   bounds, outcome consistency, signal references). Schema or domain
+   validation failure is raised as
+   `ProviderFailure(category=MALFORMED_RESPONSE, retryable=True, …)` so the
+   existing central `malformed_retries` ceiling can grant at most one fresh
+   attempt. The default category table does not treat `MALFORMED_RESPONSE` as
+   retryable unless the failure sets `retryable=True`; LLM validation must
+   set that flag. Valid semantic `uncertain` is success and does not raise.
+4. **Persist and settle (application thread).** Reconcile actual cost against
+   the reservation, record raw and validated provenance, and atomically write
+   the triage observation and its unresolved mentions. `persist` receives only
+   outcomes that already passed domain validation in `execute`; it must not
+   re-open a second paid attempt. A successful 3b1 observation creates no
+   identity work until milestone 3b2 exists.
+
+The preflight itself is attributable required work with persisted attempts,
+scheduled at higher priority than dependent generation for each configured
+model needed in the run. A fresh successful inspection may be shared within
+one run by every generation using the exact configured model and routing
+requirements; claim eligibility for those generations requires that
+observation, so waiting dependents simply remain pending rather than minting
+no-call attempt rows. Transient inspect exhaustion leaves dependents pending
+or deferred with the model; permanent inspect failure (auth, unsupported
+strict output, incompatible routing) settles dependents permanently without a
+generation attempt through the inspection handler's application-thread
+settlement callback. Inspection is not reused as fresh capability evidence in
+a later run.
 
 No SQLite transaction spans model work, and no worker thread accesses SQLite.
 The documented at-least-once remote-success/local-crash boundary remains in
@@ -204,17 +265,40 @@ the exact configured model currently supports strict structured output under
 the configured provider-routing and privacy requirements. The observation
 records current capability metadata and available pricing.
 
-With a hard OpenRouter budget, fresh usable pricing is required to calculate a
-worst-case integer nano-USD reservation from configured input/output bounds.
-Without a hard budget, absent price metadata alone does not block a compatible
-model call. Reservations occur before submission and reconcile against the
-provider's reported actual cost and usage afterward. Missing actual cost stays
-explicitly unknown rather than becoming zero.
+With a hard OpenRouter budget, fresh usable pricing is required so prepare can
+calculate a worst-case integer nano-USD reservation from configured
+input/output token bounds and the inspection's unit prices. That amount is
+returned from prepare and consumed by the engine at `start_attempt`. Without a
+hard budget, absent price metadata alone does not block a compatible model
+call, and prepare returns a zero reservation. Reservations always occur before
+submission and reconcile against the provider's reported actual cost and usage
+afterward. Missing actual cost stays explicitly unknown rather than becoming
+zero.
 
-The first implementation supports only the cost dimensions exposed by the
-approved OpenRouter contract and required for the configured model. A model
-whose pricing cannot be bounded under an enabled hard cap fails local or
-preflight validation rather than bypassing the budget.
+The first implementation supports only the cost dimensions required for the
+configured model under the approved OpenRouter contract: prompt and completion
+unit prices (as exposed by the locked SDK/provider metadata). A model whose
+pricing cannot be bounded under an enabled hard cap fails local or preflight
+validation rather than bypassing the budget; prepare must not invent prices.
+
+## Concurrency
+
+Configuration already defines independent `concurrency.http_workers` (default
+4) and `concurrency.llm_workers` (default 2). Milestone 3b1 must honour both
+when feed ingestion and model work share a run.
+
+The CLI constructs two `BoundedScheduler` instances (or an equivalent pair of
+worker pools): one sized to `http_workers` for ordinary HTTP providers, and one
+sized to `llm_workers` for OpenRouter inspection and generation. Handlers
+declare which pool they use (by provider class or an explicit pool key). The
+engine claim loop never submits more work to a pool than that pool's
+`max_workers`, and never runs OpenRouter generation on the HTTP pool or feed
+fetches on the LLM pool.
+
+A single shared pool sized to either figure is not acceptable: sizing to
+`http_workers` can oversubscribe long-running LLM generations; sizing to
+`llm_workers` underuses HTTP. Per-origin pacing and the existing mutation lock
+are unchanged.
 
 ## Failure Semantics
 
@@ -222,21 +306,28 @@ Provider and SDK failures translate into the established safe failure
 categories. The central retry policy alone starts another visible attempt.
 Generation and inspection client retries are disabled.
 
-- transient preflight exhaustion defers only work depending on that model;
+- transient preflight exhaustion leaves dependent generations unclaimed or
+  deferred with that model and starts no generation attempts;
 - authentication, invalid configuration, unsupported strict output, or
-  incompatible routing fails dependent work permanently for that material
-  input;
+  incompatible routing fails dependent work permanently without a generation
+  attempt for that material input;
 - transient generation failures follow central retry and defer when exhausted;
-- invalid structured output or invalid domain references permit at most one
-  fresh attempt using the same configured model;
+- invalid structured output or invalid domain references are raised from
+  **execute** as `ProviderFailure(MALFORMED_RESPONSE, retryable=True)` and
+  permit at most one fresh attempt using the same configured model, subject to
+  the existing `malformed_retries` ceiling and `max_attempts` outer bound;
 - a second invalid result fails permanently and retains both attempts;
-- valid `uncertain` output succeeds immediately; and
+- valid `uncertain` output succeeds immediately and does not count as
+  malformed;
+- validation must not run for the first time in `persist`: a successful
+  attempt that only fails domain checks after the call would be unable to
+  re-arm another generation through the central coordinator; and
 - budget exhaustion defers required generation without making a provider call.
 
 One source item's failure commits independently and cannot roll back another's
 triage. A provider failure, missing result, budget deferral, invalid output, or
 truncation never becomes `do_not_research` or another confident semantic
-negative.
+negative. Schedule-time `insufficient_input` is not a failure path.
 
 ## Configuration and Secrets
 
@@ -264,9 +355,10 @@ lazy run work immediately before the first generation that needs the model.
 ## Operator Surface
 
 `notable run` constructs one run-scoped OpenRouter client only when model work
-is registered, closes it on every normal and exceptional path after scheduler
-workers drain, registers inspection and detection handlers, and schedules the
-untriaged backlog.
+is registered, closes it on every normal and exceptional path after both
+scheduler pools drain, registers inspection and detection handlers (LLM pool)
+alongside feed handlers (HTTP pool), and applies the schedule-time triage
+branch for the untriaged backlog.
 
 The digest operational summary gains:
 
@@ -300,7 +392,12 @@ Default verification is offline and includes:
 - persistence constraints, replacement observations, and namesake tests;
 - backfill, new-ingestion scheduling, active-work deduplication, and restart
   continuation tests;
-- budget reservation, unknown-cost, reconciliation, and exhaustion tests;
+- budget reservation (including prepare-returned dynamic amounts),
+  unknown-cost, reconciliation, and exhaustion tests;
+- dual-pool concurrency tests proving HTTP and LLM limits are enforced
+  independently;
+- schedule-time `insufficient_input` tests proving no work item and no
+  attempt row;
 - worker-thread SQLite, transaction-boundary, scheduler-lifecycle, and
   at-least-once seam tests;
 - CLI, digest, status, partial-run, interruption, and failure-isolation tests;
@@ -337,7 +434,8 @@ Milestone 3b1 is complete when:
 
 - every existing and newly ingested untriaged usable source item becomes
   idempotently eligible for detection;
-- an empty title and summary produce `insufficient_input` without a paid call;
+- an empty title and summary produce `insufficient_input` at schedule time
+  with no work item, no attempt, and no paid call;
 - one item can yield zero, one, or several independently traceable mentions;
 - research-worthy mononyms and professional names can be retained without
   invented expansions;
@@ -345,13 +443,16 @@ Milestone 3b1 is complete when:
 - unresolved mentions contain no durable person identity and names are not
   unique across mentions;
 - every paid generation follows a fresh compatible preflight and a successful
-  reservation when a hard budget is enabled;
+  prepare-returned reservation when a hard budget is enabled;
 - one model request contains exactly one source item and only supplied
   evidence;
-- unseen references and invalid structured output cannot change domain state;
+- unseen references and invalid structured output fail in execute before
+  domain writes, permit at most one central malformed retry, and cannot change
+  domain state;
 - valid uncertainty never retries, while technical failure never becomes a
   semantic outcome;
 - no client retry bypasses persisted central attempt accounting;
+- HTTP and LLM concurrency limits are enforced on separate pools;
 - no transaction spans model work and no worker touches SQLite;
 - one item's failure cannot prevent unrelated triage or a truthful digest;
 - secrets remain absent from snapshots, diagnostics, logs, digests, database
