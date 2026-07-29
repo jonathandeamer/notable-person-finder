@@ -775,10 +775,11 @@ def settle_active_detect_people_after_permanent_preflight(
     """Fail pending/deferred ``detect_people`` work after permanent preflight loss.
 
     Owns a brief ``BEGIN IMMEDIATE`` transaction. For each active detection
-    work item whose subject is a source item, writes a failed triage
-    observation (attributing the preflight attempt, never a generation
-    attempt), points the source item at it, and settles the work item
-    ``failed_permanent``. Does not insert ``generate_structured`` attempts.
+    work item whose subject is a source item, ensures a failed triage
+    observation exists for that material fingerprint (reusing any existing
+    row so a unique-key collision cannot abort the batch), points the source
+    item at it when needed, and settles the work item ``failed_permanent``.
+    Does not insert ``generate_structured`` attempts.
     """
     connection.execute("BEGIN IMMEDIATE")
     try:
@@ -799,22 +800,46 @@ def settle_active_detect_people_after_permanent_preflight(
             work_item_id = int(row["id"])
             source_item_id = int(row["subject_id"])
             task_fingerprint = row["fingerprint"]
-            insert_failed_observation(
+            existing = load_triage_observation_by_fingerprint(
                 connection,
                 source_item_id=source_item_id,
-                run_id=run_id,
-                attempt_id=attempt_id,
-                model_inspection_id=None,
-                failure_category=failure_category,
-                canonical_supplied_input_json="{}",
-                prompt_hash=prompt_hash,
-                schema_hash=schema_hash,
-                schema_version=schema_version,
                 task_fingerprint=task_fingerprint,
-                input_truncated=False,
-                observed_at=now,
-                rationale=rationale,
             )
+            if existing is None:
+                insert_failed_observation(
+                    connection,
+                    source_item_id=source_item_id,
+                    run_id=run_id,
+                    attempt_id=attempt_id,
+                    model_inspection_id=None,
+                    failure_category=failure_category,
+                    canonical_supplied_input_json="{}",
+                    prompt_hash=prompt_hash,
+                    schema_hash=schema_hash,
+                    schema_version=schema_version,
+                    task_fingerprint=task_fingerprint,
+                    input_truncated=False,
+                    observed_at=now,
+                    rationale=rationale,
+                )
+            else:
+                current = connection.execute(
+                    """
+                    SELECT current_triage_observation_id
+                      FROM source_item
+                     WHERE id = ?
+                    """,
+                    (source_item_id,),
+                ).fetchone()
+                if (
+                    current is None
+                    or current["current_triage_observation_id"] != existing.id
+                ):
+                    _set_current_triage_observation(
+                        connection,
+                        source_item_id=source_item_id,
+                        observation_id=existing.id,
+                    )
             changed = connection.execute(
                 """
                 UPDATE work_item

@@ -427,7 +427,9 @@ def test_insert_completed_observation_persists_mentions_facts_signals_and_namesa
     run_id = insert_run(connection)
     _, item_id = _seed_feed_and_item(connection, run_id=run_id)
     attempt_id = _attempt(connection, run_id=run_id)
-    output = _sample_output(names=("Alex Smith", "Alex Smith"))
+    # Include a leading honorific so the insert path must derive search_name
+    # mechanically rather than copying exact_name.
+    output = _sample_output(names=("Dr. Jane Doe", "Dr. Jane Doe"))
     with immediate(connection):
         inspection_id = insert_model_inspection(
             connection,
@@ -473,11 +475,12 @@ def test_insert_completed_observation_persists_mentions_facts_signals_and_namesa
 
     mentions = load_person_mentions(connection, triage_observation_id=observation_id)
     assert len(mentions) == 2
-    assert mentions[0].exact_name == "Alex Smith"
-    assert mentions[1].exact_name == "Alex Smith"
+    assert mentions[0].exact_name == "Dr. Jane Doe"
+    assert mentions[1].exact_name == "Dr. Jane Doe"
     assert mentions[0].ordinal == 1
     assert mentions[1].ordinal == 2
-    assert mentions[0].search_name == "Alex Smith"
+    assert mentions[0].search_name == "Jane Doe"
+    assert mentions[1].search_name == "Jane Doe"
     assert len(mentions[0].identity_facts) == 1
     assert mentions[0].identity_facts[0].kind == "name"
     assert len(mentions[0].signals) == 2
@@ -925,3 +928,83 @@ def test_permanent_preflight_settles_active_detect_people_without_generation_att
     assert generation_attempts == 0
 
     assert list_untriaged_source_item_ids(connection) == (other_task_subject,)
+
+
+def test_permanent_preflight_reuses_existing_observation_for_material_fingerprint(
+    connection: sqlite3.Connection,
+) -> None:
+    """A prior failed observation for the same material key must not abort settle.
+
+    Unique (source_item_id, task_fingerprint) means a blind INSERT would raise
+    IntegrityError and roll back the whole batch. Reuse the existing row, keep
+    a single observation, and still settle the pending work item.
+    """
+    run_id = insert_run(connection)
+    _, item_id = _seed_feed_and_item(connection, run_id=run_id)
+    prior_attempt = _attempt(connection, run_id=run_id, operation="inspect_model")
+    with immediate(connection):
+        existing_id = insert_failed_observation(
+            connection,
+            source_item_id=item_id,
+            run_id=run_id,
+            attempt_id=prior_attempt,
+            model_inspection_id=None,
+            failure_category="authentication",
+            canonical_supplied_input_json="{}",
+            prompt_hash=_PROMPT_HASH,
+            schema_hash=_SCHEMA_HASH,
+            schema_version=1,
+            task_fingerprint=_HASH,
+            input_truncated=False,
+            observed_at=moment(),
+            rationale="Prior permanent preflight failure.",
+        )
+    # Clear the pointer so settle must re-point if it reuses the row.
+    connection.execute(
+        "UPDATE source_item SET current_triage_observation_id = NULL WHERE id = ?",
+        (item_id,),
+    )
+    connection.commit()
+    _work_item(
+        connection,
+        run_id=run_id,
+        subject_id=item_id,
+        fingerprint=_HASH,
+        state="pending",
+    )
+
+    settled = settle_active_detect_people_after_permanent_preflight(
+        connection,
+        run_id=run_id,
+        attempt_id=prior_attempt,
+        failure_category="authentication",
+        rationale="OpenRouter authentication failed during model inspection.",
+        prompt_hash=_PROMPT_HASH,
+        schema_hash=_SCHEMA_HASH,
+        schema_version=1,
+        now=moment(5),
+    )
+    assert settled == 1
+
+    observation_count = connection.execute(
+        """
+        SELECT COUNT(*) AS n FROM triage_observation
+         WHERE source_item_id = ? AND task_fingerprint = ?
+        """,
+        (item_id, _HASH),
+    ).fetchone()["n"]
+    assert observation_count == 1
+
+    current = load_current_triage_observation(connection, source_item_id=item_id)
+    assert current is not None
+    assert current.id == existing_id
+    assert current.attempt_id == prior_attempt
+
+    state = connection.execute(
+        """
+        SELECT state FROM work_item
+         WHERE task_type = ? AND subject_id = ?
+        """,
+        (DETECT_PEOPLE_TASK_TYPE, item_id),
+    ).fetchone()["state"]
+    assert state == "failed_permanent"
