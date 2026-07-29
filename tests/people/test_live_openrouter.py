@@ -83,48 +83,98 @@ def _http_error(status: int, message: str = "provider error") -> OpenRouterError
 
 
 @pytest.mark.parametrize(
-    ("category", "cause"),
+    ("category", "cause", "detail"),
     [
-        (FailureCategory.NETWORK, socket.gaierror(socket.EAI_NONAME, "no name")),
+        # Production always sets detail=type(error).__name__ via _translate_failure.
+        (
+            FailureCategory.NETWORK,
+            socket.gaierror(socket.EAI_NONAME, "no name"),
+            "ConnectError",
+        ),
         (
             FailureCategory.NETWORK,
             _connect_error_caused_by(OSError(errno.ENETUNREACH, "no route")),
+            "ConnectError",
         ),
-        (FailureCategory.NETWORK, ConnectionRefusedError("refused")),
-        (FailureCategory.TIMEOUT, httpx.ConnectTimeout("connect timed out")),
-        (FailureCategory.NETWORK, NoResponseError("no response")),
+        (
+            FailureCategory.NETWORK,
+            ConnectionRefusedError("refused"),
+            "ConnectError",
+        ),
+        (
+            FailureCategory.TIMEOUT,
+            httpx.ConnectTimeout("connect timed out"),
+            "ConnectTimeout",
+        ),
+        (
+            FailureCategory.NETWORK,
+            NoResponseError("no response"),
+            "NoResponseError",
+        ),
+        (
+            FailureCategory.NETWORK,
+            httpx.ConnectError("connect failed"),
+            "ConnectError",
+        ),
     ],
 )
 def test_environment_unavailability_has_a_skip_reason(
-    category: FailureCategory, cause: Exception
+    category: FailureCategory, cause: Exception, detail: str
 ) -> None:
-    assert _skip_reason(_failure_caused_by(category, cause)) is not None
+    assert _skip_reason(_failure_caused_by(category, cause, detail=detail)) is not None
 
 
 @pytest.mark.parametrize(
-    ("category", "cause", "status_code"),
+    ("category", "cause", "status_code", "detail"),
     [
-        (FailureCategory.AUTHENTICATION, _http_error(401), 401),
-        (FailureCategory.ACCESS_DENIED, _http_error(403), 403),
-        (FailureCategory.CONFIGURATION, _http_error(400), 400),
-        (FailureCategory.UNSUPPORTED_CAPABILITY, RuntimeError("capability"), None),
-        (FailureCategory.MALFORMED_RESPONSE, ValueError("bad body"), None),
-        (FailureCategory.RATE_LIMIT, _http_error(429), 429),
-        (FailureCategory.BUDGET_EXHAUSTED, _http_error(402), 402),
+        (FailureCategory.AUTHENTICATION, _http_error(401), 401, "OpenRouterError"),
+        (FailureCategory.ACCESS_DENIED, _http_error(403), 403, "OpenRouterError"),
+        (FailureCategory.CONFIGURATION, _http_error(400), 400, "OpenRouterError"),
+        (
+            FailureCategory.UNSUPPORTED_CAPABILITY,
+            RuntimeError("capability"),
+            None,
+            "RuntimeError",
+        ),
+        (
+            FailureCategory.MALFORMED_RESPONSE,
+            ValueError("bad body"),
+            None,
+            "ValueError",
+        ),
+        (FailureCategory.RATE_LIMIT, _http_error(429), 429, "OpenRouterError"),
+        (FailureCategory.BUDGET_EXHAUSTED, _http_error(402), 402, "OpenRouterError"),
+        # Production shape: detail="ConnectError" with nested SSLError must not skip.
         (
             FailureCategory.NETWORK,
             _connect_error_caused_by(ssl.SSLError("TLS handshake failed")),
             None,
+            "ConnectError",
         ),
-        (FailureCategory.TIMEOUT, httpx.ReadTimeout("read timed out"), None),
-        (FailureCategory.TRANSIENT_SERVER_ERROR, _http_error(500), 500),
+        (
+            FailureCategory.TIMEOUT,
+            httpx.ReadTimeout("read timed out"),
+            None,
+            "ReadTimeout",
+        ),
+        (
+            FailureCategory.TRANSIENT_SERVER_ERROR,
+            _http_error(500),
+            500,
+            "OpenRouterError",
+        ),
     ],
 )
 def test_deterministic_provider_failures_have_no_skip_reason(
-    category: FailureCategory, cause: Exception, status_code: int | None
+    category: FailureCategory,
+    cause: Exception,
+    status_code: int | None,
+    detail: str,
 ) -> None:
     assert (
-        _skip_reason(_failure_caused_by(category, cause, status_code=status_code))
+        _skip_reason(
+            _failure_caused_by(category, cause, status_code=status_code, detail=detail)
+        )
         is None
     )
 
@@ -162,13 +212,17 @@ def _skip_reason(error: ProviderFailure) -> str | None:
         for cause in causes
     ):
         return "live network unreachable"
+    # TLS handshake failure is a contract signal. Production always sets
+    # detail=type(error).__name__ (often "ConnectError") via
+    # ``raise _translate_failure(...) from error``; the detail fallback must
+    # not undo this exclusion when SSLError is on the cause chain.
+    if any(isinstance(cause, ssl.SSLError) for cause in causes):
+        return None
     # NoResponseError / bare ConnectError without a nested connect cause is
     # still pre-response environment unavailability for this smoke.
     if any(isinstance(cause, NoResponseError) for cause in causes):
         return "live OpenRouter returned no response"
-    if any(isinstance(cause, httpx.ConnectError) for cause in causes) and not any(
-        isinstance(cause, ssl.SSLError) for cause in causes
-    ):
+    if any(isinstance(cause, httpx.ConnectError) for cause in causes):
         return "live OpenRouter connection failed"
     if error.detail in {"NoResponseError", "ConnectError", "ConnectTimeout"}:
         return f"live OpenRouter transport unavailable ({error.detail})"
