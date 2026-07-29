@@ -188,10 +188,13 @@ entry quality or accept the observation as correct for that item.
 
 ## Secrets appear to be missing or wrong
 
-`[secrets].openrouter_api_key` must name an uppercase environment variable.
-`config validate` and `run` fail before creating a run when the named variable
-is blank. Put the value in the process environment or an adjacent `.env`; a
-nonblank process value wins. Never paste the key into TOML, digests, logs, or
-tests. If authentication failures persist after exporting the variable, confirm
-the variable *name* in TOML matches the exported name and that no older shell
-export is empty-overriding an adjacent `.env`.
+Every name under `[secrets]` must be an uppercase environment-variable name.
+`config validate` and `run` load with `require_secrets=True` and fail before
+creating a run when either `openrouter_api_key` or `brave_api_key` (or any
+other configured secret name) is missing or blank. Detection uses the
+OpenRouter key; Brave is unused by feed ingestion and detection today but is
+still required by the loader. Put values in the process environment or an
+adjacent `.env`; a nonblank process value wins. Never paste keys into TOML,
+digests, logs, or tests. If authentication failures persist after exporting
+variables, confirm each TOML name matches the exported name and that no older
+shell export is empty-overriding an adjacent `.env`.

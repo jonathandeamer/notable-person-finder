@@ -29,10 +29,11 @@ the named variables before `config validate` or `run`. An adjacent `.env` may
 fill missing values, but the process environment wins. Secret values are never
 stored in configuration snapshots, the database, digests, or logs.
 
-For model detection, export the variable named by
-`[secrets].openrouter_api_key` (the example uses `OPENROUTER_API_KEY`). The
-Brave secret is reserved for later search work and is not required for feed
-ingestion or detection today.
+`config validate` and `run` require every named secret environment variable to
+be present and nonblank, including both `[secrets].openrouter_api_key` (the
+example uses `OPENROUTER_API_KEY`) and `[secrets].brave_api_key` (example
+`BRAVE_API_KEY`). Detection uses the OpenRouter key; Brave is reserved for
+later search work but is still a required secret under the current loader.
 
 Use `--config` before the subcommand when the file is not at the platform
 default location:
