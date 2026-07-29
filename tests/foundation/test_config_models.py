@@ -2,10 +2,183 @@ import pytest
 from pydantic import ValidationError
 
 from notable_person_finder.config.models import (
+    DetectPeopleConfig,
     DomainProfileConfig,
     FeedsConfig,
+    GenerationParameters,
     MainConfig,
+    OpenRouterConfig,
+    ProviderRoutingConfig,
+    TasksConfig,
 )
+
+
+def _minimal_main() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "timezone": "Europe/Paris",
+        "feeds_file": "feeds.toml",
+        "domain_profile_file": "profile.toml",
+    }
+
+
+def test_model_configuration_accepts_conservative_defaults() -> None:
+    config = MainConfig.model_validate(_minimal_main())
+
+    assert config.openrouter == OpenRouterConfig.model_validate({})
+    assert config.openrouter.endpoint == "https://openrouter.ai/api/v1"
+    assert config.openrouter.routing.allow_fallbacks is True
+    assert config.openrouter.routing.data_collection == "deny"
+    assert config.openrouter.routing.zdr is True
+    assert config.tasks.detect_people.model == "openai/gpt-5.4-mini"
+    assert config.tasks.detect_people.max_input_tokens == 4096
+    assert config.tasks.detect_people.max_completion_tokens == 1024
+    assert config.tasks.detect_people.parameters == GenerationParameters(
+        temperature=0.0,
+        top_p=1.0,
+        reasoning_effort=None,
+    )
+    assert config.tasks.detect_people.max_people == 8
+    assert config.tasks.detect_people.max_title_characters == 500
+    assert config.tasks.detect_people.max_summary_characters == 4000
+    assert GenerationParameters(reasoning_effort=None).reasoning_effort is None
+
+
+@pytest.mark.parametrize(
+    ("value", "field_name"),
+    [
+        (OpenRouterConfig(), "endpoint"),
+        (ProviderRoutingConfig(), "allow_fallbacks"),
+        (GenerationParameters(), "temperature"),
+        (DetectPeopleConfig(), "model"),
+        (TasksConfig(), "detect_people"),
+    ],
+)
+def test_model_configuration_models_are_frozen(value: object, field_name: str) -> None:
+    with pytest.raises(ValidationError, match="frozen_instance"):
+        setattr(value, field_name, None)
+
+
+@pytest.mark.parametrize(
+    ("section", "extra"),
+    [
+        ("openrouter", {"response_healing": True}),
+        ("routing", {"require_parameters": False}),
+        ("tasks", {"compose_lead_summary": {}}),
+        ("detect_people", {"max_tokens": 1024}),
+        ("parameters", {"seed": 7}),
+    ],
+)
+def test_model_configuration_rejects_unknown_fields(
+    section: str, extra: dict[str, object]
+) -> None:
+    value = _minimal_main()
+    value["openrouter"] = {}
+    value["tasks"] = {"detect_people": {}}
+    if section == "openrouter":
+        value["openrouter"] = extra
+    elif section == "routing":
+        value["openrouter"] = {"routing": extra}
+    elif section == "tasks":
+        value["tasks"] = extra
+    elif section == "detect_people":
+        value["tasks"] = {"detect_people": extra}
+    else:
+        value["tasks"] = {"detect_people": {"parameters": extra}}
+
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        MainConfig.model_validate(value)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://openrouter.ai/api/v1",
+        "https://localhost/api/v1",
+        "https://127.0.0.1/api/v1",
+        "https://user:password@openrouter.ai/api/v1",
+        "https://openrouter.ai/api/v1?key=secret",
+        "https://openrouter.ai/api/v1#fragment",
+        " https://openrouter.ai/api/v1",
+        "https://openrouter.ai/api/v1\n",
+    ],
+)
+def test_openrouter_endpoint_requires_a_clean_public_https_url(endpoint: str) -> None:
+    with pytest.raises(ValidationError):
+        OpenRouterConfig(endpoint=endpoint)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "openrouter/auto",
+        "openai/gpt-5.4-mini,anthropic/claude-haiku-4.5",
+        "openai/gpt-5.4-mini:free",
+        "gpt-5.4-mini",
+        "openai/",
+        "/gpt-5.4-mini",
+        "OpenAI/gpt-5.4-mini",
+        "openai/gpt 5.4 mini",
+    ],
+)
+def test_detect_people_rejects_router_aliases_and_invalid_model_slugs(
+    model: str,
+) -> None:
+    with pytest.raises(ValidationError, match="model"):
+        DetectPeopleConfig(model=model)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("temperature", float("nan")),
+        ("temperature", float("inf")),
+        ("temperature", float("-inf")),
+        ("top_p", float("nan")),
+        ("top_p", float("inf")),
+        ("top_p", float("-inf")),
+    ],
+)
+def test_generation_parameters_reject_non_finite_numbers(
+    field: str, value: float
+) -> None:
+    with pytest.raises(ValidationError):
+        GenerationParameters.model_validate({field: value})
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"max_input_tokens": 0},
+        {"max_completion_tokens": 0},
+        {"max_input_tokens": 1024, "max_completion_tokens": 1024},
+        {"max_input_tokens": 1024, "max_completion_tokens": 2048},
+        {"max_title_characters": 1000, "max_summary_characters": 999},
+    ],
+)
+def test_detect_people_rejects_non_positive_or_incompatible_bounds(
+    values: dict[str, int],
+) -> None:
+    with pytest.raises(ValidationError):
+        DetectPeopleConfig.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"max_people": 0},
+        {"max_people": 33},
+        {"max_title_characters": 0},
+        {"max_title_characters": 2001},
+        {"max_summary_characters": 0},
+        {"max_summary_characters": 20_001},
+    ],
+)
+def test_detect_people_rejects_out_of_range_mention_and_context_limits(
+    values: dict[str, int],
+) -> None:
+    with pytest.raises(ValidationError):
+        DetectPeopleConfig.model_validate(values)
 
 
 def test_main_config_rejects_unknown_fields() -> None:

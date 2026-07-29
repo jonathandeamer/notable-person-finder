@@ -96,10 +96,7 @@ def load_config(
         main_path=main_path,
         feeds_path=feeds_path,
         domain_profile_path=domain_profile_path,
-        secret_availability={
-            main.secrets.openrouter_api_key: credentials.openrouter_api_key is not None,
-            main.secrets.brave_api_key: credentials.brave_api_key is not None,
-        },
+        secret_availability=_secret_availability(main, credentials),
     )
     snapshot_json = json.dumps(
         snapshot,
@@ -209,6 +206,14 @@ def _present_value(value: str | None) -> str | None:
         return None
     stripped = value.strip()
     return stripped or None
+
+
+def _secret_availability(main: MainConfig, credentials: Credentials) -> dict[str, bool]:
+    """Represent configured credentials by availability, never by value."""
+    return {
+        main.secrets.openrouter_api_key: credentials.openrouter_api_key is not None,
+        main.secrets.brave_api_key: credentials.brave_api_key is not None,
+    }
 
 
 def _snapshot(

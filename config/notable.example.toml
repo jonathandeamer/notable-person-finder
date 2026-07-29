@@ -38,6 +38,28 @@ brave_min_interval_ms = 1100
 # Optional hard per-run OpenRouter cap as a decimal USD string. Omit for no cap.
 # openrouter_usd_per_run = "2.50"
 
+[openrouter]
+endpoint = "https://openrouter.ai/api/v1"
+
+[openrouter.routing]
+# Provider fallback may change the serving provider, never the configured model.
+allow_fallbacks = true
+data_collection = "deny"
+zdr = true
+
+[tasks.detect_people]
+model = "openai/gpt-5.4-mini"
+max_input_tokens = 4096
+max_completion_tokens = 1024
+max_people = 8
+max_title_characters = 500
+max_summary_characters = 4000
+
+[tasks.detect_people.parameters]
+temperature = 0.0
+top_p = 1.0
+reasoning_effort = "low"
+
 [digest]
 write_latest_copy = true
 
