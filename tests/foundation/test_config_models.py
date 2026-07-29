@@ -1,5 +1,5 @@
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from notable_person_finder.config.models import (
     DetectPeopleConfig,
@@ -101,11 +101,35 @@ def test_model_configuration_rejects_unknown_fields(
         "https://openrouter.ai/api/v1#fragment",
         " https://openrouter.ai/api/v1",
         "https://openrouter.ai/api/v1\n",
+        "https://openrouter.ai:abc/api/v1",
+        "https://openrouter.ai:70000/api/v1",
     ],
 )
 def test_openrouter_endpoint_requires_a_clean_public_https_url(endpoint: str) -> None:
     with pytest.raises(ValidationError):
         OpenRouterConfig(endpoint=endpoint)
+
+
+@pytest.mark.parametrize(
+    ("model_type", "value"),
+    [
+        (ProviderRoutingConfig, {"allow_fallbacks": 1}),
+        (ProviderRoutingConfig, {"zdr": "false"}),
+        (OpenRouterConfig, {"endpoint": b"https://openrouter.ai/api/v1"}),
+        (GenerationParameters, {"temperature": True}),
+        (GenerationParameters, {"top_p": "1.0"}),
+        (DetectPeopleConfig, {"model": b"openai/gpt-5.4-mini"}),
+        (
+            TasksConfig,
+            {"detect_people": {"parameters": {"temperature": True}}},
+        ),
+    ],
+)
+def test_model_configuration_rejects_type_coercion(
+    model_type: type[BaseModel], value: dict[str, object]
+) -> None:
+    with pytest.raises(ValidationError):
+        model_type.model_validate(value)
 
 
 @pytest.mark.parametrize(

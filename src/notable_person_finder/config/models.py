@@ -161,13 +161,17 @@ class BudgetConfig(StrictModel):
         return usd_to_nano_usd(self.openrouter_usd_per_run)
 
 
-class ProviderRoutingConfig(StrictModel):
+class _StrictConfigurationModel(StrictModel):
+    model_config = ConfigDict(strict=True)
+
+
+class ProviderRoutingConfig(_StrictConfigurationModel):
     allow_fallbacks: bool = True
     data_collection: Literal["allow", "deny"] = "deny"
     zdr: bool = True
 
 
-class OpenRouterConfig(StrictModel):
+class OpenRouterConfig(_StrictConfigurationModel):
     endpoint: str = "https://openrouter.ai/api/v1"
     routing: ProviderRoutingConfig = ProviderRoutingConfig()
 
@@ -178,6 +182,10 @@ class OpenRouterConfig(StrictModel):
             raise ValueError("endpoint must not contain whitespace")
         validate_public_http_url(value)
         parsed = urlsplit(value)
+        try:
+            _ = parsed.port
+        except ValueError as error:
+            raise ValueError("endpoint must contain a valid port") from error
         if parsed.scheme != "https":
             raise ValueError("must use HTTPS")
         if parsed.query or parsed.fragment:
@@ -188,7 +196,7 @@ class OpenRouterConfig(StrictModel):
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
 
 
-class GenerationParameters(StrictModel):
+class GenerationParameters(_StrictConfigurationModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0, allow_inf_nan=False)
     top_p: float = Field(default=1.0, ge=0.0, le=1.0, allow_inf_nan=False)
     reasoning_effort: ReasoningEffort | None = None
@@ -199,7 +207,7 @@ _MODEL_SLUG_PATTERN = re.compile(
 )
 
 
-class DetectPeopleConfig(StrictModel):
+class DetectPeopleConfig(_StrictConfigurationModel):
     model: str = "openai/gpt-5.4-mini"
     max_input_tokens: int = Field(default=4096, strict=True, ge=1, le=1_000_000)
     max_completion_tokens: int = Field(default=1024, strict=True, ge=1, le=100_000)
@@ -228,7 +236,7 @@ class DetectPeopleConfig(StrictModel):
         return self
 
 
-class TasksConfig(StrictModel):
+class TasksConfig(_StrictConfigurationModel):
     detect_people: DetectPeopleConfig = DetectPeopleConfig()
 
 

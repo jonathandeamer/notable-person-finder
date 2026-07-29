@@ -142,6 +142,36 @@ def test_configuration_validation_never_resolves_or_contacts_the_endpoint(
     assert loaded.main.openrouter.endpoint == "https://openrouter.ai/api/v1"
 
 
+@pytest.mark.parametrize("port", ["abc", "70000"])
+def test_malformed_openrouter_port_is_rejected_without_network_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, port: str
+) -> None:
+    config_file = write_graph(tmp_path)
+    config_file.write_text(
+        config_file.read_text(encoding="utf-8").replace(
+            "https://openrouter.ai/api/v1",
+            f"https://openrouter.ai:{port}/api/v1",
+        ),
+        encoding="utf-8",
+    )
+
+    def unexpected_network(*args: object, **kwargs: object) -> object:
+        raise AssertionError("configuration validation attempted network access")
+
+    monkeypatch.setattr(socket, "getaddrinfo", unexpected_network)
+
+    with pytest.raises(ConfigLoadError) as captured:
+        load_config(
+            config_file,
+            environ={"TEST_OPENROUTER": "offline-key", "TEST_BRAVE": "brave"},
+        )
+
+    diagnostic = str(captured.value)
+    assert "openrouter.endpoint" in diagnostic
+    assert "valid port" in diagnostic
+    assert "network access" not in diagnostic
+
+
 def test_missing_files_and_secrets_are_actionable(tmp_path: Path) -> None:
     config_file = write_graph(tmp_path)
     (tmp_path / "feeds.toml").unlink()
