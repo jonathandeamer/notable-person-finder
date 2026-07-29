@@ -310,7 +310,7 @@ def test_pausing_one_provider_does_not_pause_another() -> None:
     )
 
 
-def test_jitter_stays_within_the_configured_ratio() -> None:
+def test_jitter_uses_the_injected_random_source_within_configured_ratio() -> None:
     import random
 
     config = RetryConfig(
@@ -328,9 +328,11 @@ def test_jitter_stays_within_the_configured_ratio() -> None:
 
     with pytest.raises(RetryExhausted):
         coordination.call("brave", "search_web", action, on_attempt=lambda _: None)
+    expected_random = random.Random(7)
+    expected_sleeps = [expected_random.uniform(7.5, 12.5) for _ in range(3)]
     assert len(clock.slept) == 3
     assert all(7.5 <= delay <= 12.5 for delay in clock.slept)
-    assert clock.slept != [10.0, 10.0, 10.0]
+    assert clock.slept == expected_sleeps
 
 
 def test_attempt_records_carry_status_and_latency() -> None:
