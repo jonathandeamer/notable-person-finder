@@ -774,14 +774,20 @@ def settle_active_detect_people_after_permanent_preflight(
 ) -> int:
     """Fail pending/deferred ``detect_people`` work after permanent preflight loss.
 
-    Owns a brief ``BEGIN IMMEDIATE`` transaction. For each active detection
-    work item whose subject is a source item, ensures a failed triage
-    observation exists for that material fingerprint (reusing any existing
-    row so a unique-key collision cannot abort the batch), points the source
-    item at it when needed, and settles the work item ``failed_permanent``.
-    Does not insert ``generate_structured`` attempts.
+    When the caller already holds a transaction (the inspection handler's
+    ``persist`` / ``persist_failure`` path inside ``complete_work``), joins
+    that transaction so domain rows and settlement commit together. Otherwise
+    owns a brief ``BEGIN IMMEDIATE``.
+
+    For each active detection work item whose subject is a source item, ensures
+    a failed triage observation exists for that material fingerprint (reusing
+    any existing row so a unique-key collision cannot abort the batch), points
+    the source item at it when needed, and settles the work item
+    ``failed_permanent``. Does not insert ``generate_structured`` attempts.
     """
-    connection.execute("BEGIN IMMEDIATE")
+    owns_transaction = not connection.in_transaction
+    if owns_transaction:
+        connection.execute("BEGIN IMMEDIATE")
     try:
         rows = connection.execute(
             """
@@ -860,10 +866,12 @@ def settle_active_detect_people_after_permanent_preflight(
                 )
             settled += 1
     except BaseException:
-        connection.rollback()
+        if owns_transaction:
+            connection.rollback()
         raise
     else:
-        connection.commit()
+        if owns_transaction:
+            connection.commit()
     return settled
 
 
