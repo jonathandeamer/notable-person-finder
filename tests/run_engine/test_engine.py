@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import logging
+import random
 import sqlite3
 import threading
 from datetime import UTC, datetime
@@ -15,7 +16,7 @@ from notable_person_finder.db.connection import connect_database
 from notable_person_finder.db.migrate import apply_migrations
 from notable_person_finder.providers.failures import FailureCategory, ProviderFailure
 from notable_person_finder.runs import repository
-from notable_person_finder.runs.clock import FakeClock, utc_timestamp
+from notable_person_finder.runs.clock import Clock, FakeClock, utc_timestamp
 from notable_person_finder.runs.engine import (
     ReportArtifact,
     RunEngine,
@@ -2650,4 +2651,169 @@ def test_persist_failure_does_not_run_for_a_non_settling_handler_state(
         ).fetchone()["state"]
         == WorkState.FAILED_PERMANENT
     )
+    connection.close()
+
+
+# --- re-arm then outcome-less settlement: last_failure is carried ----------
+
+
+class ZeroDelayRetryPolicy(RetryPolicy):
+    """A retry policy whose backoff is always zero, so re-arms are immediate."""
+
+    def _delay(self, retry_number: int, failure: ProviderFailure) -> float:
+        return 0.0
+
+
+class PauseAfterFirstCallRetryPolicy(ZeroDelayRetryPolicy):
+    """Pauses the provider immediately after the first call returns."""
+
+    def __init__(
+        self,
+        config: RetryConfig,
+        *,
+        clock: Clock,
+        random_source: random.Random | None = None,
+    ) -> None:
+        super().__init__(config, clock=clock, random_source=random_source)
+        self._call_made = False
+
+    def is_paused(self, provider: str) -> bool:
+        return self._call_made
+
+
+def test_persist_failure_runs_when_a_rearmed_item_meets_a_paused_provider(
+    database: Path,
+) -> None:
+    """A re-armed item already made a call this run; the pause should not erase it.
+
+    The first call fails transiently and is re-armed with zero delay. While it
+    is waiting to be reclaimed, the provider is paused. The second claim settles
+    through the pause branch, but it still carries the failure that actually
+    happened -- so `persist_failure` records the real event rather than leaving
+    a gap.
+    """
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "r1" * 32)
+    failed: list[str] = []
+
+    policy = PauseAfterFirstCallRetryPolicy(
+        RetryConfig(max_attempts=3, jitter_ratio=0.0),
+        clock=FakeClock(),
+    )
+
+    def execute(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
+        policy._call_made = True
+        raise ProviderFailure(
+            FailureCategory.NETWORK,
+            provider="probe_provider",
+            operation="probe_call",
+            detail="connection reset",
+        )
+
+    handler = probe_handler(
+        execute,
+        persist_failure=lambda work_item, failure: failed.append(str(failure.category)),
+    )
+    build_engine(
+        connection,
+        FakeClock(),
+        retry=policy,
+        scheduler=BoundedScheduler(max_workers=1),
+    ).execute({handler.task_type: handler})
+
+    row = connection.execute(
+        "SELECT state, reason FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["state"] == WorkState.DEFERRED
+    assert row["reason"] == "provider paused for this run"
+    assert failed == [str(FailureCategory.NETWORK)]
+    connection.close()
+
+
+def test_persist_failure_runs_when_a_rearmed_items_prepare_raises(
+    database: Path,
+) -> None:
+    """A re-armed item that then raises in `prepare` still carries its failure."""
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "r2" * 32)
+    failed: list[str] = []
+    prepare_calls = 0
+
+    def prepare(work_item: WorkItem) -> object:
+        nonlocal prepare_calls
+        prepare_calls += 1
+        if prepare_calls > 1:
+            raise ValueError("prepare blew up on re-claim")
+        return None
+
+    def execute(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
+        raise ProviderFailure(
+            FailureCategory.TIMEOUT,
+            provider="probe_provider",
+            operation="probe_call",
+            detail="deadline",
+        )
+
+    handler = probe_handler(
+        execute,
+        prepare=prepare,
+        persist_failure=lambda work_item, failure: failed.append(str(failure.category)),
+    )
+    build_engine(
+        connection,
+        FakeClock(),
+        retry=ZeroDelayRetryPolicy(
+            RetryConfig(max_attempts=3, jitter_ratio=0.0),
+            clock=FakeClock(),
+        ),
+        scheduler=BoundedScheduler(max_workers=1),
+    ).execute({handler.task_type: handler})
+
+    row = connection.execute(
+        "SELECT state, reason FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["state"] == WorkState.FAILED_PERMANENT
+    assert "prepare raised ValueError" in row["reason"]
+    assert failed == [str(FailureCategory.TIMEOUT)]
+    connection.close()
+
+
+def test_persist_failure_runs_when_a_rearmed_item_hits_budget_refusal(
+    database: Path,
+) -> None:
+    """A re-armed item whose next reservation is refused still carries its failure."""
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "r3" * 32)
+    failed: list[str] = []
+
+    def execute(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
+        raise ProviderFailure(
+            FailureCategory.PROVIDER_UNAVAILABLE,
+            provider="probe_provider",
+            operation="probe_call",
+            detail="temporarily unavailable",
+        )
+
+    handler = probe_handler(
+        execute,
+        reserved_nano_usd=300,
+        persist_failure=lambda work_item, failure: failed.append(str(failure.category)),
+    )
+    build_engine(
+        connection,
+        FakeClock(),
+        budget_limit_nano_usd=400,
+        retry=ZeroDelayRetryPolicy(
+            RetryConfig(max_attempts=3, jitter_ratio=0.0),
+            clock=FakeClock(),
+        ),
+        scheduler=BoundedScheduler(max_workers=1),
+    ).execute({handler.task_type: handler})
+
+    row = connection.execute(
+        "SELECT state, reason FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row["state"] == WorkState.DEFERRED
+    assert row["reason"] == "not_evaluated_budget"
+    assert failed == [str(FailureCategory.PROVIDER_UNAVAILABLE)]
     connection.close()

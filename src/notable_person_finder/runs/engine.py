@@ -311,14 +311,15 @@ def _failure_writes(
     here only after `_retry` has returned PERMANENT or EXHAUSTED, so a retried
     call writes one row for its final verdict rather than one per try.
 
-    Four settlements deliberately do *not* reach here, because they hold no
-    failure: a paused provider, a raising `prepare`, a refused budget
-    reservation, and a handler state the engine refused to honour. The first
-    three made no call at all. The fourth did, so it is a genuine gap in "every
-    attempt leaves a record" -- as is an item re-armed mid-run that meets a
-    newly paused provider on its re-claim. Both leave their evidence on the
-    `attempt` row rather than in handler-owned domain history. Each is pinned
-    by its own test.
+    Three settlements normally carry no failure, because no call was made: a
+    paused provider, a raising `prepare`, and a refused budget reservation. A
+    re-armed item is the exception: it made a call earlier in this run, and
+    the failure that caused the re-arm is carried in `_ItemProgress.last_failure`
+    so these settlements can still reach `persist_failure`. A handler state the
+    engine refused to honour deliberately carries neither an outcome nor a
+    failure: the call happened, but the engine discards the payload, so the
+    evidence stays on the `attempt` row alone. Each case is pinned by its own
+    test.
     """
     persist_failure = handler.persist_failure
     if persist_failure is None or failure is None:
@@ -346,10 +347,19 @@ class _ItemProgress:
     `max_attempts` bounds the calls a single run makes for one item, so this
     survives a re-arm: the item goes back to the queue, but its attempt count
     does not reset when the run re-claims it.
+
+    `last_failure` is the most recent provider failure that caused a re-arm.
+    It is carried forward so that a re-claimed item that settles without a
+    fresh call -- because the provider was paused, `prepare` raised, or the
+    budget was exhausted -- can still record the failure that actually
+    happened. An item that has never been called has no `_ItemProgress` entry,
+    so the absence of that entry naturally distinguishes "no call yet" from
+    "call happened earlier this run".
     """
 
     attempts: int = 0
     malformed_retries: int = 0
+    last_failure: ProviderFailure | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -616,7 +626,7 @@ class RunEngine:
                 for work_item in batch:
                     deadlines.pop(work_item.id, None)
                     submission = self._prepare(
-                        run_id, work_item, handlers[work_item.task_type]
+                        run_id, work_item, handlers[work_item.task_type], progress
                     )
                     if submission is not None:
                         submissions.append(submission)
@@ -659,7 +669,11 @@ class RunEngine:
             del deadlines[work_item_id]
 
     def _prepare(
-        self, run_id: int, work_item: WorkItem, handler: TaskHandler
+        self,
+        run_id: int,
+        work_item: WorkItem,
+        handler: TaskHandler,
+        progress: dict[int, _ItemProgress],
     ) -> _Submission | None:
         """Phase one: everything one call needs, read on the application thread.
 
@@ -668,7 +682,19 @@ class RunEngine:
         exactly one external call, and a paused provider is never called. This
         used to be enforced inside `RetryCoordinator.call`, which the batch
         loop no longer routes through, so the engine owns it explicitly.
+
+        The three early-return settlements normally carry no failure, because
+        none of them has made a call. A re-armed item is the exception: it made
+        a call earlier in this run, and the failure that caused the re-arm is
+        preserved in `progress`. When that failure is present it is passed
+        through so a handler's `persist_failure` can still record the last real
+        event.
         """
+        progress_entry = progress.get(work_item.id)
+        last_failure = (
+            progress_entry.last_failure if progress_entry is not None else None
+        )
+
         if self._retry.is_paused(handler.provider):
             # Deliberately NOT `f"{handler.provider} paused for this run"`:
             # `deferred_reasons` groups by this exact string, and
@@ -684,6 +710,7 @@ class RunEngine:
                 handler,
                 state=WorkState.DEFERRED,
                 reason="provider paused for this run",
+                failure=last_failure,
             )
             return None
         if handler.prepare is None:
@@ -716,6 +743,7 @@ class RunEngine:
                     handler,
                     state=WorkState.FAILED_PERMANENT,
                     reason=f"prepare raised {type(error).__name__}",
+                    failure=last_failure,
                 )
                 return None
         fingerprint = (
@@ -755,6 +783,7 @@ class RunEngine:
                 handler,
                 state=WorkState.DEFERRED,
                 reason="not_evaluated_budget",
+                failure=last_failure,
             )
             return None
         # Every repository call above has committed, so no transaction is open
@@ -910,6 +939,7 @@ class RunEngine:
             raise RuntimeError(
                 "RetryPolicy.decide returned action=RETRY with no delay_seconds"
             )
+        state.last_failure = failure
         self._rearm(
             run_id,
             work_item,
