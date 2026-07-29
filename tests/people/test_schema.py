@@ -142,6 +142,34 @@ def _source_item(connection: sqlite3.Connection, *, run_id: int) -> int:
     return item
 
 
+def _additional_source_item(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    source_entry_id: str,
+) -> int:
+    provenance = connection.execute(
+        "SELECT feed_identity_id, discovered_by_fetch_id FROM source_item ORDER BY id"
+    ).fetchone()
+    item = connection.execute(
+        """
+        INSERT INTO source_item (
+            feed_identity_id, discovered_by_fetch_id, discovered_by_run_id,
+            source_entry_id, title_text, discovered_at
+        ) VALUES (?, ?, ?, ?, 'A different article', ?)
+        """,
+        (
+            provenance["feed_identity_id"],
+            provenance["discovered_by_fetch_id"],
+            run_id,
+            source_entry_id,
+            moment(),
+        ),
+    ).lastrowid
+    assert item is not None
+    return item
+
+
 def _inspection(
     connection: sqlite3.Connection,
     *,
@@ -438,6 +466,26 @@ def test_incompatible_inspection_accepts_unavailable_pricing(
     )
 
 
+def test_compatible_inspection_requires_strict_structured_output(
+    connection: sqlite3.Connection,
+) -> None:
+    run_id = insert_run(connection)
+    attempt_id = _attempt(connection, run_id=run_id)
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """
+            INSERT INTO model_inspection (
+                run_id, attempt_id, configured_model_id, resolved_model_id,
+                routing_fingerprint, supported_parameters_json,
+                supports_strict_structured_output, pricing_usable, compatibility,
+                inspected_at
+            ) VALUES (?, ?, 'openai/gpt-test', 'openai/gpt-test', ?, '[]', 0, 0,
+                      'compatible', ?)
+            """,
+            (run_id, attempt_id, _HASH, moment()),
+        )
+
+
 @pytest.mark.parametrize(
     (
         "disposition",
@@ -477,21 +525,37 @@ def test_triage_observation_rejects_invalid_disposition_coupling(
 ) -> None:
     run_id = insert_run(connection)
     source_item_id = _source_item(connection, run_id=run_id)
-    attempt_id = _attempt(connection, run_id=run_id) if with_attempt else None
+    provenance_attempt_id = (
+        _attempt(connection, run_id=run_id)
+        if with_attempt or disposition == "completed"
+        else None
+    )
+    attempt_id = provenance_attempt_id if with_attempt else None
+    model_inspection_id = (
+        _inspection(
+            connection,
+            run_id=run_id,
+            attempt_id=provenance_attempt_id,
+        )
+        if disposition == "completed" and provenance_attempt_id is not None
+        else None
+    )
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
             """
             INSERT INTO triage_observation (
-                source_item_id, run_id, attempt_id, disposition, semantic_outcome,
-                canonical_supplied_input_json, validated_output_json, prompt_hash,
-                schema_hash, schema_version, task_fingerprint, input_truncated,
-                overflow, rationale, failure_category, observed_at
-            ) VALUES (?, ?, ?, ?, ?, '{}', ?, ?, ?, 1, ?, 0, ?, 'reason', ?, ?)
+                source_item_id, run_id, attempt_id, model_inspection_id,
+                disposition, semantic_outcome, canonical_supplied_input_json,
+                validated_output_json, prompt_hash, schema_hash, schema_version,
+                task_fingerprint, input_truncated, overflow, rationale,
+                failure_category, observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, 1, ?, 0, ?, 'reason', ?, ?)
             """,
             (
                 source_item_id,
                 run_id,
                 attempt_id,
+                model_inspection_id,
                 disposition,
                 semantic_outcome,
                 validated_output_json,
@@ -512,21 +576,23 @@ def test_completed_triage_rejects_unknown_semantic_outcome(
     run_id = insert_run(connection)
     source_item_id = _source_item(connection, run_id=run_id)
     attempt_id = _attempt(connection, run_id=run_id)
+    inspection_id = _inspection(connection, run_id=run_id, attempt_id=attempt_id)
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
             """
             INSERT INTO triage_observation (
-                source_item_id, run_id, attempt_id, disposition, semantic_outcome,
-                canonical_supplied_input_json, validated_output_json, prompt_hash,
-                schema_hash, schema_version, task_fingerprint, input_truncated,
-                overflow, rationale, observed_at
-            ) VALUES (?, ?, ?, 'completed', ?, '{}', '{}', ?, ?, 1, ?, 0, 0,
+                source_item_id, run_id, attempt_id, model_inspection_id,
+                disposition, semantic_outcome, canonical_supplied_input_json,
+                validated_output_json, prompt_hash, schema_hash, schema_version,
+                task_fingerprint, input_truncated, overflow, rationale, observed_at
+            ) VALUES (?, ?, ?, ?, 'completed', ?, '{}', '{}', ?, ?, 1, ?, 0, 0,
                       'reason', ?)
             """,
             (
                 source_item_id,
                 run_id,
                 attempt_id,
+                inspection_id,
                 semantic_outcome,
                 _HASH,
                 _OTHER_HASH,
@@ -592,22 +658,28 @@ def test_triage_attempt_must_belong_to_observation_run(
     first_run = insert_run(connection)
     second_run = insert_run(connection)
     source_item_id = _source_item(connection, run_id=second_run)
-    attempt_id = _attempt(connection, run_id=first_run)
+    first_attempt_id = _attempt(connection, run_id=first_run)
+    connection.execute("UPDATE work_item SET state = 'succeeded'")
+    second_attempt_id = _attempt(connection, run_id=second_run)
+    inspection_id = _inspection(
+        connection, run_id=second_run, attempt_id=second_attempt_id
+    )
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
             """
             INSERT INTO triage_observation (
-                source_item_id, run_id, attempt_id, disposition, semantic_outcome,
-                canonical_supplied_input_json, validated_output_json, prompt_hash,
-                schema_hash, schema_version, task_fingerprint, input_truncated,
-                overflow, rationale, observed_at
-            ) VALUES (?, ?, ?, 'completed', 'uncertain', '{}', '{}', ?, ?, 1,
+                source_item_id, run_id, attempt_id, model_inspection_id,
+                disposition, semantic_outcome, canonical_supplied_input_json,
+                validated_output_json, prompt_hash, schema_hash, schema_version,
+                task_fingerprint, input_truncated, overflow, rationale, observed_at
+            ) VALUES (?, ?, ?, ?, 'completed', 'uncertain', '{}', '{}', ?, ?, 1,
                       ?, 0, 0, 'reason', ?)
             """,
             (
                 source_item_id,
                 second_run,
-                attempt_id,
+                first_attempt_id,
+                inspection_id,
                 _HASH,
                 _OTHER_HASH,
                 _HASH,
@@ -634,6 +706,108 @@ def test_triage_model_inspection_must_belong_to_observation_run(
             attempt_id=second_attempt,
             model_inspection_id=inspection_id,
         )
+
+
+def test_completed_triage_requires_model_inspection(
+    connection: sqlite3.Connection,
+) -> None:
+    run_id = insert_run(connection)
+    source_item_id = _source_item(connection, run_id=run_id)
+    attempt_id = _attempt(connection, run_id=run_id)
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """
+            INSERT INTO triage_observation (
+                source_item_id, run_id, attempt_id, disposition, semantic_outcome,
+                canonical_supplied_input_json, validated_output_json, prompt_hash,
+                schema_hash, schema_version, task_fingerprint, input_truncated,
+                overflow, rationale, observed_at
+            ) VALUES (?, ?, ?, 'completed', 'research_people', '{}', '{}', ?, ?,
+                      1, ?, 0, 0, 'reason', ?)
+            """,
+            (
+                source_item_id,
+                run_id,
+                attempt_id,
+                _HASH,
+                _OTHER_HASH,
+                _HASH,
+                moment(),
+            ),
+        )
+
+
+@pytest.mark.parametrize("write_path", ["insert", "observation_reassignment", "update"])
+def test_source_item_current_observation_must_belong_to_same_source_item(
+    connection: sqlite3.Connection,
+    write_path: str,
+) -> None:
+    run_id, attempt_id, first_source_id, _ = _valid_graph(connection)
+    inspection_id = connection.execute("SELECT id FROM model_inspection").fetchone()[0]
+    second_source_id = _additional_source_item(
+        connection, run_id=run_id, source_entry_id="entry-b"
+    )
+    second_observation_id = _observation(
+        connection,
+        source_item_id=second_source_id,
+        run_id=run_id,
+        attempt_id=attempt_id,
+        model_inspection_id=inspection_id,
+        task_fingerprint=_OTHER_HASH,
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        if write_path == "update":
+            connection.execute(
+                """
+                UPDATE source_item
+                SET current_triage_observation_id = ?
+                WHERE id = ?
+                """,
+                (second_observation_id, first_source_id),
+            )
+        elif write_path == "insert":
+            provenance = connection.execute(
+                """
+                SELECT feed_identity_id, discovered_by_fetch_id
+                FROM source_item
+                WHERE id = ?
+                """,
+                (first_source_id,),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO source_item (
+                    id, feed_identity_id, discovered_by_fetch_id,
+                    discovered_by_run_id, source_entry_id, title_text,
+                    discovered_at, current_triage_observation_id
+                ) VALUES (999, ?, ?, ?, 'entry-c', 'A third article', ?, ?)
+                """,
+                (
+                    provenance["feed_identity_id"],
+                    provenance["discovered_by_fetch_id"],
+                    run_id,
+                    moment(),
+                    second_observation_id,
+                ),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE source_item
+                SET current_triage_observation_id = ?
+                WHERE id = ?
+                """,
+                (second_observation_id, second_source_id),
+            )
+            connection.execute(
+                """
+                UPDATE triage_observation
+                SET source_item_id = ?
+                WHERE id = ?
+                """,
+                (first_source_id, second_observation_id),
+            )
 
 
 def test_source_item_current_observation_pointer_is_nullable_and_foreign_keyed(
@@ -699,24 +873,9 @@ def test_material_fingerprint_is_unique_only_within_source_item(
             model_inspection_id=inspection_id,
         )
 
-    provenance = connection.execute(
-        "SELECT feed_identity_id, discovered_by_fetch_id FROM source_item"
-    ).fetchone()
-    second_source = connection.execute(
-        """
-        INSERT INTO source_item (
-            feed_identity_id, discovered_by_fetch_id, discovered_by_run_id,
-            source_entry_id, title_text, discovered_at
-        ) VALUES (?, ?, ?, 'entry-b', 'A different article', ?)
-        """,
-        (
-            provenance["feed_identity_id"],
-            provenance["discovered_by_fetch_id"],
-            run_id,
-            moment(),
-        ),
-    ).lastrowid
-    assert second_source is not None
+    second_source = _additional_source_item(
+        connection, run_id=run_id, source_entry_id="entry-b"
+    )
     _observation(
         connection,
         source_item_id=second_source,
@@ -733,20 +892,22 @@ def test_completed_triage_accepts_every_semantic_outcome(
     run_id = insert_run(connection)
     source_item_id = _source_item(connection, run_id=run_id)
     attempt_id = _attempt(connection, run_id=run_id)
+    inspection_id = _inspection(connection, run_id=run_id, attempt_id=attempt_id)
     connection.execute(
         """
         INSERT INTO triage_observation (
-            source_item_id, run_id, attempt_id, disposition, semantic_outcome,
-            canonical_supplied_input_json, validated_output_json, prompt_hash,
-            schema_hash, schema_version, task_fingerprint, input_truncated,
-            overflow, rationale, observed_at
-        ) VALUES (?, ?, ?, 'completed', ?, '{}', '{}', ?, ?, 1, ?, 0, 0,
+            source_item_id, run_id, attempt_id, model_inspection_id, disposition,
+            semantic_outcome, canonical_supplied_input_json, validated_output_json,
+            prompt_hash, schema_hash, schema_version, task_fingerprint,
+            input_truncated, overflow, rationale, observed_at
+        ) VALUES (?, ?, ?, ?, 'completed', ?, '{}', '{}', ?, ?, 1, ?, 0, 0,
                   'reason', ?)
         """,
         (
             source_item_id,
             run_id,
             attempt_id,
+            inspection_id,
             outcome,
             _HASH,
             _OTHER_HASH,

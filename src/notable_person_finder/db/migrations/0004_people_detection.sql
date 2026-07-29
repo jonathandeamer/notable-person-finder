@@ -34,6 +34,10 @@ CREATE TABLE model_inspection (
     inspected_at TEXT NOT NULL CHECK (inspected_at GLOB '*Z'),
     FOREIGN KEY (attempt_id, run_id) REFERENCES attempt(id, run_id),
     CHECK (
+        compatibility != 'compatible'
+        OR supports_strict_structured_output = 1
+    ),
+    CHECK (
         CASE pricing_usable
             WHEN 1 THEN
                 prompt_unit_price_nano_usd IS NOT NULL
@@ -95,6 +99,7 @@ CREATE TABLE triage_observation (
             WHEN 'completed' THEN
                 semantic_outcome IS NOT NULL
                 AND attempt_id IS NOT NULL
+                AND model_inspection_id IS NOT NULL
                 AND validated_output_json IS NOT NULL
                 AND overflow IS NOT NULL
                 AND failure_category IS NULL
@@ -135,6 +140,48 @@ ALTER TABLE source_item
 
 CREATE INDEX source_item_by_current_triage
     ON source_item(current_triage_observation_id, id);
+
+-- `ALTER TABLE ... ADD COLUMN` cannot add the composite foreign key needed to
+-- express that the pointed-to observation belongs to this same source item.
+-- These guards enforce that ownership while retaining the ordinary foreign key
+-- above for existence and delete protection.
+CREATE TRIGGER source_item_current_triage_owner_on_insert
+BEFORE INSERT ON source_item
+WHEN NEW.current_triage_observation_id IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1
+        FROM triage_observation
+        WHERE id = NEW.current_triage_observation_id
+          AND source_item_id = NEW.id
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'current triage observation belongs to another source item');
+END;
+
+CREATE TRIGGER source_item_current_triage_owner_on_update
+BEFORE UPDATE OF id, current_triage_observation_id ON source_item
+WHEN NEW.current_triage_observation_id IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1
+        FROM triage_observation
+        WHERE id = NEW.current_triage_observation_id
+          AND source_item_id = NEW.id
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'current triage observation belongs to another source item');
+END;
+
+CREATE TRIGGER triage_observation_preserves_current_owner
+BEFORE UPDATE OF id, source_item_id ON triage_observation
+WHEN EXISTS (
+    SELECT 1
+    FROM source_item
+    WHERE current_triage_observation_id = OLD.id
+      AND id != NEW.source_item_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'current triage observation ownership is immutable');
+END;
 
 CREATE TABLE person_mention (
     id INTEGER PRIMARY KEY,
