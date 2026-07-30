@@ -7,6 +7,7 @@ from notable_person_finder.config.models import (
     FeedsConfig,
     GenerationParameters,
     MainConfig,
+    MatchWikipediaIdentityConfig,
     MediaWikiConfig,
     OpenRouterConfig,
     ProviderRoutingConfig,
@@ -59,6 +60,30 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
     assert config.tasks.resolve_person_entity.max_names_per_candidate == 8
     assert config.tasks.resolve_person_entity.max_title_characters == 500
     assert config.tasks.resolve_person_entity.max_summary_characters == 4000
+    match = config.tasks.match_wikipedia_identity
+    assert match.model == "openai/gpt-5.4-mini"
+    assert match.max_input_tokens == 4096
+    assert match.max_completion_tokens == 1024
+    assert match.parameters == GenerationParameters(
+        temperature=0.0,
+        top_p=1.0,
+        reasoning_effort=None,
+    )
+    assert match.max_candidates == 8
+    assert match.max_query_forms == 6
+    assert match.search_srlimit == 10
+    assert match.max_continuations_per_form == 1
+    assert match.max_search_hits_per_form == 20
+    assert match.max_page_ids_per_facts_request == 20
+    assert match.max_redirect_hops == 3
+    assert match.max_fact_pages_per_plan == 40
+    assert match.max_extract_characters == 1200
+    assert match.max_categories_per_page == 20
+    assert match.max_names_in_prompt == 8
+    assert match.max_facts_in_prompt == 16
+    assert match.refresh_interval_hours == 720
+    assert match.max_title_characters == 500
+    assert match.max_summary_characters == 4000
     assert GenerationParameters(reasoning_effort=None).reasoning_effort is None
 
 
@@ -71,8 +96,10 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
         (GenerationParameters(), "temperature"),
         (DetectPeopleConfig(), "model"),
         (ResolvePersonEntityConfig(), "model"),
+        (MatchWikipediaIdentityConfig(), "model"),
         (TasksConfig(), "detect_people"),
         (TasksConfig(), "resolve_person_entity"),
+        (TasksConfig(), "match_wikipedia_identity"),
     ],
 )
 def test_model_configuration_models_are_frozen(value: object, field_name: str) -> None:
@@ -89,8 +116,10 @@ def test_model_configuration_models_are_frozen(value: object, field_name: str) -
         ("tasks", {"compose_lead_summary": {}}),
         ("detect_people", {"max_tokens": 1024}),
         ("resolve_person_entity", {"max_tokens": 1024}),
+        ("match_wikipedia_identity", {"max_tokens": 1024}),
         ("parameters", {"seed": 7}),
         ("resolve_parameters", {"seed": 7}),
+        ("match_parameters", {"seed": 7}),
     ],
 )
 def test_model_configuration_rejects_unknown_fields(
@@ -99,7 +128,11 @@ def test_model_configuration_rejects_unknown_fields(
     value = _minimal_main()
     value["openrouter"] = {}
     value["mediawiki"] = {}
-    value["tasks"] = {"detect_people": {}, "resolve_person_entity": {}}
+    value["tasks"] = {
+        "detect_people": {},
+        "resolve_person_entity": {},
+        "match_wikipedia_identity": {},
+    }
     if section == "openrouter":
         value["openrouter"] = extra
     elif section == "mediawiki":
@@ -112,8 +145,12 @@ def test_model_configuration_rejects_unknown_fields(
         value["tasks"] = {"detect_people": extra}
     elif section == "resolve_person_entity":
         value["tasks"] = {"resolve_person_entity": extra}
+    elif section == "match_wikipedia_identity":
+        value["tasks"] = {"match_wikipedia_identity": extra}
     elif section == "resolve_parameters":
         value["tasks"] = {"resolve_person_entity": {"parameters": extra}}
+    elif section == "match_parameters":
+        value["tasks"] = {"match_wikipedia_identity": {"parameters": extra}}
     else:
         value["tasks"] = {"detect_people": {"parameters": extra}}
 
@@ -188,6 +225,7 @@ def test_mediawiki_config_has_no_secret_fields() -> None:
         (GenerationParameters, {"top_p": "1.0"}),
         (DetectPeopleConfig, {"model": b"openai/gpt-5.4-mini"}),
         (ResolvePersonEntityConfig, {"model": b"openai/gpt-5.4-mini"}),
+        (MatchWikipediaIdentityConfig, {"model": b"openai/gpt-5.4-mini"}),
         (
             TasksConfig,
             {"detect_people": {"parameters": {"temperature": True}}},
@@ -195,6 +233,10 @@ def test_mediawiki_config_has_no_secret_fields() -> None:
         (
             TasksConfig,
             {"resolve_person_entity": {"parameters": {"temperature": True}}},
+        ),
+        (
+            TasksConfig,
+            {"match_wikipedia_identity": {"parameters": {"temperature": True}}},
         ),
     ],
 )
@@ -240,6 +282,23 @@ def test_resolve_person_entity_rejects_router_aliases_and_invalid_model_slugs(
 ) -> None:
     with pytest.raises(ValidationError, match="model"):
         ResolvePersonEntityConfig(model=model)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "openrouter/auto",
+        "openai/gpt-5.4-mini,anthropic/claude-haiku-4.5",
+        "openai/gpt-5.4-mini:free",
+        "gpt-5.4-mini",
+        "OpenAI/gpt-5.4-mini",
+    ],
+)
+def test_match_wikipedia_identity_rejects_router_aliases_and_invalid_model_slugs(
+    model: str,
+) -> None:
+    with pytest.raises(ValidationError, match="model"):
+        MatchWikipediaIdentityConfig(model=model)
 
 
 @pytest.mark.parametrize(
@@ -332,6 +391,70 @@ def test_resolve_person_entity_rejects_out_of_range_candidate_and_context_limits
 ) -> None:
     with pytest.raises(ValidationError):
         ResolvePersonEntityConfig.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"max_input_tokens": 0},
+        {"max_completion_tokens": 0},
+        {"max_input_tokens": 1024, "max_completion_tokens": 1024},
+        {"max_input_tokens": 1024, "max_completion_tokens": 2048},
+        {"max_title_characters": 1000, "max_summary_characters": 999},
+    ],
+)
+def test_match_wikipedia_identity_rejects_non_positive_or_incompatible_bounds(
+    values: dict[str, int],
+) -> None:
+    with pytest.raises(ValidationError):
+        MatchWikipediaIdentityConfig.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"max_candidates": 0},
+        {"max_candidates": 17},
+        {"max_query_forms": 0},
+        {"max_query_forms": 17},
+        {"search_srlimit": 0},
+        {"search_srlimit": 51},
+        {"max_continuations_per_form": -1},
+        {"max_continuations_per_form": 6},
+        {"max_search_hits_per_form": 0},
+        {"max_search_hits_per_form": 101},
+        {"max_page_ids_per_facts_request": 0},
+        {"max_page_ids_per_facts_request": 51},
+        {"max_redirect_hops": 0},
+        {"max_redirect_hops": 6},
+        {"max_fact_pages_per_plan": 0},
+        {"max_fact_pages_per_plan": 101},
+        {"max_extract_characters": 0},
+        {"max_categories_per_page": 0},
+        {"max_names_in_prompt": 0},
+        {"max_facts_in_prompt": 0},
+        {"refresh_interval_hours": 0},
+        {"refresh_interval_hours": -1},
+        {"max_title_characters": 0},
+        {"max_title_characters": 2001},
+        {"max_summary_characters": 0},
+        {"max_summary_characters": 20_001},
+    ],
+)
+def test_match_wikipedia_identity_rejects_out_of_range_bounds(
+    values: dict[str, int],
+) -> None:
+    with pytest.raises(ValidationError):
+        MatchWikipediaIdentityConfig.model_validate(values)
+
+
+def test_match_wikipedia_identity_has_no_secret_fields() -> None:
+    fields = set(MatchWikipediaIdentityConfig.model_fields)
+    forbidden = ("api_key", "secret", "password", "credential", "auth_token")
+    for name in fields:
+        lowered = name.lower()
+        for fragment in forbidden:
+            assert fragment not in lowered
 
 
 def test_main_config_rejects_unknown_fields() -> None:

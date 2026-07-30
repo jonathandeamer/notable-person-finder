@@ -1,0 +1,7 @@
+{
+  "outcome": "no_matching_page",
+  "selected_page_id": null,
+  "supporting_fact_ids": [],
+  "conflicting_fact_ids": ["f1"],
+  "rationale": "The supplied candidates describe different people in other fields."
+}

@@ -1,0 +1,7 @@
+{
+  "outcome": "matching_page",
+  "selected_page_id": 99999,
+  "supporting_fact_ids": ["f1"],
+  "conflicting_fact_ids": [],
+  "rationale": "Selects a page id that was never supplied."
+}

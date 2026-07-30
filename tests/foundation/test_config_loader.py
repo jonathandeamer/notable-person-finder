@@ -85,6 +85,31 @@ def test_model_settings_are_complete_in_the_redacted_snapshot(tmp_path: Path) ->
         "max_title_characters": 500,
         "max_summary_characters": 4000,
     }
+    assert snapshot["main"]["tasks"]["match_wikipedia_identity"] == {
+        "model": "openai/gpt-5.4-mini",
+        "max_input_tokens": 4096,
+        "max_completion_tokens": 1024,
+        "parameters": {
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "reasoning_effort": "low",
+        },
+        "max_candidates": 8,
+        "max_query_forms": 6,
+        "search_srlimit": 10,
+        "max_continuations_per_form": 1,
+        "max_search_hits_per_form": 20,
+        "max_page_ids_per_facts_request": 20,
+        "max_redirect_hops": 3,
+        "max_fact_pages_per_plan": 40,
+        "max_extract_characters": 1200,
+        "max_categories_per_page": 20,
+        "max_names_in_prompt": 8,
+        "max_facts_in_prompt": 16,
+        "refresh_interval_hours": 720,
+        "max_title_characters": 500,
+        "max_summary_characters": 4000,
+    }
     assert snapshot["secret_availability"]["TEST_OPENROUTER"] is True
     assert "snapshot-secret" not in loaded.snapshot_json
 
@@ -111,6 +136,18 @@ def test_model_settings_are_complete_in_the_redacted_snapshot(tmp_path: Path) ->
         ("max_names_per_candidate = 8", "max_names_per_candidate = 12"),
         ("max_title_characters = 500", "max_title_characters = 600"),
         ("max_summary_characters = 4000", "max_summary_characters = 5000"),
+        ("max_query_forms = 6", "max_query_forms = 8"),
+        ("search_srlimit = 10", "search_srlimit = 20"),
+        ("max_continuations_per_form = 1", "max_continuations_per_form = 2"),
+        ("max_search_hits_per_form = 20", "max_search_hits_per_form = 30"),
+        ("max_page_ids_per_facts_request = 20", "max_page_ids_per_facts_request = 30"),
+        ("max_redirect_hops = 3", "max_redirect_hops = 4"),
+        ("max_fact_pages_per_plan = 40", "max_fact_pages_per_plan = 50"),
+        ("max_extract_characters = 1200", "max_extract_characters = 1500"),
+        ("max_categories_per_page = 20", "max_categories_per_page = 25"),
+        ("max_names_in_prompt = 8", "max_names_in_prompt = 10"),
+        ("max_facts_in_prompt = 16", "max_facts_in_prompt = 20"),
+        ("refresh_interval_hours = 720", "refresh_interval_hours = 168"),
     ],
 )
 def test_each_model_setting_changes_the_configuration_fingerprint(
