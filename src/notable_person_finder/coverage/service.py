@@ -2473,6 +2473,12 @@ def _selected_paths_ready_to_terminalize(
 
 
 def _has_active_assess_work(connection: sqlite3.Connection, *, plan_id: int) -> bool:
+    """True when assess work still queues on this plan (design step 10).
+
+    Only ``pending``/``deferred`` block terminalize. The item under settlement
+    remains ``running`` through ``persist`` (engine settles state after), so
+    including ``running`` would wedge the last assess path forever.
+    """
     # Assess subjects are person_article; join via targets on this plan.
     row = connection.execute(
         """
@@ -2484,7 +2490,7 @@ def _has_active_assess_work(connection: sqlite3.Connection, *, plan_id: int) -> 
            AND t.plan_id = ?
          WHERE w.task_type = ?
            AND w.subject_kind = ?
-           AND w.state IN ('pending', 'running', 'deferred')
+           AND w.state IN ('pending', 'deferred')
         """,
         (plan_id, ASSESS_ARTICLE_TASK_TYPE, SUBJECT_KIND_PERSON_ARTICLE),
     ).fetchone()
@@ -2854,6 +2860,8 @@ def _persist_assess_for(
     *,
     config: MainConfig,
 ) -> Callable[[WorkItem, TaskOutcome], None]:
+    del config  # reserved: full maybe_advance with SourcePolicy if needed later
+
     def persist(work_item: WorkItem, outcome: TaskOutcome) -> None:
         payload = outcome.payload
         if not isinstance(payload, _AssessPersist):
@@ -2874,11 +2882,9 @@ def _persist_assess_for(
                     assessment_id=existing.id,
                 )
                 if payload.plan_id is not None:
-                    _maybe_advance_after_assess(
+                    advance_coverage_plan_after_assess(
                         connection,
                         plan_id=payload.plan_id,
-                        run_id=run_id,
-                        config=config,
                         now=observed_at,
                     )
             return
@@ -2941,11 +2947,9 @@ def _persist_assess_for(
             assessment_id=assessment_id,
         )
         if payload.plan_id is not None:
-            _maybe_advance_after_assess(
+            advance_coverage_plan_after_assess(
                 connection,
                 plan_id=payload.plan_id,
-                run_id=run_id,
-                config=config,
                 now=observed_at,
             )
 
@@ -3033,36 +3037,31 @@ def _persist_assess_failure_for(
         )
         # K25: do not move current pointer on permanent failure.
         if context.plan_id is not None:
-            _maybe_advance_after_assess(
+            advance_coverage_plan_after_assess(
                 connection,
                 plan_id=context.plan_id,
-                run_id=run_id,
-                config=config,
                 now=observed_at,
             )
 
     return persist_failure
 
 
-def _maybe_advance_after_assess(
+def advance_coverage_plan_after_assess(
     connection: sqlite3.Connection,
     *,
     plan_id: int,
-    run_id: int,
-    config: MainConfig,
     now: str,
 ) -> None:
-    """Advance plan after assess settlement when a policy fingerprint is known."""
+    """Terminalize a coverage plan when selected assess paths are settled.
+
+    Used by assess handler persist/persist_failure and the K23 permanent
+    preflight settler. Does not re-screen (no SourcePolicy); only advances
+    when forms/targets/assess work are already quiescent and every selected
+    path is assess-terminal or fetch-dead (T1–T11 via ``_terminalize_plan``).
+    """
     plan = load_plan(connection, plan_id=plan_id)
     if plan is None or plan.status in _TERMINAL_PLAN_STATUSES:
         return
-    # maybe_advance requires SourcePolicy; reconstruct a minimal policy view is
-    # not available here. Terminalize only when paths are already ready via
-    # internal checks that do not re-screen. Reuse policy fingerprint solely
-    # for status transitions already implemented without screening decisions.
-    # Callers that hold a SourcePolicy (fetch/brave) still pass through the
-    # full maybe_advance path; assess settlement only bumps status when assess
-    # work clears.
     if _has_active_assess_work(connection, plan_id=plan_id):
         if plan.status in {"retrieving", "selecting"}:
             update_plan_status(connection, plan_id=plan_id, status="assessing")
@@ -3086,7 +3085,6 @@ def _maybe_advance_after_assess(
         targets=targets,
         now=now,
     )
-    del run_id, config
 
 
 def _prepare_reuse_existing_assessment(

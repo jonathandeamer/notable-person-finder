@@ -25,6 +25,7 @@ from notable_person_finder.coverage.repository import (
     insert_source_screening,
     load_person_article,
     load_person_article_assessment_by_fingerprint,
+    load_plan,
     open_plan,
     point_person_article_current_assessment,
     upsert_person_article,
@@ -558,7 +559,7 @@ def test_happy_assess_path_sets_pointer_and_signals(
 ) -> None:
     run_id = insert_run(connection)
     person_id = _person_with_name(connection, run_id=run_id)
-    _plan_id, person_article_id, view_id, _article = _seed_assessable(
+    plan_id, person_article_id, view_id, _article = _seed_assessable(
         connection, person_id=person_id, run_id=run_id
     )
     _insert_compatible_inspection(connection, run_id=run_id)
@@ -605,6 +606,13 @@ def test_happy_assess_path_sets_pointer_and_signals(
     assert signals[0]["signal_kind"] == "attention"
     assert signals[0]["category"] == "significant_recognition"
 
+    # Last assess path terminal → plan closes (T10: no usable search; any assess).
+    plan = load_plan(connection, plan_id=plan_id)
+    assert plan is not None
+    assert plan.status == "completed"
+    assert plan.completed_at is not None
+    assert plan.partial_retrieval is True
+
 
 def test_bad_passage_id_malformed_then_permanent_failed_no_pointer(
     connection: sqlite3.Connection,
@@ -612,7 +620,7 @@ def test_bad_passage_id_malformed_then_permanent_failed_no_pointer(
     """Invalid passage refs → malformed retry, then permanent failed assessment."""
     run_id = insert_run(connection)
     person_id = _person_with_name(connection, run_id=run_id)
-    _plan_id, person_article_id, view_id, _article = _seed_assessable(
+    plan_id, person_article_id, view_id, _article = _seed_assessable(
         connection, person_id=person_id, run_id=run_id
     )
     _insert_compatible_inspection(connection, run_id=run_id)
@@ -646,6 +654,13 @@ def test_bad_passage_id_malformed_then_permanent_failed_no_pointer(
     assert assessment.failure_category == "invalid_model_output"
     assert assessment.person_relation is None
     assert _person_article_pointer(connection, person_article_id) is None
+
+    # Permanent invalid-output is assess-terminal → plan advances (T10).
+    plan = load_plan(connection, plan_id=plan_id)
+    assert plan is not None
+    assert plan.status == "completed"
+    assert plan.completed_at is not None
+    assert plan.partial_retrieval is True
 
 
 def test_completed_only_sets_pointer_failed_does_not(
@@ -1081,6 +1096,12 @@ def test_permanent_assess_preflight_failed_assessment_pointer_unchanged(
     )
     # person_article still loads.
     assert load_person_article(connection, person_article_id=person_article_id)
+    # K23: settler advances plan when selected assess paths are terminal (T10).
+    plan = load_plan(connection, plan_id=plan_id)
+    assert plan is not None
+    assert plan.status == "completed"
+    assert plan.completed_at is not None
+    assert plan.partial_retrieval is True
 
 
 def test_task_types_for_model_maps_assess_only() -> None:

@@ -1650,7 +1650,10 @@ def _settle_active_assess_article(
 
     Writes failed assessments with the inspection attempt id and domain
     ``permanent_preflight``. Does **not** move
-    ``person_article.current_assessment_id`` (K25).
+    ``person_article.current_assessment_id`` (K25). After work is settled,
+    advances each distinct non-terminal coverage plan so T1–T11 can close
+    when selected assess paths are terminal (multi-path analog of match
+    plan→failed).
     """
     # Local imports avoid a people→coverage package cycle at module load.
     from notable_person_finder.coverage.repository import (
@@ -1659,6 +1662,7 @@ def _settle_active_assess_article(
         load_person_article_assessment_by_fingerprint,
     )
     from notable_person_finder.coverage.service import (
+        advance_coverage_plan_after_assess,
         resolve_assess_work_context,
     )
 
@@ -1675,6 +1679,7 @@ def _settle_active_assess_article(
         (ASSESS_ARTICLE_TASK_TYPE, _SUBJECT_KIND_PERSON_ARTICLE),
     ).fetchall()
     settled = 0
+    plan_ids: set[int] = set()
     for row in rows:
         work_item_id = int(row["id"])
         person_article_id = int(row["subject_id"])
@@ -1694,6 +1699,8 @@ def _settle_active_assess_article(
                 task_fingerprint=task_fingerprint,
             )
             if context is not None:
+                if context.plan_id is not None:
+                    plan_ids.add(context.plan_id)
                 insert_person_article_assessment(
                     connection,
                     person_article_id=person_article_id,
@@ -1722,6 +1729,8 @@ def _settle_active_assess_article(
                     failure_category=_PERMANENT_PREFLIGHT_FAILURE_CATEGORY,
                     observed_at=now,
                 )
+        elif existing is not None and existing.plan_id is not None:
+            plan_ids.add(existing.plan_id)
         # K25: never point current_assessment_id at a failed assessment.
         _settle_work_item_failed_permanent(
             connection,
@@ -1732,6 +1741,14 @@ def _settle_active_assess_article(
             task_label=ASSESS_ARTICLE_TASK_TYPE,
         )
         settled += 1
+    # After all assess work for this model is permanent-failed, close plans
+    # whose selected paths are now assess-terminal (no further HTTP will run).
+    for plan_id in sorted(plan_ids):
+        advance_coverage_plan_after_assess(
+            connection,
+            plan_id=plan_id,
+            now=now,
+        )
     return settled
 
 
