@@ -5,8 +5,9 @@ transaction so a handler's domain rows and the settlement that justifies them
 commit or roll back together. Top-level scheduling helpers that own their own
 brief ``BEGIN IMMEDIATE`` are called out explicitly.
 
-Mentions remain unresolved in this milestone and never carry a durable
-``person_id``. Namesakes may coexist under the same observation.
+Person identity writers and ``match_key`` live in ``people.identity`` and are
+re-exported here so callers have a single repository import path. Mentions may
+carry an optional durable ``person_id`` after entity resolution.
 """
 
 from __future__ import annotations
@@ -16,8 +17,15 @@ import re
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from notable_person_finder.people.models import DetectionOutput
+
+if TYPE_CHECKING:
+    from notable_person_finder.people.identity import (
+        collapse_whitespace as collapse_whitespace,
+    )
+    from notable_person_finder.people.identity import match_key as match_key
 
 DETECT_PEOPLE_TASK_TYPE = "detect_people"
 _SUBJECT_KIND_SOURCE_ITEM = "source_item"
@@ -75,6 +83,22 @@ def mechanical_search_name(exact_name: str) -> str:
         return exact_name
     candidate = _HONORIFIC_PREFIX.sub("", stripped, count=1).strip()
     return candidate or stripped
+
+
+def collapse_whitespace(value: str) -> str:
+    """Re-export: collapse runs of whitespace (owned by ``people.identity``)."""
+    from notable_person_finder.people.identity import (
+        collapse_whitespace as _collapse_whitespace,
+    )
+
+    return _collapse_whitespace(value)
+
+
+def match_key(value: str) -> str:
+    """Re-export: retrieval key (owned by ``people.identity``)."""
+    from notable_person_finder.people.identity import match_key as _match_key
+
+    return _match_key(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +168,8 @@ class PersonMentionRecord:
     outcome: str
     supporting_passage_ids_json: str
     rationale: str
+    person_id: int | None
+    current_entity_resolution_observation_id: int | None
     identity_facts: tuple[MentionIdentityFactRecord, ...]
     signals: tuple[MentionSignalRecord, ...]
 
@@ -625,6 +651,12 @@ def load_person_mentions(
             outcome=row["outcome"],
             supporting_passage_ids_json=row["supporting_passage_ids_json"],
             rationale=row["rationale"],
+            person_id=(None if row["person_id"] is None else int(row["person_id"])),
+            current_entity_resolution_observation_id=(
+                None
+                if row["current_entity_resolution_observation_id"] is None
+                else int(row["current_entity_resolution_observation_id"])
+            ),
             identity_facts=tuple(facts_by_mention[int(row["id"])]),
             signals=tuple(signals_by_mention[int(row["id"])]),
         )
