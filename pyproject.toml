@@ -12,6 +12,7 @@ license = { file = "LICENSE" }
 dependencies = [
   "feedparser>=6.0,<7",
   "httpx>=0.28,<0.29",
+  "openrouter>=1.0,<2",
   "platformdirs>=4.3,<5",
   "portalocker>=3.1,<4",
   "pydantic>=2.11,<3",
@@ -79,5 +80,11 @@ known-first-party = ["notable_person_finder"]
 [tool.pyright]
 pythonVersion = "3.13"
 typeCheckingMode = "standard"
-include = ["src", "tests/foundation", "tests/run_engine", "tests/ingestion"]
+include = [
+    "src",
+    "tests/foundation",
+    "tests/run_engine",
+    "tests/ingestion",
+    "tests/people",
+]
 exclude = ["**/__pycache__", ".venv", ".worktrees"]

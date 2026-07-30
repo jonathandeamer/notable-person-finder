@@ -242,8 +242,14 @@ def schedule_work(
 
     Duplicate active scheduling is prevented by `work_item_active_identity`, so
     a caller that rediscovers the same input is a no-op rather than an error.
+
+    Joins a caller-owned open transaction when one is already active so
+    same-run ingestion can schedule detection inside the feed settlement
+    without a nested BEGIN, and so a later failure still rolls both back.
     """
-    connection.execute("BEGIN IMMEDIATE")
+    owns_transaction = not connection.in_transaction
+    if owns_transaction:
+        connection.execute("BEGIN IMMEDIATE")
     try:
         existing = connection.execute(
             """
@@ -280,10 +286,12 @@ def schedule_work(
             )
             work_id = _last_row_id(cursor)
     except BaseException:
-        connection.rollback()
+        if owns_transaction:
+            connection.rollback()
         raise
     else:
-        connection.commit()
+        if owns_transaction:
+            connection.commit()
     return work_id
 
 
@@ -296,8 +304,13 @@ def supersede_work(
     now: str,
     reason: str,
 ) -> int:
-    """Retire active work whose material input has changed."""
-    connection.execute("BEGIN IMMEDIATE")
+    """Retire active work whose material input has changed.
+
+    Joins a caller-owned open transaction when one is already active.
+    """
+    owns_transaction = not connection.in_transaction
+    if owns_transaction:
+        connection.execute("BEGIN IMMEDIATE")
     try:
         changed = connection.execute(
             """
@@ -310,10 +323,12 @@ def supersede_work(
             (reason, run_id, now, task_type, fingerprint),
         ).rowcount
     except BaseException:
-        connection.rollback()
+        if owns_transaction:
+            connection.rollback()
         raise
     else:
-        connection.commit()
+        if owns_transaction:
+            connection.commit()
     return changed
 
 

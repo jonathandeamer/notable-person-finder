@@ -115,12 +115,18 @@ def test_modified_fetch_creates_source_items_and_a_fetch_row(
             now=moment(),
         )
 
+    stored_ids = tuple(
+        int(row["id"])
+        for row in connection.execute("SELECT id FROM source_item ORDER BY id")
+    )
     assert counts == FetchPersistResult(
         source_items_created=3,
         source_items_existing=0,
         articles_created=3,
         entry_issues={},
+        created_source_item_ids=stored_ids,
     )
+    assert len(counts.created_source_item_ids) == 3
     fetch_row = connection.execute(
         "SELECT outcome, entry_count FROM feed_fetch WHERE feed_identity_id = ?",
         (feed_id,),
@@ -130,6 +136,82 @@ def test_modified_fetch_creates_source_items_and_a_fetch_row(
     assert (
         connection.execute("SELECT COUNT(*) AS n FROM source_item").fetchone()["n"] == 3
     )
+
+
+def test_created_source_item_ids_are_only_newly_inserted_and_ordered(
+    connection: sqlite3.Connection,
+) -> None:
+    """Duplicates return none; fresh inserts return IDs in entry order."""
+    run_id, feed_id = _run_and_identity(connection)
+    first_batch = _modified(
+        entries=(
+            _entry(entry_id="a", url="https://alpha.example.com/a"),
+            _entry(entry_id="b", url="https://alpha.example.com/b"),
+        )
+    )
+    with immediate(connection):
+        first = persist_fetch(
+            connection,
+            feed_identity_id=feed_id,
+            run_id=run_id,
+            result=first_batch,
+            now=moment(),
+        )
+
+    assert first.source_items_created == 2
+    assert first.created_source_item_ids == tuple(
+        int(row["id"])
+        for row in connection.execute("SELECT id FROM source_item ORDER BY id")
+    )
+    # Entry order: a then b. IDs are monotonic with insert order.
+    assert first.created_source_item_ids[0] < first.created_source_item_ids[1]
+
+    mixed = _modified(
+        entries=(
+            _entry(entry_id="a", url="https://alpha.example.com/a"),  # existing
+            _entry(entry_id="c", url="https://alpha.example.com/c"),  # new
+            _entry(entry_id="b", url="https://alpha.example.com/b"),  # existing
+            _entry(entry_id="d", url="https://alpha.example.com/d"),  # new
+        )
+    )
+    with immediate(connection):
+        second = persist_fetch(
+            connection,
+            feed_identity_id=feed_id,
+            run_id=run_id,
+            result=mixed,
+            now=moment(60),
+        )
+
+    assert second.source_items_created == 2
+    assert second.source_items_existing == 2
+    assert second.created_source_item_ids == tuple(
+        int(row["id"])
+        for row in connection.execute(
+            """
+            SELECT id FROM source_item
+             WHERE original_url IN (
+                 'https://alpha.example.com/c',
+                 'https://alpha.example.com/d'
+             )
+             ORDER BY id
+            """
+        )
+    )
+    assert len(second.created_source_item_ids) == 2
+    assert second.created_source_item_ids[0] < second.created_source_item_ids[1]
+
+    with immediate(connection):
+        third = persist_fetch(
+            connection,
+            feed_identity_id=feed_id,
+            run_id=run_id,
+            result=first_batch,
+            now=moment(120),
+        )
+    assert third.source_items_created == 0
+    assert third.source_items_existing == 2
+    assert third.created_source_item_ids == ()
 
 
 def test_rerunning_identical_fetch_creates_no_new_source_items(
@@ -156,8 +238,10 @@ def test_rerunning_identical_fetch_creates_no_new_source_items(
         )
 
     assert first.source_items_created == 1
+    assert len(first.created_source_item_ids) == 1
     assert second.source_items_created == 0
     assert second.source_items_existing == 1
+    assert second.created_source_item_ids == ()
     assert (
         connection.execute("SELECT COUNT(*) AS n FROM feed_fetch").fetchone()["n"] == 2
     )

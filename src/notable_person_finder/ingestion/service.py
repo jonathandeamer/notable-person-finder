@@ -76,7 +76,7 @@ from notable_person_finder.providers.feeds import (
 )
 from notable_person_finder.runs import repository
 from notable_person_finder.runs.clock import Clock, utc_timestamp
-from notable_person_finder.runs.engine import TaskHandler, TaskOutcome
+from notable_person_finder.runs.engine import TaskHandler, TaskOutcome, TaskPreparation
 from notable_person_finder.runs.models import WorkItem, WorkState
 
 FETCH_FEED_TASK_TYPE = "fetch_feed"
@@ -433,6 +433,7 @@ def _persist_entries(
     source_items_existing = 0
     articles_created: list[int] = []
     entry_issues: dict[str, int] = {}
+    created_source_item_ids: list[int] = []
 
     for entry in entries:
         try:
@@ -472,6 +473,7 @@ def _persist_entries(
             source_items_existing += 1
         else:
             source_items_created += 1
+            created_source_item_ids.append(item_id)
 
         if url_issue is not None:
             key = f"url:{url_issue}"
@@ -485,6 +487,7 @@ def _persist_entries(
         source_items_existing=source_items_existing,
         articles_created=sum(articles_created),
         entry_issues=entry_issues,
+        created_source_item_ids=tuple(created_source_item_ids),
     )
 
 
@@ -810,8 +813,15 @@ def _attempt_context(
 def _persist_for(
     connection: sqlite3.Connection,
     resolve: Callable[[WorkItem], tuple[int, FeedConfig]],
+    on_source_items: Callable[[tuple[int, ...], int, str], None] | None,
 ) -> Callable[[WorkItem, TaskOutcome], None]:
-    """Build the application-thread `persist` callback for `build_fetch_handler`."""
+    """Build the application-thread `persist` callback for `build_fetch_handler`.
+
+    When `on_source_items` is set, it runs on this same application thread
+    *inside* the settling transaction, after source-item inserts, so a
+    callback failure rolls back both the feed settlement and the new items.
+    Ingestion never imports people; the CLI injects scheduling here.
+    """
 
     def persist(work_item: WorkItem, outcome: TaskOutcome) -> None:
         feed_identity_id, _feed = resolve(work_item)
@@ -821,13 +831,15 @@ def _persist_for(
             raise RuntimeError(
                 f"unexpected fetch payload type: {type(result).__name__}"
             )
-        persist_fetch(
+        counts = persist_fetch(
             connection,
             feed_identity_id=feed_identity_id,
             run_id=run_id,
             result=result,
             now=requested_at,
         )
+        if on_source_items is not None and counts.created_source_item_ids:
+            on_source_items(counts.created_source_item_ids, run_id, requested_at)
 
     return persist
 
@@ -858,8 +870,15 @@ def build_fetch_handler(
     *,
     client: FeedClient,
     feeds: FeedsConfig,
+    on_source_items: Callable[[tuple[int, ...], int, str], None] | None = None,
 ) -> TaskHandler:
-    """The `fetch_feed` handler: one feed fetch, split across the two threads."""
+    """The `fetch_feed` handler: one feed fetch, split across the two threads.
+
+    `on_source_items`, when provided, is invoked from `persist` on the
+    application thread inside the settlement transaction after newly inserted
+    source items, as ``(created_source_item_ids, run_id, now)``. Absent, the
+    handler matches milestone 3a behaviour.
+    """
     configured = {feed.key: feed for feed in feeds.feeds}
 
     def resolve(work_item: WorkItem) -> tuple[int, FeedConfig]:
@@ -920,7 +939,7 @@ def build_fetch_handler(
             return None
         return urlsplit(feed.url).hostname
 
-    def prepare(work_item: WorkItem) -> object:
+    def prepare(work_item: WorkItem) -> TaskPreparation:
         """Application thread. The handler's only access to SQLite."""
         feed_identity_id, feed = resolve(work_item)
         etag, last_modified = latest_validators(
@@ -928,9 +947,11 @@ def build_fetch_handler(
             feed_identity_id=feed_identity_id,
             requested_url=feed.url,
         )
-        return FeedCall(
-            feed=feed,
-            validators=FeedValidators(etag=etag, last_modified=last_modified),
+        return TaskPreparation(
+            payload=FeedCall(
+                feed=feed,
+                validators=FeedValidators(etag=etag, last_modified=last_modified),
+            )
         )
 
     return TaskHandler(
@@ -939,7 +960,7 @@ def build_fetch_handler(
         operation=FETCH_FEED_OPERATION,
         execute=_execute_for(client),
         prepare=prepare,
-        persist=_persist_for(connection, resolve),
+        persist=_persist_for(connection, resolve, on_source_items),
         persist_failure=_persist_failure_for(connection, resolve),
         destination_host=destination_host,
         # A feed fetch costs no money, so it reserves nothing against the run

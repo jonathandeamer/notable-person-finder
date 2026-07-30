@@ -8,6 +8,7 @@ import sqlite3
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -23,11 +24,16 @@ from notable_person_finder.runs.engine import (
     RunReport,
     TaskHandler,
     TaskOutcome,
+    TaskPreparation,
     derive_run_state,
 )
 from notable_person_finder.runs.models import RunState, WorkItem, WorkState
 from notable_person_finder.runs.retry import RetryPolicy
-from notable_person_finder.runs.scheduler import BoundedScheduler
+from notable_person_finder.runs.scheduler import (
+    BoundedScheduler,
+    SchedulerSet,
+    WorkerPool,
+)
 
 # Derived from the production renderer rather than written out, so a change to
 # the canonical timestamp format cannot leave the fixture seeding rows in a
@@ -178,7 +184,7 @@ def build_engine(
     *,
     budget_limit_nano_usd: int | None = None,
     retry: RetryPolicy | None = None,
-    scheduler: BoundedScheduler | None = None,
+    scheduler: BoundedScheduler | SchedulerSet | None = None,
 ) -> RunEngine:
     return RunEngine(
         connection,
@@ -219,6 +225,27 @@ def schedule_probe(
         fingerprint=fingerprint,
         required=required,
         priority=100,
+        eligible_at=NOW,
+        run_id=None,
+        now=NOW,
+    )
+
+
+def schedule_typed_probe(
+    connection: sqlite3.Connection,
+    *,
+    task_type: str,
+    fingerprint: str,
+    priority: int = 100,
+) -> int:
+    return repository.schedule_work(
+        connection,
+        task_type=task_type,
+        subject_kind="synthetic",
+        subject_id=None,
+        fingerprint=fingerprint,
+        required=True,
+        priority=priority,
         eligible_at=NOW,
         run_id=None,
         now=NOW,
@@ -396,6 +423,187 @@ def test_refused_budget_reservation_makes_no_external_call(database: Path) -> No
         ).fetchone()["state"]
         == WorkState.DEFERRED
     )
+    assert repository.attempts_for_run(connection, run_id=report.run_id) == ()
+    connection.close()
+
+
+def test_preparation_reservation_reaches_the_attempt_and_run(
+    database: Path,
+) -> None:
+    """A dynamic reservation must be durable before its provider call starts."""
+    connection = connect_database(database)
+    schedule_probe(connection, "1" * 64)
+    seen_payloads: list[object] = []
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        seen_payloads.append(prepared)
+        reader = connect_database(database, readonly=True)
+        try:
+            row = reader.execute(
+                "SELECT budget_reserved_nano_usd FROM run ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            reader.close()
+        assert row["budget_reserved_nano_usd"] == 123
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None, actual_nano_usd=0)
+
+    handler = TaskHandler(
+        task_type="probe",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=execute,
+        reserved_nano_usd=999,
+        prepare=lambda work_item: TaskPreparation(
+            payload="prepared payload", reserved_nano_usd=123
+        ),
+    )
+    report = build_engine(connection, FakeClock(), budget_limit_nano_usd=1_000).execute(
+        {handler.task_type: handler}
+    )
+
+    attempts = repository.attempts_for_run(connection, run_id=report.run_id)
+    assert [attempt["reserved_nano_usd"] for attempt in attempts] == [123]
+    assert seen_payloads == ["prepared payload"]
+    connection.close()
+
+
+def test_preparation_without_a_reservation_uses_the_handler_default(
+    database: Path,
+) -> None:
+    """`None` preserves fixed-cost handler behaviour rather than meaning zero."""
+    connection = connect_database(database)
+    schedule_probe(connection, "2" * 64)
+    handler = TaskHandler(
+        task_type="probe",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=lambda work_item, ordinal, prepared: TaskOutcome(
+            state=WorkState.SUCCEEDED, reason=None, actual_nano_usd=0
+        ),
+        reserved_nano_usd=77,
+        prepare=lambda work_item: TaskPreparation(payload="prepared payload"),
+    )
+    report = build_engine(connection, FakeClock(), budget_limit_nano_usd=100).execute(
+        {handler.task_type: handler}
+    )
+
+    attempts = repository.attempts_for_run(connection, run_id=report.run_id)
+    assert [attempt["reserved_nano_usd"] for attempt in attempts] == [77]
+    connection.close()
+
+
+def test_zero_preparation_reservation_overrides_a_fixed_handler_default(
+    database: Path,
+) -> None:
+    """Zero is an explicit free-call override, not a fallback sentinel."""
+    connection = connect_database(database)
+    schedule_probe(connection, "3" * 64)
+    calls: list[object] = []
+    handler = TaskHandler(
+        task_type="probe",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=lambda work_item, ordinal, prepared: (
+            calls.append(prepared)
+            or TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+        ),
+        reserved_nano_usd=200,
+        prepare=lambda work_item: TaskPreparation(
+            payload="free call", reserved_nano_usd=0
+        ),
+    )
+    report = build_engine(connection, FakeClock(), budget_limit_nano_usd=0).execute(
+        {handler.task_type: handler}
+    )
+
+    assert calls == ["free call"]
+    attempts = repository.attempts_for_run(connection, run_id=report.run_id)
+    assert [attempt["reserved_nano_usd"] for attempt in attempts] == [0]
+    connection.close()
+
+
+def test_negative_preparation_reservation_is_rejected_before_an_attempt(
+    database: Path,
+) -> None:
+    """An invalid preflight amount cannot create paid-call evidence."""
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "4" * 64)
+    calls: list[int] = []
+    handler = TaskHandler(
+        task_type="probe",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=lambda work_item, ordinal, prepared: (
+            calls.append(ordinal) or TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+        ),
+        prepare=lambda work_item: TaskPreparation(reserved_nano_usd=-1),
+    )
+    report = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    assert calls == []
+    assert repository.attempts_for_run(connection, run_id=report.run_id) == ()
+    assert (
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (work_id,)
+        ).fetchone()["state"]
+        == WorkState.FAILED_PERMANENT
+    )
+    connection.close()
+
+
+@pytest.mark.parametrize("reservation", [1.5, True], ids=["float", "boolean"])
+def test_noninteger_preparation_reservation_is_rejected_before_an_attempt(
+    database: Path, reservation: object
+) -> None:
+    """Nano-USD reservations must be integers, excluding bool's int subclass."""
+    connection = connect_database(database)
+    work_id = schedule_probe(connection, "6" * 64)
+    calls: list[int] = []
+    handler = TaskHandler(
+        task_type="probe",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=lambda work_item, ordinal, prepared: (
+            calls.append(ordinal) or TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+        ),
+        prepare=lambda work_item: TaskPreparation(
+            reserved_nano_usd=cast(int, reservation)
+        ),
+    )
+    report = build_engine(connection, FakeClock()).execute({handler.task_type: handler})
+
+    assert calls == []
+    assert repository.attempts_for_run(connection, run_id=report.run_id) == ()
+    assert (
+        connection.execute(
+            "SELECT state FROM work_item WHERE id = ?", (work_id,)
+        ).fetchone()["state"]
+        == WorkState.FAILED_PERMANENT
+    )
+    connection.close()
+
+
+def test_budget_refusal_for_a_preparation_reservation_makes_no_provider_call(
+    database: Path,
+) -> None:
+    """The dynamic reservation shares the attempt insert's refusal transaction."""
+    connection = connect_database(database)
+    schedule_probe(connection, "5" * 64)
+    calls: list[int] = []
+    handler = TaskHandler(
+        task_type="probe",
+        provider="openrouter",
+        operation="generate_structured",
+        execute=lambda work_item, ordinal, prepared: (
+            calls.append(ordinal) or TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+        ),
+        prepare=lambda work_item: TaskPreparation(reserved_nano_usd=101),
+    )
+    report = build_engine(connection, FakeClock(), budget_limit_nano_usd=100).execute(
+        {handler.task_type: handler}
+    )
+
+    assert calls == []
     assert repository.attempts_for_run(connection, run_id=report.run_id) == ()
     connection.close()
 
@@ -1277,11 +1485,10 @@ class RecordingScheduler(BoundedScheduler):
         self.workers: list[object] = []
         self.submitted: list[object] = []
 
-    def run(self, items, worker):  # type: ignore[override]
-        materialized = list(items)
+    def _submit(self, item, worker):  # type: ignore[override]
         self.workers.append(worker)
-        self.submitted.extend(materialized)
-        return super().run(materialized, worker)
+        self.submitted.append(item)
+        return super()._submit(item, worker)
 
 
 def test_the_submitted_closure_never_captures_the_connection(database: Path) -> None:
@@ -1418,6 +1625,268 @@ def test_at_most_http_workers_calls_are_ever_in_flight(database: Path) -> None:
     assert peak == 2
     assert sorted(attempt_rows) == [2, 2, 4, 4]
     assert report.counters.required_succeeded == 4
+    connection.close()
+
+
+def test_handlers_route_to_their_pool_and_claim_only_that_pools_capacity(
+    database: Path,
+) -> None:
+    """Using one batch limit or routing both handlers to one pool must fail."""
+    connection = connect_database(database)
+    for index in range(4):
+        schedule_typed_probe(
+            connection,
+            task_type="http_probe",
+            fingerprint=f"{index + 1:064x}",
+        )
+    for index in range(2):
+        schedule_typed_probe(
+            connection,
+            task_type="llm_probe",
+            fingerprint=f"{index + 101:064x}",
+        )
+
+    in_flight = {WorkerPool.HTTP: 0, WorkerPool.LLM: 0}
+    peak = {WorkerPool.HTTP: 0, WorkerPool.LLM: 0}
+    attempt_rows: list[int] = []
+    guard = threading.Lock()
+    wave = threading.Barrier(3)
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        pool = (
+            WorkerPool.HTTP if work_item.task_type == "http_probe" else WorkerPool.LLM
+        )
+        with guard:
+            in_flight[pool] += 1
+            peak[pool] = max(peak[pool], in_flight[pool])
+        wave.wait(timeout=5)
+        reader = connect_database(database, readonly=True)
+        try:
+            row = reader.execute("SELECT COUNT(*) AS n FROM attempt").fetchone()
+        finally:
+            reader.close()
+        with guard:
+            attempt_rows.append(int(row["n"]))
+            in_flight[pool] -= 1
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    handlers = {
+        "http_probe": TaskHandler(
+            task_type="http_probe",
+            provider="http_provider",
+            operation="http_call",
+            execute=execute,
+            pool=WorkerPool.HTTP,
+        ),
+        "llm_probe": TaskHandler(
+            task_type="llm_probe",
+            provider="llm_provider",
+            operation="llm_call",
+            execute=execute,
+            pool=WorkerPool.LLM,
+        ),
+    }
+    with SchedulerSet(
+        {
+            WorkerPool.HTTP: BoundedScheduler(max_workers=2),
+            WorkerPool.LLM: BoundedScheduler(max_workers=1),
+        }
+    ) as schedulers:
+        report = build_engine(connection, FakeClock(), scheduler=schedulers).execute(
+            handlers
+        )
+
+    assert peak == {WorkerPool.HTTP: 2, WorkerPool.LLM: 1}
+    assert sorted(attempt_rows) == [3, 3, 3, 6, 6, 6]
+    assert report.counters.required_succeeded == 6
+    connection.close()
+
+
+def test_ready_false_prevents_claim_and_attempt_creation(database: Path) -> None:
+    """Ignoring readiness must create a second call and attempt."""
+    connection = connect_database(database)
+    runnable_id = schedule_typed_probe(
+        connection,
+        task_type="runnable_probe",
+        fingerprint="71" * 32,
+        priority=10,
+    )
+    gated_id = schedule_typed_probe(
+        connection,
+        task_type="gated_probe",
+        fingerprint="72" * 32,
+        priority=20,
+    )
+    application_thread = threading.get_ident()
+    readiness_threads: list[int] = []
+    calls: list[int] = []
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        calls.append(work_item.id)
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    handlers = {
+        "runnable_probe": TaskHandler(
+            task_type="runnable_probe",
+            provider="http_provider",
+            operation="http_call",
+            execute=execute,
+        ),
+        "gated_probe": TaskHandler(
+            task_type="gated_probe",
+            provider="llm_provider",
+            operation="llm_call",
+            execute=execute,
+            pool=WorkerPool.LLM,
+            ready=lambda run_id: (
+                readiness_threads.append(threading.get_ident()) or False
+            ),
+        ),
+    }
+    with SchedulerSet(
+        {
+            WorkerPool.HTTP: BoundedScheduler(max_workers=1),
+            WorkerPool.LLM: BoundedScheduler(max_workers=1),
+        }
+    ) as schedulers:
+        report = build_engine(connection, FakeClock(), scheduler=schedulers).execute(
+            handlers
+        )
+
+    assert calls == [runnable_id]
+    assert readiness_threads and set(readiness_threads) == {application_thread}
+    attempts = repository.attempts_for_run(connection, run_id=report.run_id)
+    assert [attempt["work_item_id"] for attempt in attempts] == [runnable_id]
+    row = connection.execute(
+        "SELECT state, claimed_by_run_id FROM work_item WHERE id = ?", (gated_id,)
+    ).fetchone()
+    assert tuple(row) == (WorkState.PENDING, None)
+    connection.close()
+
+
+def test_readiness_is_rechecked_after_another_settlement_in_the_same_run(
+    database: Path,
+) -> None:
+    """Evaluating readiness only once must leave the dependent item pending."""
+    connection = connect_database(database)
+    unlock_id = schedule_typed_probe(
+        connection,
+        task_type="unlock_probe",
+        fingerprint="73" * 32,
+        priority=10,
+    )
+    gated_id = schedule_typed_probe(
+        connection,
+        task_type="gated_probe",
+        fingerprint="74" * 32,
+        priority=20,
+    )
+    unlocked = False
+    readiness: list[bool] = []
+    readiness_threads: list[int] = []
+    application_thread = threading.get_ident()
+    calls: list[int] = []
+
+    def ready(run_id: int) -> bool:
+        readiness_threads.append(threading.get_ident())
+        readiness.append(unlocked)
+        return unlocked
+
+    def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
+        if work_item.id == gated_id:
+            assert unlocked
+        calls.append(work_item.id)
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+
+    def persist_unlock(work_item: WorkItem, outcome: TaskOutcome) -> None:
+        nonlocal unlocked
+        unlocked = True
+
+    handlers = {
+        "unlock_probe": TaskHandler(
+            task_type="unlock_probe",
+            provider="llm_provider",
+            operation="inspect",
+            execute=execute,
+            persist=persist_unlock,
+            pool=WorkerPool.LLM,
+        ),
+        "gated_probe": TaskHandler(
+            task_type="gated_probe",
+            provider="llm_provider",
+            operation="generate",
+            execute=execute,
+            pool=WorkerPool.LLM,
+            ready=ready,
+        ),
+    }
+    with SchedulerSet({WorkerPool.LLM: BoundedScheduler(max_workers=1)}) as schedulers:
+        report = build_engine(connection, FakeClock(), scheduler=schedulers).execute(
+            handlers
+        )
+
+    assert calls == [unlock_id, gated_id]
+    assert readiness[0] is False
+    assert True in readiness[1:]
+    assert set(readiness_threads) == {application_thread}
+    assert report.state is RunState.COMPLETE
+    connection.close()
+
+
+def test_pending_gated_work_remains_visible_and_makes_the_run_partial(
+    database: Path,
+) -> None:
+    """Dropping unready task types from queue accounting must fail."""
+    connection = connect_database(database)
+    schedule_typed_probe(
+        connection,
+        task_type="gated_probe",
+        fingerprint="75" * 32,
+    )
+    handler = TaskHandler(
+        task_type="gated_probe",
+        provider="llm_provider",
+        operation="generate",
+        execute=lambda work, ordinal, prepared: TaskOutcome(
+            state=WorkState.SUCCEEDED, reason=None
+        ),
+        pool=WorkerPool.LLM,
+        ready=lambda run_id: False,
+    )
+
+    with SchedulerSet({WorkerPool.LLM: BoundedScheduler(max_workers=1)}) as schedulers:
+        report = build_engine(connection, FakeClock(), scheduler=schedulers).execute(
+            {handler.task_type: handler}
+        )
+
+    assert report.state is RunState.PARTIAL
+    assert report.counters.required_pending == 1
+    connection.close()
+
+
+def test_missing_handler_pool_is_rejected_before_run_creation(database: Path) -> None:
+    """Deferring registration validation until drain must leave a run row."""
+    connection = connect_database(database)
+    handler = TaskHandler(
+        task_type="llm_probe",
+        provider="llm_provider",
+        operation="generate",
+        execute=lambda work, ordinal, prepared: TaskOutcome(
+            state=WorkState.SUCCEEDED, reason=None
+        ),
+        pool=WorkerPool.LLM,
+    )
+
+    with (
+        SchedulerSet({WorkerPool.HTTP: BoundedScheduler(max_workers=1)}) as schedulers,
+        pytest.raises(ValueError, match="llm"),
+    ):
+        build_engine(connection, FakeClock(), scheduler=schedulers).execute(
+            {handler.task_type: handler}
+        )
+
+    row = connection.execute("SELECT COUNT(*) AS n FROM run").fetchone()
+    assert row["n"] == 0
     connection.close()
 
 
@@ -1563,12 +2032,12 @@ def test_prepare_runs_on_the_application_thread_and_feeds_execute(
     prepare_threads: list[int] = []
     seen: list[object] = []
 
-    def prepare(work_item) -> object:
+    def prepare(work_item) -> TaskPreparation:
         prepare_threads.append(threading.get_ident())
         row = connection.execute(
             "SELECT fingerprint FROM work_item WHERE id = ?", (work_item.id,)
         ).fetchone()
-        return row["fingerprint"]
+        return TaskPreparation(payload=row["fingerprint"])
 
     def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
         seen.append(prepared)
@@ -1657,10 +2126,10 @@ def test_a_handler_whose_prepare_raises_settles_that_item_and_lets_siblings_run(
     bad_id = schedule_probe(connection, "p1" * 32)
     good_id = schedule_probe(connection, "p2" * 32)
 
-    def prepare(work_item) -> object:
+    def prepare(work_item) -> TaskPreparation:
         if work_item.id == bad_id:
             raise ValueError("prepare blew up")
-        return None
+        return TaskPreparation()
 
     def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
         return TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
@@ -2575,10 +3044,10 @@ def test_persist_failure_does_not_run_when_prepare_raises(database: Path) -> Non
     good = schedule_probe(connection, "g2" * 32)
     failed: list[int] = []
 
-    def prepare(work_item) -> object:
+    def prepare(work_item) -> TaskPreparation:
         if work_item.id == bad:
             raise ValueError("prepare blew up")
-        return None
+        return TaskPreparation()
 
     def execute(work_item, ordinal: int, prepared: object) -> TaskOutcome:
         raise ProviderFailure(
@@ -2739,12 +3208,12 @@ def test_persist_failure_runs_when_a_rearmed_items_prepare_raises(
     failed: list[str] = []
     prepare_calls = 0
 
-    def prepare(work_item: WorkItem) -> object:
+    def prepare(work_item: WorkItem) -> TaskPreparation:
         nonlocal prepare_calls
         prepare_calls += 1
         if prepare_calls > 1:
             raise ValueError("prepare blew up on re-claim")
-        return None
+        return TaskPreparation()
 
     def execute(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
         raise ProviderFailure(

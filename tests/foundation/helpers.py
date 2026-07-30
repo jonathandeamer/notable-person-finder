@@ -16,6 +16,27 @@ root = "portable"
 [secrets]
 openrouter_api_key = "TEST_OPENROUTER"
 brave_api_key = "TEST_BRAVE"
+
+[openrouter]
+endpoint = "https://openrouter.ai/api/v1"
+
+[openrouter.routing]
+allow_fallbacks = true
+data_collection = "deny"
+zdr = true
+
+[tasks.detect_people]
+model = "openai/gpt-5.4-mini"
+max_input_tokens = 4096
+max_completion_tokens = 1024
+max_people = 8
+max_title_characters = 500
+max_summary_characters = 4000
+
+[tasks.detect_people.parameters]
+temperature = 0.0
+top_p = 1.0
+reasoning_effort = "low"
 """,
         encoding="utf-8",
     )

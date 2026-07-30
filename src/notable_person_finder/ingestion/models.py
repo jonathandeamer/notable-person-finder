@@ -62,9 +62,15 @@ class SourceItemCounts:
 
 @dataclass(frozen=True, slots=True)
 class FetchPersistResult:
-    """The result of persisting one feed fetch and the entries it produced."""
+    """The result of persisting one feed fetch and the entries it produced.
+
+    `created_source_item_ids` is the ordered identity of rows this call
+    inserted -- entry order, duplicates omitted. Downstream same-run work
+    (detection scheduling) consumes this tuple rather than re-querying.
+    """
 
     source_items_created: int
     source_items_existing: int
     articles_created: int
     entry_issues: Mapping[str, int]
+    created_source_item_ids: tuple[int, ...] = ()

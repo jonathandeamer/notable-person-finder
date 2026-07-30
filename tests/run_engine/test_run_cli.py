@@ -594,8 +594,9 @@ def test_command_run_closes_the_scheduler_on_a_successful_run(
     _configure_in_process(monkeypatch)
     exit_code = cli_main.command_run(config_file, verbose=False)
     assert exit_code == cli_main.EXIT_OK
-    assert len(_SpyScheduler.instances) == 1
-    assert _SpyScheduler.instances[0].closed is True
+    # HTTP and LLM pools each own one BoundedScheduler.
+    assert len(_SpyScheduler.instances) == 2
+    assert all(instance.closed for instance in _SpyScheduler.instances)
 
 
 def test_command_run_closes_the_scheduler_when_the_run_raises(
@@ -621,5 +622,5 @@ def test_command_run_closes_the_scheduler_when_the_run_raises(
     with pytest.raises(RuntimeError, match="synthetic failure"):
         cli_main.command_run(config_file, verbose=False)
 
-    assert len(_SpyScheduler.instances) == 1
-    assert _SpyScheduler.instances[0].closed is True
+    assert len(_SpyScheduler.instances) == 2
+    assert all(instance.closed for instance in _SpyScheduler.instances)

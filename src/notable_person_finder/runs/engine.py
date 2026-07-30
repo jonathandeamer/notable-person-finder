@@ -20,7 +20,12 @@ from notable_person_finder.runs.models import (
     WorkState,
 )
 from notable_person_finder.runs.retry import AttemptRecord, RetryPolicy
-from notable_person_finder.runs.scheduler import BoundedScheduler, Completion
+from notable_person_finder.runs.scheduler import (
+    BoundedScheduler,
+    Completion,
+    SchedulerSet,
+    WorkerPool,
+)
 
 # A handler must hand back a state that takes the item out of the claimable
 # set. Anything else (pending, running) would leave the item eligible, and the
@@ -61,17 +66,31 @@ class TaskOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskPreparation:
+    """The application-thread inputs and reservation for one provider call."""
+
+    payload: object = None
+    reserved_nano_usd: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class TaskHandler:
     """One task type's three phases, split by the thread each may run on.
 
     `prepare` runs on the application thread before submission and is the only
     phase that may read SQLite -- a stored ETag, a validator, an assembled
-    prompt context. Its return value is handed to `execute`.
+    prompt context. Its payload is handed to `execute`; its optional
+    reservation overrides the handler's fixed default for this one attempt.
 
     `execute` runs on a scheduler worker. It performs exactly one external
     call and must never retry, never sleep, and never touch SQLite: the
     engine's connection belongs to the application thread, and the central
     retry coordination lives in the engine, not in a handler.
+
+    `pool` routes that call to one independently bounded worker pool. `ready`,
+    when present, runs on the application thread before claiming and may use
+    the run id to check a durable prerequisite. An unready required item stays
+    pending and therefore remains visible in the run's partial-state counters.
 
     `persist` runs on the application thread inside the same transaction that
     settles the work item, so a handler's domain writes and the settlement
@@ -93,10 +112,12 @@ class TaskHandler:
     execute: Callable[[WorkItem, int, object], TaskOutcome]
     request_fingerprint: Callable[[WorkItem], str] | None = None
     reserved_nano_usd: int = 0
-    prepare: Callable[[WorkItem], object] | None = None
+    prepare: Callable[[WorkItem], TaskPreparation] | None = None
     persist: Callable[[WorkItem, TaskOutcome], None] | None = None
     persist_failure: Callable[[WorkItem, ProviderFailure], None] | None = None
     destination_host: Callable[[WorkItem], str | None] | None = None
+    pool: WorkerPool = WorkerPool.HTTP
+    ready: Callable[[int], bool] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,7 +445,8 @@ class RunEngine:
     Work moves through a per-item state machine so that SQLite stays on the
     application thread while external calls run concurrently on the scheduler's
     pool. One pass of the loop claims a batch no larger than the pool's cap,
-    prepares and submits each item, then drains completions as they arrive.
+    prepares and submits each item, then drains the pools' combined completion
+    stream as calls finish.
 
     No transaction is ever open across an item's own external call: `prepare`
     and the attempt insert commit before submission, and the outcome is
@@ -437,7 +459,7 @@ class RunEngine:
         connection: sqlite3.Connection,
         *,
         retry: RetryPolicy,
-        scheduler: BoundedScheduler,
+        scheduler: SchedulerSet | BoundedScheduler,
         clock: Clock,
         timezone: str,
         window_start: str,
@@ -449,9 +471,14 @@ class RunEngine:
     ) -> None:
         self._connection = connection
         self._retry = retry
-        # Sizes every claim batch, and runs the calls. Its pool belongs to
-        # whoever constructed it, so the engine never closes it.
-        self._scheduler = scheduler
+        # Sizes every pool's claim batch, and runs their calls concurrently.
+        # The pools belong to whoever constructed the set, so the engine never
+        # closes them.
+        self._scheduler = (
+            SchedulerSet({WorkerPool.HTTP: scheduler})
+            if isinstance(scheduler, BoundedScheduler)
+            else scheduler
+        )
         self._clock = clock
         self._timezone = timezone
         self._window_start = window_start
@@ -475,6 +502,12 @@ class RunEngine:
         *,
         seed: Callable[[int], None] | None = None,
     ) -> RunReport:
+        # Configuration/wiring errors must not mint an interrupted run. Every
+        # handler has exactly one execution pool, and it has to exist before
+        # any lifecycle mutation begins.
+        for handler in handlers.values():
+            self._scheduler.max_workers(handler.pool)
+
         started_at = self._now()
         sweep = repository.sweep_interrupted(self._connection, now=started_at)
 
@@ -614,22 +647,39 @@ class RunEngine:
         progress: dict[int, _ItemProgress] = {}
         deadlines: dict[int, datetime] = {}
         while True:
-            batch = repository.claim_batch(
-                self._connection,
-                run_id=run_id,
-                now=self._now(),
-                task_types=handlers.keys(),
-                limit=self._scheduler.max_workers,
-            )
-            if batch:
-                submissions: list[_Submission] = []
-                for work_item in batch:
-                    deadlines.pop(work_item.id, None)
-                    submission = self._prepare(
-                        run_id, work_item, handlers[work_item.task_type], progress
-                    )
-                    if submission is not None:
-                        submissions.append(submission)
+            ready_task_types: dict[WorkerPool, list[str]] = {}
+            for task_type, handler in handlers.items():
+                if handler.ready is not None and not handler.ready(run_id):
+                    continue
+                ready_task_types.setdefault(handler.pool, []).append(task_type)
+
+            batches: dict[WorkerPool, tuple[WorkItem, ...]] = {}
+            for pool, task_types in ready_task_types.items():
+                batch = repository.claim_batch(
+                    self._connection,
+                    run_id=run_id,
+                    now=self._now(),
+                    task_types=task_types,
+                    limit=self._scheduler.max_workers(pool),
+                )
+                if batch:
+                    batches[pool] = batch
+
+            if batches:
+                submissions: dict[WorkerPool, list[_Submission]] = {}
+                for pool, batch in batches.items():
+                    pool_submissions: list[_Submission] = []
+                    submissions[pool] = pool_submissions
+                    for work_item in batch:
+                        deadlines.pop(work_item.id, None)
+                        submission = self._prepare(
+                            run_id,
+                            work_item,
+                            handlers[work_item.task_type],
+                            progress,
+                        )
+                        if submission is not None:
+                            pool_submissions.append(submission)
                 for completion in self._scheduler.run(submissions, _call_provider):
                     self._resolve(
                         run_id, completion, progress, deadlines, failure_categories
@@ -713,39 +763,51 @@ class RunEngine:
                 failure=last_failure,
             )
             return None
-        if handler.prepare is None:
-            prepared = None
-        else:
-            try:
-                prepared = handler.prepare(work_item)
-            except ProviderFailure:
-                # Not this task's concern -- see the matching comment in
-                # `_domain_writes`.
-                raise
-            except Exception as error:
-                # No call has been made yet, so nothing is ambiguous about
-                # money: settle just this item and let the batch's other
-                # already-prepared siblings still run, rather than abandoning
-                # them along with their committed attempt rows and budget
-                # reservations for calls that will now never happen.
-                log_event(
-                    self._logger,
-                    "run.prepare_failed",
-                    severity=logging.ERROR,
-                    run_id=run_id,
-                    work_item_id=work_item.id,
-                    task_type=handler.task_type,
-                    error_type=type(error).__name__,
-                )
-                self._settle(
-                    run_id,
-                    work_item,
-                    handler,
-                    state=WorkState.FAILED_PERMANENT,
-                    reason=f"prepare raised {type(error).__name__}",
-                    failure=last_failure,
-                )
-                return None
+        try:
+            preparation = (
+                TaskPreparation()
+                if handler.prepare is None
+                else handler.prepare(work_item)
+            )
+            reserved_nano_usd = (
+                handler.reserved_nano_usd
+                if preparation.reserved_nano_usd is None
+                else preparation.reserved_nano_usd
+            )
+            if not isinstance(reserved_nano_usd, int) or isinstance(
+                reserved_nano_usd, bool
+            ):
+                raise ValueError("a task reservation must be a non-boolean integer")
+            if reserved_nano_usd < 0:
+                raise ValueError("a task reservation must not be negative")
+        except ProviderFailure:
+            # Not this task's concern -- see the matching comment in
+            # `_domain_writes`.
+            raise
+        except Exception as error:
+            # No call has been made yet, so nothing is ambiguous about money:
+            # settle just this item and let the batch's other already-prepared
+            # siblings still run, rather than abandoning them along with their
+            # committed attempt rows and budget reservations for calls that
+            # will now never happen.
+            log_event(
+                self._logger,
+                "run.prepare_failed",
+                severity=logging.ERROR,
+                run_id=run_id,
+                work_item_id=work_item.id,
+                task_type=handler.task_type,
+                error_type=type(error).__name__,
+            )
+            self._settle(
+                run_id,
+                work_item,
+                handler,
+                state=WorkState.FAILED_PERMANENT,
+                reason=f"prepare raised {type(error).__name__}",
+                failure=last_failure,
+            )
+            return None
         fingerprint = (
             handler.request_fingerprint(work_item)
             if handler.request_fingerprint is not None
@@ -771,7 +833,7 @@ class RunEngine:
                 ordinal=ordinal,
                 request_fingerprint=fingerprint,
                 destination_host=destination_host,
-                reserved_nano_usd=handler.reserved_nano_usd,
+                reserved_nano_usd=reserved_nano_usd,
                 now=self._now(),
             )
         except BudgetExhausted:
@@ -793,7 +855,7 @@ class RunEngine:
             handler=handler,
             ordinal=ordinal,
             attempt_id=attempt_id,
-            prepared=prepared,
+            prepared=preparation.payload,
             clock=self._clock,
         )
 

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import threading
+import traceback
 from collections.abc import Iterable, Iterator
 
 import pytest
 
-from notable_person_finder.runs.scheduler import BoundedScheduler, Completion
+from notable_person_finder.runs import scheduler as scheduler_module
+from notable_person_finder.runs.scheduler import (
+    BoundedScheduler,
+    Completion,
+    WorkerPool,
+)
 
 
 def ok_results[I](completions: Iterable[Completion[I, int]]) -> list[int]:
@@ -215,3 +221,196 @@ def test_unwrap_returns_a_success_and_re_raises_a_failure() -> None:
     assert completions[0].unwrap() == "ok-0"
     with pytest.raises(ValueError, match="bad item"):
         completions[1].unwrap()
+
+
+def test_scheduler_set_enforces_each_pools_independent_in_flight_cap() -> None:
+    """Removing per-pool routing or either cap must let this test fail."""
+    worker_pool = scheduler_module.WorkerPool
+    scheduler_set_type = scheduler_module.SchedulerSet
+    in_flight = {worker_pool.HTTP: 0, worker_pool.LLM: 0}
+    peak = {worker_pool.HTTP: 0, worker_pool.LLM: 0}
+    guard = threading.Lock()
+    all_workers_started = threading.Event()
+    release = threading.Event()
+
+    def worker(item: tuple[WorkerPool, int]) -> int:
+        pool, value = item
+        with guard:
+            in_flight[pool] += 1
+            peak[pool] = max(peak[pool], in_flight[pool])
+            if in_flight[worker_pool.HTTP] == 2 and in_flight[worker_pool.LLM] == 1:
+                all_workers_started.set()
+        release.wait(timeout=5)
+        with guard:
+            in_flight[pool] -= 1
+        return value
+
+    schedulers = scheduler_set_type(
+        {
+            worker_pool.HTTP: BoundedScheduler(max_workers=2),
+            worker_pool.LLM: BoundedScheduler(max_workers=1),
+        }
+    )
+    completions: list[Completion[tuple[WorkerPool, int], int]] = []
+    with schedulers:
+        consumer = threading.Thread(
+            target=lambda: completions.extend(
+                schedulers.run(
+                    {
+                        worker_pool.HTTP: [
+                            (worker_pool.HTTP, value) for value in range(4)
+                        ],
+                        worker_pool.LLM: [
+                            (worker_pool.LLM, value) for value in range(4, 7)
+                        ],
+                    },
+                    worker,
+                )
+            )
+        )
+        consumer.start()
+        assert all_workers_started.wait(timeout=5)
+        release.set()
+        consumer.join(timeout=5)
+
+    assert not consumer.is_alive()
+    assert peak == {worker_pool.HTTP: 2, worker_pool.LLM: 1}
+    assert sorted(ok_results(completions)) == list(range(7))
+
+
+def test_scheduler_set_overlaps_work_from_different_pools() -> None:
+    """Draining one pool before submitting the next must deadlock this barrier."""
+    worker_pool = scheduler_module.WorkerPool
+    scheduler_set_type = scheduler_module.SchedulerSet
+    overlapped = threading.Barrier(2)
+
+    def worker(value: str) -> str:
+        overlapped.wait(timeout=5)
+        return value
+
+    with scheduler_set_type(
+        {
+            worker_pool.HTTP: BoundedScheduler(max_workers=1),
+            worker_pool.LLM: BoundedScheduler(max_workers=1),
+        }
+    ) as schedulers:
+        completions = list(
+            schedulers.run(
+                {worker_pool.HTTP: ["http"], worker_pool.LLM: ["llm"]}, worker
+            )
+        )
+
+    assert sorted(completion.unwrap() for completion in completions) == [
+        "http",
+        "llm",
+    ]
+
+
+def test_scheduler_set_yields_completions_on_its_calling_thread() -> None:
+    """Yielding from a callback on either executor must fail this test."""
+    worker_pool = scheduler_module.WorkerPool
+    scheduler_set_type = scheduler_module.SchedulerSet
+    caller = threading.get_ident()
+    yielded_on: list[int] = []
+
+    with scheduler_set_type(
+        {
+            worker_pool.HTTP: BoundedScheduler(max_workers=1),
+            worker_pool.LLM: BoundedScheduler(max_workers=1),
+        }
+    ) as schedulers:
+        for _completion in schedulers.run(
+            {worker_pool.HTTP: [1], worker_pool.LLM: [2]}, lambda value: value
+        ):
+            yielded_on.append(threading.get_ident())
+
+    assert yielded_on == [caller, caller]
+
+
+def test_scheduler_set_preserves_a_worker_exceptions_traceback() -> None:
+    """Replacing the worker exception must remove the named worker frame."""
+    worker_pool = scheduler_module.WorkerPool
+    scheduler_set_type = scheduler_module.SchedulerSet
+
+    def raising_worker(_value: int) -> int:
+        raise ValueError("pool worker failed")
+
+    with scheduler_set_type(
+        {worker_pool.HTTP: BoundedScheduler(max_workers=1)}
+    ) as schedulers:
+        (completion,) = schedulers.run({worker_pool.HTTP: [1]}, raising_worker)
+
+    with pytest.raises(ValueError, match="pool worker failed") as raised:
+        completion.unwrap()
+    assert "raising_worker" in {
+        frame.name for frame in traceback.extract_tb(raised.value.__traceback__)
+    }
+
+
+def test_scheduler_set_shutdown_waits_for_workers_in_both_pools() -> None:
+    """Closing only one underlying scheduler must let this test fail."""
+    worker_pool = scheduler_module.WorkerPool
+    scheduler_set_type = scheduler_module.SchedulerSet
+    http_started = threading.Event()
+    llm_started = threading.Event()
+    release_http = threading.Event()
+    release_llm = threading.Event()
+    closed = threading.Event()
+
+    def worker(pool: object) -> object:
+        if pool is worker_pool.HTTP:
+            http_started.set()
+            release_http.wait(timeout=5)
+        else:
+            llm_started.set()
+            release_llm.wait(timeout=5)
+        return pool
+
+    schedulers = scheduler_set_type(
+        {
+            worker_pool.HTTP: BoundedScheduler(max_workers=1),
+            worker_pool.LLM: BoundedScheduler(max_workers=1),
+        }
+    )
+    consumer = threading.Thread(
+        target=lambda: list(
+            schedulers.run(
+                {
+                    worker_pool.HTTP: [worker_pool.HTTP],
+                    worker_pool.LLM: [worker_pool.LLM],
+                },
+                worker,
+            )
+        )
+    )
+    consumer.start()
+    assert http_started.wait(timeout=5)
+    assert llm_started.wait(timeout=5)
+
+    def close() -> None:
+        schedulers.close()
+        closed.set()
+
+    closer = threading.Thread(target=close)
+    closer.start()
+    release_http.set()
+    assert not closed.wait(timeout=0.1)
+    release_llm.set()
+    closer.join(timeout=5)
+    consumer.join(timeout=5)
+
+    assert closed.is_set()
+    assert not closer.is_alive()
+    assert not consumer.is_alive()
+
+
+def test_scheduler_set_requires_a_distinct_scheduler_for_each_pool() -> None:
+    """Sharing one executor would collapse the independent pool limits."""
+    shared = BoundedScheduler(max_workers=1)
+    try:
+        with pytest.raises(ValueError, match="distinct"):
+            scheduler_module.SchedulerSet(
+                {WorkerPool.HTTP: shared, WorkerPool.LLM: shared}
+            )
+    finally:
+        shared.close()

@@ -55,6 +55,7 @@ from notable_person_finder.runs.engine import (
     RunEngine,
     RunReport,
     TaskHandler,
+    TaskPreparation,
 )
 from notable_person_finder.runs.models import RunState, WorkItem, WorkState
 from notable_person_finder.runs.retry import RetryPolicy
@@ -536,11 +537,15 @@ def test_prepare_returns_empty_validators_for_a_first_fetch(
     )
     assert handler.prepare is not None
 
-    call = handler.prepare(claimed_item(connection, run_id=run_id))
+    preparation = handler.prepare(claimed_item(connection, run_id=run_id))
 
-    assert isinstance(call, FeedCall)
-    assert call.feed.key == "alpha"
-    assert call.validators == FeedValidators(etag=None, last_modified=None)
+    assert isinstance(preparation, TaskPreparation)
+    assert isinstance(preparation.payload, FeedCall)
+    assert preparation.payload.feed.key == "alpha"
+    assert preparation.payload.validators == FeedValidators(
+        etag=None, last_modified=None
+    )
+    assert preparation.reserved_nano_usd is None
 
 
 def test_prepare_returns_the_stored_validators_after_a_successful_fetch(
@@ -576,10 +581,11 @@ def test_prepare_returns_the_stored_validators_after_a_successful_fetch(
     )
     assert handler.prepare is not None
 
-    call = handler.prepare(claimed_item(connection, run_id=run_id))
+    preparation = handler.prepare(claimed_item(connection, run_id=run_id))
 
-    assert isinstance(call, FeedCall)
-    assert call.validators == FeedValidators(
+    assert isinstance(preparation, TaskPreparation)
+    assert isinstance(preparation.payload, FeedCall)
+    assert preparation.payload.validators == FeedValidators(
         etag='"stored-etag"', last_modified="Wed, 22 Jul 2026 06:00:00 GMT"
     )
 
@@ -630,11 +636,15 @@ def test_prepare_does_not_offer_old_validators_after_the_configured_url_moves(
     )
     assert handler.prepare is not None
 
-    call = handler.prepare(claimed_item(connection, run_id=second_run))
+    preparation = handler.prepare(claimed_item(connection, run_id=second_run))
 
-    assert isinstance(call, FeedCall)
-    assert call.feed.url == moved[1]
-    assert call.validators == FeedValidators(etag=None, last_modified=None)
+    assert isinstance(preparation, TaskPreparation)
+    assert isinstance(preparation.payload, FeedCall)
+    assert preparation.payload.feed.url == moved[1]
+    assert preparation.payload.validators == FeedValidators(
+        etag=None, last_modified=None
+    )
+    assert preparation.reserved_nano_usd is None
 
 
 def test_prepare_refuses_an_item_whose_feed_left_configuration(
@@ -684,7 +694,8 @@ def test_prepare_refuses_an_item_that_names_no_feed(
     assert handler.prepare is not None
     # Positive control: the same item with its subject intact resolves, so the
     # refusal below is caused by the missing subject and not by the fixture.
-    assert isinstance(handler.prepare(item), FeedCall)
+    assert isinstance(handler.prepare(item), TaskPreparation)
+    assert isinstance(handler.prepare(item).payload, FeedCall)
 
     with pytest.raises(LookupError):
         handler.prepare(subjectless)
@@ -955,6 +966,211 @@ def test_execute_translates_a_wrong_prepared_value_into_a_provider_failure(
 
 
 # --- the attempt row ------------------------------------------------------------
+
+
+# --- same-run source-item notification seam ------------------------------------
+
+
+def _start_attempt_for_claimed(
+    connection: sqlite3.Connection, *, run_id: int, work_item: WorkItem
+) -> None:
+    """Insert the attempt row `persist` reads for run id and settlement time."""
+    repository.start_attempt(
+        connection,
+        run_id=run_id,
+        work_item_id=work_item.id,
+        provider="feeds",
+        operation="fetch_feed",
+        ordinal=1,
+        request_fingerprint="f" * 64,
+        destination_host="alpha.example.com",
+        reserved_nano_usd=0,
+        now=moment(1),
+    )
+
+
+def test_on_source_items_receives_created_ids_in_entry_order(
+    connection: sqlite3.Connection,
+) -> None:
+    run_id = insert_run(connection)
+    seed_feeds(connection, feeds=feeds_config(ALPHA), run_id=run_id, now=moment())
+    item = claimed_item(connection, run_id=run_id)
+    _start_attempt_for_claimed(connection, run_id=run_id, work_item=item)
+
+    seen: list[tuple[tuple[int, ...], int, str]] = []
+
+    def on_source_items(ids: tuple[int, ...], callback_run_id: int, now: str) -> None:
+        seen.append((ids, callback_run_id, now))
+
+    handler = build_fetch_handler(
+        connection,
+        client=FakeFeedClient(result=modified_result(entries=3)),
+        feeds=feeds_config(ALPHA),
+        on_source_items=on_source_items,
+    )
+    assert handler.persist is not None
+    outcome = handler.execute(
+        item,
+        1,
+        FeedCall(
+            feed=feeds_config(ALPHA).feeds[0], validators=FeedValidators(None, None)
+        ),
+    )
+
+    with immediate(connection):
+        handler.persist(item, outcome)
+
+    assert len(seen) == 1
+    ids, callback_run_id, now = seen[0]
+    assert callback_run_id == run_id
+    assert now == moment(1)
+    assert len(ids) == 3
+    assert ids == tuple(sorted(ids))
+    stored = tuple(
+        int(row["id"])
+        for row in connection.execute("SELECT id FROM source_item ORDER BY id")
+    )
+    assert ids == stored
+
+
+def test_on_source_items_is_not_called_when_all_entries_are_duplicates(
+    connection: sqlite3.Connection,
+) -> None:
+    run_id = insert_run(connection)
+    seed_feeds(connection, feeds=feeds_config(ALPHA), run_id=run_id, now=moment())
+    item = claimed_item(connection, run_id=run_id)
+    _start_attempt_for_claimed(connection, run_id=run_id, work_item=item)
+    result = modified_result(entries=1)
+
+    # First persist creates the item.
+    first_handler = build_fetch_handler(
+        connection,
+        client=FakeFeedClient(result=result),
+        feeds=feeds_config(ALPHA),
+    )
+    assert first_handler.persist is not None
+    first_outcome = first_handler.execute(
+        item,
+        1,
+        FeedCall(
+            feed=feeds_config(ALPHA).feeds[0], validators=FeedValidators(None, None)
+        ),
+    )
+    with immediate(connection):
+        first_handler.persist(item, first_outcome)
+
+    calls: list[tuple[int, ...]] = []
+
+    def on_source_items(ids: tuple[int, ...], run_id: int, now: str) -> None:
+        calls.append(ids)
+
+    # Second attempt: same entries, all duplicates.
+    repository.start_attempt(
+        connection,
+        run_id=run_id,
+        work_item_id=item.id,
+        provider="feeds",
+        operation="fetch_feed",
+        ordinal=2,
+        request_fingerprint="g" * 64,
+        destination_host="alpha.example.com",
+        reserved_nano_usd=0,
+        now=moment(2),
+    )
+    second_handler = build_fetch_handler(
+        connection,
+        client=FakeFeedClient(result=result),
+        feeds=feeds_config(ALPHA),
+        on_source_items=on_source_items,
+    )
+    assert second_handler.persist is not None
+    second_outcome = second_handler.execute(
+        item,
+        2,
+        FeedCall(
+            feed=feeds_config(ALPHA).feeds[0], validators=FeedValidators(None, None)
+        ),
+    )
+    with immediate(connection):
+        second_handler.persist(item, second_outcome)
+
+    assert calls == []
+    assert (
+        connection.execute("SELECT COUNT(*) AS n FROM source_item").fetchone()["n"] == 1
+    )
+
+
+def test_on_source_items_failure_rolls_back_source_items_and_feed_fetch(
+    connection: sqlite3.Connection,
+) -> None:
+    run_id = insert_run(connection)
+    seed_feeds(connection, feeds=feeds_config(ALPHA), run_id=run_id, now=moment())
+    item = claimed_item(connection, run_id=run_id)
+    _start_attempt_for_claimed(connection, run_id=run_id, work_item=item)
+
+    def boom(ids: tuple[int, ...], callback_run_id: int, now: str) -> None:
+        raise RuntimeError("downstream scheduling failed")
+
+    handler = build_fetch_handler(
+        connection,
+        client=FakeFeedClient(result=modified_result(entries=2)),
+        feeds=feeds_config(ALPHA),
+        on_source_items=boom,
+    )
+    assert handler.persist is not None
+    outcome = handler.execute(
+        item,
+        1,
+        FeedCall(
+            feed=feeds_config(ALPHA).feeds[0], validators=FeedValidators(None, None)
+        ),
+    )
+
+    with (
+        pytest.raises(RuntimeError, match="downstream scheduling failed"),
+        immediate(connection),
+    ):
+        handler.persist(item, outcome)
+
+    assert (
+        connection.execute("SELECT COUNT(*) AS n FROM source_item").fetchone()["n"] == 0
+    )
+    assert (
+        connection.execute("SELECT COUNT(*) AS n FROM feed_fetch").fetchone()["n"] == 0
+    )
+
+
+def test_absent_on_source_items_preserves_milestone_3a_persist(
+    connection: sqlite3.Connection,
+) -> None:
+    """No callback: source items and fetch rows still land as before."""
+    run_id = insert_run(connection)
+    seed_feeds(connection, feeds=feeds_config(ALPHA), run_id=run_id, now=moment())
+    item = claimed_item(connection, run_id=run_id)
+    _start_attempt_for_claimed(connection, run_id=run_id, work_item=item)
+
+    handler = build_fetch_handler(
+        connection,
+        client=FakeFeedClient(result=modified_result(entries=2)),
+        feeds=feeds_config(ALPHA),
+    )
+    assert handler.persist is not None
+    outcome = handler.execute(
+        item,
+        1,
+        FeedCall(
+            feed=feeds_config(ALPHA).feeds[0], validators=FeedValidators(None, None)
+        ),
+    )
+    with immediate(connection):
+        handler.persist(item, outcome)
+
+    assert (
+        connection.execute("SELECT COUNT(*) AS n FROM source_item").fetchone()["n"] == 2
+    )
+    assert (
+        connection.execute("SELECT COUNT(*) AS n FROM feed_fetch").fetchone()["n"] == 1
+    )
 
 
 def test_a_not_inspected_deferral_keeps_its_evidence_on_the_attempt_row(

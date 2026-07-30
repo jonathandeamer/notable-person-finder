@@ -4,7 +4,7 @@ import argparse
 import signal
 import sqlite3
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import NoReturn
@@ -16,6 +16,7 @@ from notable_person_finder.config.loader import (
     ResolvedConfig,
     load_config,
 )
+from notable_person_finder.config.models import DomainProfileConfig, MainConfig
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.db.migrate import MigrationError, apply_migrations
 from notable_person_finder.ingestion.repository import source_item_counts
@@ -25,7 +26,20 @@ from notable_person_finder.ingestion.service import (
     build_seed_hook,
 )
 from notable_person_finder.obs.logging import configure_logging, log_event
+from notable_person_finder.people.repository import (
+    triage_corpus_counts,
+    triage_run_counts,
+)
+from notable_person_finder.people.service import (
+    DETECT_PEOPLE_TASK_TYPE,
+    INSPECT_MODEL_TASK_TYPE,
+    build_detection_handler,
+    build_inspection_handler,
+    schedule_source_items,
+    seed_untriaged,
+)
 from notable_person_finder.providers.feeds import FeedparserClient
+from notable_person_finder.providers.openrouter import OpenRouterClient
 from notable_person_finder.providers.pacing import build_pacing_gate
 from notable_person_finder.providers.safety import SystemHostResolver
 from notable_person_finder.providers.transport import build_transport
@@ -33,19 +47,24 @@ from notable_person_finder.reporting.digest import (
     DigestRecord,
     DigestWriteError,
     IngestionSummary,
+    PeopleRunSummary,
     write_digest,
 )
 from notable_person_finder.runs import repository
-from notable_person_finder.runs.clock import SystemClock, utc_timestamp
+from notable_person_finder.runs.clock import Clock, SystemClock, utc_timestamp
 from notable_person_finder.runs.engine import (
     ReportArtifact,
     RunEngine,
     RunReport,
 )
 from notable_person_finder.runs.lock import LockUnavailable, MutationLock
-from notable_person_finder.runs.models import RunState
+from notable_person_finder.runs.models import RunState, WorkState
 from notable_person_finder.runs.retry import RetryPolicy
-from notable_person_finder.runs.scheduler import BoundedScheduler
+from notable_person_finder.runs.scheduler import (
+    BoundedScheduler,
+    SchedulerSet,
+    WorkerPool,
+)
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -134,6 +153,53 @@ def _window_start(loaded: ResolvedConfig, now: datetime) -> str:
     return utc_timestamp(start)
 
 
+def _compose_seed(
+    connection: sqlite3.Connection,
+    *,
+    loaded: ResolvedConfig,
+    clock: Clock,
+) -> Callable[[int], None]:
+    """Feed seeding plus People backfill of every still-untriaged source item."""
+    feed_seed = build_seed_hook(connection, feeds=loaded.feeds, clock=clock)
+    profile = loaded.domain_profile
+    config = loaded.main
+
+    def seed(run_id: int) -> None:
+        feed_seed(run_id)
+        seed_untriaged(
+            connection,
+            run_id=run_id,
+            config=config,
+            profile=profile,
+            now=utc_timestamp(clock.now()),
+        )
+
+    return seed
+
+
+def _on_source_items_callback(
+    connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
+    profile: DomainProfileConfig,
+) -> Callable[[tuple[int, ...], int, str], None]:
+    """Inject schedule_source_items into ingestion without people importing feeds."""
+
+    def on_source_items(
+        source_item_ids: tuple[int, ...], run_id: int, now: str
+    ) -> None:
+        schedule_source_items(
+            connection,
+            source_item_ids=source_item_ids,
+            run_id=run_id,
+            config=config,
+            profile=profile,
+            now=now,
+        )
+
+    return on_source_items
+
+
 def command_run(config_file: Path | None, *, verbose: bool) -> int:
     loaded = load_config(config_file, require_secrets=True)
     clock = SystemClock()
@@ -160,9 +226,9 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
             local_date = (
                 now.astimezone(ZoneInfo(loaded.main.timezone)).date().isoformat()
             )
-            # The transport is owned by this command. It is entered before the
-            # scheduler so reverse context-manager exit drains every in-flight
-            # worker before closing the shared HTTP client.
+            # Provider clients are entered before the dual schedulers so reverse
+            # context-manager exit drains every in-flight HTTP and LLM worker
+            # before either client or SQLite closes.
             written: DigestRecord | None = None
 
             def report_run(report: RunReport) -> ReportArtifact:
@@ -172,6 +238,11 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                     if _ingestion_schema_present(connection)
                     else None
                 )
+                people = (
+                    _people_summary(connection, report)
+                    if _people_schema_present(connection)
+                    else None
+                )
                 try:
                     written = write_digest(
                         loaded.paths.digests,
@@ -179,6 +250,7 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                         local_date=local_date,
                         config=loaded.main.digest,
                         ingestion=ingestion,
+                        people=people,
                     )
                 except DigestWriteError:
                     # `cli.` prefix, not `run.`: the engine already emits
@@ -197,19 +269,20 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                     markdown=written.markdown,
                 )
 
-            # Scoped tightly around engine construction and execution -- the
-            # only place the scheduler's worker pool is used -- so the pool
-            # is always shut down before `connection.close()` runs in the
-            # outer `finally`, on both the success and the exception path.
-            # Closing the connection first would let a worker thread still
-            # inside an HTTP call outlive the SQLite connection it will need
-            # for `persist`; closing the transport first would tear down the
-            # shared client while such a call was still in flight.
+            # Scoped tightly around engine construction and execution so both
+            # pools always shut down before provider clients and before
+            # `connection.close()` in the outer `finally`, on success and
+            # exception paths alike.
             pacing_gate = build_pacing_gate(
                 loaded.main.pacing,
                 loaded.main.concurrency,
                 clock=clock,
             )
+            openrouter_key = loaded.credentials.openrouter_api_key
+            if openrouter_key is None:
+                # require_secrets=True already refuses a missing key; this
+                # narrows the type for the client constructor.
+                raise ConfigLoadError(("openrouter_api_key is required for run",))
             with (
                 build_transport(
                     loaded.main.transport,
@@ -218,15 +291,48 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                     clock=clock,
                     pacing_gate=pacing_gate,
                 ) as transport,
-                BoundedScheduler(loaded.main.concurrency.http_workers) as scheduler,
+                OpenRouterClient(
+                    api_key=openrouter_key,
+                    endpoint=loaded.main.openrouter.endpoint,
+                    routing=loaded.main.openrouter.routing,
+                    timeout_seconds=loaded.main.transport.llm_read_timeout_seconds,
+                    clock=clock,
+                ) as llm_client,
+                SchedulerSet(
+                    {
+                        WorkerPool.HTTP: BoundedScheduler(
+                            loaded.main.concurrency.http_workers
+                        ),
+                        WorkerPool.LLM: BoundedScheduler(
+                            loaded.main.concurrency.llm_workers
+                        ),
+                    }
+                ) as scheduler,
             ):
-                client = FeedparserClient(transport)
+                feed_client = FeedparserClient(transport)
+                on_source_items = _on_source_items_callback(
+                    connection,
+                    config=loaded.main,
+                    profile=loaded.domain_profile,
+                )
                 handlers = {
                     FETCH_FEED_TASK_TYPE: build_fetch_handler(
-                        connection, client=client, feeds=loaded.feeds
-                    )
+                        connection,
+                        client=feed_client,
+                        feeds=loaded.feeds,
+                        on_source_items=on_source_items,
+                    ),
+                    INSPECT_MODEL_TASK_TYPE: build_inspection_handler(
+                        connection, client=llm_client, config=loaded.main
+                    ),
+                    DETECT_PEOPLE_TASK_TYPE: build_detection_handler(
+                        connection,
+                        client=llm_client,
+                        config=loaded.main,
+                        profile=loaded.domain_profile,
+                    ),
                 }
-                seed = build_seed_hook(connection, feeds=loaded.feeds, clock=clock)
+                seed = _compose_seed(connection, loaded=loaded, clock=clock)
 
                 engine = RunEngine(
                     connection,
@@ -295,6 +401,87 @@ def _ingestion_schema_present(connection: sqlite3.Connection) -> bool:
             "WHERE type = 'table' AND name = 'feed_identity'"
         ).fetchone()
         is not None
+    )
+
+
+def _people_schema_present(connection: sqlite3.Connection) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'triage_observation'"
+        ).fetchone()
+        is not None
+    )
+
+
+def _model_work_counts(
+    connection: sqlite3.Connection, *, run_id: int
+) -> tuple[int, int]:
+    """Deferred and permanently failed LLM work settled by this run.
+
+    ``complete_work`` always clears ``claimed_by_run_id`` and stamps
+    ``completed_by_run_id`` for every terminal state including deferred, so
+    both arms attribute via ``completed_by_run_id``.
+    """
+    deferred = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n
+              FROM work_item
+             WHERE task_type IN (?, ?)
+               AND state = ?
+               AND completed_by_run_id = ?
+            """,
+            (
+                INSPECT_MODEL_TASK_TYPE,
+                DETECT_PEOPLE_TASK_TYPE,
+                str(WorkState.DEFERRED),
+                run_id,
+            ),
+        ).fetchone()["n"]
+    )
+    failed = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n
+              FROM work_item
+             WHERE task_type IN (?, ?)
+               AND state = ?
+               AND completed_by_run_id = ?
+            """,
+            (
+                INSPECT_MODEL_TASK_TYPE,
+                DETECT_PEOPLE_TASK_TYPE,
+                str(WorkState.FAILED_PERMANENT),
+                run_id,
+            ),
+        ).fetchone()["n"]
+    )
+    return deferred, failed
+
+
+def _people_summary(
+    connection: sqlite3.Connection, report: RunReport
+) -> PeopleRunSummary | None:
+    """Counts for the digest's person-detection section, or None pre-migration."""
+    if not _people_schema_present(connection):
+        return None
+    counts = triage_run_counts(connection, run_id=report.run_id)
+    model_deferred, model_failed = _model_work_counts(connection, run_id=report.run_id)
+    return PeopleRunSummary(
+        source_items_triaged=counts.observations,
+        research_people=counts.research_people,
+        do_not_research=counts.do_not_research,
+        uncertain=counts.uncertain,
+        research_or_uncertain_mentions=counts.research_or_uncertain_mentions,
+        overflow=counts.overflow,
+        insufficient_input=counts.insufficient_input,
+        model_deferred=model_deferred,
+        model_failed=model_failed,
+        model_failed_by_category=dict(counts.failed_by_category),
+        budget_limit_nano_usd=report.budget_limit_nano_usd,
+        budget_reserved_nano_usd=report.budget_reserved_nano_usd,
+        budget_actual_nano_usd=report.budget_actual_nano_usd,
     )
 
 
@@ -417,6 +604,19 @@ def command_status(config_file: Path | None) -> int:
                 print("latest successful fetch:")
                 for key, latest in fetches:
                     print(f"  {key}: {latest or '-'}")
+        if _people_schema_present(connection):
+            triage = triage_corpus_counts(connection)
+            print(f"source items triaged: {triage.triaged}")
+            print(f"source items untriaged: {triage.untriaged}")
+            print(f"research: {triage.research_people}")
+            print(f"uncertain: {triage.uncertain}")
+            print(f"do not research: {triage.do_not_research}")
+            print(f"insufficient input: {triage.insufficient_input}")
+            print(f"failed triage: {triage.failed}")
+            print(
+                "unresolved research or uncertain mentions: "
+                f"{triage.research_or_uncertain_mentions}"
+            )
         # Digest backlog, queue tiers, and the oldest pending candidate arrive
         # with the digest queue in the lead-assessment milestone.
         return EXIT_OK

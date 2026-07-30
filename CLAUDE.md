@@ -22,42 +22,59 @@ tasks already recorded complete.
 
 ## What Is Actually Built
 
-Three milestones are complete: the application foundation, the run engine and
-shared transport, and feed ingestion. A cold-starting agent should assume
-nothing beyond this list.
+Four milestones are complete: the application foundation, the run engine and
+shared transport, feed ingestion, and the OpenRouter model gateway with person
+detection (3b1). A cold-starting agent should assume nothing beyond this list.
 
 Delivered and usable:
 
 - `notable config validate`, `notable paths`, `notable db migrate`.
 - `notable run` — validates configuration, migrates, takes the mutation lock,
   sweeps interrupted predecessor runs, executes eligible work through the
-  scheduler, ingests enabled RSS and Atom feeds, writes a dated digest plus
-  `latest.md`, and prints the same Markdown on standard output.
+  scheduler, ingests enabled RSS and Atom feeds, inspects the configured
+  detection model, detects people in untriaged source items, writes a dated
+  digest plus `latest.md`, and prints the same Markdown on standard output.
 - The shared HTTP transport with URL, DNS-preflight, redirect, timeout,
   response-size, concurrency, and pacing bounds; the retry coordinator; the
   per-run budget reservation; and redacting structured logging.
 - The feedparser-backed feed adapter, conditional feed fetching, durable feed
   identity and fetch history, canonical article and URL-alias identity, and
-  insert-once source items. Source items deliberately carry no triage
-  observation until milestone 3b.
+  insert-once source items.
+- The OpenRouter provider adapter (SDK-backed inspect and structured
+  generation with SDK retries disabled so only the central coordinator may
+  repeat a call), exact-model preflight inspection, dynamic per-generation
+  budget reservation under an optional hard USD cap, and person-detection
+  work items.
+- Triage observations and unresolved person mentions on source items. Mentions
+  retain exact names, mononyms, and professional names without inventing
+  durable people or identity links. Unresolved mentions intentionally have no
+  durable person row until milestone 3b2.
+- Separate bounded HTTP and LLM worker pools that may overlap; workers never
+  access SQLite.
 
 Delivered only in part — do not describe these as finished:
 
 - `notable status` reports the latest run, its digest, required pending and
   deferred counts, operational failures, corpus source-item and article totals,
-  and each feed's latest successful fetch. It has no digest backlog, no oldest
-  pending candidate, and no queue tiers; those need the digest queue from the
-  lead-assessment milestone.
+  each feed's latest successful fetch, and durable triage counters (triaged,
+  untriaged, research, uncertain, do not research, insufficient input, failed
+  triage, and unresolved research or uncertain mentions). It has no digest
+  backlog, no oldest pending candidate, no queue tiers, and still no budget or
+  deferral-reason breakdown; those need later milestones.
 - The digest emits its header, banner, operational summary, per-run budget
-  line, deferral-reason breakdown, and ingestion summary. Its shortlist section
-  is a placeholder: there is no ranking and no model synthesis yet.
+  line, deferral-reason breakdown, ingestion summary, and person-detection
+  summary (triage outcomes, unresolved mention counts, model deferred/failed,
+  OpenRouter cost). Its shortlist section is a placeholder: there is no
+  ranking and no model synthesis yet.
 
 Not built at all, so do not document, import, or assume any of it:
 
-- Any provider adapter other than feeds: MediaWiki, web search, article fetch
-  and extraction, and LLM adapters remain absent.
-- People, triage observations, person mentions, sourced names, Wikipedia
-  observations, assessments, and the digest queue remain absent.
+- Durable people, sourced names, entity resolution, person candidates,
+  `resolve_person_entity`, confirmed merges, or canonical work reconciliation
+  (milestone 3b2).
+- MediaWiki, web search, article fetch and extraction adapters.
+- Wikipedia observations, coverage research, assessments, ranking, synthesis,
+  drafting, or the digest queue.
 - `notable digest show`, `notable audit run`, `notable audit person`.
 
 Known gaps carried forward, recorded so a later change does not mistake them
@@ -72,7 +89,12 @@ for regressions:
   only durable call evidence; a handler-owned domain row such as `feed_fetch`
   is not written.
 - Two crash windows can repeat a paid provider call; see
-  `docs/architecture/at-least-once-execution.md`.
+  `docs/architecture/at-least-once-execution.md`. Do not restate those windows
+  elsewhere.
+- OpenRouter live smoke (`uv run pytest tests/people -m live -v`) requires a
+  real `OPENROUTER_API_KEY`. Offline gates deselect it. An operator must still
+  run the live smoke and record model/provider/usage/cost/outcome (without
+  secrets) before milestone cutover when a key is available.
 
 ## Rewrite Structure
 
@@ -83,17 +105,22 @@ for regressions:
   - `runs/` — run engine, clock, repository, work-item scheduling, retry
     coordination, budget reservation, and the mutation lock.
   - `providers/` — the shared HTTP transport, request safety checks, pacing,
-    provider failure classification, and the feedparser-backed feed adapter.
-    This is the only package that may import `httpx`.
+    provider failure classification, the feedparser-backed feed adapter, and
+    the OpenRouter client. This is the only package that may import `httpx` or
+    the OpenRouter SDK.
   - `ingestion/` — feed seeding and handling, URL identity, domain models, and
     transaction-neutral persistence helpers for ingestion settlements.
+  - `people/` — detection scheduling and handlers, triage and mention
+    persistence, detection prompts, and domain validation. Creates no durable
+    people in this milestone.
   - `obs/` — redacting structured logging.
   - `reporting/` — the daily digest writer.
 - `tests/foundation/` — application-foundation tests.
-- `tests/run_engine/` — run engine and shared transport tests. Later milestones
-  add their own rewrite test areas as specified by their plans.
+- `tests/run_engine/` — run engine and shared transport tests.
 - `tests/ingestion/` — feed adapter, domain persistence, CLI integration, seam,
   and opt-in live-smoke tests.
+- `tests/people/` — OpenRouter adapter, detection service, repository, CLI
+  integration, cross-component seams, and opt-in OpenRouter live-smoke tests.
 - `docs/architecture/at-least-once-execution.md` — the operator-facing note on
   the crash windows in which a paid provider call can be repeated. Point at it
   rather than restating it.
@@ -143,11 +170,14 @@ reviewable and executable.
   `uv run pytest tests/foundation`.
 - For the completed run engine and shared transport, use
   `uv run pytest tests/run_engine`.
-- The three completed milestones together gate with
-  `uv run pytest tests/foundation tests/run_engine tests/ingestion`. Run it
-  from a real checkout: it needs the tracked `config/` directory. The ingestion
-  live smoke is the separate opt-in command
-  `uv run pytest tests/ingestion -m live -v`.
+- For completed feed ingestion, use `uv run pytest tests/ingestion`.
+- For completed model gateway and detection, use `uv run pytest tests/people`.
+- The four completed milestones together gate with
+  `uv run pytest tests/foundation tests/run_engine tests/ingestion tests/people`.
+  Run it from a real checkout: it needs the tracked `config/` directory.
+  Default pytest `addopts` deselect `live`. Opt-in live smokes:
+  - feeds: `uv run pytest tests/ingestion -m live -v`
+  - OpenRouter: `OPENROUTER_API_KEY=… uv run pytest tests/people -m live -v`
 - Exercise the installed interface with `uv run notable ...`.
 - Keep default rewrite verification offline and isolate configuration and
   storage with temporary paths.

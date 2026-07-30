@@ -21,7 +21,6 @@ from notable_person_finder.config.models import FeedConfig, FeedsConfig, Transpo
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.ingestion import service
 from notable_person_finder.ingestion.models import (
-    FetchPersistResult,
     PublishedIssue,
     UrlIssue,
 )
@@ -174,6 +173,11 @@ def _modified(*, entries: tuple[FeedEntry, ...]) -> Modified:
 def command_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TEST_OPENROUTER", ENVIRONMENT["TEST_OPENROUTER"])
     monkeypatch.setenv("TEST_BRAVE", ENVIRONMENT["TEST_BRAVE"])
+    # Person-detection handlers are registered on the real command path; keep
+    # OpenRouter offline so these ingestion seam tests stay network-free.
+    from tests.ingestion.test_run_cli import _offline_openrouter
+
+    monkeypatch.setattr(cli_main, "OpenRouterClient", _offline_openrouter)
 
 
 def test_command_run_seed_hook_creates_and_fetches_feed_work(
@@ -196,7 +200,12 @@ def test_command_run_seed_hook_creates_and_fetches_feed_work(
     ]
     database = connect_database(tmp_path / "portable" / "data" / "notable.sqlite3")
     try:
-        assert database.execute("SELECT COUNT(*) FROM work_item").fetchone()[0] == 1
+        assert (
+            database.execute(
+                "SELECT COUNT(*) FROM work_item WHERE task_type = 'fetch_feed'"
+            ).fetchone()[0]
+            == 1
+        )
         assert database.execute("SELECT COUNT(*) FROM feed_fetch").fetchone()[0] == 1
     finally:
         database.close()
@@ -312,15 +321,14 @@ def test_persist_fetch_keeps_an_entry_with_a_typed_issue_after_resolution_fault(
             now=moment(),
         )
 
-    assert counts == FetchPersistResult(
-        1,
-        0,
-        0,
-        {
-            f"url:{UrlIssue.UNUSABLE}": 1,
-            f"published:{PublishedIssue.MISSING}": 1,
-        },
-    )
+    assert counts.source_items_created == 1
+    assert counts.source_items_existing == 0
+    assert counts.articles_created == 0
+    assert counts.entry_issues == {
+        f"url:{UrlIssue.UNUSABLE}": 1,
+        f"published:{PublishedIssue.MISSING}": 1,
+    }
+    assert len(counts.created_source_item_ids) == 1
     row = connection.execute(
         "SELECT title_text, canonical_article_id, url_issue FROM source_item"
     ).fetchone()
@@ -359,10 +367,10 @@ def test_fetch_handler_executes_on_worker_without_sqlite_access(
     client = _NotModifiedClient()
     handler = build_fetch_handler(connection, client=client, feeds=feeds)
     assert handler.prepare is not None
-    prepared = handler.prepare(item)  # positive control: SQLite is valid here.
+    preparation = handler.prepare(item)  # positive control: SQLite is valid here.
 
     with ThreadPoolExecutor(max_workers=1) as workers:
-        outcome = workers.submit(handler.execute, item, 1, prepared).result()
+        outcome = workers.submit(handler.execute, item, 1, preparation.payload).result()
 
     assert outcome.state is WorkState.SUCCEEDED
     assert outcome.reason == "not modified"

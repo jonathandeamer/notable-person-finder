@@ -161,6 +161,85 @@ class BudgetConfig(StrictModel):
         return usd_to_nano_usd(self.openrouter_usd_per_run)
 
 
+class _StrictConfigurationModel(StrictModel):
+    model_config = ConfigDict(strict=True)
+
+
+class ProviderRoutingConfig(_StrictConfigurationModel):
+    allow_fallbacks: bool = True
+    data_collection: Literal["allow", "deny"] = "deny"
+    zdr: bool = True
+
+
+class OpenRouterConfig(_StrictConfigurationModel):
+    endpoint: str = "https://openrouter.ai/api/v1"
+    routing: ProviderRoutingConfig = ProviderRoutingConfig()
+
+    @field_validator("endpoint")
+    @classmethod
+    def public_https_endpoint(cls, value: str) -> str:
+        if any(character.isspace() for character in value):
+            raise ValueError("endpoint must not contain whitespace")
+        validate_public_http_url(value)
+        parsed = urlsplit(value)
+        try:
+            _ = parsed.port
+        except ValueError as error:
+            raise ValueError("endpoint must contain a valid port") from error
+        if parsed.scheme != "https":
+            raise ValueError("must use HTTPS")
+        if parsed.query or parsed.fragment:
+            raise ValueError("endpoint must not contain a query or fragment")
+        return value
+
+
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
+
+
+class GenerationParameters(_StrictConfigurationModel):
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0, allow_inf_nan=False)
+    top_p: float = Field(default=1.0, ge=0.0, le=1.0, allow_inf_nan=False)
+    reasoning_effort: ReasoningEffort | None = None
+
+
+_MODEL_SLUG_PATTERN = re.compile(
+    r"^[a-z0-9][a-z0-9._-]{0,63}/[a-z0-9][a-z0-9._-]{0,127}$"
+)
+
+
+class DetectPeopleConfig(_StrictConfigurationModel):
+    model: str = "openai/gpt-5.4-mini"
+    max_input_tokens: int = Field(default=4096, strict=True, ge=1, le=1_000_000)
+    max_completion_tokens: int = Field(default=1024, strict=True, ge=1, le=100_000)
+    parameters: GenerationParameters = GenerationParameters()
+    max_people: int = Field(default=8, strict=True, ge=1, le=32)
+    max_title_characters: int = Field(default=500, strict=True, ge=1, le=2000)
+    max_summary_characters: int = Field(default=4000, strict=True, ge=1, le=20_000)
+
+    @field_validator("model")
+    @classmethod
+    def exact_model_slug(cls, value: str) -> str:
+        if _MODEL_SLUG_PATTERN.fullmatch(value) is None:
+            raise ValueError("model must be one exact lowercase author/slug identifier")
+        if value.startswith("openrouter/"):
+            raise ValueError("model must not use an OpenRouter routing alias")
+        return value
+
+    @model_validator(mode="after")
+    def bounds_are_compatible(self) -> DetectPeopleConfig:
+        if self.max_completion_tokens >= self.max_input_tokens:
+            raise ValueError("max_completion_tokens must be less than max_input_tokens")
+        if self.max_summary_characters < self.max_title_characters:
+            raise ValueError(
+                "max_summary_characters must be at least max_title_characters"
+            )
+        return self
+
+
+class TasksConfig(_StrictConfigurationModel):
+    detect_people: DetectPeopleConfig = DetectPeopleConfig()
+
+
 class DigestConfig(StrictModel):
     write_latest_copy: bool = True
 
@@ -182,6 +261,8 @@ class MainConfig(StrictModel):
     concurrency: ConcurrencyConfig = ConcurrencyConfig()
     pacing: PacingConfig = PacingConfig()
     budget: BudgetConfig = BudgetConfig()
+    openrouter: OpenRouterConfig = OpenRouterConfig()
+    tasks: TasksConfig = TasksConfig()
     digest: DigestConfig = DigestConfig()
     logging: LoggingConfig = LoggingConfig()
 

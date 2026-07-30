@@ -4,6 +4,7 @@ import hashlib
 import logging
 import os
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,11 +63,35 @@ class IngestionSummary:
     articles_created: int
 
 
+@dataclass(frozen=True, slots=True)
+class PeopleRunSummary:
+    """Counts rendered in the digest's person-detection section.
+
+    Mentions remain unresolved and no person identities are listed. Cost
+    fields are integer nano-USD, matching the run engine's budget ledger.
+    """
+
+    source_items_triaged: int
+    research_people: int
+    do_not_research: int
+    uncertain: int
+    research_or_uncertain_mentions: int
+    overflow: int
+    insufficient_input: int
+    model_deferred: int
+    model_failed: int
+    model_failed_by_category: Mapping[str, int]
+    budget_limit_nano_usd: int | None
+    budget_reserved_nano_usd: int
+    budget_actual_nano_usd: int
+
+
 def render_digest(
     report: RunReport,
     *,
     local_date: str,
     ingestion: IngestionSummary | None = None,
+    people: PeopleRunSummary | None = None,
 ) -> str:
     lines = [f"# Notable Person Finder — {local_date}", ""]
 
@@ -174,6 +199,44 @@ def render_digest(
             f"- Articles created: {ingestion.articles_created}",
         ]
 
+    if people is not None:
+        lines += [
+            "",
+            "### Person detection",
+            "",
+            f"- Source items triaged: {people.source_items_triaged}",
+            f"- Research: {people.research_people}",
+            f"- Uncertain: {people.uncertain}",
+            f"- Do not research: {people.do_not_research}",
+            f"- Unresolved research or uncertain mentions: "
+            f"{people.research_or_uncertain_mentions}",
+            f"- Overflow observations: {people.overflow}",
+            f"- Insufficient input: {people.insufficient_input}",
+            f"- Model work deferred: {people.model_deferred}",
+            f"- Model work permanently failed: {people.model_failed}",
+        ]
+        if people.model_failed_by_category:
+            rendered = ", ".join(
+                f"{category} ({count})"
+                for category, count in sorted(people.model_failed_by_category.items())
+            )
+            lines.append(f"- Model failures by category: {rendered}")
+        if (
+            people.budget_limit_nano_usd is not None
+            or people.budget_reserved_nano_usd
+            or people.budget_actual_nano_usd
+        ):
+            cap = (
+                _format_nano_usd(people.budget_limit_nano_usd)
+                if people.budget_limit_nano_usd is not None
+                else "none"
+            )
+            lines.append(
+                f"- OpenRouter cost: cap {cap}, "
+                f"reserved {_format_nano_usd(people.budget_reserved_nano_usd)}, "
+                f"spent {_format_nano_usd(people.budget_actual_nano_usd)}"
+            )
+
     return "\n".join(lines) + "\n"
 
 
@@ -279,6 +342,7 @@ def write_digest(
     local_date: str,
     config: DigestConfig,
     ingestion: IngestionSummary | None = None,
+    people: PeopleRunSummary | None = None,
 ) -> DigestRecord:
     """Atomically persist the immutable dated digest and the latest copy.
 
@@ -289,7 +353,9 @@ def write_digest(
     digest, since a run whose real digest exists must not be reported as
     having no digest at all.
     """
-    markdown = render_digest(report, local_date=local_date, ingestion=ingestion)
+    markdown = render_digest(
+        report, local_date=local_date, ingestion=ingestion, people=people
+    )
     try:
         digests_dir.mkdir(parents=True, exist_ok=True)
     except OSError as error:

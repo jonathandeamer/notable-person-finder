@@ -70,6 +70,23 @@ def test_secret_values_are_stripped(tmp_path: Path) -> None:
     assert loaded.credentials.brave_api_key == "brave-key"
 
 
+def test_openrouter_secret_redaction_has_a_non_secret_snapshot_control(
+    tmp_path: Path,
+) -> None:
+    config_file = write_graph(tmp_path)
+    configured_secret = "openrouter-sensitive-value"
+
+    loaded = load_config(
+        config_file,
+        environ={"TEST_OPENROUTER": configured_secret, "TEST_BRAVE": "brave-key"},
+        require_secrets=True,
+    )
+
+    assert "openai/gpt-5.4-mini" in loaded.snapshot_json
+    assert '"TEST_OPENROUTER":true' in loaded.snapshot_json
+    assert configured_secret not in loaded.snapshot_json
+
+
 def test_non_utf8_configuration_reports_actionable_error(tmp_path: Path) -> None:
     config_file = tmp_path / "notable.toml"
     config_file.write_bytes(b'schema_version = 1\ntimezone = "Europe/Paris\xe9"\n')

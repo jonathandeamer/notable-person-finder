@@ -38,7 +38,10 @@ def test_migration_0003_applies_on_top_of_an_existing_0002_database(
         first = apply_migrations(connection, database, backups, early_migrations)
         assert first.applied_versions == (1, 2)
 
-        second = apply_migrations(connection, database, backups)
+        ingestion_migrations = tuple(
+            migration for migration in load_migrations() if migration.version <= 3
+        )
+        second = apply_migrations(connection, database, backups, ingestion_migrations)
         assert second.applied_versions == (3,)
 
         versions = {
@@ -113,6 +116,7 @@ _EXPECTED_COLUMNS = {
         "published_issue",
         "url_issue",
         "discovered_at",
+        "current_triage_observation_id",
     },
 }
 
