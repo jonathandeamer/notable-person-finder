@@ -231,7 +231,7 @@ def resolution_prompt_and_schema_hashes() -> tuple[str, str, int]:
     return _sha256(prompt), _sha256(schema_envelope), RESOLUTION_SCHEMA_VERSION
 
 
-def first_pass_task_fingerprint(
+def first_pass_material_payload(
     *,
     person_mention_id: int,
     mention_outcome: str,
@@ -243,11 +243,11 @@ def first_pass_task_fingerprint(
     prompt_hash: str | None = None,
     schema_hash: str | None = None,
     schema_version: int | None = None,
-) -> str:
-    """Material fingerprint for first-pass resolve work and ER rows (K16).
+) -> dict[str, object]:
+    """Material fields for first-pass fingerprints and created_new/skipped ER JSON.
 
     Deliberately excludes live candidate person ids, candidate identity
-    fingerprints, and corpus size.
+    fingerprints, and corpus size (K16).
     """
     resolved_prompt_hash = prompt_hash
     resolved_schema_hash = schema_hash
@@ -265,7 +265,7 @@ def first_pass_task_fingerprint(
         resolved_schema_version = resolved_schema_version or default_version
 
     parameters = config.parameters
-    material = {
+    return {
         "task": RESOLVE_PERSON_ENTITY_TASK,
         "adapter_version": RESOLUTION_ADAPTER_VERSION,
         "person_mention_id": person_mention_id,
@@ -291,6 +291,68 @@ def first_pass_task_fingerprint(
         "schema_hash": resolved_schema_hash,
         "schema_version": resolved_schema_version,
     }
+
+
+def first_pass_canonical_supplied_input_json(
+    *,
+    person_mention_id: int,
+    mention_outcome: str,
+    exact_name: str,
+    search_name: str,
+    identity_facts: Sequence[IdentityFact],
+    signals: Sequence[GroundedSignal],
+    config: ResolvePersonEntityConfig,
+    prompt_hash: str | None = None,
+    schema_hash: str | None = None,
+    schema_version: int | None = None,
+) -> str:
+    """Canonical JSON snapshot stored on created_new / skipped ER rows."""
+    return _canonical_json(
+        first_pass_material_payload(
+            person_mention_id=person_mention_id,
+            mention_outcome=mention_outcome,
+            exact_name=exact_name,
+            search_name=search_name,
+            identity_facts=identity_facts,
+            signals=signals,
+            config=config,
+            prompt_hash=prompt_hash,
+            schema_hash=schema_hash,
+            schema_version=schema_version,
+        )
+    )
+
+
+def first_pass_task_fingerprint(
+    *,
+    person_mention_id: int,
+    mention_outcome: str,
+    exact_name: str,
+    search_name: str,
+    identity_facts: Sequence[IdentityFact],
+    signals: Sequence[GroundedSignal],
+    config: ResolvePersonEntityConfig,
+    prompt_hash: str | None = None,
+    schema_hash: str | None = None,
+    schema_version: int | None = None,
+) -> str:
+    """Material fingerprint for first-pass resolve work and ER rows (K16).
+
+    Deliberately excludes live candidate person ids, candidate identity
+    fingerprints, and corpus size.
+    """
+    material = first_pass_material_payload(
+        person_mention_id=person_mention_id,
+        mention_outcome=mention_outcome,
+        exact_name=exact_name,
+        search_name=search_name,
+        identity_facts=identity_facts,
+        signals=signals,
+        config=config,
+        prompt_hash=prompt_hash,
+        schema_hash=schema_hash,
+        schema_version=schema_version,
+    )
     return _sha256(_canonical_json(material))
 
 

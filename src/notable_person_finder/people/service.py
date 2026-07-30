@@ -21,6 +21,7 @@ import json
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from importlib import resources
 from urllib.parse import urlsplit
@@ -31,6 +32,11 @@ from notable_person_finder.config.models import (
     MainConfig,
     ProviderRoutingConfig,
 )
+from notable_person_finder.people.candidates import (
+    CandidatePerson,
+    retrieve_candidates,
+    scan_name_matched_peers,
+)
 from notable_person_finder.people.detection import (
     DETECTION_SCHEMA_VERSION,
     DetectionValidationError,
@@ -39,16 +45,30 @@ from notable_person_finder.people.detection import (
     render_detection_request,
     validate_detection_output,
 )
+from notable_person_finder.people.identity import (
+    canonical_person_id,
+    create_person_for_mention,
+    recompute_identity_fingerprint,
+    select_display_name,
+    upsert_sourced_names_for_mention,
+)
 from notable_person_finder.people.models import (
     AttentionCategory,
     CautionCategory,
     DetectionInput,
     DetectionOutput,
+    DetectionPassage,
     GroundedSignal,
     IdentityFact,
     IdentityFactKind,
+    ResolveCandidate,
+    ResolveCandidateFact,
+    ResolveCandidateName,
+    ResolvePersonEntityInput,
+    ResolvePersonEntityOutput,
     SignalGrounding,
     SignalKind,
+    SourcedNameKind,
 )
 from notable_person_finder.people.repository import (
     DETECT_PEOPLE_TASK_TYPE,
@@ -56,6 +76,7 @@ from notable_person_finder.people.repository import (
     RESOLVE_PERSON_ENTITY_TASK_TYPE,
     SourceItemRecord,
     insert_completed_observation,
+    insert_entity_resolution_observation,
     insert_failed_observation,
     insert_insufficient_input_observation,
     insert_model_inspection,
@@ -63,14 +84,22 @@ from notable_person_finder.people.repository import (
     load_current_triage_observation,
     load_er_by_mention_fingerprint,
     load_model_inspection,
+    load_person_mentions,
     load_source_item_record,
     load_triage_observation_by_fingerprint,
     match_key,
+    point_mention_current_er,
     settle_active_tasks_after_permanent_preflight,
+    upsert_active_possible_same_person,
 )
 from notable_person_finder.people.resolution import (
+    ResolutionValidationError,
+    build_resolve_input,
+    first_pass_canonical_supplied_input_json,
     first_pass_task_fingerprint,
+    render_resolution_request,
     resolution_prompt_and_schema_hashes,
+    validate_resolution_output,
 )
 from notable_person_finder.providers.failures import FailureCategory, ProviderFailure
 from notable_person_finder.providers.openrouter import (
@@ -83,6 +112,7 @@ from notable_person_finder.providers.openrouter import (
     StructuredGenerationRequest,
 )
 from notable_person_finder.runs import repository
+from notable_person_finder.runs.clock import utc_timestamp
 from notable_person_finder.runs.engine import TaskHandler, TaskOutcome, TaskPreparation
 from notable_person_finder.runs.models import WorkItem, WorkState
 from notable_person_finder.runs.scheduler import WorkerPool
@@ -96,6 +126,14 @@ SUBJECT_KIND_PERSON_RELATION = "person_relation"
 
 DETECT_PEOPLE_PRIORITY = 30
 DETECTION_SCHEMA_NAME = "detect_people"
+
+RESOLVE_PERSON_PRIORITY = 40
+RESOLUTION_SCHEMA_NAME = "resolve_person_entity"
+CREATED_NEW_VALIDATED_OUTPUT_JSON = '{"outcome":"created_new"}'
+SKIPPED_MATCH_KEY_RATIONALE = "insufficient_identity_match_key"
+MALFORMED_RESOLUTION_DETAIL = "invalid resolution output"
+MISSING_MENTION_DETAIL = "person mention is missing"
+RESOLVE_PREPARE_REFUSED_PREFIX = "resolve_prepare_refused:"
 
 # Re-export resolution task type constants for handlers and tests.
 assert RESOLVE_PERSON_ENTITY_TASK_TYPE == "resolve_person_entity"
@@ -1365,6 +1403,9 @@ def _execute_detection_for(
 
 def _persist_detection_for(
     connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
+    profile: DomainProfileConfig,
 ) -> Callable[[WorkItem, TaskOutcome], None]:
     def persist(work_item: WorkItem, outcome: TaskOutcome) -> None:
         payload = outcome.payload
@@ -1375,7 +1416,7 @@ def _persist_detection_for(
         # Persist only prevalidated output. Domain validation must have run in
         # execute; re-validating here would be a second paid-call gate.
         attempt_id, run_id, observed_at = _attempt_context(connection, work_item.id)
-        insert_completed_observation(
+        observation_id = insert_completed_observation(
             connection,
             source_item_id=payload.source_item_id,
             run_id=run_id,
@@ -1389,6 +1430,15 @@ def _persist_detection_for(
             task_fingerprint=payload.task_fingerprint,
             input_truncated=payload.input_truncated,
             observed_at=observed_at,
+        )
+        # Same settlement transaction: failure rolls back triage + identity.
+        schedule_resolution_for_observation(
+            connection,
+            observation_id=observation_id,
+            run_id=run_id,
+            config=config,
+            profile=profile,
+            now=observed_at,
         )
 
     return persist
@@ -1587,7 +1637,7 @@ def build_detection_handler(
         operation=GENERATE_OPERATION,
         execute=_execute_detection_for(client),
         prepare=prepare,
-        persist=_persist_detection_for(connection),
+        persist=_persist_detection_for(connection, config=config, profile=profile),
         persist_failure=_persist_detection_failure_for(
             connection, profile=profile, config=config
         ),
@@ -1596,3 +1646,1072 @@ def build_detection_handler(
         pool=WorkerPool.LLM,
         ready=ready,
     )
+
+
+# ---------------------------------------------------------------------------
+# First-pass entity resolution (created_new + model path)
+# ---------------------------------------------------------------------------
+
+
+def _retrieve_candidates_for_mention(
+    connection: sqlite3.Connection,
+    *,
+    person_mention_id: int,
+    config: MainConfig,
+) -> tuple[CandidatePerson, ...]:
+    resolve = config.tasks.resolve_person_entity
+    return retrieve_candidates(
+        connection,
+        person_mention_id=person_mention_id,
+        max_candidates=resolve.max_candidates,
+        max_facts_per_candidate=resolve.max_facts_per_candidate,
+        max_names_per_candidate=resolve.max_names_per_candidate,
+    )
+
+
+def _candidate_ids_json(candidate_ids: Sequence[int]) -> str:
+    return json.dumps(list(candidate_ids), separators=(",", ":"))
+
+
+def _to_resolve_candidates(
+    candidates: Sequence[CandidatePerson],
+) -> tuple[ResolveCandidate, ...]:
+    result: list[ResolveCandidate] = []
+    for candidate in candidates:
+        names: list[ResolveCandidateName] = []
+        for name in candidate.names:
+            kind: SourcedNameKind
+            if name.kind in {"professional", "display", "alias", "other", "mononym"}:
+                kind = name.kind  # type: ignore[assignment]
+            else:
+                kind = "other"
+            names.append(
+                ResolveCandidateName(
+                    exact_name=name.exact_name,
+                    search_name=name.search_name,
+                    match_key=name.match_key,
+                    kind=kind,
+                )
+            )
+        facts: list[ResolveCandidateFact] = []
+        for fact in candidate.facts:
+            try:
+                kind_enum = IdentityFactKind(fact.kind)
+            except ValueError:
+                kind_enum = IdentityFactKind.OTHER
+            facts.append(
+                ResolveCandidateFact(
+                    local_id=fact.local_id,
+                    kind=kind_enum,
+                    value=fact.value,
+                )
+            )
+        result.append(
+            ResolveCandidate(
+                person_id=candidate.person_id,
+                display_name=candidate.display_name,
+                names=tuple(names),
+                identity_facts=tuple(facts),
+            )
+        )
+    return tuple(result)
+
+
+def _mention_identity_fact_name_values(
+    connection: sqlite3.Connection, *, person_mention_id: int
+) -> tuple[str, ...]:
+    return tuple(
+        str(row["value"])
+        for row in connection.execute(
+            """
+            SELECT value
+              FROM mention_identity_fact
+             WHERE person_mention_id = ? AND kind = 'name'
+             ORDER BY local_id
+            """,
+            (person_mention_id,),
+        )
+    )
+
+
+def _source_item_id_for_mention(
+    connection: sqlite3.Connection, *, person_mention_id: int
+) -> int:
+    row = connection.execute(
+        """
+        SELECT t.source_item_id
+          FROM person_mention AS m
+          JOIN triage_observation AS t ON t.id = m.triage_observation_id
+         WHERE m.id = ?
+        """,
+        (person_mention_id,),
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"person_mention {person_mention_id} is missing")
+    return int(row["source_item_id"])
+
+
+def _passages_for_source_item(
+    connection: sqlite3.Connection,
+    *,
+    source_item_id: int,
+    config: MainConfig,
+) -> tuple[DetectionPassage, ...]:
+    record = load_source_item_record(connection, source_item_id=source_item_id)
+    if record is None:
+        return ()
+    resolve = config.tasks.resolve_person_entity
+    passages: list[DetectionPassage] = []
+    title = _normalized_text(record.title_text)
+    if title is not None:
+        bounded = title[: resolve.max_title_characters] or title[:1]
+        passages.append(
+            DetectionPassage(
+                id="p1",
+                field="title",
+                text=bounded,
+                truncated=bounded != title,
+            )
+        )
+    summary = _normalized_text(record.summary_text)
+    if summary is not None:
+        bounded = summary[: resolve.max_summary_characters] or summary[:1]
+        passages.append(
+            DetectionPassage(
+                id="p2",
+                field="summary",
+                text=bounded,
+                truncated=bounded != summary,
+            )
+        )
+    return tuple(passages)
+
+
+def _apply_peer_edges(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    reject_set: set[int],
+    creating_mention_id: int,
+    run_id: int,
+    observation_id: int,
+    config: MainConfig,
+    now: str,
+) -> None:
+    """Open K17 name-matched peer edges after a person create (not reconsider)."""
+    peers = scan_name_matched_peers(
+        connection,
+        person_id=person_id,
+        reject_set=reject_set,
+        max_candidates=config.tasks.resolve_person_entity.max_candidates,
+        creating_mention_id=creating_mention_id,
+    )
+    for peer_id in peers:
+        upsert_active_possible_same_person(
+            connection,
+            person_id_a=person_id,
+            person_id_b=peer_id,
+            run_id=run_id,
+            created_by_observation_id=observation_id,
+            now=now,
+        )
+
+
+def _supersede_stale_resolve_work(
+    connection: sqlite3.Connection,
+    *,
+    person_mention_id: int,
+    fingerprint: str,
+    run_id: int,
+    now: str,
+) -> None:
+    stale = connection.execute(
+        """
+        SELECT fingerprint
+          FROM work_item
+         WHERE task_type = ?
+           AND subject_kind = ?
+           AND subject_id = ?
+           AND state IN ('pending', 'deferred')
+           AND fingerprint != ?
+         ORDER BY id
+        """,
+        (
+            RESOLVE_PERSON_ENTITY_TASK_TYPE,
+            SUBJECT_KIND_PERSON_MENTION,
+            person_mention_id,
+            fingerprint,
+        ),
+    ).fetchall()
+    for row in stale:
+        repository.supersede_work(
+            connection,
+            task_type=RESOLVE_PERSON_ENTITY_TASK_TYPE,
+            fingerprint=row["fingerprint"],
+            run_id=run_id,
+            now=now,
+            reason=SUPERSEDED_DETECTION_REASON,
+        )
+
+
+def _linked_person_id_from_er(
+    *,
+    created_person_id: int | None,
+    selected_person_id: int | None,
+) -> int | None:
+    if created_person_id is not None:
+        return created_person_id
+    if selected_person_id is not None:
+        return selected_person_id
+    return None
+
+
+def _schedule_resolve_work(
+    connection: sqlite3.Connection,
+    *,
+    person_mention_id: int,
+    fingerprint: str,
+    run_id: int,
+    now: str,
+) -> None:
+    _supersede_stale_resolve_work(
+        connection,
+        person_mention_id=person_mention_id,
+        fingerprint=fingerprint,
+        run_id=run_id,
+        now=now,
+    )
+    repository.schedule_work(
+        connection,
+        task_type=RESOLVE_PERSON_ENTITY_TASK_TYPE,
+        subject_kind=SUBJECT_KIND_PERSON_MENTION,
+        subject_id=person_mention_id,
+        fingerprint=fingerprint,
+        required=True,
+        priority=RESOLVE_PERSON_PRIORITY,
+        eligible_at=now,
+        run_id=run_id,
+        now=now,
+    )
+
+
+def _write_created_new(
+    connection: sqlite3.Connection,
+    *,
+    person_mention_id: int,
+    run_id: int,
+    fingerprint: str,
+    prompt_hash: str,
+    schema_hash: str,
+    schema_version: int,
+    material_json: str,
+    config: MainConfig,
+    now: str,
+) -> None:
+    person_id = create_person_for_mention(
+        connection,
+        run_id=run_id,
+        mention_id=person_mention_id,
+        now=now,
+    )
+    er_id = insert_entity_resolution_observation(
+        connection,
+        person_mention_id=person_mention_id,
+        person_relation_id=None,
+        run_id=run_id,
+        attempt_id=None,
+        model_inspection_id=None,
+        disposition="completed",
+        semantic_outcome="created_new",
+        selected_person_id=None,
+        created_person_id=person_id,
+        candidate_person_ids_json="[]",
+        canonical_supplied_input_json=material_json,
+        validated_output_json=CREATED_NEW_VALIDATED_OUTPUT_JSON,
+        prompt_hash=prompt_hash,
+        schema_hash=schema_hash,
+        schema_version=schema_version,
+        task_fingerprint=fingerprint,
+        rationale="empty candidate set",
+        failure_category=None,
+        observed_at=now,
+    )
+    point_mention_current_er(
+        connection,
+        person_mention_id=person_mention_id,
+        observation_id=er_id,
+        person_id=person_id,
+    )
+    _apply_peer_edges(
+        connection,
+        person_id=person_id,
+        reject_set=set(),
+        creating_mention_id=person_mention_id,
+        run_id=run_id,
+        observation_id=er_id,
+        config=config,
+        now=now,
+    )
+
+
+def ensure_resolution_for_mention(
+    connection: sqlite3.Connection,
+    *,
+    person_mention_id: int,
+    run_id: int,
+    config: MainConfig,
+    profile: DomainProfileConfig,
+    now: str,
+) -> str:
+    """Schedule-time first-pass resolution for one mention.
+
+    Returns one of: ``created_new``, ``scheduled``, ``reused``, ``skipped``,
+    ``ineligible``. Caller may hold an open transaction (detection persist);
+    seed and prepare open a brief ``BEGIN IMMEDIATE`` when none is open.
+    """
+    del profile  # reserved for future domain-profile bounds
+    owns_transaction = not connection.in_transaction
+    if owns_transaction:
+        connection.execute("BEGIN IMMEDIATE")
+    try:
+        result = _ensure_resolution_for_mention_body(
+            connection,
+            person_mention_id=person_mention_id,
+            run_id=run_id,
+            config=config,
+            now=now,
+        )
+    except BaseException:
+        if owns_transaction:
+            connection.rollback()
+        raise
+    else:
+        if owns_transaction:
+            connection.commit()
+        return result
+
+
+def _ensure_resolution_for_mention_body(
+    connection: sqlite3.Connection,
+    *,
+    person_mention_id: int,
+    run_id: int,
+    config: MainConfig,
+    now: str,
+) -> str:
+    row = connection.execute(
+        """
+        SELECT exact_name, search_name, outcome, person_id
+          FROM person_mention
+         WHERE id = ?
+        """,
+        (person_mention_id,),
+    ).fetchone()
+    if row is None:
+        return "ineligible"
+    outcome = str(row["outcome"])
+    if outcome not in {"research", "uncertain"}:
+        return "ineligible"
+    exact_name = row["exact_name"]
+    if exact_name is None or not str(exact_name).strip():
+        return "ineligible"
+    exact_name_str = str(exact_name)
+    search_name_str = (
+        str(row["search_name"]) if row["search_name"] is not None else exact_name_str
+    )
+
+    resolve = config.tasks.resolve_person_entity
+    prompt_hash, schema_hash, schema_version = resolution_prompt_and_schema_hashes()
+    identity_facts = _identity_facts_for_mention(
+        connection, person_mention_id=person_mention_id
+    )
+    signals = _signals_for_mention(connection, person_mention_id=person_mention_id)
+    fingerprint = first_pass_task_fingerprint(
+        person_mention_id=person_mention_id,
+        mention_outcome=outcome,
+        exact_name=exact_name_str,
+        search_name=search_name_str,
+        identity_facts=identity_facts,
+        signals=signals,
+        config=resolve,
+        prompt_hash=prompt_hash,
+        schema_hash=schema_hash,
+        schema_version=schema_version,
+    )
+    material_json = first_pass_canonical_supplied_input_json(
+        person_mention_id=person_mention_id,
+        mention_outcome=outcome,
+        exact_name=exact_name_str,
+        search_name=search_name_str,
+        identity_facts=identity_facts,
+        signals=signals,
+        config=resolve,
+        prompt_hash=prompt_hash,
+        schema_hash=schema_hash,
+        schema_version=schema_version,
+    )
+
+    existing = load_er_by_mention_fingerprint(
+        connection,
+        person_mention_id=person_mention_id,
+        task_fingerprint=fingerprint,
+    )
+    if existing is not None:
+        linked = _linked_person_id_from_er(
+            created_person_id=existing.created_person_id,
+            selected_person_id=existing.selected_person_id,
+        )
+        current = connection.execute(
+            """
+            SELECT current_entity_resolution_observation_id, person_id
+              FROM person_mention
+             WHERE id = ?
+            """,
+            (person_mention_id,),
+        ).fetchone()
+        if current is not None and (
+            current["current_entity_resolution_observation_id"] != existing.id
+            or (linked is not None and current["person_id"] != linked)
+        ):
+            point_mention_current_er(
+                connection,
+                person_mention_id=person_mention_id,
+                observation_id=existing.id,
+                person_id=linked,
+            )
+        return "reused"
+
+    if not match_key(exact_name_str):
+        er_id = insert_entity_resolution_observation(
+            connection,
+            person_mention_id=person_mention_id,
+            person_relation_id=None,
+            run_id=run_id,
+            attempt_id=None,
+            model_inspection_id=None,
+            disposition="skipped",
+            semantic_outcome=None,
+            selected_person_id=None,
+            created_person_id=None,
+            candidate_person_ids_json="[]",
+            canonical_supplied_input_json=material_json,
+            validated_output_json=None,
+            prompt_hash=prompt_hash,
+            schema_hash=schema_hash,
+            schema_version=schema_version,
+            task_fingerprint=fingerprint,
+            rationale=SKIPPED_MATCH_KEY_RATIONALE,
+            failure_category=None,
+            observed_at=now,
+        )
+        point_mention_current_er(
+            connection,
+            person_mention_id=person_mention_id,
+            observation_id=er_id,
+            person_id=None,
+        )
+        return "skipped"
+
+    candidates = _retrieve_candidates_for_mention(
+        connection, person_mention_id=person_mention_id, config=config
+    )
+    if not candidates:
+        # K17 txn re-check before deterministic create.
+        candidates = _retrieve_candidates_for_mention(
+            connection, person_mention_id=person_mention_id, config=config
+        )
+    if not candidates:
+        _write_created_new(
+            connection,
+            person_mention_id=person_mention_id,
+            run_id=run_id,
+            fingerprint=fingerprint,
+            prompt_hash=prompt_hash,
+            schema_hash=schema_hash,
+            schema_version=schema_version,
+            material_json=material_json,
+            config=config,
+            now=now,
+        )
+        return "created_new"
+
+    _schedule_resolve_work(
+        connection,
+        person_mention_id=person_mention_id,
+        fingerprint=fingerprint,
+        run_id=run_id,
+        now=now,
+    )
+    return "scheduled"
+
+
+def schedule_resolution_for_observation(
+    connection: sqlite3.Connection,
+    *,
+    observation_id: int,
+    run_id: int,
+    config: MainConfig,
+    profile: DomainProfileConfig,
+    now: str,
+) -> int:
+    """Txn-neutral: ensure resolution for every mention on a triage observation.
+
+    Must not call BEGIN/COMMIT; joins the caller's settlement transaction.
+    """
+    mentions = load_person_mentions(connection, triage_observation_id=observation_id)
+    acted = 0
+    for mention in mentions:
+        result = ensure_resolution_for_mention(
+            connection,
+            person_mention_id=mention.id,
+            run_id=run_id,
+            config=config,
+            profile=profile,
+            now=now,
+        )
+        if result != "ineligible":
+            acted += 1
+    return acted
+
+
+def seed_unresolved_mentions(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    config: MainConfig,
+    profile: DomainProfileConfig,
+    now: str,
+) -> int:
+    """Backfill first-pass resolution for already-triaged unresolved mentions.
+
+    Calls :func:`ensure_resolution_for_mention` for every research/uncertain
+    mention with a non-empty exact_name. Ensure is idempotent (reuse / skip /
+    create / schedule). Empty ``match_key`` mentions receive disposition
+    ``skipped`` here even though they are not K24-eligible for model inspect.
+    """
+    rows = connection.execute(
+        """
+        SELECT id
+          FROM person_mention
+         WHERE outcome IN ('research', 'uncertain')
+           AND length(trim(exact_name)) > 0
+         ORDER BY id
+        """
+    ).fetchall()
+    acted = 0
+    for row in rows:
+        result = ensure_resolution_for_mention(
+            connection,
+            person_mention_id=int(row["id"]),
+            run_id=run_id,
+            config=config,
+            profile=profile,
+            now=now,
+        )
+        if result != "ineligible":
+            acted += 1
+    return acted
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolutionCall:
+    """Application-thread inputs for the worker-thread resolve generation."""
+
+    request: StructuredGenerationRequest
+    resolve_input: ResolvePersonEntityInput
+    person_mention_id: int
+    model_inspection_id: int
+    canonical_supplied_input_json: str
+    prompt_hash: str
+    schema_hash: str
+    schema_version: int
+    task_fingerprint: str
+    candidate_person_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolutionPersist:
+    """Prevalidated resolve output and provenance for application-thread persist."""
+
+    output: ResolvePersonEntityOutput
+    person_mention_id: int
+    model_inspection_id: int
+    canonical_supplied_input_json: str
+    prompt_hash: str
+    schema_hash: str
+    schema_version: int
+    task_fingerprint: str
+    candidate_person_ids: tuple[int, ...]
+
+
+def _execute_resolution_for(
+    client: LlmClient,
+) -> Callable[[WorkItem, int, object], TaskOutcome]:
+    """Worker-thread generation + domain validation; no SQLite in freevars."""
+
+    def execute(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
+        if not isinstance(prepared, _ResolutionCall):
+            raise ProviderFailure(
+                FailureCategory.INTERNAL,
+                provider=PROVIDER,
+                operation=GENERATE_OPERATION,
+                detail=f"prepared value was {type(prepared).__name__}",
+            )
+        result = client.generate_structured(prepared.request)
+        raw_text = result.raw_text
+        if result.refusal:
+            del raw_text, result
+            raise ProviderFailure(
+                FailureCategory.MALFORMED_RESPONSE,
+                provider=PROVIDER,
+                operation=GENERATE_OPERATION,
+                retryable=True,
+                detail=MALFORMED_RESOLUTION_DETAIL,
+            )
+        try:
+            output = validate_resolution_output(raw_text, prepared.resolve_input)
+        except ResolutionValidationError:
+            del raw_text, result
+            raise ProviderFailure(
+                FailureCategory.MALFORMED_RESPONSE,
+                provider=PROVIDER,
+                operation=GENERATE_OPERATION,
+                retryable=True,
+                detail=MALFORMED_RESOLUTION_DETAIL,
+            ) from None
+        del raw_text
+        payload = _ResolutionPersist(
+            output=output,
+            person_mention_id=prepared.person_mention_id,
+            model_inspection_id=prepared.model_inspection_id,
+            canonical_supplied_input_json=prepared.canonical_supplied_input_json,
+            prompt_hash=prepared.prompt_hash,
+            schema_hash=prepared.schema_hash,
+            schema_version=prepared.schema_version,
+            task_fingerprint=prepared.task_fingerprint,
+            candidate_person_ids=prepared.candidate_person_ids,
+        )
+        return TaskOutcome(
+            state=WorkState.SUCCEEDED,
+            reason=None,
+            payload=payload,
+            response_bytes=len(result.raw_text.encode("utf-8")),
+            provider_request_id=result.provider_request_id,
+            actual_nano_usd=result.actual_nano_usd,
+        )
+
+    return execute
+
+
+def _persist_resolution_for(
+    connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
+) -> Callable[[WorkItem, TaskOutcome], None]:
+    def persist(work_item: WorkItem, outcome: TaskOutcome) -> None:
+        payload = outcome.payload
+        if not isinstance(payload, _ResolutionPersist):
+            raise RuntimeError(
+                f"unexpected resolution payload type: {type(payload).__name__}"
+            )
+        attempt_id, run_id, observed_at = _attempt_context(connection, work_item.id)
+        existing = load_er_by_mention_fingerprint(
+            connection,
+            person_mention_id=payload.person_mention_id,
+            task_fingerprint=payload.task_fingerprint,
+        )
+        if existing is not None:
+            linked = _linked_person_id_from_er(
+                created_person_id=existing.created_person_id,
+                selected_person_id=existing.selected_person_id,
+            )
+            point_mention_current_er(
+                connection,
+                person_mention_id=payload.person_mention_id,
+                observation_id=existing.id,
+                person_id=linked,
+            )
+            return
+
+        candidate_ids = list(payload.candidate_person_ids)
+        candidates_json = _candidate_ids_json(candidate_ids)
+        output = payload.output
+        validated_json = output.model_dump_json()
+        supporting_json = json.dumps(
+            list(output.supporting_fact_ids), separators=(",", ":")
+        )
+        conflicting_json = json.dumps(
+            list(output.conflicting_fact_ids), separators=(",", ":")
+        )
+
+        if output.outcome == "same_person":
+            if output.selected_person_id is None:
+                raise RuntimeError("same_person output missing selected_person_id")
+            selected = canonical_person_id(connection, output.selected_person_id)
+            mention_row = connection.execute(
+                "SELECT exact_name FROM person_mention WHERE id = ?",
+                (payload.person_mention_id,),
+            ).fetchone()
+            if mention_row is None:
+                raise RuntimeError(
+                    f"person_mention {payload.person_mention_id} "
+                    "missing in resolve persist"
+                )
+            upsert_sourced_names_for_mention(
+                connection,
+                person_id=selected,
+                mention_id=payload.person_mention_id,
+                exact_name=str(mention_row["exact_name"]),
+                identity_fact_names=_mention_identity_fact_name_values(
+                    connection, person_mention_id=payload.person_mention_id
+                ),
+                observed_at=observed_at,
+            )
+            display_name = select_display_name(connection, selected)
+            fingerprint = recompute_identity_fingerprint(connection, selected)
+            connection.execute(
+                """
+                UPDATE person
+                   SET display_name = ?, identity_fingerprint = ?
+                 WHERE id = ?
+                """,
+                (display_name, fingerprint, selected),
+            )
+            er_id = insert_entity_resolution_observation(
+                connection,
+                person_mention_id=payload.person_mention_id,
+                person_relation_id=None,
+                run_id=run_id,
+                attempt_id=attempt_id,
+                model_inspection_id=payload.model_inspection_id,
+                disposition="completed",
+                semantic_outcome="same_person",
+                selected_person_id=selected,
+                created_person_id=None,
+                candidate_person_ids_json=candidates_json,
+                canonical_supplied_input_json=payload.canonical_supplied_input_json,
+                validated_output_json=validated_json,
+                prompt_hash=payload.prompt_hash,
+                schema_hash=payload.schema_hash,
+                schema_version=payload.schema_version,
+                task_fingerprint=payload.task_fingerprint,
+                supporting_fact_ids_json=supporting_json,
+                conflicting_fact_ids_json=conflicting_json,
+                rationale=output.rationale,
+                failure_category=None,
+                observed_at=observed_at,
+            )
+            point_mention_current_er(
+                connection,
+                person_mention_id=payload.person_mention_id,
+                observation_id=er_id,
+                person_id=selected,
+            )
+            return
+
+        # different_people or uncertain: create a new person.
+        person_id = create_person_for_mention(
+            connection,
+            run_id=run_id,
+            mention_id=payload.person_mention_id,
+            now=observed_at,
+        )
+        er_id = insert_entity_resolution_observation(
+            connection,
+            person_mention_id=payload.person_mention_id,
+            person_relation_id=None,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            model_inspection_id=payload.model_inspection_id,
+            disposition="completed",
+            semantic_outcome=output.outcome,
+            selected_person_id=None,
+            created_person_id=person_id,
+            candidate_person_ids_json=candidates_json,
+            canonical_supplied_input_json=payload.canonical_supplied_input_json,
+            validated_output_json=validated_json,
+            prompt_hash=payload.prompt_hash,
+            schema_hash=payload.schema_hash,
+            schema_version=payload.schema_version,
+            task_fingerprint=payload.task_fingerprint,
+            supporting_fact_ids_json=supporting_json,
+            conflicting_fact_ids_json=conflicting_json,
+            rationale=output.rationale,
+            failure_category=None,
+            observed_at=observed_at,
+        )
+        point_mention_current_er(
+            connection,
+            person_mention_id=payload.person_mention_id,
+            observation_id=er_id,
+            person_id=person_id,
+        )
+
+        reject_set: set[int] = set()
+        if output.outcome == "uncertain":
+            # K4: edges to all code-supplied candidates; peer scan reject empty.
+            for candidate_id in candidate_ids:
+                upsert_active_possible_same_person(
+                    connection,
+                    person_id_a=person_id,
+                    person_id_b=candidate_id,
+                    run_id=run_id,
+                    created_by_observation_id=er_id,
+                    now=observed_at,
+                )
+            reject_set = set()
+        else:
+            # different_people: no edges to rejected candidates.
+            reject_set = set(candidate_ids)
+
+        _apply_peer_edges(
+            connection,
+            person_id=person_id,
+            reject_set=reject_set,
+            creating_mention_id=payload.person_mention_id,
+            run_id=run_id,
+            observation_id=er_id,
+            config=config,
+            now=observed_at,
+        )
+        # K21: do not schedule reconsider_person_entity for edges opened here.
+
+    return persist
+
+
+def _persist_resolution_failure_for(
+    connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
+) -> Callable[[WorkItem, ProviderFailure], None]:
+    def persist_failure(work_item: WorkItem, failure: ProviderFailure) -> None:
+        state_row = connection.execute(
+            "SELECT state, subject_id, fingerprint FROM work_item WHERE id = ?",
+            (work_item.id,),
+        ).fetchone()
+        if state_row is None or state_row["state"] != "failed_permanent":
+            return
+        if state_row["subject_id"] is None:
+            return
+        person_mention_id = int(state_row["subject_id"])
+        task_fingerprint = state_row["fingerprint"]
+        existing = load_er_by_mention_fingerprint(
+            connection,
+            person_mention_id=person_mention_id,
+            task_fingerprint=task_fingerprint,
+        )
+        if existing is not None:
+            # Re-armed empty-at-prepare / ensure already wrote domain state.
+            return
+
+        attempt_id, run_id, observed_at = _attempt_context(connection, work_item.id)
+        prompt_hash, schema_hash, schema_version = resolution_prompt_and_schema_hashes()
+        routing_fp = routing_fingerprint(config.openrouter.routing)
+        inspection = load_model_inspection(
+            connection,
+            run_id=run_id,
+            configured_model_id=config.tasks.resolve_person_entity.model,
+            routing_fingerprint=routing_fp,
+        )
+        model_inspection_id = None if inspection is None else inspection.id
+        er_id = insert_entity_resolution_observation(
+            connection,
+            person_mention_id=person_mention_id,
+            person_relation_id=None,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            model_inspection_id=model_inspection_id,
+            disposition="failed",
+            semantic_outcome=None,
+            selected_person_id=None,
+            created_person_id=None,
+            candidate_person_ids_json="[]",
+            canonical_supplied_input_json="{}",
+            validated_output_json=None,
+            prompt_hash=prompt_hash,
+            schema_hash=schema_hash,
+            schema_version=schema_version,
+            task_fingerprint=task_fingerprint,
+            rationale=str(failure.category),
+            failure_category=str(failure.category),
+            observed_at=observed_at,
+        )
+        point_mention_current_er(
+            connection,
+            person_mention_id=person_mention_id,
+            observation_id=er_id,
+            person_id=None,
+        )
+
+    return persist_failure
+
+
+def build_resolution_handler(
+    connection: sqlite3.Connection,
+    *,
+    client: LlmClient,
+    config: MainConfig,
+    profile: DomainProfileConfig,
+) -> TaskHandler:
+    """The ``resolve_person_entity`` handler: model path only (K3 empty is ensure)."""
+    resolve = config.tasks.resolve_person_entity
+    model_id = resolve.model
+    routing_fp = routing_fingerprint(config.openrouter.routing)
+    hard_budget = config.budget.openrouter_nano_usd_per_run() is not None
+    endpoint_host = urlsplit(config.openrouter.endpoint).hostname
+    parameters = resolve.parameters
+
+    def ready(claimed_run_id: int) -> bool:
+        return inspection_ready(
+            connection,
+            run_id=claimed_run_id,
+            config=config,
+            model_id=model_id,
+        )
+
+    def prepare(work_item: WorkItem) -> TaskPreparation:
+        if work_item.subject_id is None:
+            raise ValueError(MISSING_MENTION_DETAIL)
+        person_mention_id = work_item.subject_id
+        mention = connection.execute(
+            """
+            SELECT exact_name, search_name, outcome, person_id
+              FROM person_mention
+             WHERE id = ?
+            """,
+            (person_mention_id,),
+        ).fetchone()
+        if mention is None:
+            raise ValueError(MISSING_MENTION_DETAIL)
+
+        run_id = _claimed_run_id(connection, work_item.id)
+        candidates = _retrieve_candidates_for_mention(
+            connection, person_mention_id=person_mention_id, config=config
+        )
+        existing_er = load_er_by_mention_fingerprint(
+            connection,
+            person_mention_id=person_mention_id,
+            task_fingerprint=work_item.fingerprint,
+        )
+        already_linked = mention["person_id"] is not None
+        if not candidates or already_linked or existing_er is not None:
+            ensure_resolution_for_mention(
+                connection,
+                person_mention_id=person_mention_id,
+                run_id=run_id,
+                config=config,
+                profile=profile,
+                now=_observed_at_for_prepare(connection, work_item.id),
+            )
+            raise ValueError(
+                f"{RESOLVE_PREPARE_REFUSED_PREFIX}empty_or_settled mention "
+                f"{person_mention_id}"
+            )
+
+        inspection = load_model_inspection(
+            connection,
+            run_id=run_id,
+            configured_model_id=model_id,
+            routing_fingerprint=routing_fp,
+        )
+        if inspection is None or inspection.compatibility != "compatible":
+            raise ValueError(MISSING_INSPECTION_DETAIL)
+
+        outcome = str(mention["outcome"])
+        exact_name = str(mention["exact_name"])
+        search_name = (
+            str(mention["search_name"])
+            if mention["search_name"] is not None
+            else exact_name
+        )
+        source_item_id = _source_item_id_for_mention(
+            connection, person_mention_id=person_mention_id
+        )
+        resolve_input = build_resolve_input(
+            person_mention_id=person_mention_id,
+            source_item_id=source_item_id,
+            exact_name=exact_name,
+            search_name=search_name,
+            mention_outcome=outcome,
+            passages=_passages_for_source_item(
+                connection, source_item_id=source_item_id, config=config
+            ),
+            identity_facts=_identity_facts_for_mention(
+                connection, person_mention_id=person_mention_id
+            ),
+            signals=_signals_for_mention(
+                connection, person_mention_id=person_mention_id
+            ),
+            candidates=_to_resolve_candidates(candidates),
+            config=resolve,
+        )
+        rendered = render_resolution_request(resolve_input)
+        request = StructuredGenerationRequest(
+            model_id=model_id,
+            system_prompt=rendered.system_prompt,
+            user_content=rendered.user_input_json,
+            json_schema=rendered.schema,
+            schema_name=RESOLUTION_SCHEMA_NAME,
+            max_completion_tokens=resolve.max_completion_tokens,
+            temperature=parameters.temperature,
+            top_p=parameters.top_p,
+            reasoning_effort=parameters.reasoning_effort,
+        )
+        call = _ResolutionCall(
+            request=request,
+            resolve_input=resolve_input,
+            person_mention_id=person_mention_id,
+            model_inspection_id=inspection.id,
+            canonical_supplied_input_json=rendered.canonical_input_json,
+            prompt_hash=rendered.prompt_hash,
+            schema_hash=rendered.schema_hash,
+            schema_version=rendered.schema_version,
+            task_fingerprint=work_item.fingerprint,
+            candidate_person_ids=tuple(c.person_id for c in candidates),
+        )
+        if not hard_budget:
+            return TaskPreparation(payload=call, reserved_nano_usd=0)
+
+        prompt_price = inspection.prompt_unit_price_nano_usd
+        completion_price = inspection.completion_unit_price_nano_usd
+        if (
+            not inspection.pricing_usable
+            or prompt_price is None
+            or completion_price is None
+        ):
+            raise ValueError(MISSING_PRICING_DETAIL)
+        reserved = _worst_case_reservation_nano_usd(
+            prompt_unit_price_nano_usd=prompt_price,
+            completion_unit_price_nano_usd=completion_price,
+            max_input_tokens=resolve.max_input_tokens,
+            max_completion_tokens=resolve.max_completion_tokens,
+        )
+        return TaskPreparation(payload=call, reserved_nano_usd=reserved)
+
+    def destination_host(work_item: WorkItem) -> str | None:
+        return endpoint_host
+
+    return TaskHandler(
+        task_type=RESOLVE_PERSON_ENTITY_TASK_TYPE,
+        provider=PROVIDER,
+        operation=GENERATE_OPERATION,
+        execute=_execute_resolution_for(client),
+        prepare=prepare,
+        persist=_persist_resolution_for(connection, config=config),
+        persist_failure=_persist_resolution_failure_for(connection, config=config),
+        destination_host=destination_host,
+        reserved_nano_usd=0,
+        pool=WorkerPool.LLM,
+        ready=ready,
+    )
+
+
+def _observed_at_for_prepare(connection: sqlite3.Connection, work_item_id: int) -> str:
+    """Best-effort observed_at for prepare-time ensure (work item updated_at)."""
+    row = connection.execute(
+        "SELECT updated_at FROM work_item WHERE id = ?",
+        (work_item_id,),
+    ).fetchone()
+    if row is not None and row["updated_at"]:
+        return str(row["updated_at"])
+    return utc_timestamp(datetime.now(tz=UTC))

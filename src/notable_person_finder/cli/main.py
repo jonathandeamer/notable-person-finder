@@ -27,6 +27,7 @@ from notable_person_finder.ingestion.service import (
 )
 from notable_person_finder.obs.logging import configure_logging, log_event
 from notable_person_finder.people.repository import (
+    RESOLVE_PERSON_ENTITY_TASK_TYPE,
     triage_corpus_counts,
     triage_run_counts,
 )
@@ -35,7 +36,10 @@ from notable_person_finder.people.service import (
     INSPECT_MODEL_TASK_TYPE,
     build_detection_handler,
     build_inspection_handler,
+    build_resolution_handler,
+    ensure_model_inspections_for_run,
     schedule_source_items,
+    seed_unresolved_mentions,
     seed_untriaged,
 )
 from notable_person_finder.providers.feeds import FeedparserClient
@@ -165,13 +169,27 @@ def _compose_seed(
     config = loaded.main
 
     def seed(run_id: int) -> None:
+        now = utc_timestamp(clock.now())
         feed_seed(run_id)
         seed_untriaged(
             connection,
             run_id=run_id,
             config=config,
             profile=profile,
-            now=utc_timestamp(clock.now()),
+            now=now,
+        )
+        seed_unresolved_mentions(
+            connection,
+            run_id=run_id,
+            config=config,
+            profile=profile,
+            now=now,
+        )
+        ensure_model_inspections_for_run(
+            connection,
+            run_id=run_id,
+            config=config,
+            now=now,
         )
 
     return seed
@@ -326,6 +344,12 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                         connection, client=llm_client, config=loaded.main
                     ),
                     DETECT_PEOPLE_TASK_TYPE: build_detection_handler(
+                        connection,
+                        client=llm_client,
+                        config=loaded.main,
+                        profile=loaded.domain_profile,
+                    ),
+                    RESOLVE_PERSON_ENTITY_TASK_TYPE: build_resolution_handler(
                         connection,
                         client=llm_client,
                         config=loaded.main,

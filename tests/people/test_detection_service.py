@@ -1195,6 +1195,59 @@ def test_worker_closure_contains_no_connection(
         assert not isinstance(cell.cell_contents, sqlite3.Connection)
 
 
+def test_detection_persist_rolls_back_when_resolution_schedule_fails(
+    connection: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Forced schedule_resolution failure rolls back triage observation too."""
+    bootstrap = insert_run(connection)
+    item = _seed_source_item(connection, run_id=bootstrap)
+    config = _main_config()
+    profile = _profile()
+
+    def boom(*_args: object, **_kwargs: object) -> int:
+        raise RuntimeError("forced resolution schedule failure")
+
+    monkeypatch.setattr(
+        "notable_person_finder.people.service.schedule_resolution_for_observation",
+        boom,
+    )
+    client = ScriptedLlmClient(
+        inspection=_compatible_inspection(),
+        generate_results=[
+            _generation_result(_multiple_mentions_output().model_dump_json())
+        ],
+    )
+    # Engine catches persist failures, rolls back domain writes, and
+    # re-settles the work item failed_permanent without re-running persist.
+    _run_engine(
+        connection,
+        _handlers(connection, client, config, profile),
+        seed=_people_seed(connection, config, profile, source_item_ids=[item]),
+    )
+    assert load_current_triage_observation(connection, source_item_id=item) is None
+    assert (
+        connection.execute("SELECT COUNT(*) AS n FROM triage_observation").fetchone()[
+            "n"
+        ]
+        == 0
+    )
+    assert (
+        connection.execute("SELECT COUNT(*) AS n FROM person_mention").fetchone()["n"]
+        == 0
+    )
+    assert (
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM work_item
+             WHERE task_type = 'resolve_person_entity'
+            """
+        ).fetchone()["n"]
+        == 0
+    )
+    work = _detect_work_rows(connection, source_item_id=item)[0]
+    assert work["state"] == "failed_permanent"
+
+
 def test_atomic_persistence_with_settlement(
     connection: sqlite3.Connection,
 ) -> None:
