@@ -192,6 +192,7 @@ def test_search_web_returns_ordered_results_with_ranks_and_snippets() -> None:
     assert first.snippet is not None
     assert "mathematician" in first.snippet
     assert first.language == "en"
+    assert first.provider_result_id == "brave-result-ada-lovelace-1"
     assert len(first.extra_snippets) == 2
     assert "first computer programmer" in first.extra_snippets[0]
 
@@ -199,6 +200,7 @@ def test_search_web_returns_ordered_results_with_ranks_and_snippets() -> None:
     assert second.rank == 2
     assert second.url == "https://findingada.com/"
     assert second.extra_snippets == ()
+    assert second.provider_result_id is None
 
     assert len(seen) == 1
     request = seen[0]
@@ -280,18 +282,23 @@ def test_search_web_exactly_one_http_call() -> None:
 
 
 def test_search_web_uses_configured_endpoint() -> None:
-    seen: list[httpx.Request] = []
-    custom = "https://api.search.brave.com/res/v1/web/search"
-    # Path still matches resolver host; endpoint value is what we send.
-    client = client_for(
-        fixture_bytes("brave_search_empty.json"),
-        seen=seen,
-        brave=BraveConfig(endpoint=custom),
+    # Distinct from the default so hardcoding ENDPOINT would fail this test.
+    custom = "https://api.search.brave.com/res/v1/web/search-custom"
+    assert custom != ENDPOINT
+    transport = RecordingTransport(
+        response=http_response(fixture_bytes("brave_search_empty.json"))
+    )
+    client = HttpxBraveWebSearchClient(
+        transport,
+        config=BraveConfig(endpoint=custom),
+        api_key=API_KEY,
+        clock=FakeClock(),
     )
 
     client.search_web("x", count=1, offset=0)
 
-    assert str(seen[0].url).startswith(custom)
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["url"] == custom
 
 
 # --- Failures ----------------------------------------------------------------
