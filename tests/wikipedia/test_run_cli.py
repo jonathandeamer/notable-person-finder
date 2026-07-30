@@ -224,3 +224,47 @@ def test_handlers_map_includes_wikipedia_on_correct_pools(
         assert facts.reserved_nano_usd == 0
     finally:
         connection.close()
+
+
+def test_command_run_registers_three_wikipedia_handlers_on_engine_map(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """I1: ``command_run`` passes all three Wikipedia task types to the engine.
+
+    Structural assert on the handlers mapping actually handed to
+    ``RunEngine.execute`` (not a side-constructed builder). Kills omitting any
+    of the three keys from the CLI map.
+    """
+    from notable_person_finder.runs.engine import RunEngine
+    from notable_person_finder.runs.scheduler import WorkerPool as Pool
+
+    captured: dict[str, object] = {}
+    original_execute = RunEngine.execute
+
+    def spy_execute(self: RunEngine, handlers: object, seed: object = None) -> object:
+        assert isinstance(handlers, dict)
+        captured["keys"] = frozenset(handlers.keys())
+        captured["handlers"] = handlers
+        return original_execute(self, handlers, seed=seed)
+
+    monkeypatch.setattr(RunEngine, "execute", spy_execute)
+    config = write_people_graph(tmp_path, feeds=_single_feed())
+    _wire(monkeypatch)
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
+
+    keys = captured["keys"]
+    assert isinstance(keys, frozenset)
+    for task_type in (
+        MEDIAWIKI_SEARCH_TASK_TYPE,
+        MEDIAWIKI_PAGE_FACTS_TASK_TYPE,
+        MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE,
+    ):
+        assert task_type in keys, f"missing handler key {task_type!r}"
+
+    handlers = captured["handlers"]
+    assert isinstance(handlers, dict)
+    assert handlers[MEDIAWIKI_SEARCH_TASK_TYPE].pool is Pool.HTTP
+    assert handlers[MEDIAWIKI_PAGE_FACTS_TASK_TYPE].pool is Pool.HTTP
+    assert handlers[MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE].pool is Pool.LLM
+    assert handlers[MEDIAWIKI_SEARCH_TASK_TYPE].reserved_nano_usd == 0
+    assert handlers[MEDIAWIKI_PAGE_FACTS_TASK_TYPE].reserved_nano_usd == 0
