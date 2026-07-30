@@ -74,6 +74,7 @@ from notable_person_finder.people.models import (
 )
 from notable_person_finder.people.repository import (
     DETECT_PEOPLE_TASK_TYPE,
+    MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE,
     RECONSIDER_PERSON_ENTITY_TASK_TYPE,
     RESOLVE_PERSON_ENTITY_TASK_TYPE,
     SourceItemRecord,
@@ -474,11 +475,12 @@ def _unused_profile_for_eligibility() -> DomainProfileConfig:
 def models_needed_for_run(
     connection: sqlite3.Connection, run_id: int, config: MainConfig
 ) -> tuple[str, ...]:
-    """Exact models that have dependent work this run (detect and/or resolve)."""
+    """Exact models that have dependent work this run (detect/resolve/match)."""
     del run_id  # reserved: active-work queries are run-global for pending state
     needed: list[str] = []
     detect_model = config.tasks.detect_people.model
     resolve_model = config.tasks.resolve_person_entity.model
+    match_model = config.tasks.match_wikipedia_identity.model
     if _has_usable_untriaged_source_item(connection) or _has_active_detect_work(
         connection
     ):
@@ -487,6 +489,8 @@ def models_needed_for_run(
         connection, config=config
     ) or _has_active_resolve_or_reconsider_work(connection):
         needed.append(resolve_model)
+    if _wikipedia_match_model_needed(connection, config=config):
+        needed.append(match_model)
     return tuple(dict.fromkeys(needed))
 
 
@@ -498,7 +502,20 @@ def task_types_for_model(config: MainConfig, model_id: str) -> tuple[str, ...]:
     if config.tasks.resolve_person_entity.model == model_id:
         types.append(RESOLVE_PERSON_ENTITY_TASK_TYPE)
         types.append(RECONSIDER_PERSON_ENTITY_TASK_TYPE)
+    if config.tasks.match_wikipedia_identity.model == model_id:
+        # HTTP MediaWiki kinds have no model ready gate (K21).
+        types.append(MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE)
     return tuple(types)
+
+
+def _wikipedia_match_model_needed(
+    connection: sqlite3.Connection, *, config: MainConfig
+) -> bool:
+    """K21 match-model inspection arming (lazy import avoids package cycle)."""
+    # Import inside the call: wikipedia.service imports ensure_model_inspections.
+    from notable_person_finder.wikipedia.service import wikipedia_match_model_needed
+
+    return wikipedia_match_model_needed(connection, config=config)
 
 
 def ensure_model_inspections_for_run(
@@ -816,6 +833,7 @@ def _model_id_for_inspection_work(
         (
             config.tasks.detect_people.model,
             config.tasks.resolve_person_entity.model,
+            config.tasks.match_wikipedia_identity.model,
         )
     )
     for model_id in candidates:

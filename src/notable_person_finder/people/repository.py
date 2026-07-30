@@ -34,9 +34,12 @@ if TYPE_CHECKING:
 DETECT_PEOPLE_TASK_TYPE = "detect_people"
 RESOLVE_PERSON_ENTITY_TASK_TYPE = "resolve_person_entity"
 RECONSIDER_PERSON_ENTITY_TASK_TYPE = "reconsider_person_entity"
+MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE = "match_wikipedia_identity"
 _SUBJECT_KIND_SOURCE_ITEM = "source_item"
 _SUBJECT_KIND_PERSON_MENTION = "person_mention"
 _SUBJECT_KIND_PERSON_RELATION = "person_relation"
+_SUBJECT_KIND_PERSON = "person"
+_PERMANENT_PREFLIGHT_FAILURE_CATEGORY = "permanent_preflight"
 
 # Leading honorifics stripped only for the mechanical search form. Exact names
 # remain source-written. The list is deliberately small and text-grounded; it
@@ -1094,6 +1097,11 @@ def settle_active_tasks_after_permanent_preflight(
       the mention's current ER when needed; leave ``person_id`` NULL.
     * ``reconsider_person_entity`` (subject person relation): ensure a failed
       relation-scoped ER (reuse on conflict); do not change edge status.
+    * ``match_wikipedia_identity`` (subject person): ensure a failed Wikipedia
+      observation with the **inspection** ``attempt_id`` and domain
+      ``failure_category='permanent_preflight'`` (reuse on fingerprint
+      conflict); mark the active plan ``failed``; **do not** move the current
+      Wikipedia pointer (K25 / K18).
 
     Does not insert ``generate_structured`` attempts. Dependent handlers'
     ``persist_failure`` never runs on this path.
@@ -1169,6 +1177,20 @@ def settle_active_tasks_after_permanent_preflight(
                     prompt_hash=resolve_prompt_hash,
                     schema_hash=resolve_schema_hash,
                     schema_version=resolve_schema_version,
+                    now=now,
+                )
+            elif task_type == MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE:
+                # Match hashes are optional: preflight failure rows store null
+                # prompt/schema when the match path never rendered a request.
+                settled += _settle_active_match_wikipedia_identity(
+                    connection,
+                    run_id=run_id,
+                    attempt_id=attempt_id,
+                    model_inspection_id=model_inspection_id,
+                    rationale=rationale,
+                    prompt_hash=None,
+                    schema_hash=None,
+                    schema_version=None,
                     now=now,
                 )
             else:
@@ -1491,6 +1513,107 @@ def _settle_active_reconsider_person_entity(
             rationale=rationale,
             now=now,
             task_label=RECONSIDER_PERSON_ENTITY_TASK_TYPE,
+        )
+        settled += 1
+    return settled
+
+
+def _settle_active_match_wikipedia_identity(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    attempt_id: int,
+    model_inspection_id: int | None,
+    rationale: str,
+    prompt_hash: str | None,
+    schema_hash: str | None,
+    schema_version: int | None,
+    now: str,
+) -> int:
+    """Fail active match work after permanent match-model preflight (K18).
+
+    Writes failed Wikipedia observations with the inspection attempt id and
+    domain ``permanent_preflight``. Does **not** move
+    ``person.current_wikipedia_identity_observation_id`` (K25).
+    """
+    # Local imports avoid a people→wikipedia package cycle at module load.
+    from notable_person_finder.wikipedia.repository import (
+        insert_wikipedia_identity_observation,
+        load_active_plan_for_fingerprint,
+        load_wikipedia_identity_observation_by_fingerprint,
+        mark_plan_status,
+    )
+
+    rows = connection.execute(
+        """
+        SELECT id, subject_id, fingerprint
+          FROM work_item
+         WHERE task_type = ?
+           AND subject_kind = ?
+           AND subject_id IS NOT NULL
+           AND state IN ('pending', 'deferred')
+         ORDER BY id
+        """,
+        (MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE, _SUBJECT_KIND_PERSON),
+    ).fetchall()
+    settled = 0
+    for row in rows:
+        work_item_id = int(row["id"])
+        person_id = int(row["subject_id"])
+        task_fingerprint = str(row["fingerprint"])
+        plan = load_active_plan_for_fingerprint(
+            connection,
+            person_id=person_id,
+            material_fingerprint=task_fingerprint,
+        )
+        plan_id = None if plan is None else plan.id
+        existing = load_wikipedia_identity_observation_by_fingerprint(
+            connection,
+            person_id=person_id,
+            task_fingerprint=task_fingerprint,
+        )
+        if existing is None:
+            insert_wikipedia_identity_observation(
+                connection,
+                person_id=person_id,
+                plan_id=plan_id,
+                run_id=run_id,
+                attempt_id=attempt_id,
+                model_inspection_id=model_inspection_id,
+                disposition="failed",
+                semantic_outcome=None,
+                matched_mediawiki_page_id=None,
+                candidate_page_ids_json="[]",
+                canonical_supplied_input_json="{}",
+                validated_output_json=None,
+                prompt_hash=prompt_hash,
+                schema_hash=schema_hash,
+                schema_version=schema_version,
+                task_fingerprint=task_fingerprint,
+                rationale=rationale,
+                failure_category=_PERMANENT_PREFLIGHT_FAILURE_CATEGORY,
+                observed_at=now,
+            )
+        # K25: never point current at a failed observation.
+        if plan is not None and plan.status not in {
+            "superseded",
+            "completed",
+            "failed",
+        }:
+            mark_plan_status(
+                connection,
+                plan_id=plan.id,
+                status="failed",
+                completed_at=now,
+                failure_category=_PERMANENT_PREFLIGHT_FAILURE_CATEGORY,
+            )
+        _settle_work_item_failed_permanent(
+            connection,
+            work_item_id=work_item_id,
+            run_id=run_id,
+            rationale=rationale,
+            now=now,
+            task_label=MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE,
         )
         settled += 1
     return settled

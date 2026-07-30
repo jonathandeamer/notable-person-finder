@@ -1,12 +1,13 @@
-"""Wikipedia identity HTTP handlers and plan advancement.
+"""Wikipedia identity HTTP handlers, match generation, and plan advancement.
 
 ``mediawiki_search`` and ``mediawiki_page_facts`` each perform exactly one
-MediaWiki call per ``execute``. Workers never open SQLite. Domain settlement
-and ``maybe_advance_plan`` run on the application thread inside the engine's
-settlement transaction.
+MediaWiki call per ``execute``. ``match_wikipedia_identity`` performs exactly
+one OpenRouter ``generate_structured`` call. Workers never open SQLite. Domain
+settlement and ``maybe_advance_plan`` run on the application thread inside the
+engine's settlement transaction.
 
-Match-model generation is Task 6; this module schedules ``match_wikipedia_identity``
-work and re-arms multi-model inspection (K21b) when candidates exist.
+When match work is scheduled, ``ensure_model_inspections_for_run`` re-arms
+multi-model inspection (K21b) so cold-start HTTP-only seeds unlock readiness.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import json
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -23,25 +25,65 @@ from notable_person_finder.config.models import (
     MainConfig,
     MatchWikipediaIdentityConfig,
 )
-from notable_person_finder.people.service import ensure_model_inspections_for_run
+from notable_person_finder.people.identity import (
+    canonical_person_id,
+    mentions_for_canonical_person,
+    person_id_closure_for_canonical,
+    select_display_name,
+)
+from notable_person_finder.people.models import IdentityFactKind, SourcedNameKind
+from notable_person_finder.people.repository import load_model_inspection
+from notable_person_finder.people.service import (
+    _worst_case_reservation_nano_usd,
+    ensure_model_inspections_for_run,
+    inspection_ready,
+    routing_fingerprint,
+)
 from notable_person_finder.providers.failures import FailureCategory, ProviderFailure
 from notable_person_finder.providers.mediawiki import (
     PAGE_FACTS_OPERATION,
-    PROVIDER,
     SEARCH_OPERATION,
     MediaWikiClient,
     MediaWikiPageFact,
     MediaWikiPageFactsBatch,
     MediaWikiSearchPage,
 )
+from notable_person_finder.providers.mediawiki import (
+    PROVIDER as MEDIAWIKI_PROVIDER,
+)
+from notable_person_finder.providers.openrouter import (
+    GENERATE_OPERATION,
+    LlmClient,
+    StructuredGenerationRequest,
+)
+from notable_person_finder.providers.openrouter import (
+    PROVIDER as OPENROUTER_PROVIDER,
+)
 from notable_person_finder.runs import repository as runs_repository
+from notable_person_finder.runs.clock import utc_timestamp
 from notable_person_finder.runs.engine import TaskHandler, TaskOutcome, TaskPreparation
 from notable_person_finder.runs.models import WorkItem, WorkState
 from notable_person_finder.runs.scheduler import WorkerPool
 from notable_person_finder.wikipedia.candidates import (
     AssemblyPage,
     AssemblySearchHit,
+    BiographyCandidate,
     assemble_biography_candidates,
+)
+from notable_person_finder.wikipedia.matching import (
+    MatchValidationError,
+    build_match_input,
+    map_model_outcome_to_semantic,
+    match_prompt_and_schema_hashes,
+    render_match_request,
+    validate_match_output,
+)
+from notable_person_finder.wikipedia.models import (
+    MatchFact,
+    MatchName,
+    MatchWikiCandidate,
+    MatchWikipediaIdentityInput,
+    MatchWikipediaIdentityOutput,
 )
 from notable_person_finder.wikipedia.queries import generate_accent_fallback_forms
 from notable_person_finder.wikipedia.repository import (
@@ -55,9 +97,11 @@ from notable_person_finder.wikipedia.repository import (
     list_page_facts_batches_for_plan,
     list_query_forms_for_plan,
     list_search_hit_page_ids_for_completed_forms,
+    load_active_plan_for_fingerprint,
     load_page_facts_batch,
     load_plan,
     load_query_form,
+    load_wikipedia_identity_observation_by_fingerprint,
     mark_batch_completed,
     mark_batch_failed,
     mark_plan_status,
@@ -94,10 +138,29 @@ LOCAL_FAILED_SUPPLIED_INPUT_JSON = (
     '{"task":"wikipedia_identity","path":"local_assembly_failed",'
     '"candidate_page_ids":[]}'
 )
+MATCH_FAILED_SUPPLIED_INPUT_JSON = (
+    '{"task":"wikipedia_identity","path":"match_failed","candidate_page_ids":[]}'
+)
+
+MATCH_SCHEMA_NAME = "match_wikipedia_identity"
+MALFORMED_MATCH_DETAIL = "invalid match output"
+MISSING_PERSON_DETAIL = "person is missing"
+MISSING_INSPECTION_DETAIL = "compatible model inspection is missing"
+MISSING_PRICING_DETAIL = "usable unit pricing is required under a hard budget"
+MATCH_PREPARE_REFUSED_PREFIX = "match_prepare_refused:"
+INVALID_MODEL_OUTPUT_CATEGORY = "invalid_model_output"
+PERMANENT_PREFLIGHT_CATEGORY = "permanent_preflight"
 
 _PRIMARY_VARIANT_KINDS = frozenset({"exact", "comma_swap"})
 _ACCENT_VARIANT_KIND = "accent_fallback"
 _TERMINAL_PLAN_STATUSES = frozenset({"superseded", "completed", "failed"})
+_NAME_KIND_ORDER: dict[str, int] = {
+    "professional": 0,
+    "display": 1,
+    "alias": 2,
+    "other": 3,
+    "mononym": 4,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +301,104 @@ def schedule_match_wikipedia_identity(
         run_id=run_id,
         now=now,
     )
+
+
+def wikipedia_match_model_needed(
+    connection: sqlite3.Connection, *, config: MainConfig
+) -> bool:
+    """K21: whether the match model needs current-run inspection.
+
+    Arms when K17-eligible people exist, active match work exists, an active
+    Wikipedia plan is retrieving/ready_for_match, or MediaWiki HTTP work for
+    a Wikipedia plan is active. Full K17 eligibility lands in Task 7; until
+    then the eligible arm is a thin provisional scan.
+    """
+    del config  # reserved for full is_wikipedia_match_eligible (Task 7)
+    return (
+        _has_wikipedia_match_eligible_people_provisional(connection)
+        or _has_active_match_wikipedia_work(connection)
+        or _has_active_wikipedia_plan(connection)
+        or _has_active_mediawiki_wikipedia_http_work(connection)
+    )
+
+
+def _has_wikipedia_match_eligible_people_provisional(
+    connection: sqlite3.Connection,
+) -> bool:
+    """Provisional K17 arm until Task 7 ships ``is_wikipedia_match_eligible``.
+
+    True when a canonical person has sourced names and no current Wikipedia
+    pointer and no terminal observation yet — enough for multi-model inspect
+    when only a Wikipedia backlog remains before seed opens plans.
+    """
+    row = connection.execute(
+        """
+        SELECT 1 AS present
+          FROM person AS p
+         WHERE p.merged_into_person_id IS NULL
+           AND p.current_wikipedia_identity_observation_id IS NULL
+           AND EXISTS (
+                SELECT 1
+                  FROM sourced_name AS sn
+                 WHERE sn.person_id = p.id
+                   AND length(sn.match_key) > 0
+           )
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM wikipedia_identity_observation AS o
+                 WHERE o.person_id = p.id
+           )
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM wikipedia_identity_plan AS pl
+                 WHERE pl.person_id = p.id
+                   AND pl.status IN ('retrieving', 'ready_for_match')
+           )
+         LIMIT 1
+        """
+    ).fetchone()
+    return row is not None
+
+
+def _has_active_match_wikipedia_work(connection: sqlite3.Connection) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1 AS present
+          FROM work_item
+         WHERE task_type = ?
+           AND state IN ('pending', 'deferred', 'running')
+         LIMIT 1
+        """,
+        (MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE,),
+    ).fetchone()
+    return row is not None
+
+
+def _has_active_wikipedia_plan(connection: sqlite3.Connection) -> bool:
+    """Active plan arm (retrieving | ready_for_match). Mutation-sensitive (K21)."""
+    row = connection.execute(
+        """
+        SELECT 1 AS present
+          FROM wikipedia_identity_plan
+         WHERE status IN ('retrieving', 'ready_for_match')
+         LIMIT 1
+        """
+    ).fetchone()
+    return row is not None
+
+
+def _has_active_mediawiki_wikipedia_http_work(connection: sqlite3.Connection) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1 AS present
+          FROM work_item
+         WHERE task_type IN (?, ?)
+           AND state IN ('pending', 'deferred', 'running')
+         LIMIT 1
+        """,
+        (MEDIAWIKI_SEARCH_TASK_TYPE, MEDIAWIKI_PAGE_FACTS_TASK_TYPE),
+    ).fetchone()
+    return row is not None
 
 
 def maybe_advance_plan(
@@ -386,7 +547,7 @@ def build_mediawiki_search_handler(
 
     return TaskHandler(
         task_type=MEDIAWIKI_SEARCH_TASK_TYPE,
-        provider=PROVIDER,
+        provider=MEDIAWIKI_PROVIDER,
         operation=SEARCH_OPERATION,
         execute=_execute_search_for(client),
         request_fingerprint=request_fingerprint,
@@ -444,7 +605,7 @@ def build_mediawiki_page_facts_handler(
 
     return TaskHandler(
         task_type=MEDIAWIKI_PAGE_FACTS_TASK_TYPE,
-        provider=PROVIDER,
+        provider=MEDIAWIKI_PROVIDER,
         operation=PAGE_FACTS_OPERATION,
         execute=_execute_facts_for(client),
         request_fingerprint=request_fingerprint,
@@ -470,7 +631,7 @@ def _execute_search_for(
         if not isinstance(prepared, _SearchCall):
             raise ProviderFailure(
                 FailureCategory.INTERNAL,
-                provider=PROVIDER,
+                provider=MEDIAWIKI_PROVIDER,
                 operation=SEARCH_OPERATION,
                 detail=f"prepared value was {type(prepared).__name__}",
             )
@@ -495,7 +656,7 @@ def _execute_facts_for(
         if not isinstance(prepared, _FactsCall):
             raise ProviderFailure(
                 FailureCategory.INTERNAL,
-                provider=PROVIDER,
+                provider=MEDIAWIKI_PROVIDER,
                 operation=PAGE_FACTS_OPERATION,
                 detail=f"prepared value was {type(prepared).__name__}",
             )
@@ -1514,3 +1675,840 @@ def _canonical_json(value: object) -> str:
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# match_wikipedia_identity (OpenRouter LLM)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _MatchCall:
+    """Application-thread inputs for the worker-thread match generation."""
+
+    request: StructuredGenerationRequest
+    match_input: MatchWikipediaIdentityInput
+    person_id: int
+    plan_id: int
+    model_inspection_id: int
+    canonical_supplied_input_json: str
+    prompt_hash: str
+    schema_hash: str
+    schema_version: int
+    task_fingerprint: str
+    truncated_unsafe_for_negative: bool
+    candidate_page_ids: tuple[int, ...]
+    mediawiki_row_id_by_page_id: dict[int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _MatchPersist:
+    """Prevalidated match output and provenance for application-thread persist."""
+
+    output: MatchWikipediaIdentityOutput
+    person_id: int
+    plan_id: int
+    model_inspection_id: int
+    canonical_supplied_input_json: str
+    prompt_hash: str
+    schema_hash: str
+    schema_version: int
+    task_fingerprint: str
+    candidate_page_ids: tuple[int, ...]
+    mediawiki_row_id_by_page_id: dict[int, int]
+
+
+def build_match_wikipedia_handler(
+    connection: sqlite3.Connection,
+    *,
+    client: LlmClient,
+    config: MainConfig,
+) -> TaskHandler:
+    """The ``match_wikipedia_identity`` handler: one structured generation."""
+    match_config = config.tasks.match_wikipedia_identity
+    model_id = match_config.model
+    routing_fp = routing_fingerprint(config.openrouter.routing)
+    hard_budget = config.budget.openrouter_nano_usd_per_run() is not None
+    endpoint_host = urlsplit(config.openrouter.endpoint).hostname
+    parameters = match_config.parameters
+
+    def ready(claimed_run_id: int) -> bool:
+        return inspection_ready(
+            connection,
+            run_id=claimed_run_id,
+            config=config,
+            model_id=model_id,
+        )
+
+    def prepare(work_item: WorkItem) -> TaskPreparation:
+        if work_item.subject_id is None:
+            raise ValueError(MISSING_PERSON_DETAIL)
+        person_id = int(work_item.subject_id)
+        task_fingerprint = work_item.fingerprint
+        run_id = _claimed_run_id(connection, work_item.id)
+
+        existing = load_wikipedia_identity_observation_by_fingerprint(
+            connection,
+            person_id=person_id,
+            task_fingerprint=task_fingerprint,
+        )
+        if existing is not None:
+            _prepare_reuse_existing_observation(
+                connection,
+                person_id=person_id,
+                task_fingerprint=task_fingerprint,
+                existing_id=existing.id,
+                disposition=existing.disposition,
+                work_item_id=work_item.id,
+            )
+            raise ValueError(
+                f"{MATCH_PREPARE_REFUSED_PREFIX}already_settled person {person_id}"
+            )
+
+        plan = load_active_plan_for_fingerprint(
+            connection,
+            person_id=person_id,
+            material_fingerprint=task_fingerprint,
+        )
+        if plan is None:
+            raise ValueError(
+                f"{MATCH_PREPARE_REFUSED_PREFIX}no_active_plan person {person_id}"
+            )
+        if plan.status == "superseded":
+            raise ValueError(
+                f"{MATCH_PREPARE_REFUSED_PREFIX}superseded_plan person {person_id}"
+            )
+
+        candidates, page_row_ids = _assemble_match_candidates(
+            connection,
+            plan_id=plan.id,
+            match_config=match_config,
+            truncated_unsafe_for_negative=plan.truncated_unsafe_for_negative,
+            partial_retrieval=plan.partial_retrieval,
+        )
+        if not candidates:
+            _prepare_empty_candidates_path(
+                connection,
+                person_id=person_id,
+                plan=plan,
+                task_fingerprint=task_fingerprint,
+                run_id=run_id,
+                work_item_id=work_item.id,
+            )
+            raise ValueError(
+                f"{MATCH_PREPARE_REFUSED_PREFIX}empty_candidates person {person_id}"
+            )
+
+        inspection = load_model_inspection(
+            connection,
+            run_id=run_id,
+            configured_model_id=model_id,
+            routing_fingerprint=routing_fp,
+        )
+        if inspection is None or inspection.compatibility != "compatible":
+            raise ValueError(MISSING_INSPECTION_DETAIL)
+
+        display_name, sourced_names, identity_facts = _operational_match_material(
+            connection,
+            person_id=person_id,
+            match_config=match_config,
+        )
+        match_input = build_match_input(
+            person_id=person_id,
+            display_name=display_name,
+            sourced_names=sourced_names,
+            identity_facts=identity_facts,
+            candidates=candidates,
+            config=match_config,
+            truncated_unsafe_for_negative=plan.truncated_unsafe_for_negative,
+            partial_retrieval=plan.partial_retrieval,
+        )
+        rendered = render_match_request(match_input)
+        request = StructuredGenerationRequest(
+            model_id=model_id,
+            system_prompt=rendered.system_prompt,
+            user_content=rendered.user_input_json,
+            json_schema=rendered.schema,
+            schema_name=MATCH_SCHEMA_NAME,
+            max_completion_tokens=match_config.max_completion_tokens,
+            temperature=parameters.temperature,
+            top_p=parameters.top_p,
+            reasoning_effort=parameters.reasoning_effort,
+        )
+        call = _MatchCall(
+            request=request,
+            match_input=match_input,
+            person_id=person_id,
+            plan_id=plan.id,
+            model_inspection_id=inspection.id,
+            canonical_supplied_input_json=rendered.canonical_input_json,
+            prompt_hash=rendered.prompt_hash,
+            schema_hash=rendered.schema_hash,
+            schema_version=rendered.schema_version,
+            task_fingerprint=task_fingerprint,
+            truncated_unsafe_for_negative=plan.truncated_unsafe_for_negative,
+            candidate_page_ids=tuple(c.page_id for c in candidates),
+            mediawiki_row_id_by_page_id=page_row_ids,
+        )
+        if not hard_budget:
+            return TaskPreparation(payload=call, reserved_nano_usd=0)
+
+        prompt_price = inspection.prompt_unit_price_nano_usd
+        completion_price = inspection.completion_unit_price_nano_usd
+        if (
+            not inspection.pricing_usable
+            or prompt_price is None
+            or completion_price is None
+        ):
+            raise ValueError(MISSING_PRICING_DETAIL)
+        reserved = _worst_case_reservation_nano_usd(
+            prompt_unit_price_nano_usd=prompt_price,
+            completion_unit_price_nano_usd=completion_price,
+            max_input_tokens=match_config.max_input_tokens,
+            max_completion_tokens=match_config.max_completion_tokens,
+        )
+        return TaskPreparation(payload=call, reserved_nano_usd=reserved)
+
+    def destination_host(_work_item: WorkItem) -> str | None:
+        return endpoint_host
+
+    return TaskHandler(
+        task_type=MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE,
+        provider=OPENROUTER_PROVIDER,
+        operation=GENERATE_OPERATION,
+        execute=_execute_match_for(client),
+        prepare=prepare,
+        persist=_persist_match_for(connection),
+        persist_failure=_persist_match_failure_for(connection, config=config),
+        destination_host=destination_host,
+        reserved_nano_usd=0,
+        pool=WorkerPool.LLM,
+        ready=ready,
+    )
+
+
+def _execute_match_for(
+    client: LlmClient,
+) -> Callable[[WorkItem, int, object], TaskOutcome]:
+    def execute(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
+        del work_item, ordinal
+        if not isinstance(prepared, _MatchCall):
+            raise ProviderFailure(
+                FailureCategory.INTERNAL,
+                provider=OPENROUTER_PROVIDER,
+                operation=GENERATE_OPERATION,
+                detail=f"prepared value was {type(prepared).__name__}",
+            )
+        result = client.generate_structured(prepared.request)
+        raw_text = result.raw_text
+        if result.refusal:
+            del raw_text, result
+            raise ProviderFailure(
+                FailureCategory.MALFORMED_RESPONSE,
+                provider=OPENROUTER_PROVIDER,
+                operation=GENERATE_OPERATION,
+                retryable=True,
+                detail=MALFORMED_MATCH_DETAIL,
+            )
+        try:
+            output = validate_match_output(
+                raw_text,
+                prepared.match_input,
+                truncated_unsafe_for_negative=prepared.truncated_unsafe_for_negative,
+            )
+        except MatchValidationError:
+            del raw_text, result
+            raise ProviderFailure(
+                FailureCategory.MALFORMED_RESPONSE,
+                provider=OPENROUTER_PROVIDER,
+                operation=GENERATE_OPERATION,
+                retryable=True,
+                detail=MALFORMED_MATCH_DETAIL,
+            ) from None
+        del raw_text
+        payload = _MatchPersist(
+            output=output,
+            person_id=prepared.person_id,
+            plan_id=prepared.plan_id,
+            model_inspection_id=prepared.model_inspection_id,
+            canonical_supplied_input_json=prepared.canonical_supplied_input_json,
+            prompt_hash=prepared.prompt_hash,
+            schema_hash=prepared.schema_hash,
+            schema_version=prepared.schema_version,
+            task_fingerprint=prepared.task_fingerprint,
+            candidate_page_ids=prepared.candidate_page_ids,
+            mediawiki_row_id_by_page_id=prepared.mediawiki_row_id_by_page_id,
+        )
+        return TaskOutcome(
+            state=WorkState.SUCCEEDED,
+            reason=None,
+            payload=payload,
+            response_bytes=len(result.raw_text.encode("utf-8")),
+            provider_request_id=result.provider_request_id,
+            actual_nano_usd=result.actual_nano_usd,
+        )
+
+    return execute
+
+
+def _persist_match_for(
+    connection: sqlite3.Connection,
+) -> Callable[[WorkItem, TaskOutcome], None]:
+    def persist(work_item: WorkItem, outcome: TaskOutcome) -> None:
+        payload = outcome.payload
+        if not isinstance(payload, _MatchPersist):
+            raise RuntimeError(
+                f"unexpected match payload type: {type(payload).__name__}"
+            )
+        attempt_id, run_id, observed_at = _attempt_context(connection, work_item.id)
+        existing = load_wikipedia_identity_observation_by_fingerprint(
+            connection,
+            person_id=payload.person_id,
+            task_fingerprint=payload.task_fingerprint,
+        )
+        if existing is not None:
+            if existing.disposition == "completed":
+                point_person_current_wikipedia_observation(
+                    connection,
+                    person_id=payload.person_id,
+                    observation_id=existing.id,
+                )
+                plan = load_plan(connection, plan_id=payload.plan_id)
+                if plan is not None and plan.status not in _TERMINAL_PLAN_STATUSES:
+                    mark_plan_status(
+                        connection,
+                        plan_id=payload.plan_id,
+                        status="completed",
+                        completed_at=observed_at,
+                    )
+            return
+
+        plan = load_plan(connection, plan_id=payload.plan_id)
+        if plan is None or plan.status == "superseded":
+            return
+
+        output = payload.output
+        semantic = map_model_outcome_to_semantic(output.outcome)
+        matched_row_id: int | None = None
+        if output.outcome == "matching_page":
+            if output.selected_page_id is None:
+                raise RuntimeError("matching_page output missing selected_page_id")
+            matched_row_id = payload.mediawiki_row_id_by_page_id.get(
+                output.selected_page_id
+            )
+            if matched_row_id is None:
+                raise RuntimeError(
+                    f"selected page {output.selected_page_id} has no mediawiki_page row"
+                )
+
+        observation_id = insert_wikipedia_identity_observation(
+            connection,
+            person_id=payload.person_id,
+            plan_id=payload.plan_id,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            model_inspection_id=payload.model_inspection_id,
+            disposition="completed",
+            semantic_outcome=semantic,
+            matched_mediawiki_page_id=matched_row_id,
+            candidate_page_ids_json=_candidate_page_ids_json(
+                payload.candidate_page_ids
+            ),
+            canonical_supplied_input_json=payload.canonical_supplied_input_json,
+            validated_output_json=output.model_dump_json(),
+            prompt_hash=payload.prompt_hash,
+            schema_hash=payload.schema_hash,
+            schema_version=payload.schema_version,
+            task_fingerprint=payload.task_fingerprint,
+            supporting_fact_ids_json=json.dumps(
+                list(output.supporting_fact_ids), separators=(",", ":")
+            ),
+            conflicting_fact_ids_json=json.dumps(
+                list(output.conflicting_fact_ids), separators=(",", ":")
+            ),
+            rationale=output.rationale,
+            failure_category=None,
+            observed_at=observed_at,
+        )
+        # K25: set pointer on completed model outcomes (including uncertain).
+        point_person_current_wikipedia_observation(
+            connection,
+            person_id=payload.person_id,
+            observation_id=observation_id,
+        )
+        mark_plan_status(
+            connection,
+            plan_id=payload.plan_id,
+            status="completed",
+            completed_at=observed_at,
+        )
+
+    return persist
+
+
+def _persist_match_failure_for(
+    connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
+) -> Callable[[WorkItem, ProviderFailure], None]:
+    def persist_failure(work_item: WorkItem, failure: ProviderFailure) -> None:
+        state_row = connection.execute(
+            "SELECT state, subject_id, fingerprint FROM work_item WHERE id = ?",
+            (work_item.id,),
+        ).fetchone()
+        if state_row is None or state_row["state"] != "failed_permanent":
+            return
+        if state_row["subject_id"] is None:
+            return
+        person_id = int(state_row["subject_id"])
+        task_fingerprint = str(state_row["fingerprint"])
+        existing = load_wikipedia_identity_observation_by_fingerprint(
+            connection,
+            person_id=person_id,
+            task_fingerprint=task_fingerprint,
+        )
+        if existing is not None:
+            # Completed exists → no-op (re-armed empty-at-prepare race).
+            # Failed exists → idempotent no-op.
+            return
+
+        attempt_id, run_id, observed_at = _attempt_context(connection, work_item.id)
+        routing_fp = routing_fingerprint(config.openrouter.routing)
+        inspection = load_model_inspection(
+            connection,
+            run_id=run_id,
+            configured_model_id=config.tasks.match_wikipedia_identity.model,
+            routing_fingerprint=routing_fp,
+        )
+        model_inspection_id = None if inspection is None else inspection.id
+        prompt_hash, schema_hash, schema_version = match_prompt_and_schema_hashes()
+        plan = load_active_plan_for_fingerprint(
+            connection,
+            person_id=person_id,
+            material_fingerprint=task_fingerprint,
+        )
+        plan_id = None if plan is None else plan.id
+        category = (
+            INVALID_MODEL_OUTPUT_CATEGORY
+            if failure.category is FailureCategory.MALFORMED_RESPONSE
+            else str(failure.category)
+        )
+        insert_wikipedia_identity_observation(
+            connection,
+            person_id=person_id,
+            plan_id=plan_id,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            model_inspection_id=model_inspection_id,
+            disposition="failed",
+            semantic_outcome=None,
+            matched_mediawiki_page_id=None,
+            candidate_page_ids_json="[]",
+            canonical_supplied_input_json=MATCH_FAILED_SUPPLIED_INPUT_JSON,
+            validated_output_json=None,
+            prompt_hash=prompt_hash,
+            schema_hash=schema_hash,
+            schema_version=schema_version,
+            task_fingerprint=task_fingerprint,
+            rationale=str(failure.category),
+            failure_category=category,
+            observed_at=observed_at,
+        )
+        # K25: do not move current pointer.
+        if plan is not None and plan.status not in _TERMINAL_PLAN_STATUSES:
+            mark_plan_status(
+                connection,
+                plan_id=plan.id,
+                status="failed",
+                completed_at=observed_at,
+                failure_category=category,
+            )
+
+    return persist_failure
+
+
+def _prepare_reuse_existing_observation(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    task_fingerprint: str,
+    existing_id: int,
+    disposition: str,
+    work_item_id: int,
+) -> None:
+    """Point / complete plan for an existing completed obs (prepare-time)."""
+    if disposition != "completed":
+        return
+    owns = not connection.in_transaction
+    if owns:
+        connection.execute("BEGIN IMMEDIATE")
+    try:
+        point_person_current_wikipedia_observation(
+            connection,
+            person_id=person_id,
+            observation_id=existing_id,
+        )
+        plan = load_active_plan_for_fingerprint(
+            connection,
+            person_id=person_id,
+            material_fingerprint=task_fingerprint,
+        )
+        if plan is not None:
+            mark_plan_status(
+                connection,
+                plan_id=plan.id,
+                status="completed",
+                completed_at=_observed_at_for_prepare(connection, work_item_id),
+            )
+    except BaseException:
+        if owns:
+            connection.rollback()
+        raise
+    else:
+        if owns:
+            connection.commit()
+
+
+def _prepare_empty_candidates_path(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    plan: Any,
+    task_fingerprint: str,
+    run_id: int,
+    work_item_id: int,
+) -> None:
+    """Deterministic empty race settlement owned by prepare (brief txn)."""
+    now = _observed_at_for_prepare(connection, work_item_id)
+    owns = not connection.in_transaction
+    if owns:
+        connection.execute("BEGIN IMMEDIATE")
+    try:
+        if not plan.truncated_unsafe_for_negative and not plan.partial_retrieval:
+            _write_empty_no_match(
+                connection,
+                person_id=person_id,
+                plan_id=plan.id,
+                material_fingerprint=task_fingerprint,
+                run_id=run_id,
+                now=now,
+            )
+        else:
+            _write_local_failed(
+                connection,
+                person_id=person_id,
+                plan_id=plan.id,
+                material_fingerprint=task_fingerprint,
+                run_id=run_id,
+                failure_category="unsafe_truncation",
+                truncated_unsafe=plan.truncated_unsafe_for_negative,
+                partial_retrieval=plan.partial_retrieval,
+                now=now,
+            )
+    except BaseException:
+        if owns:
+            connection.rollback()
+        raise
+    else:
+        if owns:
+            connection.commit()
+
+
+def _claimed_run_id(connection: sqlite3.Connection, work_item_id: int) -> int:
+    row = connection.execute(
+        "SELECT claimed_by_run_id FROM work_item WHERE id = ?",
+        (work_item_id,),
+    ).fetchone()
+    if row is None or row["claimed_by_run_id"] is None:
+        # Fixture paths may not claim; fall back to latest attempt run.
+        attempt = connection.execute(
+            """
+            SELECT run_id FROM attempt
+             WHERE work_item_id = ?
+             ORDER BY id DESC LIMIT 1
+            """,
+            (work_item_id,),
+        ).fetchone()
+        if attempt is not None:
+            return int(attempt["run_id"])
+        raise ValueError(f"work item {work_item_id} is not claimed by a run")
+    return int(row["claimed_by_run_id"])
+
+
+def _observed_at_for_prepare(connection: sqlite3.Connection, work_item_id: int) -> str:
+    row = connection.execute(
+        "SELECT updated_at FROM work_item WHERE id = ?",
+        (work_item_id,),
+    ).fetchone()
+    if row is not None and row["updated_at"]:
+        return str(row["updated_at"])
+    return utc_timestamp(datetime.now(tz=UTC))
+
+
+def _candidate_page_ids_json(page_ids: Sequence[int]) -> str:
+    return json.dumps(list(page_ids), separators=(",", ":"))
+
+
+def _operational_match_material(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    match_config: MatchWikipediaIdentityConfig,
+) -> tuple[str, tuple[MatchName, ...], tuple[MatchFact, ...]]:
+    """K27: names and facts from the operational projection."""
+    canonical_id = canonical_person_id(connection, person_id)
+    try:
+        display_name = select_display_name(connection, canonical_id)
+    except LookupError:
+        row = connection.execute(
+            "SELECT display_name FROM person WHERE id = ?",
+            (canonical_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(MISSING_PERSON_DETAIL) from None
+        display_name = str(row["display_name"])
+
+    closure = person_id_closure_for_canonical(connection, canonical_id)
+    if not closure:
+        raise ValueError(MISSING_PERSON_DETAIL)
+    placeholders = ",".join("?" for _ in closure)
+    name_rows = connection.execute(
+        f"""
+        SELECT id, exact_name, search_name, match_key, kind
+          FROM sourced_name
+         WHERE person_id IN ({placeholders})
+         ORDER BY id
+        """,
+        closure,
+    ).fetchall()
+    names: list[MatchName] = []
+    seen_keys: set[str] = set()
+    sorted_names = sorted(
+        name_rows,
+        key=lambda row: (
+            _NAME_KIND_ORDER.get(str(row["kind"]), 99),
+            int(row["id"]),
+        ),
+    )
+    for row in sorted_names:
+        key = str(row["match_key"])
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        kind_raw = str(row["kind"])
+        kind: SourcedNameKind
+        if kind_raw in {"professional", "display", "alias", "other", "mononym"}:
+            kind = kind_raw  # type: ignore[assignment]
+        else:
+            kind = "other"
+        names.append(
+            MatchName(
+                exact_name=str(row["exact_name"]),
+                search_name=str(row["search_name"]),
+                match_key=key,
+                kind=kind,
+            )
+        )
+        if len(names) >= match_config.max_names_in_prompt:
+            break
+
+    if not names:
+        names.append(
+            MatchName(
+                exact_name=display_name,
+                search_name=display_name,
+                match_key=display_name.casefold() or "unknown",
+                kind="display",
+            )
+        )
+
+    mentions = mentions_for_canonical_person(connection, canonical_id)
+    facts: list[MatchFact] = []
+    fact_index = 1
+    for mention in mentions:
+        for fact in mention.identity_facts:
+            kind_raw = str(fact.kind)
+            try:
+                kind_enum = IdentityFactKind(kind_raw)
+            except ValueError:
+                kind_enum = IdentityFactKind.OTHER
+            facts.append(
+                MatchFact(
+                    local_id=f"f{fact_index}",
+                    kind=kind_enum,
+                    value=str(fact.value)[:500] or str(fact.value)[:1],
+                )
+            )
+            fact_index += 1
+            if len(facts) >= match_config.max_facts_in_prompt:
+                break
+        if len(facts) >= match_config.max_facts_in_prompt:
+            break
+
+    return display_name, tuple(names), tuple(facts)
+
+
+def _assemble_match_candidates(
+    connection: sqlite3.Connection,
+    *,
+    plan_id: int,
+    match_config: MatchWikipediaIdentityConfig,
+    truncated_unsafe_for_negative: bool,
+    partial_retrieval: bool,
+) -> tuple[tuple[MatchWikiCandidate, ...], dict[int, int]]:
+    """Rebuild code-selected candidates for the match model from plan state."""
+    hits_raw = list_search_hit_page_ids_for_completed_forms(connection, plan_id=plan_id)
+    hits = tuple(
+        AssemblySearchHit(page_id=page_id, rank=rank) for page_id, rank in hits_raw
+    )
+    covered = covered_fact_page_ids(connection, plan_id=plan_id)
+    needed_ids = set(covered) | {page_id for page_id, _ in hits_raw}
+    pages_records = list_mediawiki_pages_by_page_ids(
+        connection,
+        wiki_id=DEFAULT_WIKI_ID,
+        page_ids=sorted(needed_ids),
+    )
+    for _ in range(match_config.max_redirect_hops + 1):
+        extra: set[int] = set()
+        for page in pages_records.values():
+            if (
+                page.redirect_to_page_id is not None
+                and page.redirect_to_page_id not in pages_records
+            ):
+                extra.add(page.redirect_to_page_id)
+        if not extra:
+            break
+        pages_records.update(
+            list_mediawiki_pages_by_page_ids(
+                connection,
+                wiki_id=DEFAULT_WIKI_ID,
+                page_ids=sorted(extra),
+            )
+        )
+    pages_by_id = {
+        page_id: AssemblyPage(
+            page_id=rec.page_id,
+            canonical_title=rec.canonical_title,
+            canonical_url=rec.canonical_url,
+            namespace=rec.namespace,
+            is_disambiguation=rec.is_disambiguation,
+            is_missing=rec.is_missing,
+            redirect_to_page_id=rec.redirect_to_page_id,
+            description=rec.description,
+            extract=rec.extract,
+            categories=_parse_categories(rec.categories_json),
+        )
+        for page_id, rec in pages_records.items()
+    }
+    assembly = assemble_biography_candidates(
+        hits,
+        pages_by_id,
+        max_candidates=match_config.max_candidates,
+        max_redirect_hops=match_config.max_redirect_hops,
+        search_incomplete=truncated_unsafe_for_negative,
+        partial_retrieval=partial_retrieval,
+    )
+    page_row_ids = {
+        rec.page_id: rec.id for rec in pages_records.values() if not rec.is_missing
+    }
+    candidates = tuple(
+        _to_match_wiki_candidate(
+            candidate,
+            pages_by_id=pages_by_id,
+            hits_raw=hits_raw,
+            match_config=match_config,
+        )
+        for candidate in assembly.candidates
+    )
+    return candidates, page_row_ids
+
+
+def _to_match_wiki_candidate(
+    candidate: BiographyCandidate,
+    *,
+    pages_by_id: dict[int, AssemblyPage],
+    hits_raw: Sequence[tuple[int, int]],
+    match_config: MatchWikipediaIdentityConfig,
+) -> MatchWikiCandidate:
+    trail = _redirect_trail_titles(
+        terminal_page_id=candidate.page_id,
+        pages_by_id=pages_by_id,
+        hits_raw=hits_raw,
+        max_redirect_hops=match_config.max_redirect_hops,
+    )
+    extract = candidate.extract
+    if extract is not None and len(extract) > match_config.max_extract_characters:
+        extract = extract[: match_config.max_extract_characters]
+    categories = candidate.categories[: match_config.max_categories_per_page]
+    title = candidate.canonical_title
+    if len(title) > match_config.max_title_characters:
+        title = title[: match_config.max_title_characters]
+    return MatchWikiCandidate(
+        page_id=candidate.page_id,
+        title=title,
+        canonical_url=candidate.canonical_url,
+        namespace=0,
+        is_disambiguation=False,
+        description=candidate.description,
+        extract=extract,
+        categories=categories,
+        redirect_trail=trail,
+    )
+
+
+def _redirect_trail_titles(
+    *,
+    terminal_page_id: int,
+    pages_by_id: dict[int, AssemblyPage],
+    hits_raw: Sequence[tuple[int, int]],
+    max_redirect_hops: int,
+) -> tuple[str, ...]:
+    """Titles of redirect intermediates from the best root to the terminal."""
+    best_root: int | None = None
+    best_rank: int | None = None
+    for root_id, rank in hits_raw:
+        terminal = _walk_terminal(
+            root_id, pages_by_id, max_redirect_hops=max_redirect_hops
+        )
+        if terminal != terminal_page_id:
+            continue
+        if best_rank is None or rank < best_rank:
+            best_rank = rank
+            best_root = root_id
+    if best_root is None or best_root == terminal_page_id:
+        return ()
+    titles: list[str] = []
+    current = best_root
+    seen: set[int] = set()
+    while current != terminal_page_id and current not in seen:
+        seen.add(current)
+        page = pages_by_id.get(current)
+        if page is None or page.redirect_to_page_id is None:
+            break
+        titles.append(page.canonical_title)
+        current = page.redirect_to_page_id
+    return tuple(titles)
+
+
+def _walk_terminal(
+    root_id: int,
+    pages_by_id: dict[int, AssemblyPage],
+    *,
+    max_redirect_hops: int,
+) -> int | None:
+    current = root_id
+    seen: set[int] = set()
+    hops = 0
+    while True:
+        if current in seen:
+            return None
+        seen.add(current)
+        page = pages_by_id.get(current)
+        if page is None:
+            return None
+        if page.redirect_to_page_id is None:
+            return current
+        hops += 1
+        if hops > max_redirect_hops:
+            return None
+        current = page.redirect_to_page_id
