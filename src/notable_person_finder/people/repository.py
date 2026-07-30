@@ -35,10 +35,12 @@ DETECT_PEOPLE_TASK_TYPE = "detect_people"
 RESOLVE_PERSON_ENTITY_TASK_TYPE = "resolve_person_entity"
 RECONSIDER_PERSON_ENTITY_TASK_TYPE = "reconsider_person_entity"
 MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE = "match_wikipedia_identity"
+ASSESS_ARTICLE_TASK_TYPE = "assess_article"
 _SUBJECT_KIND_SOURCE_ITEM = "source_item"
 _SUBJECT_KIND_PERSON_MENTION = "person_mention"
 _SUBJECT_KIND_PERSON_RELATION = "person_relation"
 _SUBJECT_KIND_PERSON = "person"
+_SUBJECT_KIND_PERSON_ARTICLE = "person_article"
 _PERMANENT_PREFLIGHT_FAILURE_CATEGORY = "permanent_preflight"
 
 # Leading honorifics stripped only for the mechanical search form. Exact names
@@ -1102,6 +1104,11 @@ def settle_active_tasks_after_permanent_preflight(
       ``failure_category='permanent_preflight'`` (reuse on fingerprint
       conflict); mark the active plan ``failed``; **do not** move the current
       Wikipedia pointer (K25 / K18).
+    * ``assess_article`` (subject person_article): ensure a failed person–
+      article assessment with the **inspection** ``attempt_id`` and domain
+      ``failure_category='permanent_preflight'`` (reuse on fingerprint
+      conflict); **do not** move ``person_article.current_assessment_id``
+      (K23 / K25).
 
     Does not insert ``generate_structured`` attempts. Dependent handlers'
     ``persist_failure`` never runs on this path.
@@ -1191,6 +1198,17 @@ def settle_active_tasks_after_permanent_preflight(
                     prompt_hash=None,
                     schema_hash=None,
                     schema_version=None,
+                    now=now,
+                )
+            elif task_type == ASSESS_ARTICLE_TASK_TYPE:
+                # Assess hashes optional: preflight rows store null prompt/schema
+                # when the assess path never rendered a request.
+                settled += _settle_active_assess_article(
+                    connection,
+                    run_id=run_id,
+                    attempt_id=attempt_id,
+                    model_inspection_id=model_inspection_id,
+                    rationale=rationale,
                     now=now,
                 )
             else:
@@ -1614,6 +1632,104 @@ def _settle_active_match_wikipedia_identity(
             rationale=rationale,
             now=now,
             task_label=MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE,
+        )
+        settled += 1
+    return settled
+
+
+def _settle_active_assess_article(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    attempt_id: int,
+    model_inspection_id: int | None,
+    rationale: str,
+    now: str,
+) -> int:
+    """Fail active assess work after permanent assess-model preflight (K23).
+
+    Writes failed assessments with the inspection attempt id and domain
+    ``permanent_preflight``. Does **not** move
+    ``person_article.current_assessment_id`` (K25).
+    """
+    # Local imports avoid a people→coverage package cycle at module load.
+    from notable_person_finder.coverage.repository import (
+        insert_person_article_assessment,
+        load_person_article,
+        load_person_article_assessment_by_fingerprint,
+    )
+    from notable_person_finder.coverage.service import (
+        resolve_assess_work_context,
+    )
+
+    rows = connection.execute(
+        """
+        SELECT id, subject_id, fingerprint
+          FROM work_item
+         WHERE task_type = ?
+           AND subject_kind = ?
+           AND subject_id IS NOT NULL
+           AND state IN ('pending', 'deferred')
+         ORDER BY id
+        """,
+        (ASSESS_ARTICLE_TASK_TYPE, _SUBJECT_KIND_PERSON_ARTICLE),
+    ).fetchall()
+    settled = 0
+    for row in rows:
+        work_item_id = int(row["id"])
+        person_article_id = int(row["subject_id"])
+        task_fingerprint = str(row["fingerprint"])
+        person_article = load_person_article(
+            connection, person_article_id=person_article_id
+        )
+        existing = load_person_article_assessment_by_fingerprint(
+            connection,
+            person_article_id=person_article_id,
+            task_fingerprint=task_fingerprint,
+        )
+        if existing is None and person_article is not None:
+            context = resolve_assess_work_context(
+                connection,
+                person_article_id=person_article_id,
+                task_fingerprint=task_fingerprint,
+            )
+            if context is not None:
+                insert_person_article_assessment(
+                    connection,
+                    person_article_id=person_article_id,
+                    person_id=person_article.person_id,
+                    canonical_article_id=person_article.canonical_article_id,
+                    plan_id=context.plan_id,
+                    article_view_id=context.article_view_id,
+                    run_id=run_id,
+                    attempt_id=attempt_id,
+                    model_inspection_id=model_inspection_id,
+                    disposition="failed",
+                    person_relation=None,
+                    coverage_depth=None,
+                    content_types_json=None,
+                    subject_relationship=None,
+                    screening_rule_id=context.screening_rule_id,
+                    screening_rule_status=context.screening_rule_status,
+                    source_policy_fingerprint=context.source_policy_fingerprint,
+                    canonical_supplied_input_json="{}",
+                    validated_output_json=None,
+                    prompt_hash=None,
+                    schema_hash=None,
+                    schema_version=None,
+                    task_fingerprint=task_fingerprint,
+                    rationale=rationale,
+                    failure_category=_PERMANENT_PREFLIGHT_FAILURE_CATEGORY,
+                    observed_at=now,
+                )
+        # K25: never point current_assessment_id at a failed assessment.
+        _settle_work_item_failed_permanent(
+            connection,
+            work_item_id=work_item_id,
+            run_id=run_id,
+            rationale=rationale,
+            now=now,
+            task_label=ASSESS_ARTICLE_TASK_TYPE,
         )
         settled += 1
     return settled

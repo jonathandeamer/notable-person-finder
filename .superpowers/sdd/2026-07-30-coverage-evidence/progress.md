@@ -15,7 +15,7 @@
 | 5 | PassageSelector + assess contract + config | complete |
 | 6a | Plan lifecycle + brave_web_search | complete |
 | 6b | fetch_article + views | complete |
-| 7 | assess_article + multi-model inspect | pending |
+| 7 | assess_article + multi-model inspect | complete |
 | 8 | Seed, supersede, merge | pending |
 | 9 | Digest/status/CLI + gate | pending |
 
@@ -64,3 +64,13 @@ Task 6b: complete — build_fetch_article_handler (one GET + in-process extract,
 K3 HTML ban), article_view full/partial/snippets, K28 snippets fallback, K31
 person_article, schedule_assess_article when view ready; CLI registers fetch;
 mutation evidence in task-6b-report.md
+Task 6b: fix round 1/5 (1 Important addressed — permanent-failure K28 split
+tests with-snippets vs no-text; mutation-killed)
+
+Task 6b: fix round 1/5 (1 addressed, 0 open; commits a714305..8ade6e8)
+Task 6b: complete (commits 34b0d1a..8ade6e8, review clean)
+
+Task 7: complete — build_assess_article_handler (PassageSelector + validate,
+K25 completed-only pointer), assess_model_needed + mid-run ensure (K20),
+permanent preflight settler for assess_article (K23); 10 new tests;
+mutation evidence in task-7-report.md; gate 214 passed

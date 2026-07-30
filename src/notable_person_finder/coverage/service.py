@@ -1,16 +1,16 @@
-"""Coverage plan lifecycle, Brave search, and ``fetch_article`` handlers.
+"""Coverage plan lifecycle, Brave search, fetch, and ``assess_article`` handlers.
 
 Plan open attaches discovery (K10), schedules exact-name forms (K6), and
 stages alias/context after exact terminal. ``brave_web_search`` performs
 exactly one Brave ``search_web`` call per execute. ``fetch_article`` performs
 exactly one GET, extracts in-process (K3), and persists cleaned article views
-with snippets fallback (K28). Workers never open SQLite; domain settlement and
+with snippets fallback (K28). ``assess_article`` runs one OpenRouter structured
+generation with PassageSelector input and completed-only current pointers
+(K25). Workers never open SQLite; domain settlement and
 ``maybe_advance_coverage_plan`` run on the application thread inside the engine
 settlement transaction.
 
-Assess handler lands in Task 7; this module schedules ``assess_article`` when a
-view is ready. Terminal truth table T1–T11 applies once search/targets/assess
-are quiescent.
+Terminal truth table T1–T11 applies once search/targets/assess are quiescent.
 """
 
 from __future__ import annotations
@@ -24,11 +24,30 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from notable_person_finder.config.models import AssessArticleConfig, MainConfig
-from notable_person_finder.coverage.assessment import assess_task_fingerprint
+from notable_person_finder.config.models import (
+    AssessArticleConfig,
+    DomainProfileConfig,
+    MainConfig,
+)
+from notable_person_finder.coverage.assessment import (
+    AssessArticleInput,
+    AssessArticleOutput,
+    AssessFact,
+    AssessName,
+    AssessValidationError,
+    assess_task_fingerprint,
+    build_assess_input,
+    render_assess_request,
+    validate_assess_output,
+)
 from notable_person_finder.coverage.models import (
     CoverageQueryFormRecord,
     PersonCoveragePlanRecord,
+)
+from notable_person_finder.coverage.passages import (
+    ArticleViewLike,
+    TextBlock,
+    select_passages,
 )
 from notable_person_finder.coverage.queries import (
     generate_alias_forms,
@@ -37,16 +56,21 @@ from notable_person_finder.coverage.queries import (
 )
 from notable_person_finder.coverage.repository import (
     insert_article_view,
+    insert_assessment_signals,
     insert_coverage_article_target,
     insert_coverage_discovery_article,
     insert_or_load_brave_search_observation_by_attempt,
+    insert_person_article_assessment,
     insert_query_forms,
     insert_search_result_occurrences,
     insert_source_screening,
     list_coverage_article_targets_for_plan,
     list_coverage_discovery_articles_for_plan,
     list_query_forms_for_plan,
+    load_article_view,
     load_coverage_article_target,
+    load_person_article,
+    load_person_article_assessment_by_fingerprint,
     load_person_article_by_pair,
     load_plan,
     load_query_form,
@@ -55,6 +79,7 @@ from notable_person_finder.coverage.repository import (
     mark_query_form_failed,
     mark_query_form_progress,
     open_plan,
+    point_person_article_current_assessment,
     update_coverage_article_target,
     update_plan_status,
     upsert_person_article,
@@ -73,8 +98,22 @@ from notable_person_finder.coverage.selection import (
 from notable_person_finder.ingestion.repository import record_alias, upsert_article
 from notable_person_finder.ingestion.urls import publisher_key
 from notable_person_finder.people.identity import (
+    canonical_person_id,
+    mentions_for_canonical_person,
     person_id_closure_for_canonical,
     select_display_name,
+)
+from notable_person_finder.people.models import (
+    AttentionCategory,
+    DomainProfileEvidence,
+    DomainProfileEvidenceExample,
+    IdentityFactKind,
+)
+from notable_person_finder.people.repository import load_model_inspection
+from notable_person_finder.people.service import (
+    _worst_case_reservation_nano_usd,
+    inspection_ready,
+    routing_fingerprint,
 )
 from notable_person_finder.providers.article_versions import EXTRACTOR_VERSION
 from notable_person_finder.providers.articles import (
@@ -96,6 +135,14 @@ from notable_person_finder.providers.brave import (
     PROVIDER as BRAVE_PROVIDER,
 )
 from notable_person_finder.providers.failures import FailureCategory, ProviderFailure
+from notable_person_finder.providers.openrouter import (
+    GENERATE_OPERATION,
+    LlmClient,
+    StructuredGenerationRequest,
+)
+from notable_person_finder.providers.openrouter import (
+    PROVIDER as OPENROUTER_PROVIDER,
+)
 from notable_person_finder.runs import repository as runs_repository
 from notable_person_finder.runs.engine import TaskHandler, TaskOutcome, TaskPreparation
 from notable_person_finder.runs.models import WorkItem, WorkState
@@ -139,6 +186,15 @@ _ALTERED_QUERY_CATEGORY = "altered_query"
 _UNSAFE_TRUNCATION_CATEGORY = "unsafe_truncation"
 _PARTIAL_RETRIEVAL_EMPTY_CATEGORY = "partial_retrieval_empty"
 _PERMANENT_PROVIDER_CATEGORY = "permanent_provider"
+_INVALID_MODEL_OUTPUT_CATEGORY = "invalid_model_output"
+ASSESS_SCHEMA_NAME = "assess_article"
+MALFORMED_ASSESS_DETAIL = "invalid assess output"
+MISSING_INSPECTION_DETAIL = "compatible model inspection is missing"
+MISSING_PRICING_DETAIL = "usable model pricing is missing"
+MISSING_PERSON_ARTICLE_DETAIL = "person_article is missing"
+ASSESS_PREPARE_REFUSED_PREFIX = "assess_prepare_refused:"
+ASSESS_FAILED_SUPPLIED_INPUT_JSON = "{}"
+_ACTIVE_COVERAGE_PLAN_STATUSES = frozenset({"retrieving", "selecting", "assessing"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,17 +348,19 @@ def schedule_assess_article(
     material_fingerprint: str,
     run_id: int,
     now: str,
+    config: MainConfig,
 ) -> int:
     """Schedule one ``assess_article`` work item when a view is ready.
 
-    The assess handler lands in Task 7; scheduling here arms work for it.
+    Mid-run inspect arming (K20): ensures the assess model is inspected once
+    assess work exists, so cold-start plan/HTTP-only seeds unlock preflight.
     """
     fingerprint = assess_task_fingerprint(
         material_fingerprint=material_fingerprint,
         person_article_id=person_article_id,
         article_view_id=article_view_id,
     )
-    return runs_repository.schedule_work(
+    work_id = runs_repository.schedule_work(
         connection,
         task_type=ASSESS_ARTICLE_TASK_TYPE,
         subject_kind=SUBJECT_KIND_PERSON_ARTICLE,
@@ -314,6 +372,119 @@ def schedule_assess_article(
         run_id=run_id,
         now=now,
     )
+    # Lazy import: people.service.models_needed_for_run imports assess_model_needed.
+    from notable_person_finder.people.service import ensure_model_inspections_for_run
+
+    ensure_model_inspections_for_run(
+        connection,
+        run_id=run_id,
+        config=config,
+        now=now,
+    )
+    return work_id
+
+
+def assess_model_needed(
+    connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
+    run_id: int | None = None,
+) -> bool:
+    """K20: whether the assess model needs current-run inspection.
+
+    Arms when active assess work exists, an active coverage plan is
+    retrieving/selecting/assessing, or Brave/fetch HTTP work is active.
+    K19-eligible people are folded in once seed lands (Task 8); active
+    plan/HTTP alone closes cold-start before assess work exists.
+    """
+    del config, run_id  # config reserved for K19 eligibility arming (Task 8)
+    return (
+        _has_active_assess_article_work(connection)
+        or _has_active_coverage_plan(connection)
+        or _has_active_coverage_http_work(connection)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class AssessWorkContext:
+    """Resolved plan/view/screening material for one assess work fingerprint."""
+
+    plan_id: int | None
+    material_fingerprint: str
+    article_view_id: int
+    screening_rule_id: str
+    screening_rule_status: str
+    source_policy_fingerprint: str
+    plan_status: str | None
+
+
+def resolve_assess_work_context(
+    connection: sqlite3.Connection,
+    *,
+    person_article_id: int,
+    task_fingerprint: str,
+) -> AssessWorkContext | None:
+    """Recover plan/view/screening for an assess work-item fingerprint.
+
+    The work fingerprint embeds material + person_article_id + article_view_id;
+    subject_id alone is the person_article. Used by prepare and K23 preflight.
+    """
+    person_article = load_person_article(
+        connection, person_article_id=person_article_id
+    )
+    if person_article is None:
+        return None
+    rows = connection.execute(
+        """
+        SELECT av.id AS article_view_id,
+               p.id AS plan_id,
+               p.material_fingerprint AS material_fingerprint,
+               p.status AS plan_status,
+               p.source_policy_fingerprint AS source_policy_fingerprint
+          FROM article_view AS av
+          JOIN coverage_article_target AS t
+            ON t.article_view_id = av.id
+          JOIN person_coverage_plan AS p
+            ON p.id = t.plan_id
+         WHERE av.canonical_article_id = ?
+           AND p.person_id = ?
+         ORDER BY av.id, p.id
+        """,
+        (person_article.canonical_article_id, person_article.person_id),
+    ).fetchall()
+    for row in rows:
+        material = str(row["material_fingerprint"])
+        view_id = int(row["article_view_id"])
+        if (
+            assess_task_fingerprint(
+                material_fingerprint=material,
+                person_article_id=person_article_id,
+                article_view_id=view_id,
+            )
+            != task_fingerprint
+        ):
+            continue
+        screening = _screening_for_article_on_plan(
+            connection,
+            plan_id=int(row["plan_id"]),
+            canonical_article_id=person_article.canonical_article_id,
+        )
+        if screening is None:
+            screening = (
+                "unknown",
+                "unclassified",
+                str(row["source_policy_fingerprint"]),
+            )
+        return AssessWorkContext(
+            plan_id=int(row["plan_id"]),
+            material_fingerprint=material,
+            article_view_id=view_id,
+            screening_rule_id=screening[0],
+            screening_rule_status=screening[1],
+            source_policy_fingerprint=screening[2],
+            plan_status=str(row["plan_status"]),
+        )
+    return None
 
 
 def open_coverage_plan(
@@ -1271,6 +1442,7 @@ def _persist_fetch_for(
             material_fingerprint=plan.material_fingerprint,
             run_id=run_id,
             now=observed_at,
+            config=config,
         )
         maybe_advance_coverage_plan(
             connection,
@@ -1366,6 +1538,7 @@ def _persist_fetch_failure_for(
                 material_fingerprint=plan.material_fingerprint,
                 run_id=run_id,
                 now=observed_at,
+                config=config,
             )
         else:
             update_coverage_article_target(
@@ -2378,3 +2551,834 @@ def _canonical_json(value: object) -> str:
 
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# assess_article handler (K20/K22/K25)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _AssessCall:
+    request: StructuredGenerationRequest
+    assess_input: AssessArticleInput
+    person_article_id: int
+    person_id: int
+    canonical_article_id: int
+    plan_id: int | None
+    article_view_id: int
+    model_inspection_id: int
+    canonical_supplied_input_json: str
+    prompt_hash: str
+    schema_hash: str
+    schema_version: int
+    task_fingerprint: str
+    screening_rule_id: str
+    screening_rule_status: str
+    source_policy_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class _AssessPersist:
+    output: AssessArticleOutput
+    person_article_id: int
+    person_id: int
+    canonical_article_id: int
+    plan_id: int | None
+    article_view_id: int
+    model_inspection_id: int
+    canonical_supplied_input_json: str
+    prompt_hash: str
+    schema_hash: str
+    schema_version: int
+    task_fingerprint: str
+    screening_rule_id: str
+    screening_rule_status: str
+    source_policy_fingerprint: str
+
+
+def build_assess_article_handler(
+    connection: sqlite3.Connection,
+    *,
+    client: LlmClient,
+    config: MainConfig,
+    profile: DomainProfileConfig,
+) -> TaskHandler:
+    """The ``assess_article`` handler: one structured generation (Task 4)."""
+    assess_config = config.tasks.assess_article
+    model_id = assess_config.model
+    routing_fp = routing_fingerprint(config.openrouter.routing)
+    hard_budget = config.budget.openrouter_nano_usd_per_run() is not None
+    endpoint_host = urlsplit(config.openrouter.endpoint).hostname
+    parameters = assess_config.parameters
+
+    def ready(claimed_run_id: int) -> bool:
+        return inspection_ready(
+            connection,
+            run_id=claimed_run_id,
+            config=config,
+            model_id=model_id,
+        )
+
+    def prepare(work_item: WorkItem) -> TaskPreparation:
+        if work_item.subject_id is None:
+            raise ValueError(MISSING_PERSON_ARTICLE_DETAIL)
+        person_article_id = int(work_item.subject_id)
+        task_fingerprint = work_item.fingerprint
+        run_id = _claimed_run_id(connection, work_item.id)
+
+        existing = load_person_article_assessment_by_fingerprint(
+            connection,
+            person_article_id=person_article_id,
+            task_fingerprint=task_fingerprint,
+        )
+        if existing is not None:
+            _prepare_reuse_existing_assessment(
+                connection,
+                person_article_id=person_article_id,
+                existing_id=existing.id,
+                disposition=existing.disposition,
+                plan_id=existing.plan_id,
+                work_item_id=work_item.id,
+            )
+            raise ValueError(
+                f"{ASSESS_PREPARE_REFUSED_PREFIX}already_settled "
+                f"person_article {person_article_id}"
+            )
+
+        person_article = load_person_article(
+            connection, person_article_id=person_article_id
+        )
+        if person_article is None:
+            raise ValueError(MISSING_PERSON_ARTICLE_DETAIL)
+
+        context = resolve_assess_work_context(
+            connection,
+            person_article_id=person_article_id,
+            task_fingerprint=task_fingerprint,
+        )
+        if context is None:
+            raise ValueError(
+                f"{ASSESS_PREPARE_REFUSED_PREFIX}unresolved_context "
+                f"person_article {person_article_id}"
+            )
+        if context.plan_status == "superseded":
+            raise ValueError(
+                f"{ASSESS_PREPARE_REFUSED_PREFIX}superseded_plan "
+                f"person_article {person_article_id}"
+            )
+
+        view = load_article_view(connection, view_id=context.article_view_id)
+        if view is None:
+            raise ValueError(
+                f"{ASSESS_PREPARE_REFUSED_PREFIX}missing_view "
+                f"article_view {context.article_view_id}"
+            )
+
+        inspection = load_model_inspection(
+            connection,
+            run_id=run_id,
+            configured_model_id=model_id,
+            routing_fingerprint=routing_fp,
+        )
+        if inspection is None or inspection.compatibility != "compatible":
+            raise ValueError(MISSING_INSPECTION_DETAIL)
+
+        display_name, sourced_names, identity_facts, person_name_texts = (
+            _operational_assess_material(connection, person_id=person_article.person_id)
+        )
+        article_view_like = _article_view_like(view)
+        passage_view = select_passages(
+            person_name_texts,
+            article_view_like,
+            assess_config,
+        )
+        access_kind = view.access_kind
+        if access_kind not in {"full", "partial", "snippets"}:
+            access_kind = "snippets"
+        domain_profile = _domain_profile_evidence(profile)
+        assess_input = build_assess_input(
+            person_id=person_article.person_id,
+            display_name=display_name,
+            sourced_names=sourced_names,
+            identity_facts=identity_facts,
+            person_article_id=person_article_id,
+            canonical_article_id=person_article.canonical_article_id,
+            article_view_id=view.id,
+            screening_rule_id=context.screening_rule_id,
+            screening_rule_status=context.screening_rule_status,
+            title=view.title,
+            dek=view.dek,
+            byline=view.byline,
+            published_at=view.published_at,
+            editorial_labels=_parse_string_list(view.editorial_labels_json),
+            passage_view=passage_view,
+            access_kind=access_kind,  # type: ignore[arg-type]
+            extraction_quality=view.extraction_quality,
+            domain_profile=domain_profile,
+            config=assess_config,
+        )
+        rendered = render_assess_request(assess_input)
+        request = StructuredGenerationRequest(
+            model_id=model_id,
+            system_prompt=rendered.system_prompt,
+            user_content=rendered.user_input_json,
+            json_schema=rendered.schema,
+            schema_name=ASSESS_SCHEMA_NAME,
+            max_completion_tokens=assess_config.max_completion_tokens,
+            temperature=parameters.temperature,
+            top_p=parameters.top_p,
+            reasoning_effort=parameters.reasoning_effort,
+        )
+        call = _AssessCall(
+            request=request,
+            assess_input=assess_input,
+            person_article_id=person_article_id,
+            person_id=person_article.person_id,
+            canonical_article_id=person_article.canonical_article_id,
+            plan_id=context.plan_id,
+            article_view_id=view.id,
+            model_inspection_id=inspection.id,
+            canonical_supplied_input_json=rendered.canonical_input_json,
+            prompt_hash=rendered.prompt_hash,
+            schema_hash=rendered.schema_hash,
+            schema_version=rendered.schema_version,
+            task_fingerprint=task_fingerprint,
+            screening_rule_id=context.screening_rule_id,
+            screening_rule_status=context.screening_rule_status,
+            source_policy_fingerprint=context.source_policy_fingerprint,
+        )
+        if not hard_budget:
+            return TaskPreparation(payload=call, reserved_nano_usd=0)
+
+        prompt_price = inspection.prompt_unit_price_nano_usd
+        completion_price = inspection.completion_unit_price_nano_usd
+        if (
+            not inspection.pricing_usable
+            or prompt_price is None
+            or completion_price is None
+        ):
+            raise ValueError(MISSING_PRICING_DETAIL)
+        reserved = _worst_case_reservation_nano_usd(
+            prompt_unit_price_nano_usd=prompt_price,
+            completion_unit_price_nano_usd=completion_price,
+            max_input_tokens=assess_config.max_input_tokens,
+            max_completion_tokens=assess_config.max_completion_tokens,
+        )
+        return TaskPreparation(payload=call, reserved_nano_usd=reserved)
+
+    def destination_host(_work_item: WorkItem) -> str | None:
+        return endpoint_host
+
+    return TaskHandler(
+        task_type=ASSESS_ARTICLE_TASK_TYPE,
+        provider=OPENROUTER_PROVIDER,
+        operation=GENERATE_OPERATION,
+        execute=_execute_assess_for(client),
+        prepare=prepare,
+        persist=_persist_assess_for(connection, config=config),
+        persist_failure=_persist_assess_failure_for(connection, config=config),
+        destination_host=destination_host,
+        reserved_nano_usd=0,
+        pool=WorkerPool.LLM,
+        ready=ready,
+    )
+
+
+def _execute_assess_for(
+    client: LlmClient,
+) -> Callable[[WorkItem, int, object], TaskOutcome]:
+    def execute(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
+        del work_item, ordinal
+        if not isinstance(prepared, _AssessCall):
+            raise ProviderFailure(
+                FailureCategory.INTERNAL,
+                provider=OPENROUTER_PROVIDER,
+                operation=GENERATE_OPERATION,
+                detail=f"prepared value was {type(prepared).__name__}",
+            )
+        result = client.generate_structured(prepared.request)
+        raw_text = result.raw_text
+        if result.refusal:
+            del raw_text, result
+            raise ProviderFailure(
+                FailureCategory.MALFORMED_RESPONSE,
+                provider=OPENROUTER_PROVIDER,
+                operation=GENERATE_OPERATION,
+                retryable=True,
+                detail=MALFORMED_ASSESS_DETAIL,
+            )
+        try:
+            output = validate_assess_output(raw_text, prepared.assess_input)
+        except AssessValidationError:
+            del raw_text, result
+            raise ProviderFailure(
+                FailureCategory.MALFORMED_RESPONSE,
+                provider=OPENROUTER_PROVIDER,
+                operation=GENERATE_OPERATION,
+                retryable=True,
+                detail=MALFORMED_ASSESS_DETAIL,
+            ) from None
+        del raw_text
+        payload = _AssessPersist(
+            output=output,
+            person_article_id=prepared.person_article_id,
+            person_id=prepared.person_id,
+            canonical_article_id=prepared.canonical_article_id,
+            plan_id=prepared.plan_id,
+            article_view_id=prepared.article_view_id,
+            model_inspection_id=prepared.model_inspection_id,
+            canonical_supplied_input_json=prepared.canonical_supplied_input_json,
+            prompt_hash=prepared.prompt_hash,
+            schema_hash=prepared.schema_hash,
+            schema_version=prepared.schema_version,
+            task_fingerprint=prepared.task_fingerprint,
+            screening_rule_id=prepared.screening_rule_id,
+            screening_rule_status=prepared.screening_rule_status,
+            source_policy_fingerprint=prepared.source_policy_fingerprint,
+        )
+        return TaskOutcome(
+            state=WorkState.SUCCEEDED,
+            reason=None,
+            payload=payload,
+            response_bytes=len(result.raw_text.encode("utf-8")),
+            provider_request_id=result.provider_request_id,
+            actual_nano_usd=result.actual_nano_usd,
+        )
+
+    return execute
+
+
+def _persist_assess_for(
+    connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
+) -> Callable[[WorkItem, TaskOutcome], None]:
+    def persist(work_item: WorkItem, outcome: TaskOutcome) -> None:
+        payload = outcome.payload
+        if not isinstance(payload, _AssessPersist):
+            raise RuntimeError(
+                f"unexpected assess payload type: {type(payload).__name__}"
+            )
+        attempt_id, run_id, observed_at = _attempt_context(connection, work_item.id)
+        existing = load_person_article_assessment_by_fingerprint(
+            connection,
+            person_article_id=payload.person_article_id,
+            task_fingerprint=payload.task_fingerprint,
+        )
+        if existing is not None:
+            if existing.disposition == "completed":
+                point_person_article_current_assessment(
+                    connection,
+                    person_article_id=payload.person_article_id,
+                    assessment_id=existing.id,
+                )
+                if payload.plan_id is not None:
+                    _maybe_advance_after_assess(
+                        connection,
+                        plan_id=payload.plan_id,
+                        run_id=run_id,
+                        config=config,
+                        now=observed_at,
+                    )
+            return
+
+        if payload.plan_id is not None:
+            plan = load_plan(connection, plan_id=payload.plan_id)
+            if plan is not None and plan.status == "superseded":
+                return
+
+        output = payload.output
+        assessment_id = insert_person_article_assessment(
+            connection,
+            person_article_id=payload.person_article_id,
+            person_id=payload.person_id,
+            canonical_article_id=payload.canonical_article_id,
+            plan_id=payload.plan_id,
+            article_view_id=payload.article_view_id,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            model_inspection_id=payload.model_inspection_id,
+            disposition="completed",
+            person_relation=output.person_relation,
+            coverage_depth=output.coverage_depth,
+            content_types_json=_canonical_json(list(output.content_types)),
+            subject_relationship=output.subject_relationship,
+            screening_rule_id=payload.screening_rule_id,
+            screening_rule_status=payload.screening_rule_status,
+            source_policy_fingerprint=payload.source_policy_fingerprint,
+            canonical_supplied_input_json=payload.canonical_supplied_input_json,
+            validated_output_json=output.model_dump_json(),
+            prompt_hash=payload.prompt_hash,
+            schema_hash=payload.schema_hash,
+            schema_version=payload.schema_version,
+            task_fingerprint=payload.task_fingerprint,
+            rationale=output.person_relation_rationale,
+            failure_category=None,
+            observed_at=observed_at,
+        )
+        if output.signals:
+            insert_assessment_signals(
+                connection,
+                assessment_id=assessment_id,
+                signals=tuple(
+                    {
+                        "signal_kind": signal.kind,
+                        "category": signal.category,
+                        "claim": signal.claim,
+                        "supporting_passage_ids_json": _canonical_json(
+                            list(signal.supporting_passage_ids)
+                        ),
+                        "ordinal": index,
+                    }
+                    for index, signal in enumerate(output.signals, start=1)
+                ),
+            )
+        # K25: current pointer only for completed assessments.
+        point_person_article_current_assessment(
+            connection,
+            person_article_id=payload.person_article_id,
+            assessment_id=assessment_id,
+        )
+        if payload.plan_id is not None:
+            _maybe_advance_after_assess(
+                connection,
+                plan_id=payload.plan_id,
+                run_id=run_id,
+                config=config,
+                now=observed_at,
+            )
+
+    return persist
+
+
+def _persist_assess_failure_for(
+    connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
+) -> Callable[[WorkItem, ProviderFailure], None]:
+    def persist_failure(work_item: WorkItem, failure: ProviderFailure) -> None:
+        state_row = connection.execute(
+            "SELECT state, subject_id, fingerprint FROM work_item WHERE id = ?",
+            (work_item.id,),
+        ).fetchone()
+        if state_row is None or state_row["state"] != "failed_permanent":
+            return
+        if state_row["subject_id"] is None:
+            return
+        person_article_id = int(state_row["subject_id"])
+        task_fingerprint = str(state_row["fingerprint"])
+        existing = load_person_article_assessment_by_fingerprint(
+            connection,
+            person_article_id=person_article_id,
+            task_fingerprint=task_fingerprint,
+        )
+        if existing is not None:
+            return
+
+        person_article = load_person_article(
+            connection, person_article_id=person_article_id
+        )
+        if person_article is None:
+            return
+        context = resolve_assess_work_context(
+            connection,
+            person_article_id=person_article_id,
+            task_fingerprint=task_fingerprint,
+        )
+        if context is None:
+            return
+
+        attempt_id, run_id, observed_at = _attempt_context(connection, work_item.id)
+        routing_fp = routing_fingerprint(config.openrouter.routing)
+        inspection = load_model_inspection(
+            connection,
+            run_id=run_id,
+            configured_model_id=config.tasks.assess_article.model,
+            routing_fingerprint=routing_fp,
+        )
+        model_inspection_id = None if inspection is None else inspection.id
+        category = (
+            _INVALID_MODEL_OUTPUT_CATEGORY
+            if failure.category is FailureCategory.MALFORMED_RESPONSE
+            else str(failure.category)
+        )
+        insert_person_article_assessment(
+            connection,
+            person_article_id=person_article_id,
+            person_id=person_article.person_id,
+            canonical_article_id=person_article.canonical_article_id,
+            plan_id=context.plan_id,
+            article_view_id=context.article_view_id,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            model_inspection_id=model_inspection_id,
+            disposition="failed",
+            person_relation=None,
+            coverage_depth=None,
+            content_types_json=None,
+            subject_relationship=None,
+            screening_rule_id=context.screening_rule_id,
+            screening_rule_status=context.screening_rule_status,
+            source_policy_fingerprint=context.source_policy_fingerprint,
+            canonical_supplied_input_json=ASSESS_FAILED_SUPPLIED_INPUT_JSON,
+            validated_output_json=None,
+            prompt_hash=None,
+            schema_hash=None,
+            schema_version=None,
+            task_fingerprint=task_fingerprint,
+            rationale=str(failure.category),
+            failure_category=category,
+            observed_at=observed_at,
+        )
+        # K25: do not move current pointer on permanent failure.
+        if context.plan_id is not None:
+            _maybe_advance_after_assess(
+                connection,
+                plan_id=context.plan_id,
+                run_id=run_id,
+                config=config,
+                now=observed_at,
+            )
+
+    return persist_failure
+
+
+def _maybe_advance_after_assess(
+    connection: sqlite3.Connection,
+    *,
+    plan_id: int,
+    run_id: int,
+    config: MainConfig,
+    now: str,
+) -> None:
+    """Advance plan after assess settlement when a policy fingerprint is known."""
+    plan = load_plan(connection, plan_id=plan_id)
+    if plan is None or plan.status in _TERMINAL_PLAN_STATUSES:
+        return
+    # maybe_advance requires SourcePolicy; reconstruct a minimal policy view is
+    # not available here. Terminalize only when paths are already ready via
+    # internal checks that do not re-screen. Reuse policy fingerprint solely
+    # for status transitions already implemented without screening decisions.
+    # Callers that hold a SourcePolicy (fetch/brave) still pass through the
+    # full maybe_advance path; assess settlement only bumps status when assess
+    # work clears.
+    if _has_active_assess_work(connection, plan_id=plan_id):
+        if plan.status in {"retrieving", "selecting"}:
+            update_plan_status(connection, plan_id=plan_id, status="assessing")
+        return
+    targets = list(list_coverage_article_targets_for_plan(connection, plan_id=plan_id))
+    if targets and not _selected_paths_ready_to_terminalize(
+        connection, plan_id=plan_id, person_id=plan.person_id, targets=targets
+    ):
+        if plan.status in {"retrieving", "selecting"}:
+            update_plan_status(connection, plan_id=plan_id, status="assessing")
+        return
+    forms = list(list_query_forms_for_plan(connection, plan_id=plan_id))
+    if any(form.status == "pending" for form in forms):
+        return
+    if any(t.status == "pending" for t in targets):
+        return
+    _terminalize_plan(
+        connection,
+        plan=plan,
+        forms=forms,
+        targets=targets,
+        now=now,
+    )
+    del run_id, config
+
+
+def _prepare_reuse_existing_assessment(
+    connection: sqlite3.Connection,
+    *,
+    person_article_id: int,
+    existing_id: int,
+    disposition: str,
+    plan_id: int | None,
+    work_item_id: int,
+) -> None:
+    """Point current for an existing completed assessment (prepare-time)."""
+    if disposition != "completed":
+        return
+    owns = not connection.in_transaction
+    if owns:
+        connection.execute("BEGIN IMMEDIATE")
+    try:
+        point_person_article_current_assessment(
+            connection,
+            person_article_id=person_article_id,
+            assessment_id=existing_id,
+        )
+        del plan_id, work_item_id
+    except BaseException:
+        if owns:
+            connection.rollback()
+        raise
+    else:
+        if owns:
+            connection.commit()
+
+
+def _claimed_run_id(connection: sqlite3.Connection, work_item_id: int) -> int:
+    row = connection.execute(
+        "SELECT claimed_by_run_id FROM work_item WHERE id = ?",
+        (work_item_id,),
+    ).fetchone()
+    if row is None or row["claimed_by_run_id"] is None:
+        attempt = connection.execute(
+            """
+            SELECT run_id FROM attempt
+             WHERE work_item_id = ?
+             ORDER BY id DESC LIMIT 1
+            """,
+            (work_item_id,),
+        ).fetchone()
+        if attempt is not None:
+            return int(attempt["run_id"])
+        raise ValueError(f"work item {work_item_id} is not claimed by a run")
+    return int(row["claimed_by_run_id"])
+
+
+def _has_active_assess_article_work(connection: sqlite3.Connection) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1 AS present
+          FROM work_item
+         WHERE task_type = ?
+           AND state IN ('pending', 'deferred', 'running')
+         LIMIT 1
+        """,
+        (ASSESS_ARTICLE_TASK_TYPE,),
+    ).fetchone()
+    return row is not None
+
+
+def _has_active_coverage_plan(connection: sqlite3.Connection) -> bool:
+    """Active plan arm (retrieving | selecting | assessing). K20 cold-start."""
+    row = connection.execute(
+        """
+        SELECT 1 AS present
+          FROM person_coverage_plan
+         WHERE status IN ('retrieving', 'selecting', 'assessing')
+         LIMIT 1
+        """
+    ).fetchone()
+    return row is not None
+
+
+def _has_active_coverage_http_work(connection: sqlite3.Connection) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1 AS present
+          FROM work_item
+         WHERE task_type IN (?, ?)
+           AND state IN ('pending', 'deferred', 'running')
+         LIMIT 1
+        """,
+        (BRAVE_WEB_SEARCH_TASK_TYPE, FETCH_ARTICLE_TASK_TYPE),
+    ).fetchone()
+    return row is not None
+
+
+def _screening_for_article_on_plan(
+    connection: sqlite3.Connection,
+    *,
+    plan_id: int,
+    canonical_article_id: int,
+) -> tuple[str, str, str] | None:
+    """Return (rule_id, rule_status, policy_fp) for discovery or search path."""
+    discovery = connection.execute(
+        """
+        SELECT s.rule_id, s.rule_status, s.source_policy_fingerprint
+          FROM coverage_discovery_article AS d
+          JOIN source_screening AS s ON s.id = d.screening_id
+         WHERE d.plan_id = ? AND d.canonical_article_id = ?
+         LIMIT 1
+        """,
+        (plan_id, canonical_article_id),
+    ).fetchone()
+    if discovery is not None:
+        return (
+            str(discovery["rule_id"]),
+            str(discovery["rule_status"]),
+            str(discovery["source_policy_fingerprint"]),
+        )
+    search = connection.execute(
+        """
+        SELECT s.rule_id, s.rule_status, s.source_policy_fingerprint
+          FROM brave_search_result_occurrence AS o
+          JOIN brave_search_observation AS obs
+            ON obs.id = o.search_observation_id
+          JOIN coverage_query_form AS f ON f.id = obs.query_form_id
+          JOIN source_screening AS s ON s.id = o.screening_id
+         WHERE f.plan_id = ?
+           AND o.canonical_article_id = ?
+         ORDER BY o.rank, o.id
+         LIMIT 1
+        """,
+        (plan_id, canonical_article_id),
+    ).fetchone()
+    if search is not None:
+        return (
+            str(search["rule_id"]),
+            str(search["rule_status"]),
+            str(search["source_policy_fingerprint"]),
+        )
+    plan = load_plan(connection, plan_id=plan_id)
+    if plan is None:
+        return None
+    return (
+        "unknown",
+        "unclassified",
+        plan.source_policy_fingerprint,
+    )
+
+
+def _operational_assess_material(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+) -> tuple[str, tuple[AssessName, ...], tuple[AssessFact, ...], list[str]]:
+    """K27: names and facts from the operational projection for assess input."""
+    canonical_id = canonical_person_id(connection, person_id)
+    try:
+        display_name = select_display_name(connection, canonical_id)
+    except LookupError:
+        row = connection.execute(
+            "SELECT display_name FROM person WHERE id = ?",
+            (canonical_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(MISSING_PERSON_ARTICLE_DETAIL) from None
+        display_name = str(row["display_name"])
+
+    closure = person_id_closure_for_canonical(connection, canonical_id)
+    if not closure:
+        raise ValueError(MISSING_PERSON_ARTICLE_DETAIL)
+    placeholders = ",".join("?" for _ in closure)
+    name_rows = connection.execute(
+        f"""
+        SELECT id, exact_name, match_key, kind
+          FROM sourced_name
+         WHERE person_id IN ({placeholders})
+         ORDER BY id
+        """,
+        closure,
+    ).fetchall()
+    names: list[AssessName] = []
+    name_texts: list[str] = []
+    seen_keys: set[str] = set()
+    sorted_names = sorted(
+        name_rows,
+        key=lambda row: (
+            _NAME_KIND_ORDER.get(str(row["kind"]), 99),
+            int(row["id"]),
+        ),
+    )
+    for row in sorted_names:
+        key = str(row["match_key"])
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        exact = str(row["exact_name"])
+        names.append(
+            AssessName(
+                exact_name=exact,
+                match_key=key,
+                kind=str(row["kind"]),
+            )
+        )
+        name_texts.append(exact)
+        if len(names) >= 8:
+            break
+
+    if not names:
+        names.append(
+            AssessName(
+                exact_name=display_name,
+                match_key=display_name.casefold() or "unknown",
+                kind="display",
+            )
+        )
+        name_texts.append(display_name)
+
+    mentions = mentions_for_canonical_person(connection, canonical_id)
+    facts: list[AssessFact] = []
+    fact_index = 1
+    for mention in mentions:
+        for fact in mention.identity_facts:
+            kind_raw = str(fact.kind)
+            try:
+                kind_enum = IdentityFactKind(kind_raw)
+            except ValueError:
+                kind_enum = IdentityFactKind.OTHER
+            facts.append(
+                AssessFact(
+                    local_id=f"f{fact_index}",
+                    kind=kind_enum,
+                    value=str(fact.value)[:500] or str(fact.value)[:1],
+                )
+            )
+            fact_index += 1
+            if len(facts) >= 16:
+                break
+        if len(facts) >= 16:
+            break
+
+    return display_name, tuple(names), tuple(facts), name_texts
+
+
+def _article_view_like(view: Any) -> ArticleViewLike:
+    blocks_raw = json.loads(view.main_text_blocks_json or "[]")
+    blocks: list[TextBlock] = []
+    if isinstance(blocks_raw, list):
+        for index, item in enumerate(blocks_raw, start=1):
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            block_id = item.get("id")
+            if not isinstance(block_id, str) or not block_id:
+                block_id = f"b{index}"
+            blocks.append(TextBlock(id=block_id, text=text))
+    snippets_raw = json.loads(view.snippets_json or "[]")
+    snippets: list[str] = []
+    if isinstance(snippets_raw, list):
+        for item in snippets_raw:
+            if isinstance(item, str) and item.strip():
+                snippets.append(item)
+    return ArticleViewLike(
+        title=view.title,
+        dek=view.dek,
+        main_text_blocks=tuple(blocks),
+        snippets=tuple(snippets),
+    )
+
+
+def _domain_profile_evidence(profile: DomainProfileConfig) -> DomainProfileEvidence:
+    examples = tuple(
+        DomainProfileEvidenceExample(
+            category=AttentionCategory(category),
+            examples=tuple(values),
+        )
+        for category, values in sorted(profile.attention_examples.items())
+    )
+    return DomainProfileEvidence(
+        version=profile.schema_version,
+        key=profile.key,
+        label=profile.label,
+        language=profile.language,
+        attention_examples=examples,
+    )
+
+
+def _parse_string_list(raw: str) -> tuple[str, ...]:
+    try:
+        parsed = json.loads(raw or "[]")
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(str(item) for item in parsed if isinstance(item, str))

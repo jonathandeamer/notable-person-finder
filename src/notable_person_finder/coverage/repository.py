@@ -1167,6 +1167,26 @@ def load_person_article_assessment(
     return _assessment_record(row)
 
 
+def load_person_article_assessment_by_fingerprint(
+    connection: sqlite3.Connection,
+    *,
+    person_article_id: int,
+    task_fingerprint: str,
+) -> PersonArticleAssessmentRecord | None:
+    """Load the assessment row for ``(person_article_id, task_fingerprint)``."""
+    row = connection.execute(
+        """
+        SELECT *
+          FROM person_article_assessment
+         WHERE person_article_id = ? AND task_fingerprint = ?
+        """,
+        (person_article_id, task_fingerprint),
+    ).fetchone()
+    if row is None:
+        return None
+    return _assessment_record(row)
+
+
 def insert_assessment_signals(
     connection: sqlite3.Connection,
     *,
