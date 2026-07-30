@@ -14,7 +14,7 @@
 | 4 | Policy, selection, queries, eligibility | complete |
 | 5 | PassageSelector + assess contract + config | complete |
 | 6a | Plan lifecycle + brave_web_search | complete |
-| 6b | fetch_article + views | pending |
+| 6b | fetch_article + views | complete |
 | 7 | assess_article + multi-model inspect | pending |
 | 8 | Seed, supersede, merge | pending |
 | 9 | Digest/status/CLI + gate | pending |
@@ -53,3 +53,14 @@ Task 6a: complete — plan open (K10 discovery + exact forms), brave_web_search
 handler (one search_web / UNIQUE attempt), offset semantics, maybe_advance
 stages + T1–T11 terminalize; CLI registers Brave only (fetch/assess later);
 mutation evidence in task-6a-report.md
+Task 6a: fix round 1/5 (3 Important addressed — positive alias/context gate,
+fetched-without-assess terminalize block, expanded mutation evidence;
+commit 34b0d1a)
+
+Task 6a: fix round 1/5 (3 addressed, 0 open; commits f6f7a5f..34b0d1a)
+Task 6a: complete (commits 618b856..34b0d1a, review clean)
+
+Task 6b: complete — build_fetch_article_handler (one GET + in-process extract,
+K3 HTML ban), article_view full/partial/snippets, K28 snippets fallback, K31
+person_article, schedule_assess_article when view ready; CLI registers fetch;
+mutation evidence in task-6b-report.md

@@ -1,14 +1,16 @@
-"""Coverage plan lifecycle and ``brave_web_search`` handler (Task 6a).
+"""Coverage plan lifecycle, Brave search, and ``fetch_article`` handlers.
 
 Plan open attaches discovery (K10), schedules exact-name forms (K6), and
 stages alias/context after exact terminal. ``brave_web_search`` performs
-exactly one Brave ``search_web`` call per execute. Workers never open SQLite;
-domain settlement and ``maybe_advance_coverage_plan`` run on the application
-thread inside the engine settlement transaction.
+exactly one Brave ``search_web`` call per execute. ``fetch_article`` performs
+exactly one GET, extracts in-process (K3), and persists cleaned article views
+with snippets fallback (K28). Workers never open SQLite; domain settlement and
+``maybe_advance_coverage_plan`` run on the application thread inside the engine
+settlement transaction.
 
-Fetch and assess handlers land in Tasks 6b/7; this module still final-selects
-targets and schedules ``fetch_article`` so those handlers can settle them.
-Terminal truth table T1–T11 applies once search/targets/assess are quiescent.
+Assess handler lands in Task 7; this module schedules ``assess_article`` when a
+view is ready. Terminal truth table T1–T11 applies once search/targets/assess
+are quiescent.
 """
 
 from __future__ import annotations
@@ -19,10 +21,11 @@ import re
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from notable_person_finder.config.models import AssessArticleConfig, MainConfig
+from notable_person_finder.coverage.assessment import assess_task_fingerprint
 from notable_person_finder.coverage.models import (
     CoverageQueryFormRecord,
     PersonCoveragePlanRecord,
@@ -33,6 +36,7 @@ from notable_person_finder.coverage.queries import (
     generate_exact_forms,
 )
 from notable_person_finder.coverage.repository import (
+    insert_article_view,
     insert_coverage_article_target,
     insert_coverage_discovery_article,
     insert_or_load_brave_search_observation_by_attempt,
@@ -42,6 +46,8 @@ from notable_person_finder.coverage.repository import (
     list_coverage_article_targets_for_plan,
     list_coverage_discovery_articles_for_plan,
     list_query_forms_for_plan,
+    load_coverage_article_target,
+    load_person_article_by_pair,
     load_plan,
     load_query_form,
     load_source_screening,
@@ -49,6 +55,7 @@ from notable_person_finder.coverage.repository import (
     mark_query_form_failed,
     mark_query_form_progress,
     open_plan,
+    update_coverage_article_target,
     update_plan_status,
     upsert_person_article,
 )
@@ -68,6 +75,17 @@ from notable_person_finder.ingestion.urls import publisher_key
 from notable_person_finder.people.identity import (
     person_id_closure_for_canonical,
     select_display_name,
+)
+from notable_person_finder.providers.article_versions import EXTRACTOR_VERSION
+from notable_person_finder.providers.articles import (
+    ARTICLE_PROVIDER,
+    OPERATION_FETCH_ARTICLE,
+    ArticleAccessDenied,
+    ArticleExtractor,
+    ArticleFetcher,
+    ArticleFetchSuccess,
+    ExtractedArticle,
+    ExtractionQuality,
 )
 from notable_person_finder.providers.brave import (
     OPERATION_SEARCH_WEB,
@@ -135,6 +153,43 @@ class _BraveSearchCall:
     max_offsets_per_form: int
     max_results_per_form: int
     reject_altered_query: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _FetchArticleCall:
+    target_id: int
+    plan_id: int
+    person_id: int
+    canonical_article_id: int
+    request_url: str
+    material_fingerprint: str
+    person_article_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CleanBlock:
+    id: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FetchArticlePayload:
+    """Cleaned fetch result only — never carries HTML (K3)."""
+
+    kind: Literal["extracted", "access_denied"]
+    requested_url: str
+    final_url: str | None
+    status_code: int | None
+    access_kind: Literal["full", "partial", "snippets"]
+    title: str | None
+    dek: str | None
+    byline: str | None
+    published_at: str | None
+    editorial_labels: tuple[str, ...]
+    blocks: tuple[_CleanBlock, ...]
+    extraction_quality: str | None
+    access_denied_kind: str | None
+    detail: str | None
 
 
 def brave_web_search_fingerprint(
@@ -210,7 +265,7 @@ def schedule_fetch_article(
     run_id: int,
     now: str,
 ) -> int:
-    """Schedule one ``fetch_article`` work item (handler lands in Task 6b)."""
+    """Schedule one ``fetch_article`` work item for a coverage target."""
     fingerprint = fetch_article_fingerprint(
         material_fingerprint=material_fingerprint,
         coverage_article_target_id=target_id,
@@ -223,6 +278,38 @@ def schedule_fetch_article(
         fingerprint=fingerprint,
         required=True,
         priority=FETCH_ARTICLE_PRIORITY,
+        eligible_at=now,
+        run_id=run_id,
+        now=now,
+    )
+
+
+def schedule_assess_article(
+    connection: sqlite3.Connection,
+    *,
+    person_article_id: int,
+    article_view_id: int,
+    material_fingerprint: str,
+    run_id: int,
+    now: str,
+) -> int:
+    """Schedule one ``assess_article`` work item when a view is ready.
+
+    The assess handler lands in Task 7; scheduling here arms work for it.
+    """
+    fingerprint = assess_task_fingerprint(
+        material_fingerprint=material_fingerprint,
+        person_article_id=person_article_id,
+        article_view_id=article_view_id,
+    )
+    return runs_repository.schedule_work(
+        connection,
+        task_type=ASSESS_ARTICLE_TASK_TYPE,
+        subject_kind=SUBJECT_KIND_PERSON_ARTICLE,
+        subject_id=person_article_id,
+        fingerprint=fingerprint,
+        required=True,
+        priority=ASSESS_ARTICLE_PRIORITY,
         eligible_at=now,
         run_id=run_id,
         now=now,
@@ -627,6 +714,81 @@ def build_brave_web_search_handler(
     )
 
 
+def build_fetch_article_handler(
+    connection: sqlite3.Connection,
+    *,
+    fetcher: ArticleFetcher,
+    extractor: ArticleExtractor,
+    config: MainConfig,
+    policy: SourcePolicy,
+) -> TaskHandler:
+    """HTTP handler: one article GET + in-process extract; no HTML on return (K3)."""
+
+    def prepare(work_item: WorkItem) -> TaskPreparation:
+        target_id = work_item.subject_id
+        if target_id is None:
+            raise ValueError("fetch_article work item names no coverage target")
+        target = load_coverage_article_target(connection, target_id=target_id)
+        if target is None:
+            raise ValueError(f"coverage_article_target {target_id} is missing")
+        if target.status != "pending":
+            raise ValueError(
+                f"coverage_article_target {target_id} is not pending ({target.status})"
+            )
+        plan = load_plan(connection, plan_id=target.plan_id)
+        if plan is None:
+            raise ValueError(f"person_coverage_plan {target.plan_id} is missing")
+        if plan.status == "superseded":
+            raise ValueError("coverage plan is superseded")
+        person_article = load_person_article_by_pair(
+            connection,
+            person_id=plan.person_id,
+            canonical_article_id=target.canonical_article_id,
+        )
+        return TaskPreparation(
+            payload=_FetchArticleCall(
+                target_id=target.id,
+                plan_id=plan.id,
+                person_id=plan.person_id,
+                canonical_article_id=target.canonical_article_id,
+                request_url=target.request_url,
+                material_fingerprint=plan.material_fingerprint,
+                person_article_id=person_article.id if person_article else None,
+            )
+        )
+
+    def destination_host(work_item: WorkItem) -> str | None:
+        target_id = work_item.subject_id
+        if target_id is None:
+            return None
+        target = load_coverage_article_target(connection, target_id=int(target_id))
+        if target is None:
+            return None
+        try:
+            return urlsplit(target.request_url).hostname
+        except Exception:
+            return None
+
+    def request_fingerprint(work_item: WorkItem) -> str:
+        return work_item.fingerprint
+
+    return TaskHandler(
+        task_type=FETCH_ARTICLE_TASK_TYPE,
+        provider=ARTICLE_PROVIDER,
+        operation=OPERATION_FETCH_ARTICLE,
+        execute=_execute_fetch_for(fetcher, extractor),
+        request_fingerprint=request_fingerprint,
+        reserved_nano_usd=0,
+        prepare=prepare,
+        persist=_persist_fetch_for(connection, config=config, policy=policy),
+        persist_failure=_persist_fetch_failure_for(
+            connection, config=config, policy=policy
+        ),
+        destination_host=destination_host,
+        pool=WorkerPool.HTTP,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Execute / persist
 # ---------------------------------------------------------------------------
@@ -874,6 +1036,418 @@ def _persist_brave_failure_for(
         )
 
     return persist_failure
+
+
+def _execute_fetch_for(
+    fetcher: ArticleFetcher,
+    extractor: ArticleExtractor,
+) -> Callable[[WorkItem, int, object], TaskOutcome]:
+    def execute(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
+        del work_item, ordinal
+        if not isinstance(prepared, _FetchArticleCall):
+            raise ProviderFailure(
+                FailureCategory.INTERNAL,
+                provider=ARTICLE_PROVIDER,
+                operation=OPERATION_FETCH_ARTICLE,
+                detail=f"prepared value was {type(prepared).__name__}",
+            )
+        result = fetcher.fetch_article(prepared.request_url)
+        if isinstance(result, ArticleAccessDenied):
+            # Typed access outcome: no HTML ever existed on this path.
+            return TaskOutcome(
+                state=WorkState.SUCCEEDED,
+                reason=None,
+                payload=_FetchArticlePayload(
+                    kind="access_denied",
+                    requested_url=result.requested_url,
+                    final_url=result.final_url,
+                    status_code=result.status_code,
+                    access_kind="snippets",
+                    title=None,
+                    dek=None,
+                    byline=None,
+                    published_at=None,
+                    editorial_labels=(),
+                    blocks=(),
+                    extraction_quality=None,
+                    access_denied_kind=str(result.kind),
+                    detail=result.detail,
+                ),
+            )
+        if not isinstance(result, ArticleFetchSuccess):
+            raise ProviderFailure(
+                FailureCategory.INTERNAL,
+                provider=ARTICLE_PROVIDER,
+                operation=OPERATION_FETCH_ARTICLE,
+                detail=f"unexpected fetch result {type(result).__name__}",
+            )
+
+        # Extract in-process on the worker; drop HTML before return (K3).
+        html = result.html
+        extracted = extractor.extract_article(html)
+        # Explicitly drop HTML references so the payload cannot retain them.
+        del html
+        payload = _payload_from_extracted(
+            extracted,
+            requested_url=result.requested_url,
+            final_url=result.final_url,
+            status_code=result.status_code,
+        )
+        return TaskOutcome(
+            state=WorkState.SUCCEEDED,
+            reason=None,
+            payload=payload,
+            response_bytes=result.response_bytes,
+            # Compact only — never HTML or full bodies.
+            detail_json=None,
+        )
+
+    return execute
+
+
+def _payload_from_extracted(
+    extracted: ExtractedArticle,
+    *,
+    requested_url: str,
+    final_url: str | None,
+    status_code: int | None,
+) -> _FetchArticlePayload:
+    quality = extracted.quality
+    if quality is ExtractionQuality.EMPTY:
+        access_kind: Literal["full", "partial", "snippets"] = "snippets"
+        quality_value: str | None = "empty"
+        blocks: tuple[_CleanBlock, ...] = ()
+    elif quality is ExtractionQuality.PARTIAL:
+        access_kind = "partial"
+        quality_value = "partial"
+        blocks = tuple(_CleanBlock(id=b.id, text=b.text) for b in extracted.blocks)
+    else:
+        access_kind = "full"
+        quality_value = "full"
+        blocks = tuple(_CleanBlock(id=b.id, text=b.text) for b in extracted.blocks)
+    return _FetchArticlePayload(
+        kind="extracted",
+        requested_url=requested_url,
+        final_url=final_url,
+        status_code=status_code,
+        access_kind=access_kind,
+        title=extracted.title,
+        dek=extracted.dek,
+        byline=extracted.byline,
+        published_at=extracted.published_at,
+        editorial_labels=tuple(extracted.editorial_labels),
+        blocks=blocks,
+        extraction_quality=quality_value,
+        access_denied_kind=None,
+        detail=None,
+    )
+
+
+def _persist_fetch_for(
+    connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
+    policy: SourcePolicy,
+) -> Callable[[WorkItem, TaskOutcome], None]:
+    def persist(work_item: WorkItem, outcome: TaskOutcome) -> None:
+        if not isinstance(outcome.payload, _FetchArticlePayload):
+            raise RuntimeError(
+                f"unexpected fetch payload type: {type(outcome.payload).__name__}"
+            )
+        payload = outcome.payload
+        target_id = work_item.subject_id
+        if target_id is None:
+            raise RuntimeError("fetch work item missing subject_id")
+        target = load_coverage_article_target(connection, target_id=int(target_id))
+        if target is None or target.status != "pending":
+            return
+        plan = load_plan(connection, plan_id=target.plan_id)
+        if plan is None or plan.status == "superseded":
+            return
+
+        attempt_id, run_id, observed_at = _attempt_context(connection, work_item.id)
+
+        # Idempotent: one view per external attempt.
+        existing = connection.execute(
+            "SELECT id FROM article_view WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if existing is not None:
+            maybe_advance_coverage_plan(
+                connection,
+                plan_id=plan.id,
+                run_id=run_id,
+                config=config,
+                policy=policy,
+                now=observed_at,
+            )
+            return
+
+        person_article_id = upsert_person_article(
+            connection,
+            person_id=plan.person_id,
+            canonical_article_id=target.canonical_article_id,
+            first_plan_id=plan.id,
+        )
+
+        title, snippets = _title_and_snippets_for_article(
+            connection,
+            plan_id=plan.id,
+            canonical_article_id=target.canonical_article_id,
+        )
+        if payload.access_kind in {"full", "partial"}:
+            view_title = payload.title if payload.title else title
+            view_dek = payload.dek
+            view_byline = payload.byline
+            view_published = payload.published_at
+            labels_json = _canonical_json(list(payload.editorial_labels))
+            blocks_json = _canonical_json(
+                [{"id": b.id, "text": b.text} for b in payload.blocks]
+            )
+            snippets_json = _canonical_json(list(snippets))
+            extraction_quality = payload.extraction_quality
+            target_status = "fetched"
+            failure_category = None
+        else:
+            # Snippets path (K28): access denied or empty extract.
+            view_title = payload.title if payload.title else title
+            view_dek = payload.dek
+            view_byline = payload.byline
+            view_published = payload.published_at
+            labels_json = _canonical_json(list(payload.editorial_labels))
+            blocks_json = "[]"
+            snippets_json = _canonical_json(list(snippets))
+            extraction_quality = (
+                payload.extraction_quality if payload.kind == "extracted" else None
+            )
+            target_status = "snippets_only"
+            failure_category = (
+                payload.access_denied_kind
+                if payload.kind == "access_denied"
+                else "empty_extract"
+            )
+
+        view_id = insert_article_view(
+            connection,
+            canonical_article_id=target.canonical_article_id,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            access_kind=payload.access_kind,
+            requested_url=payload.requested_url,
+            final_url=payload.final_url,
+            title=view_title,
+            dek=view_dek,
+            byline=view_byline,
+            published_at=view_published,
+            editorial_labels_json=labels_json,
+            main_text_blocks_json=blocks_json,
+            snippets_json=snippets_json,
+            extraction_quality=extraction_quality,
+            extractor_version=EXTRACTOR_VERSION,
+            observed_at=observed_at,
+        )
+        update_coverage_article_target(
+            connection,
+            target_id=target.id,
+            status=target_status,
+            article_view_id=view_id,
+            attempt_id=attempt_id,
+            failure_category=failure_category,
+        )
+
+        if payload.final_url and payload.final_url != target.request_url:
+            record_alias(
+                connection,
+                canonical_article_id=target.canonical_article_id,
+                url=payload.final_url,
+                kind="redirect_destination",
+                now=observed_at,
+            )
+
+        schedule_assess_article(
+            connection,
+            person_article_id=person_article_id,
+            article_view_id=view_id,
+            material_fingerprint=plan.material_fingerprint,
+            run_id=run_id,
+            now=observed_at,
+        )
+        maybe_advance_coverage_plan(
+            connection,
+            plan_id=plan.id,
+            run_id=run_id,
+            config=config,
+            policy=policy,
+            now=observed_at,
+        )
+
+    return persist
+
+
+def _persist_fetch_failure_for(
+    connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
+    policy: SourcePolicy,
+) -> Callable[[WorkItem, ProviderFailure], None]:
+    def persist_failure(work_item: WorkItem, failure: ProviderFailure) -> None:
+        state_row = connection.execute(
+            "SELECT state, subject_id FROM work_item WHERE id = ?",
+            (work_item.id,),
+        ).fetchone()
+        if state_row is None or state_row["state"] != "failed_permanent":
+            return
+        target_id = state_row["subject_id"]
+        if target_id is None:
+            return
+        target = load_coverage_article_target(connection, target_id=int(target_id))
+        if target is None or target.status != "pending":
+            return
+        plan = load_plan(connection, plan_id=target.plan_id)
+        if plan is None or plan.status == "superseded":
+            return
+
+        attempt_id, run_id, observed_at = _attempt_context(connection, work_item.id)
+        person_article_id = upsert_person_article(
+            connection,
+            person_id=plan.person_id,
+            canonical_article_id=target.canonical_article_id,
+            first_plan_id=plan.id,
+        )
+        title, snippets = _title_and_snippets_for_article(
+            connection,
+            plan_id=plan.id,
+            canonical_article_id=target.canonical_article_id,
+        )
+
+        # K28: still materialize a snippets view when search/discovery text exists.
+        view_id: int | None = None
+        if title is not None or snippets:
+            existing = connection.execute(
+                "SELECT id FROM article_view WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if existing is not None:
+                view_id = int(existing["id"])
+            else:
+                view_id = insert_article_view(
+                    connection,
+                    canonical_article_id=target.canonical_article_id,
+                    run_id=run_id,
+                    attempt_id=attempt_id,
+                    access_kind="snippets",
+                    requested_url=target.request_url,
+                    final_url=None,
+                    title=title,
+                    dek=None,
+                    byline=None,
+                    published_at=None,
+                    editorial_labels_json="[]",
+                    main_text_blocks_json="[]",
+                    snippets_json=_canonical_json(list(snippets)),
+                    extraction_quality=None,
+                    extractor_version=EXTRACTOR_VERSION,
+                    observed_at=observed_at,
+                )
+
+        if view_id is not None:
+            update_coverage_article_target(
+                connection,
+                target_id=target.id,
+                status="snippets_only",
+                article_view_id=view_id,
+                attempt_id=attempt_id,
+                failure_category=str(failure.category),
+            )
+            schedule_assess_article(
+                connection,
+                person_article_id=person_article_id,
+                article_view_id=view_id,
+                material_fingerprint=plan.material_fingerprint,
+                run_id=run_id,
+                now=observed_at,
+            )
+        else:
+            update_coverage_article_target(
+                connection,
+                target_id=target.id,
+                status="failed",
+                attempt_id=attempt_id,
+                failure_category=str(failure.category),
+            )
+
+        maybe_advance_coverage_plan(
+            connection,
+            plan_id=plan.id,
+            run_id=run_id,
+            config=config,
+            policy=policy,
+            now=observed_at,
+        )
+
+    return persist_failure
+
+
+def _title_and_snippets_for_article(
+    connection: sqlite3.Connection,
+    *,
+    plan_id: int,
+    canonical_article_id: int,
+) -> tuple[str | None, list[str]]:
+    """Collect search/feed title and snippets for K28 snippets-only views."""
+    title: str | None = None
+    snippets: list[str] = []
+    seen: set[str] = set()
+
+    rows = connection.execute(
+        """
+        SELECT o.title, o.snippet, o.extra_snippet
+          FROM brave_search_result_occurrence AS o
+          JOIN brave_search_observation AS obs
+            ON obs.id = o.search_observation_id
+          JOIN coverage_query_form AS f
+            ON f.id = obs.query_form_id
+         WHERE f.plan_id = ?
+           AND o.canonical_article_id = ?
+         ORDER BY f.stage, o.rank, o.id
+        """,
+        (plan_id, canonical_article_id),
+    ).fetchall()
+    for row in rows:
+        if title is None and row["title"]:
+            title = str(row["title"]).strip() or None
+        for field in ("snippet", "extra_snippet"):
+            raw = row[field]
+            if not raw:
+                continue
+            text = str(raw).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            snippets.append(text)
+
+    discovery = connection.execute(
+        """
+        SELECT si.title_text, si.summary_text
+          FROM coverage_discovery_article AS d
+          JOIN source_item AS si ON si.id = d.source_item_id
+         WHERE d.plan_id = ?
+           AND d.canonical_article_id = ?
+         LIMIT 1
+        """,
+        (plan_id, canonical_article_id),
+    ).fetchone()
+    if discovery is not None:
+        if title is None and discovery["title_text"]:
+            title = str(discovery["title_text"]).strip() or None
+        summary = discovery["summary_text"]
+        if summary:
+            text = str(summary).strip()
+            if text and text not in seen:
+                seen.add(text)
+                snippets.append(text)
+
+    return title, snippets
 
 
 def _screen_search_results(

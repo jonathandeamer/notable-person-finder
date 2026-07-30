@@ -20,7 +20,9 @@ from notable_person_finder.config.models import DomainProfileConfig, MainConfig
 from notable_person_finder.coverage.screening import load_source_policy
 from notable_person_finder.coverage.service import (
     BRAVE_WEB_SEARCH_TASK_TYPE,
+    FETCH_ARTICLE_TASK_TYPE,
     build_brave_web_search_handler,
+    build_fetch_article_handler,
 )
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.db.migrate import MigrationError, apply_migrations
@@ -51,6 +53,10 @@ from notable_person_finder.people.service import (
     schedule_source_items,
     seed_unresolved_mentions,
     seed_untriaged,
+)
+from notable_person_finder.providers.articles import (
+    HttpxArticleFetcher,
+    TrafilaturaArticleExtractor,
 )
 from notable_person_finder.providers.brave import HttpxBraveWebSearchClient
 from notable_person_finder.providers.feeds import FeedparserClient
@@ -355,8 +361,8 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
             brave_key = loaded.credentials.brave_api_key
             if brave_key is None:
                 raise ConfigLoadError(("brave_api_key is required for run",))
-            # Task 6a: Brave search handler only. fetch_article / assess_article
-            # register in Tasks 6b/7. Coverage seed lands in Task 8.
+            # Task 6b: Brave search + fetch_article. assess_article / coverage
+            # seed land in Tasks 7–8.
             source_policy = load_source_policy(loaded.main.source_policy_file)
             with (
                 build_transport(
@@ -400,6 +406,8 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                     api_key=brave_key,
                     clock=clock,
                 )
+                article_fetcher = HttpxArticleFetcher(transport, clock=clock)
+                article_extractor = TrafilaturaArticleExtractor()
                 on_source_items = _on_source_items_callback(
                     connection,
                     config=loaded.main,
@@ -425,6 +433,13 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                     BRAVE_WEB_SEARCH_TASK_TYPE: build_brave_web_search_handler(
                         connection,
                         client=brave_client,
+                        config=loaded.main,
+                        policy=source_policy,
+                    ),
+                    FETCH_ARTICLE_TASK_TYPE: build_fetch_article_handler(
+                        connection,
+                        fetcher=article_fetcher,
+                        extractor=article_extractor,
                         config=loaded.main,
                         policy=source_policy,
                     ),
