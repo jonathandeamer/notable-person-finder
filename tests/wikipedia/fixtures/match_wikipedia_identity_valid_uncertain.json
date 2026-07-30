@@ -1,0 +1,7 @@
+{
+  "outcome": "uncertain",
+  "selected_page_id": null,
+  "supporting_fact_ids": ["f1"],
+  "conflicting_fact_ids": [],
+  "rationale": "Name aligns but biographical details are insufficient to decide."
+}

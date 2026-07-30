@@ -74,6 +74,7 @@ from notable_person_finder.people.models import (
 )
 from notable_person_finder.people.repository import (
     DETECT_PEOPLE_TASK_TYPE,
+    MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE,
     RECONSIDER_PERSON_ENTITY_TASK_TYPE,
     RESOLVE_PERSON_ENTITY_TASK_TYPE,
     SourceItemRecord,
@@ -474,11 +475,12 @@ def _unused_profile_for_eligibility() -> DomainProfileConfig:
 def models_needed_for_run(
     connection: sqlite3.Connection, run_id: int, config: MainConfig
 ) -> tuple[str, ...]:
-    """Exact models that have dependent work this run (detect and/or resolve)."""
+    """Exact models that have dependent work this run (detect/resolve/match)."""
     del run_id  # reserved: active-work queries are run-global for pending state
     needed: list[str] = []
     detect_model = config.tasks.detect_people.model
     resolve_model = config.tasks.resolve_person_entity.model
+    match_model = config.tasks.match_wikipedia_identity.model
     if _has_usable_untriaged_source_item(connection) or _has_active_detect_work(
         connection
     ):
@@ -487,6 +489,8 @@ def models_needed_for_run(
         connection, config=config
     ) or _has_active_resolve_or_reconsider_work(connection):
         needed.append(resolve_model)
+    if _wikipedia_match_model_needed(connection, config=config):
+        needed.append(match_model)
     return tuple(dict.fromkeys(needed))
 
 
@@ -498,7 +502,20 @@ def task_types_for_model(config: MainConfig, model_id: str) -> tuple[str, ...]:
     if config.tasks.resolve_person_entity.model == model_id:
         types.append(RESOLVE_PERSON_ENTITY_TASK_TYPE)
         types.append(RECONSIDER_PERSON_ENTITY_TASK_TYPE)
+    if config.tasks.match_wikipedia_identity.model == model_id:
+        # HTTP MediaWiki kinds have no model ready gate (K21).
+        types.append(MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE)
     return tuple(types)
+
+
+def _wikipedia_match_model_needed(
+    connection: sqlite3.Connection, *, config: MainConfig
+) -> bool:
+    """K21 match-model inspection arming (lazy import avoids package cycle)."""
+    # Import inside the call: wikipedia.service imports ensure_model_inspections.
+    from notable_person_finder.wikipedia.service import wikipedia_match_model_needed
+
+    return wikipedia_match_model_needed(connection, config=config)
 
 
 def ensure_model_inspections_for_run(
@@ -816,6 +833,7 @@ def _model_id_for_inspection_work(
         (
             config.tasks.detect_people.model,
             config.tasks.resolve_person_entity.model,
+            config.tasks.match_wikipedia_identity.model,
         )
     )
     for model_id in candidates:
@@ -1828,6 +1846,28 @@ def _passages_for_source_item(
     return tuple(passages)
 
 
+def _schedule_wikipedia_after_person_ready(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    run_id: int,
+    config: MainConfig,
+    now: str,
+) -> None:
+    """Lazy join to Wikipedia ensure after person create/link (avoids import cycle)."""
+    from notable_person_finder.wikipedia.service import (
+        schedule_wikipedia_after_person_ready,
+    )
+
+    schedule_wikipedia_after_person_ready(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        config=config,
+        now=now,
+    )
+
+
 def _apply_peer_edges(
     connection: sqlite3.Connection,
     *,
@@ -2000,6 +2040,13 @@ def _write_created_new(
         connection,
         person_id=person_id,
         pre_existing_relation_ids=pre_existing_relation_ids,
+        run_id=run_id,
+        config=config,
+        now=now,
+    )
+    _schedule_wikipedia_after_person_ready(
+        connection,
+        person_id=person_id,
         run_id=run_id,
         config=config,
         now=now,
@@ -2502,6 +2549,13 @@ def _persist_resolution_for(
                 config=config,
                 now=observed_at,
             )
+            _schedule_wikipedia_after_person_ready(
+                connection,
+                person_id=selected,
+                run_id=run_id,
+                config=config,
+                now=observed_at,
+            )
             return
 
         # different_people or uncertain: create a new person.
@@ -2575,6 +2629,13 @@ def _persist_resolution_for(
             connection,
             person_id=person_id,
             pre_existing_relation_ids=pre_existing_relation_ids,
+            run_id=run_id,
+            config=config,
+            now=observed_at,
+        )
+        _schedule_wikipedia_after_person_ready(
+            connection,
+            person_id=person_id,
             run_id=run_id,
             config=config,
             now=observed_at,
@@ -3187,6 +3248,7 @@ def _attempt_confirm_person_merge(
     run_id: int,
     observation_id: int,
     now: str,
+    config: MainConfig,
 ) -> bool:
     """Run ``confirm_person_merge`` and report that a merge was attempted."""
     confirm_person_merge(
@@ -3196,6 +3258,7 @@ def _attempt_confirm_person_merge(
         run_id=run_id,
         observation_id=observation_id,
         now=now,
+        config=config,
     )
     return True
 
@@ -3301,6 +3364,7 @@ def _persist_reconsideration_for(
             run_id=run_id,
             observation_id=er_id,
             now=observed_at,
+            config=config,
         )
         if not merged:
             # Edge stays active if merge is unavailable; fingerprint change

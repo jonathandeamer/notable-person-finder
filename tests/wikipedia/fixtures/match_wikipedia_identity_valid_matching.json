@@ -1,0 +1,7 @@
+{
+  "outcome": "matching_page",
+  "selected_page_id": 101,
+  "supporting_fact_ids": ["f1", "f2"],
+  "conflicting_fact_ids": [],
+  "rationale": "Supplied profession and era align with the candidate biography extract."
+}

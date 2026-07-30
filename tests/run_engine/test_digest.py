@@ -11,6 +11,7 @@ from notable_person_finder.reporting.digest import (
     IdentityRunSummary,
     IngestionSummary,
     PeopleRunSummary,
+    WikipediaRunSummary,
     render_digest,
     write_digest,
 )
@@ -309,6 +310,55 @@ def test_person_identity_section_renders_every_counter_line() -> None:
     # Shared OpenRouter cost stays under Person detection only.
     assert "OpenRouter cost:" in markdown.split("### Person identity", 1)[0]
     assert "OpenRouter cost:" not in section
+
+
+def test_wikipedia_identity_section_renders_every_counter_line() -> None:
+    """Each digest Wikipedia line has a positive control for non-zero values."""
+    wikipedia = WikipediaRunSummary(
+        matching_this_run=1,
+        no_match_this_run=2,
+        uncertain_this_run=3,
+        deterministic_no_match_this_run=4,
+        current_matching=5,
+        current_no_match=6,
+        current_uncertain=7,
+        eligible_remaining=8,
+        without_pointer=9,
+        mediawiki_deferred=10,
+        mediawiki_failed=11,
+        match_model_deferred=12,
+        match_model_failed=13,
+    )
+    markdown = render_digest(
+        report(),
+        local_date="2026-07-25",
+        wikipedia=wikipedia,
+    )
+    section = markdown.split("### Wikipedia identity\n\n", 1)[1]
+    for line in (
+        "Matching page found (this run): 1",
+        "No matching page (this run): 2",
+        "Uncertain identity (this run): 3",
+        "Deterministic no-match (empty complete search): 4",
+        "People with current matching page (corpus): 5",
+        "People with current no-match (corpus): 6",
+        "People with current uncertain identity (corpus): 7",
+        "Wikipedia eligible remaining: 8",
+        "Canonical people without Wikipedia pointer: 9",
+        "MediaWiki work deferred: 10",
+        "MediaWiki work permanently failed: 11",
+        "Match model deferred: 12",
+        "Match model permanently failed: 13",
+    ):
+        assert f"- {line}" in section
+    # K11: no invented coverage-skipped wording.
+    assert "coverage" not in section.lower()
+    assert "skipped" not in section.lower()
+
+
+def test_wikipedia_section_absent_without_summary() -> None:
+    markdown = render_digest(report(), local_date="2026-07-25")
+    assert "### Wikipedia identity" not in markdown
 
 
 def test_digest_ends_with_exactly_one_trailing_newline() -> None:

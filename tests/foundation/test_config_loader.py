@@ -52,6 +52,11 @@ def test_model_settings_are_complete_in_the_redacted_snapshot(tmp_path: Path) ->
             "zdr": True,
         },
     }
+    assert snapshot["main"]["mediawiki"] == {
+        "endpoint": "https://en.wikipedia.org/w/api.php",
+        "maxlag_seconds": 5,
+    }
+    assert "api_key" not in snapshot["main"]["mediawiki"]
     assert snapshot["main"]["tasks"]["detect_people"] == {
         "model": "openai/gpt-5.4-mini",
         "max_input_tokens": 4096,
@@ -77,6 +82,31 @@ def test_model_settings_are_complete_in_the_redacted_snapshot(tmp_path: Path) ->
         "max_candidates": 8,
         "max_facts_per_candidate": 12,
         "max_names_per_candidate": 8,
+        "max_title_characters": 500,
+        "max_summary_characters": 4000,
+    }
+    assert snapshot["main"]["tasks"]["match_wikipedia_identity"] == {
+        "model": "openai/gpt-5.4-mini",
+        "max_input_tokens": 4096,
+        "max_completion_tokens": 1024,
+        "parameters": {
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "reasoning_effort": "low",
+        },
+        "max_candidates": 8,
+        "max_query_forms": 6,
+        "search_srlimit": 10,
+        "max_continuations_per_form": 1,
+        "max_search_hits_per_form": 20,
+        "max_page_ids_per_facts_request": 20,
+        "max_redirect_hops": 3,
+        "max_fact_pages_per_plan": 40,
+        "max_extract_characters": 1200,
+        "max_categories_per_page": 20,
+        "max_names_in_prompt": 8,
+        "max_facts_in_prompt": 16,
+        "refresh_interval_hours": 720,
         "max_title_characters": 500,
         "max_summary_characters": 4000,
     }
@@ -106,12 +136,59 @@ def test_model_settings_are_complete_in_the_redacted_snapshot(tmp_path: Path) ->
         ("max_names_per_candidate = 8", "max_names_per_candidate = 12"),
         ("max_title_characters = 500", "max_title_characters = 600"),
         ("max_summary_characters = 4000", "max_summary_characters = 5000"),
+        ("max_query_forms = 6", "max_query_forms = 8"),
+        ("search_srlimit = 10", "search_srlimit = 20"),
+        ("max_continuations_per_form = 1", "max_continuations_per_form = 2"),
+        ("max_search_hits_per_form = 20", "max_search_hits_per_form = 30"),
+        ("max_page_ids_per_facts_request = 20", "max_page_ids_per_facts_request = 30"),
+        ("max_redirect_hops = 3", "max_redirect_hops = 4"),
+        ("max_fact_pages_per_plan = 40", "max_fact_pages_per_plan = 50"),
+        ("max_extract_characters = 1200", "max_extract_characters = 1500"),
+        ("max_categories_per_page = 20", "max_categories_per_page = 25"),
+        ("max_names_in_prompt = 8", "max_names_in_prompt = 10"),
+        ("max_facts_in_prompt = 16", "max_facts_in_prompt = 20"),
+        ("refresh_interval_hours = 720", "refresh_interval_hours = 168"),
     ],
 )
 def test_each_model_setting_changes_the_configuration_fingerprint(
     tmp_path: Path, old: str, new: str
 ) -> None:
     first_file = write_graph(tmp_path)
+    environment = {"TEST_OPENROUTER": "first-key", "TEST_BRAVE": "brave-key"}
+    first = load_config(first_file, environ=environment)
+    first_file.write_text(
+        first_file.read_text(encoding="utf-8").replace(old, new),
+        encoding="utf-8",
+    )
+
+    second = load_config(first_file, environ=environment)
+
+    assert first.fingerprint != second.fingerprint
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            'endpoint = "https://en.wikipedia.org/w/api.php"',
+            'endpoint = "https://wiki.example/w/api.php"',
+        ),
+        ("maxlag_seconds = 5", "maxlag_seconds = 9"),
+    ],
+)
+def test_each_mediawiki_setting_changes_the_configuration_fingerprint(
+    tmp_path: Path, old: str, new: str
+) -> None:
+    first_file = write_graph(tmp_path)
+    # Defaults are implicit; materialise the section so replacements bind.
+    text = first_file.read_text(encoding="utf-8")
+    if "[mediawiki]" not in text:
+        text = text + (
+            "\n[mediawiki]\n"
+            'endpoint = "https://en.wikipedia.org/w/api.php"\n'
+            "maxlag_seconds = 5\n"
+        )
+        first_file.write_text(text, encoding="utf-8")
     environment = {"TEST_OPENROUTER": "first-key", "TEST_BRAVE": "brave-key"}
     first = load_config(first_file, environ=environment)
     first_file.write_text(

@@ -1,0 +1,32 @@
+{
+  "batchcomplete": true,
+  "continue": {
+    "sroffset": 2,
+    "continue": "-||"
+  },
+  "query": {
+    "searchinfo": {
+      "totalhits": 42
+    },
+    "search": [
+      {
+        "ns": 0,
+        "title": "Ada Lovelace",
+        "pageid": 101,
+        "size": 5000,
+        "wordcount": 800,
+        "snippet": "Augusta <span class=\"searchmatch\">Ada</span> King, Countess of Lovelace",
+        "timestamp": "2026-01-15T12:00:00Z"
+      },
+      {
+        "ns": 0,
+        "title": "Ada (programming language)",
+        "pageid": 102,
+        "size": 3000,
+        "wordcount": 400,
+        "snippet": "Ada is a structured programming language",
+        "timestamp": "2026-02-01T08:30:00Z"
+      }
+    ]
+  }
+}

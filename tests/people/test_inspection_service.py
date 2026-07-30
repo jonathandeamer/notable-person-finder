@@ -12,6 +12,8 @@ from notable_person_finder.config.models import (
     DetectPeopleConfig,
     DomainProfileConfig,
     MainConfig,
+    MatchWikipediaIdentityConfig,
+    MediaWikiConfig,
     OpenRouterConfig,
     ProviderRoutingConfig,
     ResolvePersonEntityConfig,
@@ -1242,6 +1244,74 @@ def test_task_types_for_model_maps_detect_and_resolve_separately() -> None:
         RECONSIDER_PERSON_ENTITY_TASK_TYPE,
     )
     assert task_types_for_model(split, "openai/gpt-other") == ()
+
+
+def test_multi_model_inspect_when_only_wikipedia_backlog(
+    connection: sqlite3.Connection,
+) -> None:
+    """K21: active Wikipedia plan arms only the match model (no detect/resolve)."""
+    from notable_person_finder.people.identity import insert_person, upsert_sourced_name
+    from notable_person_finder.wikipedia.repository import open_plan
+    from notable_person_finder.wikipedia.service import (
+        MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE,
+    )
+
+    match_model = "openai/gpt-match-only"
+    run_id = insert_run(connection)
+    with immediate(connection):
+        person_id = insert_person(
+            connection,
+            run_id=run_id,
+            display_name="Alex Smith",
+            identity_fingerprint="c" * 64,
+            created_at=NOW,
+        )
+        upsert_sourced_name(
+            connection,
+            person_id=person_id,
+            exact_name="Alex Smith",
+            kind="professional",
+            origin_kind="manual",
+            origin_mention_id=None,
+            observed_at=NOW,
+        )
+        open_plan(
+            connection,
+            person_id=person_id,
+            run_id=run_id,
+            material_fingerprint="d" * 64,
+            created_at=NOW,
+        )
+    config = MainConfig(
+        schema_version=1,
+        timezone="Europe/Paris",
+        feeds_file=Path("feeds.toml"),
+        domain_profile_file=Path("profiles/art.toml"),
+        budget=BudgetConfig(openrouter_usd_per_run=None),
+        openrouter=OpenRouterConfig(routing=ProviderRoutingConfig()),
+        mediawiki=MediaWikiConfig(),
+        tasks=TasksConfig(
+            detect_people=DetectPeopleConfig(model=MODEL),
+            resolve_person_entity=ResolvePersonEntityConfig(model=RESOLVE_MODEL),
+            match_wikipedia_identity=MatchWikipediaIdentityConfig(model=match_model),
+        ),
+    )
+    assert models_needed_for_run(connection, run_id, config) == (match_model,)
+    ensured = ensure_model_inspections_for_run(
+        connection, run_id=run_id, config=config, now=NOW
+    )
+    assert ensured == 1
+    assert task_types_for_model(config, match_model) == (
+        MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE,
+    )
+    pending = connection.execute(
+        """
+        SELECT COUNT(*) AS n FROM work_item
+         WHERE task_type = ? AND state = 'pending'
+        """,
+        (INSPECT_MODEL_TASK_TYPE,),
+    ).fetchone()["n"]
+    assert pending == 1
 
 
 def test_permanent_resolve_preflight_writes_failed_er_with_inspection_attempt(

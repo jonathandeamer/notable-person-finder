@@ -193,6 +193,30 @@ class OpenRouterConfig(_StrictConfigurationModel):
         return value
 
 
+class MediaWikiConfig(_StrictConfigurationModel):
+    """Public MediaWiki Action API endpoint settings (no authentication secret)."""
+
+    endpoint: str = "https://en.wikipedia.org/w/api.php"
+    maxlag_seconds: int = Field(default=5, strict=True, ge=0, le=120)
+
+    @field_validator("endpoint")
+    @classmethod
+    def public_https_endpoint(cls, value: str) -> str:
+        if any(character.isspace() for character in value):
+            raise ValueError("endpoint must not contain whitespace")
+        validate_public_http_url(value)
+        parsed = urlsplit(value)
+        try:
+            _ = parsed.port
+        except ValueError as error:
+            raise ValueError("endpoint must contain a valid port") from error
+        if parsed.scheme != "https":
+            raise ValueError("must use HTTPS")
+        if parsed.query or parsed.fragment:
+            raise ValueError("endpoint must not contain a query or fragment")
+        return value
+
+
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
 
 
@@ -267,9 +291,49 @@ class ResolvePersonEntityConfig(_StrictConfigurationModel):
         return self
 
 
+class MatchWikipediaIdentityConfig(_StrictConfigurationModel):
+    model: str = "openai/gpt-5.4-mini"
+    max_input_tokens: int = Field(default=4096, strict=True, ge=1, le=1_000_000)
+    max_completion_tokens: int = Field(default=1024, strict=True, ge=1, le=100_000)
+    parameters: GenerationParameters = GenerationParameters()
+    max_candidates: int = Field(default=8, strict=True, ge=1, le=16)
+    max_query_forms: int = Field(default=6, strict=True, ge=1, le=16)
+    search_srlimit: int = Field(default=10, strict=True, ge=1, le=50)
+    max_continuations_per_form: int = Field(default=1, strict=True, ge=0, le=5)
+    max_search_hits_per_form: int = Field(default=20, strict=True, ge=1, le=100)
+    max_page_ids_per_facts_request: int = Field(default=20, strict=True, ge=1, le=50)
+    max_redirect_hops: int = Field(default=3, strict=True, ge=1, le=5)
+    max_fact_pages_per_plan: int = Field(default=40, strict=True, ge=1, le=100)
+    max_extract_characters: int = Field(default=1200, strict=True, ge=1, le=20_000)
+    max_categories_per_page: int = Field(default=20, strict=True, ge=1, le=100)
+    max_names_in_prompt: int = Field(default=8, strict=True, ge=1, le=32)
+    max_facts_in_prompt: int = Field(default=16, strict=True, ge=1, le=64)
+    refresh_interval_hours: int = Field(default=720, strict=True, ge=1, le=87_600)
+    max_title_characters: int = Field(default=500, strict=True, ge=1, le=2000)
+    max_summary_characters: int = Field(default=4000, strict=True, ge=1, le=20_000)
+
+    @field_validator("model")
+    @classmethod
+    def exact_model_slug(cls, value: str) -> str:
+        return _exact_model_slug(value)
+
+    @model_validator(mode="after")
+    def bounds_are_compatible(self) -> MatchWikipediaIdentityConfig:
+        if self.max_completion_tokens >= self.max_input_tokens:
+            raise ValueError("max_completion_tokens must be less than max_input_tokens")
+        if self.max_summary_characters < self.max_title_characters:
+            raise ValueError(
+                "max_summary_characters must be at least max_title_characters"
+            )
+        return self
+
+
 class TasksConfig(_StrictConfigurationModel):
     detect_people: DetectPeopleConfig = DetectPeopleConfig()
     resolve_person_entity: ResolvePersonEntityConfig = ResolvePersonEntityConfig()
+    match_wikipedia_identity: MatchWikipediaIdentityConfig = (
+        MatchWikipediaIdentityConfig()
+    )
 
 
 class DigestConfig(StrictModel):
@@ -294,6 +358,7 @@ class MainConfig(StrictModel):
     pacing: PacingConfig = PacingConfig()
     budget: BudgetConfig = BudgetConfig()
     openrouter: OpenRouterConfig = OpenRouterConfig()
+    mediawiki: MediaWikiConfig = MediaWikiConfig()
     tasks: TasksConfig = TasksConfig()
     digest: DigestConfig = DigestConfig()
     logging: LoggingConfig = LoggingConfig()

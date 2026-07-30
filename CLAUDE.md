@@ -22,11 +22,12 @@ tasks already recorded complete.
 
 ## What Is Actually Built
 
-Five milestones are complete: the application foundation, the run engine and
+Six milestones are complete: the application foundation, the run engine and
 shared transport, feed ingestion, the OpenRouter model gateway with person
-detection (3b1), and durable person identity with first-pass resolution,
-reconsideration, and confirmed merges (3b2). A cold-starting agent should
-assume nothing beyond this list.
+detection (3b1), durable person identity with first-pass resolution,
+reconsideration, and confirmed merges (3b2), and Wikipedia identity matching
+with MediaWiki retrieval and semantic match (milestone 4). A cold-starting
+agent should assume nothing beyond this list.
 
 Delivered and usable:
 
@@ -56,6 +57,14 @@ Delivered and usable:
   with lower-id survivors and canonical work reconciliation.
 - Separate bounded HTTP and LLM worker pools that may overlap; workers never
   access SQLite.
+- MediaWiki adapter (`search_pages`, `get_page_facts`) with shared transport,
+  pacing, maxlag, and no auth secret; durable pages, query plans, search
+  observations, page-fact batches, and Wikipedia identity observations with
+  outcomes `matching_page_found`, `no_matching_page_found`, and
+  `uncertain_identity`; person current Wikipedia pointer; work kinds
+  `mediawiki_search`, `mediawiki_page_facts`, and `match_wikipedia_identity`;
+  deterministic empty complete search no-match; refresh, merge reconcile, and
+  Wikipedia counters on digest and `notable status`.
 
 Delivered only in part — do not describe these as finished:
 
@@ -80,9 +89,9 @@ Delivered only in part — do not describe these as finished:
 
 Not built at all, so do not document, import, or assume any of it:
 
-- MediaWiki, web search, article fetch and extraction adapters.
-- Wikipedia observations, coverage research, assessments, ranking, synthesis,
-  drafting, or the digest queue.
+- Brave web search, article fetch and extraction adapters.
+- Coverage research, assessments, ranking, synthesis, drafting, or the digest
+  queue.
 - `notable digest show`, `notable audit run`, `notable audit person`.
 
 Known gaps carried forward, recorded so a later change does not mistake them
@@ -113,14 +122,16 @@ for regressions:
   - `runs/` — run engine, clock, repository, work-item scheduling, retry
     coordination, budget reservation, and the mutation lock.
   - `providers/` — the shared HTTP transport, request safety checks, pacing,
-    provider failure classification, the feedparser-backed feed adapter, and
-    the OpenRouter client. This is the only package that may import `httpx` or
+    provider failure classification, the feedparser-backed feed adapter, the MediaWiki client, and the
+    OpenRouter client. This is the only package that may import `httpx` or
     the OpenRouter SDK.
   - `ingestion/` — feed seeding and handling, URL identity, domain models, and
     transaction-neutral persistence helpers for ingestion settlements.
   - `people/` — detection and identity: triage, first-pass resolution,
     reconsideration, confirmed merges, candidate retrieval, prompts, and
     domain validation.
+  - `wikipedia/` — MediaWiki query plans, candidate assembly, identity
+    observations, match handler, seed/merge hooks.
   - `obs/` — redacting structured logging.
   - `reporting/` — the daily digest writer.
 - `tests/foundation/` — application-foundation tests.
@@ -129,6 +140,9 @@ for regressions:
   and opt-in live-smoke tests.
 - `tests/people/` — OpenRouter adapter, detection service, repository, CLI
   integration, cross-component seams, and opt-in OpenRouter live-smoke tests.
+- `tests/wikipedia/` — MediaWiki adapter, schema, queries/candidates, match
+  contract, HTTP and match handlers, seed/merge hooks, digest/status, CLI
+  seams, and opt-in MediaWiki/OpenRouter live-smoke tests.
 - `docs/architecture/at-least-once-execution.md` — the operator-facing note on
   the crash windows in which a paid provider call can be repeated. Point at it
   rather than restating it.
@@ -181,13 +195,17 @@ reviewable and executable.
 - For completed feed ingestion, use `uv run pytest tests/ingestion`.
 - For completed model gateway, detection, and durable person identity, use
   `uv run pytest tests/people`.
-- The five completed milestones together gate with
-  `uv run pytest tests/foundation tests/run_engine tests/ingestion tests/people`.
+- For completed Wikipedia identity matching, use
+  `uv run pytest tests/wikipedia`.
+- The six completed milestones together gate with
+  `uv run pytest tests/foundation tests/run_engine tests/ingestion tests/people tests/wikipedia`.
   Run it from a real checkout: it needs the tracked `config/` directory.
   Default pytest `addopts` deselect `live`. Opt-in live smokes:
   - feeds: `uv run pytest tests/ingestion -m live -v`
   - OpenRouter (detect + resolve):
     `OPENROUTER_API_KEY=… uv run pytest tests/people -m live -v`
+  - MediaWiki + match OpenRouter:
+    `uv run pytest tests/wikipedia -m live -v` (OpenRouter key for match smoke)
 - Exercise the installed interface with `uv run notable ...`.
 - Keep default rewrite verification offline and isolate configuration and
   storage with temporary paths.
