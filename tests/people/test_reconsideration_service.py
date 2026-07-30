@@ -826,6 +826,124 @@ def test_subject_is_fingerprint_changed_side(
     assert prepared.resolve_input.candidates[0].person_id == person_b
 
 
+def test_subject_is_higher_person_when_higher_is_trigger(
+    connection: sqlite3.Connection,
+) -> None:
+    """Discriminating case: higher person_id is the fingerprint-changed side.
+
+    Killing this would leave only the lower-id default and pass the lower-trigger
+    test without implementing subject = changed side.
+    """
+    (
+        run_id,
+        attempt_id,
+        inspection_id,
+        mention_a,
+        person_a,
+        person_b,
+        relation_id,
+    ) = _two_people_with_edge(connection)
+    del inspection_id
+    assert person_b > person_a
+    mention_b = connection.execute(
+        """
+        SELECT id FROM person_mention
+         WHERE person_id = ?
+         ORDER BY id DESC LIMIT 1
+        """,
+        (person_b,),
+    ).fetchone()
+    assert mention_b is not None
+    mention_b_id = int(mention_b["id"])
+    assert mention_b_id != mention_a
+
+    config = _main_config()
+    profile = _profile()
+    with immediate(connection):
+        recompute_identity_fingerprint(connection, person_a)
+        recompute_identity_fingerprint(connection, person_b)
+        # Trigger side is the *higher* person id.
+        maybe_schedule_reconsideration_for_person(
+            connection,
+            person_id=person_b,
+            pre_existing_relation_ids=frozenset({relation_id}),
+            run_id=run_id,
+            config=config,
+            now=NOW,
+        )
+
+    handler = build_reconsideration_handler(
+        connection,
+        client=ScriptedLlmClient(inspection=_compatible_inspection()),
+        config=config,
+        profile=profile,
+    )
+    work_row = connection.execute(
+        """
+        SELECT id, fingerprint FROM work_item
+         WHERE task_type = ? AND subject_id = ?
+        """,
+        (RECONSIDER_PERSON_ENTITY_TASK_TYPE, relation_id),
+    ).fetchone()
+    assert work_row is not None
+    # Fingerprint must encode higher as subject (not lower-id default).
+    expected_fp = reconsider_task_fingerprint(
+        person_relation_id=relation_id,
+        subject_identity_fingerprint=connection.execute(
+            "SELECT identity_fingerprint FROM person WHERE id = ?",
+            (person_b,),
+        ).fetchone()["identity_fingerprint"],
+        peer_identity_fingerprint=connection.execute(
+            "SELECT identity_fingerprint FROM person WHERE id = ?",
+            (person_a,),
+        ).fetchone()["identity_fingerprint"],
+        config=config.tasks.resolve_person_entity,
+    )
+    assert work_row["fingerprint"] == expected_fp
+
+    routing_fp = routing_fingerprint(config.openrouter.routing)
+    connection.execute(
+        """
+        INSERT INTO model_inspection (
+            run_id, attempt_id, configured_model_id, resolved_model_id,
+            routing_fingerprint, supported_parameters_json,
+            supports_strict_structured_output, pricing_usable,
+            prompt_unit_price_nano_usd, completion_unit_price_nano_usd,
+            compatibility, inspected_at
+        ) VALUES (?, ?, ?, ?, ?,
+                  '["response_format"]', 1, 1, 100, 200, 'compatible', ?)
+        """,
+        (run_id, attempt_id, MODEL, MODEL, routing_fp, NOW),
+    )
+    connection.execute(
+        """
+        UPDATE work_item
+           SET state = 'running', claimed_by_run_id = ?, updated_at = ?
+         WHERE id = ?
+        """,
+        (run_id, NOW, work_row["id"]),
+    )
+    connection.commit()
+    work_item = WorkItem(
+        id=int(work_row["id"]),
+        task_type=RECONSIDER_PERSON_ENTITY_TASK_TYPE,
+        subject_kind="person_relation",
+        subject_id=relation_id,
+        fingerprint=work_row["fingerprint"],
+        required=True,
+        priority=RECONSIDER_PERSON_PRIORITY,
+        state=WorkState.RUNNING,
+    )
+    assert handler.prepare is not None
+    prepared = cast(Any, handler.prepare(work_item).payload)
+    assert prepared is not None
+    assert prepared.subject_person_id == person_b
+    assert prepared.peer_person_id == person_a
+    assert prepared.resolve_input.person_mention_id == mention_b_id
+    assert len(prepared.resolve_input.candidates) == 1
+    assert prepared.resolve_input.candidates[0].person_id == person_a
+
+
 def test_dismiss_outcome_dismisses_edge(connection: sqlite3.Connection) -> None:
     (
         run_id,
@@ -1024,6 +1142,97 @@ def test_same_person_guardrails_fail_leaves_edge_active(
         ).fetchone()["n"]
         == 0
     )
+
+
+def test_same_person_guardrails_pass_ready_to_merge(
+    connection: sqlite3.Connection,
+) -> None:
+    """K18 positive path: guardrails pass ⇒ ready-to-merge note; edge stays active.
+
+    Both sides have non-name facts; model returns same_person for the peer with
+    a validated supporting fact id. Task 8 merge is not present, so no merge
+    relation is written and created_person_id stays NULL (K22).
+    """
+    (
+        run_id,
+        _a,
+        _i,
+        _m,
+        person_a,
+        person_b,
+        relation_id,
+    ) = _two_people_with_edge(connection)
+    config = _main_config()
+    profile = _profile()
+    with immediate(connection):
+        recompute_identity_fingerprint(connection, person_a)
+        recompute_identity_fingerprint(connection, person_b)
+        maybe_schedule_reconsideration_for_person(
+            connection,
+            person_id=person_a,
+            pre_existing_relation_ids=frozenset({relation_id}),
+            run_id=run_id,
+            config=config,
+            now=NOW,
+        )
+
+    # Subject mention non-name fact local_id is "fact-1" (see _two_people_with_edge).
+    client = ScriptedLlmClient(
+        inspection=_compatible_inspection(),
+        generate_results=[
+            _generation_result(
+                _resolve_output(
+                    outcome="same_person",
+                    selected_person_id=person_b,
+                    supporting=("fact-1",),
+                )
+            )
+        ],
+    )
+
+    def seed(engine_run_id: int) -> None:
+        ensure_model_inspections_for_run(
+            connection, run_id=engine_run_id, config=config, now=NOW
+        )
+
+    _run_engine(connection, _handlers(connection, client, config, profile), seed=seed)
+
+    relation = connection.execute(
+        "SELECT status FROM person_relation WHERE id = ?", (relation_id,)
+    ).fetchone()
+    assert relation is not None
+    assert relation["status"] == "active"
+    er = connection.execute(
+        """
+        SELECT semantic_outcome, created_person_id, rationale, selected_person_id,
+               person_mention_id
+          FROM entity_resolution_observation
+         WHERE person_relation_id = ?
+         ORDER BY id DESC LIMIT 1
+        """,
+        (relation_id,),
+    ).fetchone()
+    assert er is not None
+    assert er["semantic_outcome"] == "same_person"
+    assert er["created_person_id"] is None
+    assert er["person_mention_id"] is None
+    assert er["selected_person_id"] == person_b
+    assert READY_TO_MERGE_NOTE.strip() in er["rationale"]
+    assert MERGE_GUARDRAILS_FAILED_NOTE not in er["rationale"]
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) AS n FROM person_relation WHERE kind = 'merge'"
+        ).fetchone()["n"]
+        == 0
+    )
+    # Both people remain canonical (no merge applied).
+    for person_id in (person_a, person_b):
+        row = connection.execute(
+            "SELECT merged_into_person_id FROM person WHERE id = ?",
+            (person_id,),
+        ).fetchone()
+        assert row is not None
+        assert row["merged_into_person_id"] is None
 
 
 def test_missing_peer_prepare_refuse(connection: sqlite3.Connection) -> None:
