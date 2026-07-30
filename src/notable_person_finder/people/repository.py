@@ -32,7 +32,11 @@ if TYPE_CHECKING:
     from notable_person_finder.people.identity import match_key as match_key
 
 DETECT_PEOPLE_TASK_TYPE = "detect_people"
+RESOLVE_PERSON_ENTITY_TASK_TYPE = "resolve_person_entity"
+RECONSIDER_PERSON_ENTITY_TASK_TYPE = "reconsider_person_entity"
 _SUBJECT_KIND_SOURCE_ITEM = "source_item"
+_SUBJECT_KIND_PERSON_MENTION = "person_mention"
+_SUBJECT_KIND_PERSON_RELATION = "person_relation"
 
 # Leading honorifics stripped only for the mechanical search form. Exact names
 # remain source-written. The list is deliberately small and text-grounded; it
@@ -873,6 +877,132 @@ def triage_run_counts(
     )
 
 
+def settle_active_tasks_after_permanent_preflight(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    attempt_id: int,
+    model_inspection_id: int | None,
+    model_id: str,
+    failure_category: str,
+    rationale: str,
+    task_types: tuple[str, ...],
+    now: str,
+    detect_prompt_hash: str | None = None,
+    detect_schema_hash: str | None = None,
+    detect_schema_version: int | None = None,
+    resolve_prompt_hash: str | None = None,
+    resolve_schema_hash: str | None = None,
+    resolve_schema_version: int | None = None,
+) -> int:
+    """Fail active work for ``task_types`` after permanent preflight loss (K23).
+
+    When the caller already holds a transaction (the inspection handler's
+    ``persist`` / ``persist_failure`` path inside ``complete_work``), joins
+    that transaction so domain rows and settlement commit together. Otherwise
+    owns a brief ``BEGIN IMMEDIATE``.
+
+    For each active work item of a mapped task type:
+
+    * ``detect_people`` (subject source item): ensure a failed triage
+      observation for that material fingerprint (reuse on unique conflict).
+    * ``resolve_person_entity`` (subject person mention): ensure a failed ER
+      with the **inspection** ``attempt_id`` (reuse on unique conflict); point
+      the mention's current ER when needed; leave ``person_id`` NULL.
+    * ``reconsider_person_entity`` (subject person relation): ensure a failed
+      relation-scoped ER (reuse on conflict); do not change edge status.
+
+    Does not insert ``generate_structured`` attempts. Dependent handlers'
+    ``persist_failure`` never runs on this path.
+    """
+    del model_id  # reserved for diagnostics / future task→model filtering
+    owns_transaction = not connection.in_transaction
+    if owns_transaction:
+        connection.execute("BEGIN IMMEDIATE")
+    try:
+        settled = 0
+        for task_type in task_types:
+            if task_type == DETECT_PEOPLE_TASK_TYPE:
+                if (
+                    detect_prompt_hash is None
+                    or detect_schema_hash is None
+                    or detect_schema_version is None
+                ):
+                    raise ValueError(
+                        "detect prompt/schema hashes are required to settle "
+                        "detect_people after permanent preflight"
+                    )
+                settled += _settle_active_detect_people(
+                    connection,
+                    run_id=run_id,
+                    attempt_id=attempt_id,
+                    model_inspection_id=model_inspection_id,
+                    failure_category=failure_category,
+                    rationale=rationale,
+                    prompt_hash=detect_prompt_hash,
+                    schema_hash=detect_schema_hash,
+                    schema_version=detect_schema_version,
+                    now=now,
+                )
+            elif task_type == RESOLVE_PERSON_ENTITY_TASK_TYPE:
+                if (
+                    resolve_prompt_hash is None
+                    or resolve_schema_hash is None
+                    or resolve_schema_version is None
+                ):
+                    raise ValueError(
+                        "resolve prompt/schema hashes are required to settle "
+                        "resolve_person_entity after permanent preflight"
+                    )
+                settled += _settle_active_resolve_person_entity(
+                    connection,
+                    run_id=run_id,
+                    attempt_id=attempt_id,
+                    model_inspection_id=model_inspection_id,
+                    failure_category=failure_category,
+                    rationale=rationale,
+                    prompt_hash=resolve_prompt_hash,
+                    schema_hash=resolve_schema_hash,
+                    schema_version=resolve_schema_version,
+                    now=now,
+                )
+            elif task_type == RECONSIDER_PERSON_ENTITY_TASK_TYPE:
+                if (
+                    resolve_prompt_hash is None
+                    or resolve_schema_hash is None
+                    or resolve_schema_version is None
+                ):
+                    raise ValueError(
+                        "resolve prompt/schema hashes are required to settle "
+                        "reconsider_person_entity after permanent preflight"
+                    )
+                settled += _settle_active_reconsider_person_entity(
+                    connection,
+                    run_id=run_id,
+                    attempt_id=attempt_id,
+                    model_inspection_id=model_inspection_id,
+                    failure_category=failure_category,
+                    rationale=rationale,
+                    prompt_hash=resolve_prompt_hash,
+                    schema_hash=resolve_schema_hash,
+                    schema_version=resolve_schema_version,
+                    now=now,
+                )
+            else:
+                raise ValueError(
+                    f"unsupported task_type for permanent-preflight settlement: "
+                    f"{task_type}"
+                )
+    except BaseException:
+        if owns_transaction:
+            connection.rollback()
+        raise
+    else:
+        if owns_transaction:
+            connection.commit()
+    return settled
+
+
 def settle_active_detect_people_after_permanent_preflight(
     connection: sqlite3.Connection,
     *,
@@ -887,104 +1017,299 @@ def settle_active_detect_people_after_permanent_preflight(
 ) -> int:
     """Fail pending/deferred ``detect_people`` work after permanent preflight loss.
 
-    When the caller already holds a transaction (the inspection handler's
-    ``persist`` / ``persist_failure`` path inside ``complete_work``), joins
-    that transaction so domain rows and settlement commit together. Otherwise
-    owns a brief ``BEGIN IMMEDIATE``.
-
-    For each active detection work item whose subject is a source item, ensures
-    a failed triage observation exists for that material fingerprint (reusing
-    any existing row so a unique-key collision cannot abort the batch), points
-    the source item at it when needed, and settles the work item
-    ``failed_permanent``. Does not insert ``generate_structured`` attempts.
+    Backward-compatible wrapper around
+    :func:`settle_active_tasks_after_permanent_preflight`.
     """
-    owns_transaction = not connection.in_transaction
-    if owns_transaction:
-        connection.execute("BEGIN IMMEDIATE")
-    try:
-        rows = connection.execute(
-            """
-            SELECT id, subject_id, fingerprint
-              FROM work_item
-             WHERE task_type = ?
-               AND subject_kind = ?
-               AND subject_id IS NOT NULL
-               AND state IN ('pending', 'deferred')
-             ORDER BY id
-            """,
-            (DETECT_PEOPLE_TASK_TYPE, _SUBJECT_KIND_SOURCE_ITEM),
-        ).fetchall()
-        settled = 0
-        for row in rows:
-            work_item_id = int(row["id"])
-            source_item_id = int(row["subject_id"])
-            task_fingerprint = row["fingerprint"]
-            existing = load_triage_observation_by_fingerprint(
+    return settle_active_tasks_after_permanent_preflight(
+        connection,
+        run_id=run_id,
+        attempt_id=attempt_id,
+        model_inspection_id=None,
+        model_id="",
+        failure_category=failure_category,
+        rationale=rationale,
+        task_types=(DETECT_PEOPLE_TASK_TYPE,),
+        now=now,
+        detect_prompt_hash=prompt_hash,
+        detect_schema_hash=schema_hash,
+        detect_schema_version=schema_version,
+    )
+
+
+def _settle_work_item_failed_permanent(
+    connection: sqlite3.Connection,
+    *,
+    work_item_id: int,
+    run_id: int,
+    rationale: str,
+    now: str,
+    task_label: str,
+) -> None:
+    changed = connection.execute(
+        """
+        UPDATE work_item
+           SET state = 'failed_permanent',
+               reason = ?,
+               completed_by_run_id = ?,
+               claimed_by_run_id = NULL,
+               updated_at = ?
+         WHERE id = ?
+           AND state IN ('pending', 'deferred')
+        """,
+        (rationale, run_id, now, work_item_id),
+    ).rowcount
+    if changed != 1:
+        raise RuntimeError(
+            f"work item {work_item_id} is not active {task_label} work "
+            f"that run-{run_id} may settle"
+        )
+
+
+def _settle_active_detect_people(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    attempt_id: int,
+    model_inspection_id: int | None,
+    failure_category: str,
+    rationale: str,
+    prompt_hash: str,
+    schema_hash: str,
+    schema_version: int,
+    now: str,
+) -> int:
+    rows = connection.execute(
+        """
+        SELECT id, subject_id, fingerprint
+          FROM work_item
+         WHERE task_type = ?
+           AND subject_kind = ?
+           AND subject_id IS NOT NULL
+           AND state IN ('pending', 'deferred')
+         ORDER BY id
+        """,
+        (DETECT_PEOPLE_TASK_TYPE, _SUBJECT_KIND_SOURCE_ITEM),
+    ).fetchall()
+    settled = 0
+    for row in rows:
+        work_item_id = int(row["id"])
+        source_item_id = int(row["subject_id"])
+        task_fingerprint = row["fingerprint"]
+        existing = load_triage_observation_by_fingerprint(
+            connection,
+            source_item_id=source_item_id,
+            task_fingerprint=task_fingerprint,
+        )
+        if existing is None:
+            insert_failed_observation(
                 connection,
                 source_item_id=source_item_id,
+                run_id=run_id,
+                attempt_id=attempt_id,
+                model_inspection_id=model_inspection_id,
+                failure_category=failure_category,
+                canonical_supplied_input_json="{}",
+                prompt_hash=prompt_hash,
+                schema_hash=schema_hash,
+                schema_version=schema_version,
                 task_fingerprint=task_fingerprint,
+                input_truncated=False,
+                observed_at=now,
+                rationale=rationale,
             )
-            if existing is None:
-                insert_failed_observation(
+        else:
+            current = connection.execute(
+                """
+                SELECT current_triage_observation_id
+                  FROM source_item
+                 WHERE id = ?
+                """,
+                (source_item_id,),
+            ).fetchone()
+            if (
+                current is None
+                or current["current_triage_observation_id"] != existing.id
+            ):
+                _set_current_triage_observation(
                     connection,
                     source_item_id=source_item_id,
-                    run_id=run_id,
-                    attempt_id=attempt_id,
-                    model_inspection_id=None,
-                    failure_category=failure_category,
-                    canonical_supplied_input_json="{}",
-                    prompt_hash=prompt_hash,
-                    schema_hash=schema_hash,
-                    schema_version=schema_version,
-                    task_fingerprint=task_fingerprint,
-                    input_truncated=False,
-                    observed_at=now,
-                    rationale=rationale,
+                    observation_id=existing.id,
                 )
-            else:
-                current = connection.execute(
-                    """
-                    SELECT current_triage_observation_id
-                      FROM source_item
-                     WHERE id = ?
-                    """,
-                    (source_item_id,),
-                ).fetchone()
-                if (
-                    current is None
-                    or current["current_triage_observation_id"] != existing.id
-                ):
-                    _set_current_triage_observation(
-                        connection,
-                        source_item_id=source_item_id,
-                        observation_id=existing.id,
-                    )
-            changed = connection.execute(
-                """
-                UPDATE work_item
-                   SET state = 'failed_permanent',
-                       reason = ?,
-                       completed_by_run_id = ?,
-                       claimed_by_run_id = NULL,
-                       updated_at = ?
-                 WHERE id = ?
-                   AND state IN ('pending', 'deferred')
-                """,
-                (rationale, run_id, now, work_item_id),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError(
-                    f"work item {work_item_id} is not active detect_people work "
-                    f"that run-{run_id} may settle"
-                )
-            settled += 1
-    except BaseException:
-        if owns_transaction:
-            connection.rollback()
-        raise
-    else:
-        if owns_transaction:
-            connection.commit()
+        _settle_work_item_failed_permanent(
+            connection,
+            work_item_id=work_item_id,
+            run_id=run_id,
+            rationale=rationale,
+            now=now,
+            task_label=DETECT_PEOPLE_TASK_TYPE,
+        )
+        settled += 1
+    return settled
+
+
+def _settle_active_resolve_person_entity(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    attempt_id: int,
+    model_inspection_id: int | None,
+    failure_category: str,
+    rationale: str,
+    prompt_hash: str,
+    schema_hash: str,
+    schema_version: int,
+    now: str,
+) -> int:
+    rows = connection.execute(
+        """
+        SELECT id, subject_id, fingerprint
+          FROM work_item
+         WHERE task_type = ?
+           AND subject_kind = ?
+           AND subject_id IS NOT NULL
+           AND state IN ('pending', 'deferred')
+         ORDER BY id
+        """,
+        (RESOLVE_PERSON_ENTITY_TASK_TYPE, _SUBJECT_KIND_PERSON_MENTION),
+    ).fetchall()
+    settled = 0
+    for row in rows:
+        work_item_id = int(row["id"])
+        person_mention_id = int(row["subject_id"])
+        task_fingerprint = row["fingerprint"]
+        existing = load_er_by_mention_fingerprint(
+            connection,
+            person_mention_id=person_mention_id,
+            task_fingerprint=task_fingerprint,
+        )
+        if existing is None:
+            observation_id = insert_entity_resolution_observation(
+                connection,
+                person_mention_id=person_mention_id,
+                person_relation_id=None,
+                run_id=run_id,
+                attempt_id=attempt_id,
+                model_inspection_id=model_inspection_id,
+                disposition="failed",
+                semantic_outcome=None,
+                selected_person_id=None,
+                created_person_id=None,
+                candidate_person_ids_json="[]",
+                canonical_supplied_input_json="{}",
+                validated_output_json=None,
+                prompt_hash=prompt_hash,
+                schema_hash=schema_hash,
+                schema_version=schema_version,
+                task_fingerprint=task_fingerprint,
+                rationale=rationale,
+                failure_category=failure_category,
+                observed_at=now,
+            )
+        else:
+            observation_id = existing.id
+        current = connection.execute(
+            """
+            SELECT current_entity_resolution_observation_id, person_id
+              FROM person_mention
+             WHERE id = ?
+            """,
+            (person_mention_id,),
+        ).fetchone()
+        if current is None:
+            raise RuntimeError(
+                f"person_mention {person_mention_id} is missing during "
+                "permanent-preflight settle"
+            )
+        if current["current_entity_resolution_observation_id"] != observation_id:
+            # Keep person_id as-is (NULL for unresolved preflight failures).
+            point_mention_current_er(
+                connection,
+                person_mention_id=person_mention_id,
+                observation_id=observation_id,
+                person_id=(
+                    None if current["person_id"] is None else int(current["person_id"])
+                ),
+            )
+        _settle_work_item_failed_permanent(
+            connection,
+            work_item_id=work_item_id,
+            run_id=run_id,
+            rationale=rationale,
+            now=now,
+            task_label=RESOLVE_PERSON_ENTITY_TASK_TYPE,
+        )
+        settled += 1
+    return settled
+
+
+def _settle_active_reconsider_person_entity(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    attempt_id: int,
+    model_inspection_id: int | None,
+    failure_category: str,
+    rationale: str,
+    prompt_hash: str,
+    schema_hash: str,
+    schema_version: int,
+    now: str,
+) -> int:
+    rows = connection.execute(
+        """
+        SELECT id, subject_id, fingerprint
+          FROM work_item
+         WHERE task_type = ?
+           AND subject_kind = ?
+           AND subject_id IS NOT NULL
+           AND state IN ('pending', 'deferred')
+         ORDER BY id
+        """,
+        (RECONSIDER_PERSON_ENTITY_TASK_TYPE, _SUBJECT_KIND_PERSON_RELATION),
+    ).fetchall()
+    settled = 0
+    for row in rows:
+        work_item_id = int(row["id"])
+        person_relation_id = int(row["subject_id"])
+        task_fingerprint = row["fingerprint"]
+        existing = load_er_by_relation_fingerprint(
+            connection,
+            person_relation_id=person_relation_id,
+            task_fingerprint=task_fingerprint,
+        )
+        if existing is None:
+            insert_entity_resolution_observation(
+                connection,
+                person_mention_id=None,
+                person_relation_id=person_relation_id,
+                run_id=run_id,
+                attempt_id=attempt_id,
+                model_inspection_id=model_inspection_id,
+                disposition="failed",
+                semantic_outcome=None,
+                selected_person_id=None,
+                created_person_id=None,
+                candidate_person_ids_json="[]",
+                canonical_supplied_input_json="{}",
+                validated_output_json=None,
+                prompt_hash=prompt_hash,
+                schema_hash=schema_hash,
+                schema_version=schema_version,
+                task_fingerprint=task_fingerprint,
+                rationale=rationale,
+                failure_category=failure_category,
+                observed_at=now,
+            )
+        # Do not change person_relation status (design: leave edge active).
+        _settle_work_item_failed_permanent(
+            connection,
+            work_item_id=work_item_id,
+            run_id=run_id,
+            rationale=rationale,
+            now=now,
+            task_label=RECONSIDER_PERSON_ENTITY_TASK_TYPE,
+        )
+        settled += 1
     return settled
 
 

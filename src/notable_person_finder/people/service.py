@@ -39,9 +39,21 @@ from notable_person_finder.people.detection import (
     render_detection_request,
     validate_detection_output,
 )
-from notable_person_finder.people.models import DetectionInput, DetectionOutput
+from notable_person_finder.people.models import (
+    AttentionCategory,
+    CautionCategory,
+    DetectionInput,
+    DetectionOutput,
+    GroundedSignal,
+    IdentityFact,
+    IdentityFactKind,
+    SignalGrounding,
+    SignalKind,
+)
 from notable_person_finder.people.repository import (
     DETECT_PEOPLE_TASK_TYPE,
+    RECONSIDER_PERSON_ENTITY_TASK_TYPE,
+    RESOLVE_PERSON_ENTITY_TASK_TYPE,
     SourceItemRecord,
     insert_completed_observation,
     insert_failed_observation,
@@ -49,10 +61,16 @@ from notable_person_finder.people.repository import (
     insert_model_inspection,
     list_untriaged_source_item_ids,
     load_current_triage_observation,
+    load_er_by_mention_fingerprint,
     load_model_inspection,
     load_source_item_record,
     load_triage_observation_by_fingerprint,
-    settle_active_detect_people_after_permanent_preflight,
+    match_key,
+    settle_active_tasks_after_permanent_preflight,
+)
+from notable_person_finder.people.resolution import (
+    first_pass_task_fingerprint,
+    resolution_prompt_and_schema_hashes,
 )
 from notable_person_finder.providers.failures import FailureCategory, ProviderFailure
 from notable_person_finder.providers.openrouter import (
@@ -73,9 +91,15 @@ INSPECT_MODEL_TASK_TYPE = "inspect_model"
 INSPECT_MODEL_PRIORITY = 20
 SUBJECT_KIND_MODEL = "model"
 SUBJECT_KIND_SOURCE_ITEM = "source_item"
+SUBJECT_KIND_PERSON_MENTION = "person_mention"
+SUBJECT_KIND_PERSON_RELATION = "person_relation"
 
 DETECT_PEOPLE_PRIORITY = 30
 DETECTION_SCHEMA_NAME = "detect_people"
+
+# Re-export resolution task type constants for handlers and tests.
+assert RESOLVE_PERSON_ENTITY_TASK_TYPE == "resolve_person_entity"
+assert RECONSIDER_PERSON_ENTITY_TASK_TYPE == "reconsider_person_entity"
 
 # Bumped when inspection request identity or capability adjudication changes.
 ADAPTER_VERSION = 1
@@ -165,27 +189,264 @@ def _has_usable_untriaged_source_item(connection: sqlite3.Connection) -> bool:
     return row is not None
 
 
-def ensure_model_inspection(
+def _has_active_work(
+    connection: sqlite3.Connection, *, task_types: tuple[str, ...]
+) -> bool:
+    if not task_types:
+        return False
+    placeholders = ",".join("?" for _ in task_types)
+    row = connection.execute(
+        f"""
+        SELECT 1 AS present
+          FROM work_item
+         WHERE task_type IN ({placeholders})
+           AND state IN ('pending', 'deferred', 'running')
+         LIMIT 1
+        """,
+        task_types,
+    ).fetchone()
+    return row is not None
+
+
+def _has_active_detect_work(connection: sqlite3.Connection) -> bool:
+    return _has_active_work(connection, task_types=(DETECT_PEOPLE_TASK_TYPE,))
+
+
+def _has_active_resolve_or_reconsider_work(connection: sqlite3.Connection) -> bool:
+    return _has_active_work(
+        connection,
+        task_types=(
+            RESOLVE_PERSON_ENTITY_TASK_TYPE,
+            RECONSIDER_PERSON_ENTITY_TASK_TYPE,
+        ),
+    )
+
+
+def _passage_ids_from_json(raw: str) -> tuple[str, ...]:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(str(item) for item in parsed if isinstance(item, str) and item)
+
+
+def _signal_category(raw: str) -> AttentionCategory | CautionCategory:
+    try:
+        return AttentionCategory(raw)
+    except ValueError:
+        return CautionCategory(raw)
+
+
+def _identity_facts_for_mention(
+    connection: sqlite3.Connection, *, person_mention_id: int
+) -> tuple[IdentityFact, ...]:
+    facts: list[IdentityFact] = []
+    for row in connection.execute(
+        """
+        SELECT local_id, kind, value, supporting_passage_ids_json
+          FROM mention_identity_fact
+         WHERE person_mention_id = ?
+         ORDER BY local_id
+        """,
+        (person_mention_id,),
+    ):
+        passages = _passage_ids_from_json(row["supporting_passage_ids_json"])
+        if not passages:
+            continue
+        try:
+            facts.append(
+                IdentityFact(
+                    local_id=row["local_id"],
+                    kind=IdentityFactKind(row["kind"]),
+                    value=row["value"],
+                    supporting_passage_ids=passages,  # type: ignore[arg-type]
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+    return tuple(facts)
+
+
+def _signals_for_mention(
+    connection: sqlite3.Connection, *, person_mention_id: int
+) -> tuple[GroundedSignal, ...]:
+    signals: list[GroundedSignal] = []
+    for row in connection.execute(
+        """
+        SELECT kind, category, claim, supporting_passage_ids_json, grounding
+          FROM mention_signal
+         WHERE person_mention_id = ?
+         ORDER BY ordinal
+        """,
+        (person_mention_id,),
+    ):
+        passages = _passage_ids_from_json(row["supporting_passage_ids_json"])
+        if not passages:
+            continue
+        try:
+            signals.append(
+                GroundedSignal(
+                    kind=SignalKind(row["kind"]),
+                    category=_signal_category(str(row["category"])),
+                    claim=row["claim"],
+                    supporting_passage_ids=passages,  # type: ignore[arg-type]
+                    grounding=SignalGrounding(row["grounding"]),
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+    return tuple(signals)
+
+
+def is_resolution_eligible_mention(
+    connection: sqlite3.Connection,
+    *,
+    person_mention_id: int,
+    config: MainConfig,
+    profile: DomainProfileConfig,
+) -> bool:
+    """K24: research/uncertain, usable match_key, no ER at current fingerprint.
+
+    Shared by seed, ``models_needed_for_run``, digest, and status. Mentions with
+    only ``person_id IS NULL`` are not sufficient — skipped and permanently
+    failed rows keep ``person_id`` null forever.
+    """
+    del profile  # reserved for ensure_resolution_for_mention parity
+    row = connection.execute(
+        """
+        SELECT exact_name, search_name, outcome
+          FROM person_mention
+         WHERE id = ?
+        """,
+        (person_mention_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    outcome = row["outcome"]
+    if outcome not in {"research", "uncertain"}:
+        return False
+    exact_name = row["exact_name"]
+    if exact_name is None or not str(exact_name).strip():
+        return False
+    if not match_key(str(exact_name)):
+        return False
+    search_name = row["search_name"] if row["search_name"] is not None else exact_name
+    fingerprint = first_pass_task_fingerprint(
+        person_mention_id=person_mention_id,
+        mention_outcome=str(outcome),
+        exact_name=str(exact_name),
+        search_name=str(search_name),
+        identity_facts=_identity_facts_for_mention(
+            connection, person_mention_id=person_mention_id
+        ),
+        signals=_signals_for_mention(connection, person_mention_id=person_mention_id),
+        config=config.tasks.resolve_person_entity,
+    )
+    existing = load_er_by_mention_fingerprint(
+        connection,
+        person_mention_id=person_mention_id,
+        task_fingerprint=fingerprint,
+    )
+    return existing is None
+
+
+def _has_resolution_eligible_mentions(
+    connection: sqlite3.Connection, *, config: MainConfig
+) -> bool:
+    """True when any research/uncertain mention still lacks current-fingerprint ER.
+
+    Uses the same material filters as :func:`is_resolution_eligible_mention`
+    without requiring a domain profile (fingerprint does not include profile).
+    """
+    rows = connection.execute(
+        """
+        SELECT id
+          FROM person_mention
+         WHERE outcome IN ('research', 'uncertain')
+           AND length(trim(exact_name)) > 0
+         ORDER BY id
+        """
+    ).fetchall()
+    # Minimal profile stand-in is unused by the predicate body.
+    for row in rows:
+        if is_resolution_eligible_mention(
+            connection,
+            person_mention_id=int(row["id"]),
+            config=config,
+            profile=_unused_profile_for_eligibility(),
+        ):
+            return True
+    return False
+
+
+def _unused_profile_for_eligibility() -> DomainProfileConfig:
+    """Placeholder profile: K24 fingerprint does not read domain profile fields."""
+    return DomainProfileConfig(
+        schema_version=1,
+        key="eligibility-check",
+        label="Eligibility check",
+        language="en",
+        attention_examples={},
+    )
+
+
+def models_needed_for_run(
+    connection: sqlite3.Connection, run_id: int, config: MainConfig
+) -> tuple[str, ...]:
+    """Exact models that have dependent work this run (detect and/or resolve)."""
+    del run_id  # reserved: active-work queries are run-global for pending state
+    needed: list[str] = []
+    detect_model = config.tasks.detect_people.model
+    resolve_model = config.tasks.resolve_person_entity.model
+    if _has_usable_untriaged_source_item(connection) or _has_active_detect_work(
+        connection
+    ):
+        needed.append(detect_model)
+    if _has_resolution_eligible_mentions(
+        connection, config=config
+    ) or _has_active_resolve_or_reconsider_work(connection):
+        needed.append(resolve_model)
+    return tuple(dict.fromkeys(needed))
+
+
+def task_types_for_model(config: MainConfig, model_id: str) -> tuple[str, ...]:
+    """Task types that depend on a successful inspection of ``model_id``."""
+    types: list[str] = []
+    if config.tasks.detect_people.model == model_id:
+        types.append(DETECT_PEOPLE_TASK_TYPE)
+    if config.tasks.resolve_person_entity.model == model_id:
+        types.append(RESOLVE_PERSON_ENTITY_TASK_TYPE)
+        types.append(RECONSIDER_PERSON_ENTITY_TASK_TYPE)
+    return tuple(types)
+
+
+def ensure_model_inspections_for_run(
     connection: sqlite3.Connection,
     *,
     run_id: int,
     config: MainConfig,
     now: str,
 ) -> int:
-    """Schedule current-run model inspection when usable untriaged work exists.
+    """Schedule current-run ``inspect_model`` work for every needed model.
 
-    Returns ``1`` when inspection work is ensured for this run's model, else
-    ``0``. Supersedes older active ``inspect_model`` work so every run collects
-    fresh capability evidence (no cross-run reuse).
+    One work item per ``(run_id, model_id, routing_fingerprint)``. Supersedes
+    active inspect work whose fingerprint is not among the currently needed
+    set so prior-run or stale-model preflights do not linger. Returns the
+    number of models for which inspection work is ensured.
     """
-    if not _has_usable_untriaged_source_item(connection):
+    needed = models_needed_for_run(connection, run_id, config)
+    if not needed:
         return 0
 
-    model_id = config.tasks.detect_people.model
     routing_fp = routing_fingerprint(config.openrouter.routing)
-    fingerprint = _inspection_work_fingerprint(
-        run_id=run_id, model_id=model_id, routing_fp=routing_fp
-    )
+    needed_fingerprints = {
+        _inspection_work_fingerprint(
+            run_id=run_id, model_id=model_id, routing_fp=routing_fp
+        )
+        for model_id in needed
+    }
 
     stale = connection.execute(
         """
@@ -193,12 +454,13 @@ def ensure_model_inspection(
           FROM work_item
          WHERE task_type = ?
            AND state IN ('pending', 'deferred')
-           AND fingerprint != ?
          ORDER BY id
         """,
-        (INSPECT_MODEL_TASK_TYPE, fingerprint),
+        (INSPECT_MODEL_TASK_TYPE,),
     ).fetchall()
     for row in stale:
+        if row["fingerprint"] in needed_fingerprints:
+            continue
         repository.supersede_work(
             connection,
             task_type=INSPECT_MODEL_TASK_TYPE,
@@ -208,35 +470,64 @@ def ensure_model_inspection(
             reason=SUPERSEDED_REASON,
         )
 
-    repository.schedule_work(
-        connection,
-        task_type=INSPECT_MODEL_TASK_TYPE,
-        subject_kind=SUBJECT_KIND_MODEL,
-        subject_id=None,
-        fingerprint=fingerprint,
-        required=True,
-        priority=INSPECT_MODEL_PRIORITY,
-        eligible_at=now,
-        run_id=run_id,
-        now=now,
+    for model_id in needed:
+        fingerprint = _inspection_work_fingerprint(
+            run_id=run_id, model_id=model_id, routing_fp=routing_fp
+        )
+        repository.schedule_work(
+            connection,
+            task_type=INSPECT_MODEL_TASK_TYPE,
+            subject_kind=SUBJECT_KIND_MODEL,
+            subject_id=None,
+            fingerprint=fingerprint,
+            required=True,
+            priority=INSPECT_MODEL_PRIORITY,
+            eligible_at=now,
+            run_id=run_id,
+            now=now,
+        )
+    return len(needed)
+
+
+def ensure_model_inspection(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    config: MainConfig,
+    now: str,
+) -> int:
+    """Schedule inspections for every model that currently has dependent work.
+
+    Backward-compatible entry point used by detection scheduling. Delegates to
+    :func:`ensure_model_inspections_for_run` so a fully-triaged resolve backlog
+    still receives resolve-model preflight when this helper is the only seed.
+    """
+    return ensure_model_inspections_for_run(
+        connection, run_id=run_id, config=config, now=now
     )
-    return 1
 
 
 def inspection_ready(
-    connection: sqlite3.Connection, *, run_id: int, config: MainConfig
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    config: MainConfig,
+    model_id: str | None = None,
 ) -> bool:
-    """True when this run has a compatible inspection for the configured model.
+    """True when this run has a compatible inspection for ``model_id``.
 
+    When ``model_id`` is omitted, the detect-people model is used (3b1 callers).
     Under a hard OpenRouter budget, usable unit pricing is also required so
     generation prepare can compute a worst-case reservation.
     """
-    model_id = config.tasks.detect_people.model
+    resolved_model_id = (
+        config.tasks.detect_people.model if model_id is None else model_id
+    )
     routing_fp = routing_fingerprint(config.openrouter.routing)
     inspection = load_model_inspection(
         connection,
         run_id=run_id,
-        configured_model_id=model_id,
+        configured_model_id=resolved_model_id,
         routing_fingerprint=routing_fp,
     )
     if inspection is None:
@@ -388,21 +679,75 @@ def _settle_dependents(
     *,
     run_id: int,
     attempt_id: int,
+    model_id: str,
+    config: MainConfig,
     failure_category: str,
     rationale: str,
     now: str,
+    model_inspection_id: int | None = None,
 ) -> None:
-    prompt_hash, schema_hash, schema_version = _detection_prompt_and_schema_hashes()
-    settle_active_detect_people_after_permanent_preflight(
+    task_types = task_types_for_model(config, model_id)
+    if not task_types:
+        return
+    detect_prompt_hash: str | None = None
+    detect_schema_hash: str | None = None
+    detect_schema_version: int | None = None
+    resolve_prompt_hash: str | None = None
+    resolve_schema_hash: str | None = None
+    resolve_schema_version: int | None = None
+    if DETECT_PEOPLE_TASK_TYPE in task_types:
+        detect_prompt_hash, detect_schema_hash, detect_schema_version = (
+            _detection_prompt_and_schema_hashes()
+        )
+    if (
+        RESOLVE_PERSON_ENTITY_TASK_TYPE in task_types
+        or RECONSIDER_PERSON_ENTITY_TASK_TYPE in task_types
+    ):
+        resolve_prompt_hash, resolve_schema_hash, resolve_schema_version = (
+            resolution_prompt_and_schema_hashes()
+        )
+    settle_active_tasks_after_permanent_preflight(
         connection,
         run_id=run_id,
         attempt_id=attempt_id,
+        model_inspection_id=model_inspection_id,
+        model_id=model_id,
         failure_category=failure_category,
         rationale=rationale,
-        prompt_hash=prompt_hash,
-        schema_hash=schema_hash,
-        schema_version=schema_version,
+        task_types=task_types,
         now=now,
+        detect_prompt_hash=detect_prompt_hash,
+        detect_schema_hash=detect_schema_hash,
+        detect_schema_version=detect_schema_version,
+        resolve_prompt_hash=resolve_prompt_hash,
+        resolve_schema_hash=resolve_schema_hash,
+        resolve_schema_version=resolve_schema_version,
+    )
+
+
+def _model_id_for_inspection_work(
+    work_item: WorkItem,
+    *,
+    run_id: int,
+    config: MainConfig,
+) -> str:
+    """Match the work-item fingerprint to a configured model for this run."""
+    routing_fp = routing_fingerprint(config.openrouter.routing)
+    candidates = dict.fromkeys(
+        (
+            config.tasks.detect_people.model,
+            config.tasks.resolve_person_entity.model,
+        )
+    )
+    for model_id in candidates:
+        expected = _inspection_work_fingerprint(
+            run_id=run_id, model_id=model_id, routing_fp=routing_fp
+        )
+        if work_item.fingerprint == expected:
+            return model_id
+    raise ValueError(
+        f"inspect_model work item {work_item.id} fingerprint does not match "
+        f"any configured model for run {run_id}"
     )
 
 
@@ -442,6 +787,7 @@ def _persist_for(
     connection: sqlite3.Connection,
     *,
     routing_fp: str,
+    config: MainConfig,
 ) -> Callable[[WorkItem, TaskOutcome], None]:
     def persist(work_item: WorkItem, outcome: TaskOutcome) -> None:
         payload = outcome.payload
@@ -450,7 +796,7 @@ def _persist_for(
                 f"unexpected inspection payload type: {type(payload).__name__}"
             )
         attempt_id, run_id, inspected_at = _attempt_context(connection, work_item.id)
-        _insert_inspection_row(
+        inspection_id = _insert_inspection_row(
             connection,
             run_id=run_id,
             attempt_id=attempt_id,
@@ -467,9 +813,12 @@ def _persist_for(
                 connection,
                 run_id=run_id,
                 attempt_id=attempt_id,
+                model_id=payload.result.configured_model_id,
+                config=config,
                 failure_category=payload.failure_category,
                 rationale=payload.reason,
                 now=inspected_at,
+                model_inspection_id=inspection_id,
             )
 
     return persist
@@ -477,6 +826,8 @@ def _persist_for(
 
 def _persist_failure_for(
     connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
 ) -> Callable[[WorkItem, ProviderFailure], None]:
     def persist_failure(work_item: WorkItem, failure: ProviderFailure) -> None:
         # Transient exhaustion leaves dependents pending and unclaimable via
@@ -484,13 +835,19 @@ def _persist_failure_for(
         if failure.category not in _PERMANENT_PREFLIGHT_CATEGORIES:
             return
         attempt_id, run_id, observed_at = _attempt_context(connection, work_item.id)
+        model_id = _model_id_for_inspection_work(
+            work_item, run_id=run_id, config=config
+        )
         _settle_dependents(
             connection,
             run_id=run_id,
             attempt_id=attempt_id,
+            model_id=model_id,
+            config=config,
             failure_category=str(failure.category),
             rationale=str(failure.category),
             now=observed_at,
+            model_inspection_id=None,
         )
 
     return persist_failure
@@ -502,13 +859,20 @@ def build_inspection_handler(
     client: LlmClient,
     config: MainConfig,
 ) -> TaskHandler:
-    """The ``inspect_model`` handler: one capability preflight, two threads."""
-    model_id = config.tasks.detect_people.model
+    """The ``inspect_model`` handler: one capability preflight, two threads.
+
+    ``prepare`` resolves the model id from the work-item fingerprint so one
+    handler instance can preflight both the detect and resolve models.
+    """
     routing_fp = routing_fingerprint(config.openrouter.routing)
     hard_budget = config.budget.openrouter_nano_usd_per_run() is not None
     endpoint_host = urlsplit(config.openrouter.endpoint).hostname
 
     def prepare(work_item: WorkItem) -> TaskPreparation:
+        run_id = _claimed_run_id(connection, work_item.id)
+        model_id = _model_id_for_inspection_work(
+            work_item, run_id=run_id, config=config
+        )
         return TaskPreparation(
             payload=_InspectionCall(model_id=model_id, hard_budget=hard_budget),
             reserved_nano_usd=0,
@@ -523,8 +887,8 @@ def build_inspection_handler(
         operation=INSPECT_OPERATION,
         execute=_execute_for(client),
         prepare=prepare,
-        persist=_persist_for(connection, routing_fp=routing_fp),
-        persist_failure=_persist_failure_for(connection),
+        persist=_persist_for(connection, routing_fp=routing_fp, config=config),
+        persist_failure=_persist_failure_for(connection, config=config),
         destination_host=destination_host,
         reserved_nano_usd=0,
         pool=WorkerPool.LLM,
@@ -1136,7 +1500,12 @@ def build_detection_handler(
     parameters = detect.parameters
 
     def ready(claimed_run_id: int) -> bool:
-        return inspection_ready(connection, run_id=claimed_run_id, config=config)
+        return inspection_ready(
+            connection,
+            run_id=claimed_run_id,
+            config=config,
+            model_id=model_id,
+        )
 
     def prepare(work_item: WorkItem) -> TaskPreparation:
         if work_item.subject_id is None:
