@@ -7,13 +7,17 @@ roll back together.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from notable_person_finder.wikipedia.models import (
+    MediaWikiPageRecord,
     WikipediaIdentityObservationRecord,
     WikipediaIdentityPlanRecord,
+    WikipediaPageFactsBatchRecord,
+    WikipediaQueryFormRecord,
 )
 
 
@@ -569,3 +573,442 @@ def point_person_current_wikipedia_observation(
         raise RuntimeError(
             f"person {person_id} is missing; cannot set current wikipedia identity"
         )
+
+
+def _query_form_record(row: sqlite3.Row) -> WikipediaQueryFormRecord:
+    return WikipediaQueryFormRecord(
+        id=int(row["id"]),
+        plan_id=int(row["plan_id"]),
+        ordinal=int(row["ordinal"]),
+        variant_kind=str(row["variant_kind"]),
+        query_text=str(row["query_text"]),
+        status=str(row["status"]),
+        continuations_used=int(row["continuations_used"]),
+        hit_count=int(row["hit_count"]) if row["hit_count"] is not None else None,
+        truncated=bool(row["truncated"]),
+        failure_category=(
+            str(row["failure_category"])
+            if row["failure_category"] is not None
+            else None
+        ),
+    )
+
+
+def _batch_record(row: sqlite3.Row) -> WikipediaPageFactsBatchRecord:
+    return WikipediaPageFactsBatchRecord(
+        id=int(row["id"]),
+        plan_id=int(row["plan_id"]),
+        ordinal=int(row["ordinal"]),
+        page_ids_json=str(row["page_ids_json"]),
+        status=str(row["status"]),
+        wave=int(row["wave"]),
+        attempt_id=int(row["attempt_id"]) if row["attempt_id"] is not None else None,
+        failure_category=(
+            str(row["failure_category"])
+            if row["failure_category"] is not None
+            else None
+        ),
+        created_at=str(row["created_at"]),
+        completed_at=(
+            str(row["completed_at"]) if row["completed_at"] is not None else None
+        ),
+    )
+
+
+def _page_record(row: sqlite3.Row) -> MediaWikiPageRecord:
+    return MediaWikiPageRecord(
+        id=int(row["id"]),
+        wiki_id=str(row["wiki_id"]),
+        page_id=int(row["page_id"]),
+        canonical_title=str(row["canonical_title"]),
+        canonical_url=str(row["canonical_url"]),
+        namespace=int(row["namespace"]),
+        is_disambiguation=bool(row["is_disambiguation"]),
+        is_missing=bool(row["is_missing"]),
+        redirect_to_page_id=(
+            int(row["redirect_to_page_id"])
+            if row["redirect_to_page_id"] is not None
+            else None
+        ),
+        description=(
+            str(row["description"]) if row["description"] is not None else None
+        ),
+        extract=str(row["extract"]) if row["extract"] is not None else None,
+        categories_json=str(row["categories_json"]),
+        last_observed_at=str(row["last_observed_at"]),
+        last_attempt_id=(
+            int(row["last_attempt_id"]) if row["last_attempt_id"] is not None else None
+        ),
+    )
+
+
+def load_plan(
+    connection: sqlite3.Connection, *, plan_id: int
+) -> WikipediaIdentityPlanRecord | None:
+    row = connection.execute(
+        "SELECT * FROM wikipedia_identity_plan WHERE id = ?",
+        (plan_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _plan_record(row)
+
+
+def load_query_form(
+    connection: sqlite3.Connection, *, form_id: int
+) -> WikipediaQueryFormRecord | None:
+    row = connection.execute(
+        "SELECT * FROM wikipedia_query_form WHERE id = ?",
+        (form_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _query_form_record(row)
+
+
+def list_query_forms_for_plan(
+    connection: sqlite3.Connection, *, plan_id: int
+) -> tuple[WikipediaQueryFormRecord, ...]:
+    rows = connection.execute(
+        """
+        SELECT *
+          FROM wikipedia_query_form
+         WHERE plan_id = ?
+         ORDER BY ordinal
+        """,
+        (plan_id,),
+    ).fetchall()
+    return tuple(_query_form_record(row) for row in rows)
+
+
+def load_page_facts_batch(
+    connection: sqlite3.Connection, *, batch_id: int
+) -> WikipediaPageFactsBatchRecord | None:
+    row = connection.execute(
+        "SELECT * FROM wikipedia_page_facts_batch WHERE id = ?",
+        (batch_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _batch_record(row)
+
+
+def list_page_facts_batches_for_plan(
+    connection: sqlite3.Connection, *, plan_id: int
+) -> tuple[WikipediaPageFactsBatchRecord, ...]:
+    rows = connection.execute(
+        """
+        SELECT *
+          FROM wikipedia_page_facts_batch
+         WHERE plan_id = ?
+         ORDER BY ordinal
+        """,
+        (plan_id,),
+    ).fetchall()
+    return tuple(_batch_record(row) for row in rows)
+
+
+def mark_query_form_completed(
+    connection: sqlite3.Connection,
+    *,
+    form_id: int,
+    continuations_used: int,
+    hit_count: int,
+    truncated: bool,
+) -> None:
+    """Mark a query form completed after its search work finishes.
+
+    **The caller must already hold an open transaction.**
+    """
+    _require_transaction(connection, "mark_query_form_completed")
+    changed = connection.execute(
+        """
+        UPDATE wikipedia_query_form
+           SET status = 'completed',
+               continuations_used = ?,
+               hit_count = ?,
+               truncated = ?
+         WHERE id = ?
+        """,
+        (
+            continuations_used,
+            hit_count,
+            _as_bool_int(truncated),
+            form_id,
+        ),
+    ).rowcount
+    if changed != 1:
+        raise RuntimeError(
+            f"wikipedia_query_form {form_id} is missing; cannot complete"
+        )
+
+
+def mark_query_form_progress(
+    connection: sqlite3.Connection,
+    *,
+    form_id: int,
+    continuations_used: int,
+    hit_count: int,
+    truncated: bool,
+) -> None:
+    """Update form counters while the form remains pending (more continuations).
+
+    **The caller must already hold an open transaction.**
+    """
+    _require_transaction(connection, "mark_query_form_progress")
+    changed = connection.execute(
+        """
+        UPDATE wikipedia_query_form
+           SET continuations_used = ?,
+               hit_count = ?,
+               truncated = ?
+         WHERE id = ? AND status = 'pending'
+        """,
+        (
+            continuations_used,
+            hit_count,
+            _as_bool_int(truncated),
+            form_id,
+        ),
+    ).rowcount
+    if changed != 1:
+        raise RuntimeError(
+            f"wikipedia_query_form {form_id} is not pending; cannot progress"
+        )
+
+
+def mark_query_form_failed(
+    connection: sqlite3.Connection,
+    *,
+    form_id: int,
+    failure_category: str,
+) -> None:
+    """Mark a query form permanently failed (K22 form-level).
+
+    **The caller must already hold an open transaction.**
+    """
+    _require_transaction(connection, "mark_query_form_failed")
+    changed = connection.execute(
+        """
+        UPDATE wikipedia_query_form
+           SET status = 'failed',
+               failure_category = ?
+         WHERE id = ?
+        """,
+        (failure_category, form_id),
+    ).rowcount
+    if changed != 1:
+        raise RuntimeError(f"wikipedia_query_form {form_id} is missing; cannot fail")
+
+
+def mark_batch_failed(
+    connection: sqlite3.Connection,
+    *,
+    batch_id: int,
+    failure_category: str,
+    completed_at: str,
+    attempt_id: int | None = None,
+) -> None:
+    """Mark a facts batch permanently failed.
+
+    **The caller must already hold an open transaction.**
+    """
+    _require_transaction(connection, "mark_batch_failed")
+    changed = connection.execute(
+        """
+        UPDATE wikipedia_page_facts_batch
+           SET status = 'failed',
+               failure_category = ?,
+               attempt_id = COALESCE(?, attempt_id),
+               completed_at = ?
+         WHERE id = ?
+        """,
+        (failure_category, attempt_id, completed_at, batch_id),
+    ).rowcount
+    if changed != 1:
+        raise RuntimeError(
+            f"wikipedia_page_facts_batch {batch_id} is missing; cannot fail"
+        )
+
+
+def update_plan_retrieval_flags(
+    connection: sqlite3.Connection,
+    *,
+    plan_id: int,
+    truncated_unsafe_for_negative: bool | None = None,
+    partial_retrieval: bool | None = None,
+    failure_category: str | None = None,
+) -> None:
+    """Update plan truncation / partial-retrieval flags (and optional category).
+
+    **The caller must already hold an open transaction.**
+    """
+    _require_transaction(connection, "update_plan_retrieval_flags")
+    assignments: list[str] = []
+    params: list[Any] = []
+    if truncated_unsafe_for_negative is not None:
+        assignments.append("truncated_unsafe_for_negative = ?")
+        params.append(_as_bool_int(truncated_unsafe_for_negative))
+    if partial_retrieval is not None:
+        assignments.append("partial_retrieval = ?")
+        params.append(_as_bool_int(partial_retrieval))
+    if failure_category is not None:
+        assignments.append("failure_category = ?")
+        params.append(failure_category)
+    if not assignments:
+        return
+    params.append(plan_id)
+    changed = connection.execute(
+        f"""
+        UPDATE wikipedia_identity_plan
+           SET {", ".join(assignments)}
+         WHERE id = ?
+        """,
+        tuple(params),
+    ).rowcount
+    if changed != 1:
+        raise RuntimeError(
+            f"wikipedia_identity_plan {plan_id} is missing; cannot update flags"
+        )
+
+
+def mark_plan_status(
+    connection: sqlite3.Connection,
+    *,
+    plan_id: int,
+    status: str,
+    completed_at: str | None = None,
+    failure_category: str | None = None,
+    truncated_unsafe_for_negative: bool | None = None,
+    partial_retrieval: bool | None = None,
+) -> None:
+    """Set plan status and optional terminal fields.
+
+    **The caller must already hold an open transaction.**
+    """
+    _require_transaction(connection, "mark_plan_status")
+    assignments = ["status = ?"]
+    params: list[Any] = [status]
+    if completed_at is not None:
+        assignments.append("completed_at = ?")
+        params.append(completed_at)
+    if failure_category is not None:
+        assignments.append("failure_category = ?")
+        params.append(failure_category)
+    if truncated_unsafe_for_negative is not None:
+        assignments.append("truncated_unsafe_for_negative = ?")
+        params.append(_as_bool_int(truncated_unsafe_for_negative))
+    if partial_retrieval is not None:
+        assignments.append("partial_retrieval = ?")
+        params.append(_as_bool_int(partial_retrieval))
+    params.append(plan_id)
+    changed = connection.execute(
+        f"""
+        UPDATE wikipedia_identity_plan
+           SET {", ".join(assignments)}
+         WHERE id = ?
+        """,
+        tuple(params),
+    ).rowcount
+    if changed != 1:
+        raise RuntimeError(
+            f"wikipedia_identity_plan {plan_id} is missing; cannot mark status"
+        )
+
+
+def list_search_hit_page_ids_for_completed_forms(
+    connection: sqlite3.Connection, *, plan_id: int
+) -> tuple[tuple[int, int], ...]:
+    """Return ``(page_id, best_rank)`` for hits on completed forms of a plan.
+
+    Rank is global-best (lowest) across forms; hits without a page id are dropped.
+    """
+    rows = connection.execute(
+        """
+        SELECT h.page_id AS page_id,
+               MIN(
+                   (f.ordinal - 1) * 100000 + h.rank
+               ) AS best_rank
+          FROM mediawiki_search_hit AS h
+          JOIN mediawiki_search_observation AS o
+            ON o.id = h.search_observation_id
+          JOIN wikipedia_query_form AS f
+            ON f.id = o.query_form_id
+         WHERE f.plan_id = ?
+           AND f.status = 'completed'
+           AND h.page_id IS NOT NULL
+         GROUP BY h.page_id
+         ORDER BY best_rank, h.page_id
+        """,
+        (plan_id,),
+    ).fetchall()
+    return tuple((int(row["page_id"]), int(row["best_rank"])) for row in rows)
+
+
+def list_mediawiki_pages_by_page_ids(
+    connection: sqlite3.Connection,
+    *,
+    wiki_id: str,
+    page_ids: Sequence[int],
+) -> dict[int, MediaWikiPageRecord]:
+    """Load MediaWiki pages keyed by provider page_id."""
+    if not page_ids:
+        return {}
+    placeholders = ",".join("?" for _ in page_ids)
+    rows = connection.execute(
+        f"""
+        SELECT *
+          FROM mediawiki_page
+         WHERE wiki_id = ?
+           AND page_id IN ({placeholders})
+        """,
+        (wiki_id, *page_ids),
+    ).fetchall()
+    return {int(row["page_id"]): _page_record(row) for row in rows}
+
+
+def next_batch_ordinal(connection: sqlite3.Connection, *, plan_id: int) -> int:
+    row = connection.execute(
+        """
+        SELECT COALESCE(MAX(ordinal), 0) + 1 AS next_ordinal
+          FROM wikipedia_page_facts_batch
+         WHERE plan_id = ?
+        """,
+        (plan_id,),
+    ).fetchone()
+    assert row is not None
+    return int(row["next_ordinal"])
+
+
+def next_form_ordinal(connection: sqlite3.Connection, *, plan_id: int) -> int:
+    row = connection.execute(
+        """
+        SELECT COALESCE(MAX(ordinal), 0) + 1 AS next_ordinal
+          FROM wikipedia_query_form
+         WHERE plan_id = ?
+        """,
+        (plan_id,),
+    ).fetchone()
+    assert row is not None
+    return int(row["next_ordinal"])
+
+
+def covered_fact_page_ids(connection: sqlite3.Connection, *, plan_id: int) -> set[int]:
+    """Page IDs already present on any non-superseded facts batch for the plan."""
+    rows = connection.execute(
+        """
+        SELECT page_ids_json
+          FROM wikipedia_page_facts_batch
+         WHERE plan_id = ?
+           AND status != 'superseded'
+        """,
+        (plan_id,),
+    ).fetchall()
+    covered: set[int] = set()
+    for row in rows:
+        raw = json.loads(str(row["page_ids_json"]))
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, int):
+                    covered.add(item)
+    return covered
