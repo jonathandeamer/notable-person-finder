@@ -23,7 +23,7 @@ from notable_person_finder.people.models import (
     DomainProfileEvidence,
     IdentityFactKind,
 )
-from notable_person_finder.providers.articles import EXTRACTOR_VERSION
+from notable_person_finder.providers.article_versions import EXTRACTOR_VERSION
 
 ASSESS_SCHEMA_VERSION = 1
 COVERAGE_ADAPTER_VERSION = 1

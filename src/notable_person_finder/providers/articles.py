@@ -23,6 +23,7 @@ from typing import Protocol
 
 import trafilatura
 
+from notable_person_finder.providers import article_versions as _article_versions
 from notable_person_finder.providers.failures import (
     FailureCategory,
     ProviderFailure,
@@ -36,7 +37,8 @@ from notable_person_finder.runs.clock import Clock, SystemClock
 
 ARTICLE_PROVIDER = "article_http"
 OPERATION_FETCH_ARTICLE = "fetch_article"
-EXTRACTOR_VERSION = 1
+# Single source of truth lives in article_versions (no Trafilatura import).
+EXTRACTOR_VERSION = _article_versions.EXTRACTOR_VERSION
 
 # Drop nav/footer crumbs shorter than this before quality is judged.
 _MIN_BLOCK_CHARS = 40

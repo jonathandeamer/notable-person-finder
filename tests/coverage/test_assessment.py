@@ -41,7 +41,7 @@ from notable_person_finder.people.models import (
     DomainProfileEvidenceExample,
     IdentityFactKind,
 )
-from notable_person_finder.providers.articles import EXTRACTOR_VERSION
+from notable_person_finder.providers.article_versions import EXTRACTOR_VERSION
 
 
 def _config(**changes: object) -> AssessArticleConfig:
@@ -175,6 +175,28 @@ def test_schema_version_is_one() -> None:
     assert rendered.schema_version == 1
 
 
+def test_assessment_contract_does_not_import_trafilatura() -> None:
+    """Design: coverage assess contract must not pull Trafilatura into its graph."""
+    import inspect
+
+    import notable_person_finder.coverage.assessment as assessment_mod
+
+    source = inspect.getsource(assessment_mod)
+    assert "providers.articles" not in source
+    assert "trafilatura" not in source
+    assert "article_versions" in source
+    assert assessment_mod.EXTRACTOR_VERSION == 1
+
+
+def test_extractor_version_matches_articles_reexport() -> None:
+    from notable_person_finder.providers import articles as articles_mod
+    from notable_person_finder.providers.article_versions import (
+        EXTRACTOR_VERSION as version_constant,
+    )
+
+    assert version_constant == EXTRACTOR_VERSION == articles_mod.EXTRACTOR_VERSION == 1
+
+
 def test_content_types_closed_set_includes_press_release_snake_case() -> None:
     assert "press_release" in CONTENT_TYPES
     assert "press release" not in CONTENT_TYPES
@@ -200,6 +222,22 @@ def test_unseen_passage_ids_are_rejected() -> None:
 def test_duplicate_content_types_are_rejected() -> None:
     payload = _valid_output_payload(content_types=("profile", "profile"))
     with pytest.raises(AssessValidationError, match="duplicates"):
+        validate_assess_output(json.dumps(payload), _supplied())
+
+
+def test_content_types_empty_list_is_rejected() -> None:
+    """Design: content_types array length 1–3; empty fails schema."""
+    payload = _valid_output_payload(content_types=())
+    with pytest.raises(AssessValidationError, match="output schema"):
+        validate_assess_output(json.dumps(payload), _supplied())
+
+
+def test_content_types_four_items_are_rejected() -> None:
+    """Design: content_types array length 1–3; four fails schema (maxLength)."""
+    payload = _valid_output_payload(
+        content_types=("reporting", "profile", "review", "interview")
+    )
+    with pytest.raises(AssessValidationError, match="output schema"):
         validate_assess_output(json.dumps(payload), _supplied())
 
 
