@@ -28,6 +28,7 @@ from notable_person_finder.people.repository import (
 )
 from notable_person_finder.people.service import (
     INSPECT_MODEL_TASK_TYPE,
+    _inspection_work_fingerprint,
     ensure_model_inspections_for_run,
     inspection_ready,
     models_needed_for_run,
@@ -35,6 +36,7 @@ from notable_person_finder.people.service import (
     task_types_for_model,
 )
 from notable_person_finder.providers.failures import FailureCategory, ProviderFailure
+from notable_person_finder.providers.mediawiki import MediaWikiPageFactsBatch
 from notable_person_finder.providers.openrouter import (
     GENERATE_OPERATION,
     PROVIDER,
@@ -47,6 +49,7 @@ from notable_person_finder.wikipedia.matching import match_prompt_and_schema_has
 from notable_person_finder.wikipedia.repository import (
     insert_query_forms,
     insert_wikipedia_identity_observation,
+    list_page_facts_batches_for_plan,
     load_plan,
     load_wikipedia_identity_observation_by_fingerprint,
     mark_plan_status,
@@ -57,11 +60,20 @@ from notable_person_finder.wikipedia.repository import (
 )
 from notable_person_finder.wikipedia.service import (
     MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE,
+    MATCH_WIKIPEDIA_PRIORITY,
     build_match_wikipedia_handler,
     schedule_match_wikipedia_identity,
     wikipedia_match_model_needed,
 )
 from tests.ingestion.helpers import immediate, insert_run, moment
+from tests.wikipedia.test_http_service import (
+    ScriptedMediaWikiClient,
+    _open_plan_with_forms,
+    _page,
+    _run_facts,
+    _run_search,
+    _search_page,
+)
 
 _HASH = "a" * 64
 _OTHER = "b" * 64
@@ -499,6 +511,7 @@ def test_match_handler_pool_priority_provider_operation(
     assert handler.pool is WorkerPool.LLM
     assert handler.reserved_nano_usd == 0
     assert handler.ready is not None
+    assert MATCH_WIKIPEDIA_PRIORITY == 55
 
 
 def _model_output(
@@ -858,6 +871,119 @@ def test_active_plan_arms_match_model_inspect(connection: sqlite3.Connection) ->
     assert rows["n"] == 1
 
 
+def test_mid_run_facts_settlement_schedules_match_and_match_model_inspect(
+    connection: sqlite3.Connection,
+) -> None:
+    """K21b: search→facts→maybe_advance_plan arms match work + match inspect.
+
+    Cold-start path opens only MediaWiki HTTP; after facts complete, both
+    pending match_wikipedia_identity (priority 55) and pending inspect_model
+    for the match model must exist without a separate seed-time ensure call.
+    """
+    config = _main_config()
+    run_id = insert_run(connection)
+    person_id = _person_with_name(connection, run_id=run_id)
+    plan_id, form_ids = _open_plan_with_forms(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        forms=(("exact", "Alex Smith"),),
+        material_fingerprint=_HASH,
+    )
+    client = ScriptedMediaWikiClient(
+        search_results=[_search_page(((101, "Alex Smith"),))],
+        facts_results=[MediaWikiPageFactsBatch(pages=(_page(101, "Alex Smith"),))],
+    )
+    # Before any HTTP: no match work, and seed did not open inspect.
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) AS n FROM work_item WHERE task_type = ?",
+            (MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE,),
+        ).fetchone()["n"]
+        == 0
+    )
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) AS n FROM work_item WHERE task_type = ?",
+            (INSPECT_MODEL_TASK_TYPE,),
+        ).fetchone()["n"]
+        == 0
+    )
+
+    _run_search(
+        connection,
+        client=client,
+        config=config,
+        form_id=form_ids[0],
+        material_fingerprint=_HASH,
+        run_id=run_id,
+    )
+    batches = list_page_facts_batches_for_plan(connection, plan_id=plan_id)
+    assert len(batches) == 1
+    assert batches[0].status == "pending"
+    # Facts still pending: match not yet scheduled.
+    assert (
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM work_item
+             WHERE task_type = ? AND state IN ('pending', 'deferred')
+            """,
+            (MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE,),
+        ).fetchone()["n"]
+        == 0
+    )
+
+    _run_facts(
+        connection,
+        client=client,
+        config=config,
+        batch_id=batches[0].id,
+        run_id=run_id,
+    )
+
+    plan = load_plan(connection, plan_id=plan_id)
+    assert plan is not None
+    assert plan.status == "ready_for_match"
+
+    match_rows = connection.execute(
+        """
+        SELECT id, state, priority, required, subject_kind, subject_id
+          FROM work_item
+         WHERE task_type = ?
+           AND state IN ('pending', 'deferred')
+         ORDER BY id
+        """,
+        (MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE,),
+    ).fetchall()
+    assert len(match_rows) == 1
+    assert match_rows[0]["state"] == "pending"
+    assert match_rows[0]["priority"] == MATCH_WIKIPEDIA_PRIORITY == 55
+    assert match_rows[0]["required"] == 1
+    assert match_rows[0]["subject_kind"] == "person"
+    assert int(match_rows[0]["subject_id"]) == person_id
+
+    expected_inspect_fp = _inspection_work_fingerprint(
+        run_id=run_id,
+        model_id=MATCH_MODEL,
+        routing_fp=routing_fingerprint(config.openrouter.routing),
+    )
+    inspect_rows = connection.execute(
+        """
+        SELECT fingerprint, state, priority
+          FROM work_item
+         WHERE task_type = ?
+           AND state IN ('pending', 'deferred')
+         ORDER BY id
+        """,
+        (INSPECT_MODEL_TASK_TYPE,),
+    ).fetchall()
+    assert len(inspect_rows) == 1
+    assert inspect_rows[0]["state"] == "pending"
+    assert inspect_rows[0]["fingerprint"] == expected_inspect_fp
+    # Match model is the sole needed model on this Wikipedia-only path.
+    assert models_needed_for_run(connection, run_id, config) == (MATCH_MODEL,)
+
+
 def test_cold_start_after_facts_match_and_inspect_present(
     connection: sqlite3.Connection,
 ) -> None:
@@ -872,9 +998,10 @@ def test_cold_start_after_facts_match_and_inspect_present(
     _insert_compatible_inspection(connection, run_id=run_id)
 
     match_work = connection.execute(
-        "SELECT state FROM work_item WHERE id = ?", (work_id,)
+        "SELECT state, priority FROM work_item WHERE id = ?", (work_id,)
     ).fetchone()
     assert match_work["state"] == "pending"
+    assert match_work["priority"] == MATCH_WIKIPEDIA_PRIORITY == 55
     assert inspection_ready(
         connection, run_id=run_id, config=config, model_id=MATCH_MODEL
     )

@@ -1343,8 +1343,8 @@ def _assemble_and_terminalize(
         run_id=run_id,
         now=now,
     )
-    # Mid-run inspect arming (K21b). Until Task 6 extends models_needed_for_run,
-    # this is a no-op for the match model when only Wikipedia work is active.
+    # Mid-run inspect arming (K21b): match model is needed once match work and
+    # ready_for_match plan exist, so cold-start HTTP-only seeds unlock inspect.
     ensure_model_inspections_for_run(
         connection,
         run_id=run_id,
