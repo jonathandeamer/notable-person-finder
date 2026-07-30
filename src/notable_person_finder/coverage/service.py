@@ -21,6 +21,7 @@ import re
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -35,15 +36,17 @@ from notable_person_finder.coverage.assessment import (
     AssessFact,
     AssessName,
     AssessValidationError,
+    CoveragePersonMaterialView,
     assess_task_fingerprint,
     build_assess_input,
+    coverage_material_fingerprint,
     render_assess_request,
     validate_assess_output,
 )
 from notable_person_finder.coverage.models import (
     CoverageQueryFormRecord,
     PersonCoveragePlanRecord,
-)
+)  # PersonCoveragePlanRecord used by eligibility/ensure
 from notable_person_finder.coverage.passages import (
     ArticleViewLike,
     TextBlock,
@@ -67,6 +70,7 @@ from notable_person_finder.coverage.repository import (
     list_coverage_article_targets_for_plan,
     list_coverage_discovery_articles_for_plan,
     list_query_forms_for_plan,
+    load_active_plan_for_fingerprint,
     load_article_view,
     load_coverage_article_target,
     load_person_article,
@@ -80,6 +84,8 @@ from notable_person_finder.coverage.repository import (
     mark_query_form_progress,
     open_plan,
     point_person_article_current_assessment,
+    supersede_pending_targets_for_plan,
+    supersede_plan,
     update_coverage_article_target,
     update_plan_status,
     upsert_person_article,
@@ -144,6 +150,7 @@ from notable_person_finder.providers.openrouter import (
     PROVIDER as OPENROUTER_PROVIDER,
 )
 from notable_person_finder.runs import repository as runs_repository
+from notable_person_finder.runs.clock import utc_timestamp
 from notable_person_finder.runs.engine import TaskHandler, TaskOutcome, TaskPreparation
 from notable_person_finder.runs.models import WorkItem, WorkState
 from notable_person_finder.runs.scheduler import WorkerPool
@@ -160,7 +167,13 @@ BRAVE_SEARCH_PRIORITY = 60
 FETCH_ARTICLE_PRIORITY = 65
 ASSESS_ARTICLE_PRIORITY = 70
 
+COVERAGE_SUPERSEDED_REASON = "coverage_superseded"
+MATCHING_WIKIPEDIA_REASON = "matching_wikipedia_page"
+MERGED_AWAY_COVERAGE_REASON = "merged_away"
+
 _TERMINAL_PLAN_STATUSES = frozenset({"superseded", "completed", "failed", "incomplete"})
+_ACTIVE_PLAN_STATUSES = frozenset({"retrieving", "selecting", "assessing"})
+_ELIGIBLE_WIKI_OUTCOMES = frozenset({"no_matching_page_found", "uncertain_identity"})
 _NAME_KIND_ORDER: dict[str, int] = {
     "professional": 0,
     "display": 1,
@@ -389,20 +402,853 @@ def assess_model_needed(
     *,
     config: MainConfig,
     run_id: int | None = None,
+    policy: SourcePolicy | None = None,
+    now: str | None = None,
 ) -> bool:
     """K20: whether the assess model needs current-run inspection.
 
     Arms when active assess work exists, an active coverage plan is
-    retrieving/selecting/assessing, or Brave/fetch HTTP work is active.
-    K19-eligible people are folded in once seed lands (Task 8); active
-    plan/HTTP alone closes cold-start before assess work exists.
+    retrieving/selecting/assessing, Brave/fetch HTTP work is active, or
+    (when ``policy`` is supplied) any person is K19-eligible.
     """
-    del config, run_id  # config reserved for K19 eligibility arming (Task 8)
-    return (
+    del run_id
+    if (
         _has_active_assess_article_work(connection)
         or _has_active_coverage_plan(connection)
         or _has_active_coverage_http_work(connection)
+    ):
+        return True
+    if policy is None:
+        return False
+    effective_now = now if now is not None else utc_timestamp(datetime.now(tz=UTC))
+    return has_coverage_research_eligible_people(
+        connection, config=config, policy=policy, now=effective_now
     )
+
+
+def has_coverage_research_eligible_people(
+    connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
+    policy: SourcePolicy,
+    now: str,
+) -> bool:
+    """True when any canonical person is K19-eligible at ``now``."""
+    rows = connection.execute(
+        """
+        SELECT id
+          FROM person
+         WHERE merged_into_person_id IS NULL
+         ORDER BY id
+        """
+    ).fetchall()
+    for row in rows:
+        if is_coverage_research_eligible(
+            connection,
+            person_id=int(row["id"]),
+            config=config,
+            policy=policy,
+            now=now,
+        ):
+            return True
+    return False
+
+
+def plan_matches_live_material(
+    plan: PersonCoveragePlanRecord,
+    person: CoveragePersonMaterialView,
+    config: AssessArticleConfig,
+    *,
+    source_policy_fingerprint: str,
+) -> bool:
+    """Forward-only material match (K30): recompute fingerprint with plan's refresh."""
+    expected = coverage_material_fingerprint(
+        person,
+        config,
+        source_policy_fingerprint=source_policy_fingerprint,
+        refresh_of_plan_id=plan.refresh_of_plan_id,
+    )
+    return plan.material_fingerprint == expected
+
+
+def is_coverage_research_eligible(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    config: MainConfig,
+    policy: SourcePolicy,
+    now: str,
+) -> bool:
+    """Shared K5/K19 eligibility used by seed, digest, and status."""
+    person_row = connection.execute(
+        """
+        SELECT id, merged_into_person_id, identity_fingerprint,
+               current_wikipedia_identity_observation_id
+          FROM person
+         WHERE id = ?
+        """,
+        (person_id,),
+    ).fetchone()
+    if person_row is None:
+        return False
+    if person_row["merged_into_person_id"] is not None:
+        return False
+    canonical_id = int(person_row["id"])
+    if not _has_operational_match_key_name(connection, person_id=canonical_id):
+        return False
+
+    wiki_id = person_row["current_wikipedia_identity_observation_id"]
+    if wiki_id is None:
+        return False
+    wiki = connection.execute(
+        """
+        SELECT disposition, semantic_outcome
+          FROM wikipedia_identity_observation
+         WHERE id = ?
+        """,
+        (int(wiki_id),),
+    ).fetchone()
+    if wiki is None or wiki["disposition"] != "completed":
+        return False
+    if wiki["semantic_outcome"] == "matching_page_found":
+        return False
+    if wiki["semantic_outcome"] not in _ELIGIBLE_WIKI_OUTCOMES:
+        return False
+
+    assess = config.tasks.assess_article
+    person_view = CoveragePersonMaterialView(
+        person_id=canonical_id,
+        identity_fingerprint=str(person_row["identity_fingerprint"]),
+    )
+    policy_fp = policy.fingerprint
+    base_fp = coverage_material_fingerprint(
+        person_view,
+        assess,
+        source_policy_fingerprint=policy_fp,
+        refresh_of_plan_id=None,
+    )
+
+    cur_plan = _latest_terminal_plan_matching_live(
+        connection,
+        person_id=canonical_id,
+        person_view=person_view,
+        assess=assess,
+        source_policy_fingerprint=policy_fp,
+    )
+    if cur_plan is not None:
+        if cur_plan.status == "failed":
+            return False
+        if cur_plan.status in ("completed", "incomplete"):
+            completed_at = cur_plan.completed_at
+            if completed_at is None:
+                return False
+            if not _refresh_interval_elapsed(
+                completed_at=completed_at,
+                now=now,
+                hours=assess.coverage_refresh_interval_hours,
+            ):
+                return False
+            live_fp = coverage_material_fingerprint(
+                person_view,
+                assess,
+                source_policy_fingerprint=policy_fp,
+                refresh_of_plan_id=cur_plan.id,
+            )
+            return not _has_terminal_plan_fp(
+                connection, person_id=canonical_id, material_fingerprint=live_fp
+            ) and not _has_active_plan_fp(
+                connection, person_id=canonical_id, material_fingerprint=live_fp
+            )
+        return False
+
+    terminal_base = _terminal_plan_for_fingerprint(
+        connection, person_id=canonical_id, material_fingerprint=base_fp
+    )
+    if terminal_base is not None:
+        if terminal_base.status == "failed":
+            return False
+        if terminal_base.status in ("completed", "incomplete"):
+            completed_at = terminal_base.completed_at
+            if completed_at is None:
+                return False
+            if not _refresh_interval_elapsed(
+                completed_at=completed_at,
+                now=now,
+                hours=assess.coverage_refresh_interval_hours,
+            ):
+                return False
+            live_fp = coverage_material_fingerprint(
+                person_view,
+                assess,
+                source_policy_fingerprint=policy_fp,
+                refresh_of_plan_id=terminal_base.id,
+            )
+            return not _has_terminal_plan_fp(
+                connection, person_id=canonical_id, material_fingerprint=live_fp
+            ) and not _has_active_plan_fp(
+                connection, person_id=canonical_id, material_fingerprint=live_fp
+            )
+        return False
+
+    return not _has_active_plan_fp(
+        connection, person_id=canonical_id, material_fingerprint=base_fp
+    )
+
+
+def ensure_coverage_research(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    run_id: int,
+    config: MainConfig,
+    policy: SourcePolicy,
+    now: str,
+) -> str:
+    """Open coverage research for an eligible person, or no-op.
+
+    Returns ``scheduled``, ``reused``, ``ineligible``, or ``stopped_matching``.
+    Joins an open caller transaction when present; otherwise opens a brief
+    ``BEGIN IMMEDIATE``.
+    """
+    owns_transaction = not connection.in_transaction
+    if owns_transaction:
+        connection.execute("BEGIN IMMEDIATE")
+    try:
+        result = _ensure_coverage_research_body(
+            connection,
+            person_id=person_id,
+            run_id=run_id,
+            config=config,
+            policy=policy,
+            now=now,
+        )
+    except BaseException:
+        if owns_transaction:
+            connection.rollback()
+        raise
+    else:
+        if owns_transaction:
+            connection.commit()
+        return result
+
+
+def schedule_coverage_after_wikipedia_ready(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    run_id: int,
+    config: MainConfig,
+    policy: SourcePolicy,
+    now: str,
+) -> None:
+    """After completed Wikipedia identity: supersede on matching, else ensure.
+
+    Mandatory on every completed Wikipedia settle path (including matching) so
+    mid-flight coverage work is cancelled when a page match is found (K5).
+    """
+    person_row = connection.execute(
+        """
+        SELECT id, merged_into_person_id, current_wikipedia_identity_observation_id
+          FROM person
+         WHERE id = ?
+        """,
+        (person_id,),
+    ).fetchone()
+    if person_row is None:
+        return
+    if person_row["merged_into_person_id"] is not None:
+        supersede_coverage_work_for_person(
+            connection,
+            person_id=int(person_row["id"]),
+            run_id=run_id,
+            now=now,
+            reason=MERGED_AWAY_COVERAGE_REASON,
+        )
+        return
+    wiki_id = person_row["current_wikipedia_identity_observation_id"]
+    if wiki_id is None:
+        return
+    wiki = connection.execute(
+        """
+        SELECT disposition, semantic_outcome
+          FROM wikipedia_identity_observation
+         WHERE id = ?
+        """,
+        (int(wiki_id),),
+    ).fetchone()
+    if wiki is None or wiki["disposition"] != "completed":
+        return
+    if wiki["semantic_outcome"] == "matching_page_found":
+        supersede_coverage_work_for_person(
+            connection,
+            person_id=int(person_row["id"]),
+            run_id=run_id,
+            now=now,
+            reason=MATCHING_WIKIPEDIA_REASON,
+        )
+        return
+    if wiki["semantic_outcome"] in _ELIGIBLE_WIKI_OUTCOMES:
+        ensure_coverage_research(
+            connection,
+            person_id=int(person_row["id"]),
+            run_id=run_id,
+            config=config,
+            policy=policy,
+            now=now,
+        )
+
+
+def seed_coverage_research(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    config: MainConfig,
+    policy: SourcePolicy,
+    now: str,
+) -> int:
+    """Backfill coverage for every canonical person after Wikipedia seed.
+
+    Matching current Wikipedia → supersede mid-flight work. Else ensure when
+    eligible. Returns the count of people for which ensure returned a non-
+    ineligible result (``scheduled``, ``reused``, or ``stopped_matching``),
+    plus people whose matching path superseded active coverage.
+    """
+    rows = connection.execute(
+        """
+        SELECT id
+          FROM person
+         WHERE merged_into_person_id IS NULL
+         ORDER BY id
+        """
+    ).fetchall()
+    acted = 0
+    for row in rows:
+        person_id = int(row["id"])
+        wiki = _current_wikipedia_row(connection, person_id=person_id)
+        if wiki is not None and wiki["semantic_outcome"] == "matching_page_found":
+            had_active = _person_has_active_coverage(connection, person_id=person_id)
+            supersede_coverage_work_for_person(
+                connection,
+                person_id=person_id,
+                run_id=run_id,
+                now=now,
+                reason=MATCHING_WIKIPEDIA_REASON,
+            )
+            if had_active:
+                acted += 1
+            continue
+        result = ensure_coverage_research(
+            connection,
+            person_id=person_id,
+            run_id=run_id,
+            config=config,
+            policy=policy,
+            now=now,
+        )
+        if result != "ineligible":
+            acted += 1
+    return acted
+
+
+def supersede_coverage_work_for_person(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    run_id: int,
+    now: str,
+    reason: str = COVERAGE_SUPERSEDED_REASON,
+) -> None:
+    """Supersede active coverage plans and work for a person (K5 / K18).
+
+    Does not delete historical assessments, occurrences, or views.
+    Does not open a new plan.
+
+    **The caller must already hold an open transaction** when one is required
+    by surrounding settlement; this helper also joins or opens one briefly.
+    """
+    owns_transaction = not connection.in_transaction
+    if owns_transaction:
+        connection.execute("BEGIN IMMEDIATE")
+    try:
+        _supersede_coverage_work_for_person_body(
+            connection,
+            person_id=person_id,
+            run_id=run_id,
+            now=now,
+            reason=reason,
+        )
+    except BaseException:
+        if owns_transaction:
+            connection.rollback()
+        raise
+    else:
+        if owns_transaction:
+            connection.commit()
+
+
+def _ensure_coverage_research_body(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    run_id: int,
+    config: MainConfig,
+    policy: SourcePolicy,
+    now: str,
+) -> str:
+    person_row = connection.execute(
+        """
+        SELECT id, merged_into_person_id, identity_fingerprint,
+               current_wikipedia_identity_observation_id
+          FROM person
+         WHERE id = ?
+        """,
+        (person_id,),
+    ).fetchone()
+    if person_row is None:
+        return "ineligible"
+    if person_row["merged_into_person_id"] is not None:
+        supersede_coverage_work_for_person(
+            connection,
+            person_id=int(person_row["id"]),
+            run_id=run_id,
+            now=now,
+            reason=MERGED_AWAY_COVERAGE_REASON,
+        )
+        return "ineligible"
+
+    canonical_id = int(person_row["id"])
+    wiki_id = person_row["current_wikipedia_identity_observation_id"]
+    if wiki_id is None:
+        return "ineligible"
+    wiki = connection.execute(
+        """
+        SELECT disposition, semantic_outcome
+          FROM wikipedia_identity_observation
+         WHERE id = ?
+        """,
+        (int(wiki_id),),
+    ).fetchone()
+    if wiki is None or wiki["disposition"] != "completed":
+        return "ineligible"
+    if wiki["semantic_outcome"] == "matching_page_found":
+        supersede_coverage_work_for_person(
+            connection,
+            person_id=canonical_id,
+            run_id=run_id,
+            now=now,
+            reason=MATCHING_WIKIPEDIA_REASON,
+        )
+        return "stopped_matching"
+    if wiki["semantic_outcome"] not in _ELIGIBLE_WIKI_OUTCOMES:
+        return "ineligible"
+    if not _has_operational_match_key_name(connection, person_id=canonical_id):
+        return "ineligible"
+
+    target = _resolve_coverage_live_target(
+        connection,
+        person_id=canonical_id,
+        identity_fingerprint=str(person_row["identity_fingerprint"]),
+        config=config,
+        policy=policy,
+        now=now,
+    )
+    if target is None:
+        return "ineligible"
+    live_fp, refresh_of, _ = target
+
+    active = load_active_plan_for_fingerprint(
+        connection,
+        person_id=canonical_id,
+        material_fingerprint=live_fp,
+    )
+    if active is not None:
+        return "reused"
+    if _has_terminal_plan_fp(
+        connection, person_id=canonical_id, material_fingerprint=live_fp
+    ):
+        return "reused"
+
+    open_coverage_plan(
+        connection,
+        person_id=canonical_id,
+        run_id=run_id,
+        config=config,
+        policy=policy,
+        now=now,
+        material_fingerprint=live_fp,
+        refresh_of_plan_id=refresh_of,
+    )
+    return "scheduled"
+
+
+def _resolve_coverage_live_target(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    identity_fingerprint: str,
+    config: MainConfig,
+    policy: SourcePolicy,
+    now: str,
+) -> tuple[str, int | None, int] | None:
+    """Return ``(live_fp, refresh_of_plan_id, person_id)`` for ensure/open."""
+    assess = config.tasks.assess_article
+    person_view = CoveragePersonMaterialView(
+        person_id=person_id,
+        identity_fingerprint=identity_fingerprint,
+    )
+    policy_fp = policy.fingerprint
+    base_fp = coverage_material_fingerprint(
+        person_view,
+        assess,
+        source_policy_fingerprint=policy_fp,
+        refresh_of_plan_id=None,
+    )
+
+    cur_plan = _latest_terminal_plan_matching_live(
+        connection,
+        person_id=person_id,
+        person_view=person_view,
+        assess=assess,
+        source_policy_fingerprint=policy_fp,
+    )
+    if cur_plan is not None:
+        if cur_plan.status == "failed":
+            return None
+        if cur_plan.status in ("completed", "incomplete"):
+            completed_at = cur_plan.completed_at
+            if completed_at is None:
+                return None
+            if not _refresh_interval_elapsed(
+                completed_at=completed_at,
+                now=now,
+                hours=assess.coverage_refresh_interval_hours,
+            ):
+                return None
+            live_fp = coverage_material_fingerprint(
+                person_view,
+                assess,
+                source_policy_fingerprint=policy_fp,
+                refresh_of_plan_id=cur_plan.id,
+            )
+            return live_fp, cur_plan.id, person_id
+        return None
+
+    terminal_base = _terminal_plan_for_fingerprint(
+        connection, person_id=person_id, material_fingerprint=base_fp
+    )
+    if terminal_base is not None:
+        if terminal_base.status == "failed":
+            return None
+        if terminal_base.status in ("completed", "incomplete"):
+            completed_at = terminal_base.completed_at
+            if completed_at is None:
+                return None
+            if not _refresh_interval_elapsed(
+                completed_at=completed_at,
+                now=now,
+                hours=assess.coverage_refresh_interval_hours,
+            ):
+                return None
+            live_fp = coverage_material_fingerprint(
+                person_view,
+                assess,
+                source_policy_fingerprint=policy_fp,
+                refresh_of_plan_id=terminal_base.id,
+            )
+            return live_fp, terminal_base.id, person_id
+        return None
+
+    return base_fp, None, person_id
+
+
+def _supersede_coverage_work_for_person_body(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    run_id: int,
+    now: str,
+    reason: str,
+) -> None:
+    plan_rows = connection.execute(
+        """
+        SELECT id, material_fingerprint
+          FROM person_coverage_plan
+         WHERE person_id = ?
+           AND status IN ('retrieving', 'selecting', 'assessing')
+         ORDER BY id
+        """,
+        (person_id,),
+    ).fetchall()
+    for row in plan_rows:
+        plan_id = int(row["id"])
+        _supersede_coverage_plan_and_work(
+            connection,
+            plan_id=plan_id,
+            person_id=person_id,
+            run_id=run_id,
+            now=now,
+            reason=reason,
+        )
+
+    # Assess work may still name person_article rows for this person.
+    pa_ids = [
+        int(row["id"])
+        for row in connection.execute(
+            "SELECT id FROM person_article WHERE person_id = ?",
+            (person_id,),
+        )
+    ]
+    if pa_ids:
+        placeholders = ",".join("?" for _ in pa_ids)
+        connection.execute(
+            f"""
+            UPDATE work_item
+               SET state = 'superseded', reason = ?, completed_by_run_id = ?,
+                   updated_at = ?
+             WHERE task_type = ?
+               AND subject_kind = ?
+               AND subject_id IN ({placeholders})
+               AND state IN ('pending', 'deferred')
+            """,
+            (
+                reason,
+                run_id,
+                now,
+                ASSESS_ARTICLE_TASK_TYPE,
+                SUBJECT_KIND_PERSON_ARTICLE,
+                *pa_ids,
+            ),
+        )
+
+
+def _supersede_coverage_plan_and_work(
+    connection: sqlite3.Connection,
+    *,
+    plan_id: int,
+    person_id: int,
+    run_id: int,
+    now: str,
+    reason: str,
+) -> None:
+    del person_id  # reserved for future person-scoped work kinds
+    form_ids = [
+        int(row["id"])
+        for row in connection.execute(
+            "SELECT id FROM coverage_query_form WHERE plan_id = ?",
+            (plan_id,),
+        )
+    ]
+    if form_ids:
+        placeholders = ",".join("?" for _ in form_ids)
+        connection.execute(
+            f"""
+            UPDATE work_item
+               SET state = 'superseded', reason = ?, completed_by_run_id = ?,
+                   updated_at = ?
+             WHERE task_type = ?
+               AND subject_kind = ?
+               AND subject_id IN ({placeholders})
+               AND state IN ('pending', 'deferred')
+            """,
+            (
+                reason,
+                run_id,
+                now,
+                BRAVE_WEB_SEARCH_TASK_TYPE,
+                SUBJECT_KIND_COVERAGE_QUERY_FORM,
+                *form_ids,
+            ),
+        )
+
+    target_ids = [
+        int(row["id"])
+        for row in connection.execute(
+            "SELECT id FROM coverage_article_target WHERE plan_id = ?",
+            (plan_id,),
+        )
+    ]
+    if target_ids:
+        placeholders = ",".join("?" for _ in target_ids)
+        connection.execute(
+            f"""
+            UPDATE work_item
+               SET state = 'superseded', reason = ?, completed_by_run_id = ?,
+                   updated_at = ?
+             WHERE task_type = ?
+               AND subject_kind = ?
+               AND subject_id IN ({placeholders})
+               AND state IN ('pending', 'deferred')
+            """,
+            (
+                reason,
+                run_id,
+                now,
+                FETCH_ARTICLE_TASK_TYPE,
+                SUBJECT_KIND_COVERAGE_ARTICLE_TARGET,
+                *target_ids,
+            ),
+        )
+
+    supersede_pending_targets_for_plan(connection, plan_id=plan_id)
+    plan = load_plan(connection, plan_id=plan_id)
+    if plan is not None and plan.status in _ACTIVE_PLAN_STATUSES:
+        supersede_plan(connection, plan_id=plan_id, completed_at=now)
+
+
+def _latest_terminal_plan_matching_live(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    person_view: CoveragePersonMaterialView,
+    assess: AssessArticleConfig,
+    source_policy_fingerprint: str,
+) -> PersonCoveragePlanRecord | None:
+    rows = connection.execute(
+        """
+        SELECT *
+          FROM person_coverage_plan
+         WHERE person_id = ?
+           AND status IN ('completed', 'failed', 'incomplete')
+         ORDER BY id DESC
+        """,
+        (person_id,),
+    ).fetchall()
+    for row in rows:
+        plan = load_plan(connection, plan_id=int(row["id"]))
+        if plan is None:
+            continue
+        if plan_matches_live_material(
+            plan,
+            person_view,
+            assess,
+            source_policy_fingerprint=source_policy_fingerprint,
+        ):
+            return plan
+    return None
+
+
+def _terminal_plan_for_fingerprint(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    material_fingerprint: str,
+) -> PersonCoveragePlanRecord | None:
+    row = connection.execute(
+        """
+        SELECT *
+          FROM person_coverage_plan
+         WHERE person_id = ?
+           AND material_fingerprint = ?
+           AND status IN ('completed', 'failed', 'incomplete')
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (person_id, material_fingerprint),
+    ).fetchone()
+    if row is None:
+        return None
+    return load_plan(connection, plan_id=int(row["id"]))
+
+
+def _has_terminal_plan_fp(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    material_fingerprint: str,
+) -> bool:
+    return (
+        _terminal_plan_for_fingerprint(
+            connection,
+            person_id=person_id,
+            material_fingerprint=material_fingerprint,
+        )
+        is not None
+    )
+
+
+def _has_active_plan_fp(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    material_fingerprint: str,
+) -> bool:
+    return (
+        load_active_plan_for_fingerprint(
+            connection,
+            person_id=person_id,
+            material_fingerprint=material_fingerprint,
+        )
+        is not None
+    )
+
+
+def _has_operational_match_key_name(
+    connection: sqlite3.Connection, *, person_id: int
+) -> bool:
+    closure = person_id_closure_for_canonical(connection, person_id)
+    if not closure:
+        return False
+    placeholders = ",".join("?" for _ in closure)
+    row = connection.execute(
+        f"""
+        SELECT 1 AS present
+          FROM sourced_name
+         WHERE person_id IN ({placeholders})
+           AND length(match_key) > 0
+         LIMIT 1
+        """,
+        closure,
+    ).fetchone()
+    return row is not None
+
+
+def _refresh_interval_elapsed(*, completed_at: str, now: str, hours: int) -> bool:
+    completed_dt = _parse_utc_timestamp(completed_at)
+    now_dt = _parse_utc_timestamp(now)
+    return now_dt - completed_dt >= timedelta(hours=hours)
+
+
+def _parse_utc_timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _current_wikipedia_row(
+    connection: sqlite3.Connection, *, person_id: int
+) -> sqlite3.Row | None:
+    person = connection.execute(
+        """
+        SELECT current_wikipedia_identity_observation_id
+          FROM person
+         WHERE id = ?
+        """,
+        (person_id,),
+    ).fetchone()
+    if person is None or person["current_wikipedia_identity_observation_id"] is None:
+        return None
+    return connection.execute(
+        """
+        SELECT disposition, semantic_outcome
+          FROM wikipedia_identity_observation
+         WHERE id = ?
+        """,
+        (int(person["current_wikipedia_identity_observation_id"]),),
+    ).fetchone()
+
+
+def _person_has_active_coverage(
+    connection: sqlite3.Connection, *, person_id: int
+) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1 AS present
+          FROM person_coverage_plan
+         WHERE person_id = ?
+           AND status IN ('retrieving', 'selecting', 'assessing')
+         LIMIT 1
+        """,
+        (person_id,),
+    ).fetchone()
+    return row is not None
 
 
 @dataclass(frozen=True, slots=True)

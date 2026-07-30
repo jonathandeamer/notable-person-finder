@@ -16,7 +16,7 @@
 | 6a | Plan lifecycle + brave_web_search | complete |
 | 6b | fetch_article + views | complete |
 | 7 | assess_article + multi-model inspect | complete |
-| 8 | Seed, supersede, merge | pending |
+| 8 | Seed, supersede, merge | complete |
 | 9 | Digest/status/CLI + gate | pending |
 
 ## Ledger lines
@@ -73,4 +73,16 @@ Task 6b: complete (commits 34b0d1a..8ade6e8, review clean)
 Task 7: complete — build_assess_article_handler (PassageSelector + validate,
 K25 completed-only pointer), assess_model_needed + mid-run ensure (K20),
 permanent preflight settler for assess_article (K23); 10 new tests;
-mutation evidence in task-7-report.md; gate 214 passed
+mutation evidence in task-7-report.md; gate 214 passed; commit cc7b420
+
+Task 7: fix round 1/5 (2 Important addressed, 0 open — K23 settler + handler
+plan terminalize; advance_coverage_plan_after_assess; commit 90be14f)
+
+Task 7: fix round 1/5 (2 addressed, 0 open; commits cc7b420..90be14f)
+Task 7: complete (commits 8ade6e8..90be14f, review clean)
+
+Task 8: complete — seed_coverage_research, ensure_coverage_research,
+schedule_coverage_after_wikipedia_ready, supersede_coverage_work_for_person,
+DB is_coverage_research_eligible (K5/K19/K30 multi-refresh), merge_hooks
+reconcile_on_merge (K18); wikipedia settle + people/merge wired;
+mutation evidence in task-8-report.md
