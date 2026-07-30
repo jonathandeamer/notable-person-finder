@@ -284,6 +284,19 @@ def test_reconcile_supersedes_loser_work_and_ensures_survivor(
     assert loser_form_work is not None
     assert loser_form_work["state"] == "superseded"
 
+    loser_facts_work = connection.execute(
+        """
+        SELECT wi.state
+          FROM work_item AS wi
+          JOIN wikipedia_page_facts_batch AS b ON b.id = wi.subject_id
+         WHERE wi.task_type = ?
+           AND b.plan_id = ?
+        """,
+        (MEDIAWIKI_PAGE_FACTS_TASK_TYPE, plan_id),
+    ).fetchone()
+    assert loser_facts_work is not None
+    assert loser_facts_work["state"] == "superseded"
+
     survivor_plan = connection.execute(
         """
         SELECT COUNT(*) AS n

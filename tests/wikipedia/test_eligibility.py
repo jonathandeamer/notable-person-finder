@@ -436,6 +436,134 @@ def test_double_and_triple_refresh_reanchors_on_current(
     assert int(plan_r3["refresh_of_observation_id"]) == r2
 
 
+def test_branch2_completed_without_pointer_time_refresh(
+    connection: sqlite3.Connection,
+) -> None:
+    """Completed base_fp without current pointer: interval then refresh_of=that id."""
+    run_id = insert_run(connection)
+    person_id = _person_with_name(connection, run_id=run_id)
+    config = _config()
+    view = _person_view(connection, person_id)
+    base_fp = base_material_fingerprint(
+        view, config.tasks.match_wikipedia_identity, refresh_of_observation_id=None
+    )
+    obs_id = _complete_observation(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        material_fingerprint=base_fp,
+        observed_at=NOW,
+        point_current=False,
+    )
+    ptr = connection.execute(
+        "SELECT current_wikipedia_identity_observation_id FROM person WHERE id = ?",
+        (person_id,),
+    ).fetchone()
+    assert ptr is not None
+    assert ptr["current_wikipedia_identity_observation_id"] is None
+
+    soon = _hours_after(NOW, REFRESH_HOURS - 1)
+    assert (
+        is_wikipedia_match_eligible(
+            connection, person_id=person_id, config=config, now=soon
+        )
+        is False
+    )
+    due = _hours_after(NOW, REFRESH_HOURS)
+    assert (
+        is_wikipedia_match_eligible(
+            connection, person_id=person_id, config=config, now=due
+        )
+        is True
+    )
+    assert (
+        ensure_wikipedia_identity(
+            connection,
+            person_id=person_id,
+            run_id=run_id,
+            config=config,
+            now=due,
+        )
+        == "scheduled"
+    )
+    plan = connection.execute(
+        """
+        SELECT refresh_of_observation_id
+          FROM wikipedia_identity_plan
+         WHERE person_id = ? AND status = 'retrieving'
+         ORDER BY id DESC LIMIT 1
+        """,
+        (person_id,),
+    ).fetchone()
+    assert plan is not None
+    assert int(plan["refresh_of_observation_id"]) == obs_id
+
+
+def test_k19_stale_active_plan_superseded_on_material_change(
+    connection: sqlite3.Connection,
+) -> None:
+    """Ensure under new live_fp supersedes active plan for a different fingerprint."""
+    run_id = insert_run(connection)
+    person_id = _person_with_name(connection, run_id=run_id)
+    config = _config()
+    assert (
+        ensure_wikipedia_identity(
+            connection,
+            person_id=person_id,
+            run_id=run_id,
+            config=config,
+            now=NOW,
+        )
+        == "scheduled"
+    )
+    old_plan = connection.execute(
+        """
+        SELECT id, material_fingerprint
+          FROM wikipedia_identity_plan
+         WHERE person_id = ? AND status = 'retrieving'
+        """,
+        (person_id,),
+    ).fetchone()
+    assert old_plan is not None
+
+    with immediate(connection):
+        connection.execute(
+            """
+            UPDATE person
+               SET identity_fingerprint = ?
+             WHERE id = ?
+            """,
+            ("9" * 64, person_id),
+        )
+    assert (
+        ensure_wikipedia_identity(
+            connection,
+            person_id=person_id,
+            run_id=run_id,
+            config=config,
+            now=NOW,
+        )
+        == "scheduled"
+    )
+    old_status = connection.execute(
+        "SELECT status FROM wikipedia_identity_plan WHERE id = ?",
+        (int(old_plan["id"]),),
+    ).fetchone()
+    assert old_status is not None
+    assert old_status["status"] == "superseded"
+    new_plan = connection.execute(
+        """
+        SELECT material_fingerprint
+          FROM wikipedia_identity_plan
+         WHERE person_id = ? AND status = 'retrieving'
+         ORDER BY id DESC LIMIT 1
+        """,
+        (person_id,),
+    ).fetchone()
+    assert new_plan is not None
+    assert new_plan["material_fingerprint"] != old_plan["material_fingerprint"]
+
+
 def test_failed_terminal_does_not_time_refresh(connection: sqlite3.Connection) -> None:
     run_id = insert_run(connection)
     person_id = _person_with_name(connection, run_id=run_id)

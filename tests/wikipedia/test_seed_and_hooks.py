@@ -330,6 +330,72 @@ def test_do_not_research_without_person_does_not_schedule(
     assert int(plans["n"]) == 0
 
 
+def _persist_model_resolution(
+    connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
+    run_id: int,
+    inspection_id: int,
+    mention_id: int,
+    output: ResolvePersonEntityOutput,
+    candidate_person_ids: tuple[int, ...],
+    fingerprint: str = "f" * 64,
+) -> None:
+    """Drive first-pass model persist (not empty-candidate ensure)."""
+    work_id = connection.execute(
+        """
+        INSERT INTO work_item (
+            task_type, subject_kind, subject_id, fingerprint, required,
+            priority, eligible_at, state, created_by_run_id, created_at, updated_at
+        ) VALUES (
+            'resolve_person_entity', 'person_mention', ?, ?, 1, 40, ?,
+            'running', ?, ?, ?
+        )
+        """,
+        (mention_id, fingerprint, NOW, run_id, NOW, NOW),
+    ).lastrowid
+    assert work_id is not None
+    attempt_id = connection.execute(
+        """
+        INSERT INTO attempt (
+            run_id, work_item_id, provider, operation, ordinal, started_at,
+            finished_at, outcome, request_fingerprint
+        ) VALUES (?, ?, 'openrouter', 'generate_structured', 1, ?, ?, 'succeeded', ?)
+        """,
+        (run_id, work_id, NOW, moment(1), fingerprint),
+    ).lastrowid
+    assert attempt_id is not None
+    connection.commit()
+
+    payload = _ResolutionPersist(
+        output=output,
+        person_mention_id=mention_id,
+        model_inspection_id=inspection_id,
+        canonical_supplied_input_json="{}",
+        prompt_hash=_PROMPT,
+        schema_hash=_SCHEMA,
+        schema_version=1,
+        task_fingerprint=fingerprint,
+        candidate_person_ids=candidate_person_ids,
+    )
+    work_item = WorkItem(
+        id=work_id,
+        task_type="resolve_person_entity",
+        subject_kind="person_mention",
+        subject_id=mention_id,
+        fingerprint=fingerprint,
+        required=True,
+        priority=40,
+        state=WorkState.RUNNING,
+    )
+    persist = _persist_resolution_for(connection, config=config)
+    with immediate(connection):
+        persist(
+            work_item,
+            TaskOutcome(state=WorkState.SUCCEEDED, reason=None, payload=payload),
+        )
+
+
 def test_same_person_link_hook_schedules_wikipedia(
     connection: sqlite3.Connection,
 ) -> None:
@@ -356,65 +422,21 @@ def test_same_person_link_hook_schedules_wikipedia(
             observed_at=NOW,
         )
 
-    work_id = connection.execute(
-        """
-        INSERT INTO work_item (
-            task_type, subject_kind, subject_id, fingerprint, required,
-            priority, eligible_at, state, created_by_run_id, created_at, updated_at
-        ) VALUES (
-            'resolve_person_entity', 'person_mention', ?, ?, 1, 40, ?,
-            'running', ?, ?, ?
-        )
-        """,
-        (mention_id, "f" * 64, NOW, run_id, NOW, NOW),
-    ).lastrowid
-    assert work_id is not None
-    attempt_id = connection.execute(
-        """
-        INSERT INTO attempt (
-            run_id, work_item_id, provider, operation, ordinal, started_at,
-            finished_at, outcome, request_fingerprint
-        ) VALUES (?, ?, 'openrouter', 'generate_structured', 1, ?, ?, 'succeeded', ?)
-        """,
-        (run_id, work_id, NOW, moment(1), "f" * 64),
-    ).lastrowid
-    assert attempt_id is not None
-    connection.commit()
-
-    output = ResolvePersonEntityOutput(
-        outcome="same_person",
-        selected_person_id=person_id,
-        supporting_fact_ids=(),
-        conflicting_fact_ids=(),
-        rationale="same individual",
-    )
-    payload = _ResolutionPersist(
-        output=output,
-        person_mention_id=mention_id,
-        model_inspection_id=inspection_id,
-        canonical_supplied_input_json="{}",
-        prompt_hash=_PROMPT,
-        schema_hash=_SCHEMA,
-        schema_version=1,
-        task_fingerprint="f" * 64,
+    _persist_model_resolution(
+        connection,
+        config=config,
+        run_id=run_id,
+        inspection_id=inspection_id,
+        mention_id=mention_id,
+        output=ResolvePersonEntityOutput(
+            outcome="same_person",
+            selected_person_id=person_id,
+            supporting_fact_ids=(),
+            conflicting_fact_ids=(),
+            rationale="same individual",
+        ),
         candidate_person_ids=(person_id,),
     )
-    work_item = WorkItem(
-        id=work_id,
-        task_type="resolve_person_entity",
-        subject_kind="person_mention",
-        subject_id=mention_id,
-        fingerprint="f" * 64,
-        required=True,
-        priority=40,
-        state=WorkState.RUNNING,
-    )
-    persist = _persist_resolution_for(connection, config=config)
-    with immediate(connection):
-        persist(
-            work_item,
-            TaskOutcome(state=WorkState.SUCCEEDED, reason=None, payload=payload),
-        )
 
     linked = connection.execute(
         "SELECT person_id FROM person_mention WHERE id = ?",
@@ -423,6 +445,123 @@ def test_same_person_link_hook_schedules_wikipedia(
     assert linked is not None
     assert int(linked["person_id"]) == person_id
     assert _active_plan_count(connection, person_id=person_id) == 1
+    assert _wiki_search_work_count(connection) >= 1
+
+
+def test_different_people_create_hook_schedules_wikipedia(
+    connection: sqlite3.Connection,
+) -> None:
+    """Model-path different_people create (not empty ensure) arms Wikipedia."""
+    config = _main_config()
+    run_id, inspection_id, mention_id = _seed_mention_graph(
+        connection,
+        exact_name="Gina Vale",
+        feed_key="feed-dp",
+        source_entry_id="entry-dp",
+        material_fingerprint="d" * 64,
+    )
+    with immediate(connection):
+        candidate_id = insert_person(
+            connection,
+            run_id=run_id,
+            display_name="Gina Other",
+            identity_fingerprint="e" * 64,
+            created_at=NOW,
+        )
+        upsert_sourced_name(
+            connection,
+            person_id=candidate_id,
+            exact_name="Gina Other",
+            kind="professional",
+            origin_kind="manual",
+            origin_mention_id=None,
+            observed_at=NOW,
+        )
+
+    _persist_model_resolution(
+        connection,
+        config=config,
+        run_id=run_id,
+        inspection_id=inspection_id,
+        mention_id=mention_id,
+        output=ResolvePersonEntityOutput(
+            outcome="different_people",
+            selected_person_id=None,
+            supporting_fact_ids=(),
+            conflicting_fact_ids=(),
+            rationale="distinct individuals",
+        ),
+        candidate_person_ids=(candidate_id,),
+        fingerprint="1" * 64,
+    )
+
+    person_row = connection.execute(
+        "SELECT person_id FROM person_mention WHERE id = ?",
+        (mention_id,),
+    ).fetchone()
+    assert person_row is not None and person_row["person_id"] is not None
+    created_id = int(person_row["person_id"])
+    assert created_id != candidate_id
+    assert _active_plan_count(connection, person_id=created_id) == 1
+    assert _wiki_search_work_count(connection) >= 1
+
+
+def test_uncertain_create_hook_schedules_wikipedia(
+    connection: sqlite3.Connection,
+) -> None:
+    """Model-path uncertain create (not empty ensure) arms Wikipedia."""
+    config = _main_config()
+    run_id, inspection_id, mention_id = _seed_mention_graph(
+        connection,
+        exact_name="Holly Quinn",
+        feed_key="feed-unc",
+        source_entry_id="entry-unc",
+        material_fingerprint="u" * 64,
+    )
+    with immediate(connection):
+        candidate_id = insert_person(
+            connection,
+            run_id=run_id,
+            display_name="Holly Peer",
+            identity_fingerprint="v" * 64,
+            created_at=NOW,
+        )
+        upsert_sourced_name(
+            connection,
+            person_id=candidate_id,
+            exact_name="Holly Peer",
+            kind="professional",
+            origin_kind="manual",
+            origin_mention_id=None,
+            observed_at=NOW,
+        )
+
+    _persist_model_resolution(
+        connection,
+        config=config,
+        run_id=run_id,
+        inspection_id=inspection_id,
+        mention_id=mention_id,
+        output=ResolvePersonEntityOutput(
+            outcome="uncertain",
+            selected_person_id=None,
+            supporting_fact_ids=(),
+            conflicting_fact_ids=(),
+            rationale="insufficient evidence",
+        ),
+        candidate_person_ids=(candidate_id,),
+        fingerprint="2" * 64,
+    )
+
+    person_row = connection.execute(
+        "SELECT person_id FROM person_mention WHERE id = ?",
+        (mention_id,),
+    ).fetchone()
+    assert person_row is not None and person_row["person_id"] is not None
+    created_id = int(person_row["person_id"])
+    assert created_id != candidate_id
+    assert _active_plan_count(connection, person_id=created_id) == 1
+    assert _wiki_search_work_count(connection) >= 1
 
 
 def test_schedule_wikipedia_after_person_ready_direct(
