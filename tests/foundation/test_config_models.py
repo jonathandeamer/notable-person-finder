@@ -2,6 +2,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from notable_person_finder.config.models import (
+    AssessArticleConfig,
     BraveConfig,
     DetectPeopleConfig,
     DomainProfileConfig,
@@ -88,6 +89,32 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
     assert match.refresh_interval_hours == 720
     assert match.max_title_characters == 500
     assert match.max_summary_characters == 4000
+    assess = config.tasks.assess_article
+    assert assess.model == "openai/gpt-5.4-mini"
+    assert assess.max_input_tokens == 4096
+    assert assess.max_completion_tokens == 1024
+    assert assess.parameters == GenerationParameters(
+        temperature=0.0,
+        top_p=1.0,
+        reasoning_effort=None,
+    )
+    assert assess.retrieval_target == 5
+    assert assess.max_exact_forms == 4
+    assert assess.max_alias_forms == 4
+    assert assess.max_context_forms == 1
+    assert assess.search_count == 10
+    assert assess.max_offsets_per_form == 0
+    assert assess.max_results_per_form == 20
+    assert assess.max_eligible_fetches == 8
+    assert assess.max_unclassified_fetches == 2
+    assert assess.max_passage_characters == 6000
+    assert assess.max_passage_blocks == 24
+    assert assess.opening_block_count == 2
+    assert assess.coverage_refresh_interval_hours == 720
+    assert assess.reject_altered_query is False
+    assert assess.assess_ineligible is False
+    assert assess.max_title_characters == 500
+    assert assess.max_summary_characters == 4000
     assert GenerationParameters(reasoning_effort=None).reasoning_effort is None
 
 
@@ -102,9 +129,11 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
         (DetectPeopleConfig(), "model"),
         (ResolvePersonEntityConfig(), "model"),
         (MatchWikipediaIdentityConfig(), "model"),
+        (AssessArticleConfig(), "model"),
         (TasksConfig(), "detect_people"),
         (TasksConfig(), "resolve_person_entity"),
         (TasksConfig(), "match_wikipedia_identity"),
+        (TasksConfig(), "assess_article"),
     ],
 )
 def test_model_configuration_models_are_frozen(value: object, field_name: str) -> None:
@@ -123,9 +152,11 @@ def test_model_configuration_models_are_frozen(value: object, field_name: str) -
         ("detect_people", {"max_tokens": 1024}),
         ("resolve_person_entity", {"max_tokens": 1024}),
         ("match_wikipedia_identity", {"max_tokens": 1024}),
+        ("assess_article", {"max_tokens": 1024}),
         ("parameters", {"seed": 7}),
         ("resolve_parameters", {"seed": 7}),
         ("match_parameters", {"seed": 7}),
+        ("assess_parameters", {"seed": 7}),
     ],
 )
 def test_model_configuration_rejects_unknown_fields(
@@ -139,6 +170,7 @@ def test_model_configuration_rejects_unknown_fields(
         "detect_people": {},
         "resolve_person_entity": {},
         "match_wikipedia_identity": {},
+        "assess_article": {},
     }
     if section == "openrouter":
         value["openrouter"] = extra
@@ -156,10 +188,14 @@ def test_model_configuration_rejects_unknown_fields(
         value["tasks"] = {"resolve_person_entity": extra}
     elif section == "match_wikipedia_identity":
         value["tasks"] = {"match_wikipedia_identity": extra}
+    elif section == "assess_article":
+        value["tasks"] = {"assess_article": extra}
     elif section == "resolve_parameters":
         value["tasks"] = {"resolve_person_entity": {"parameters": extra}}
     elif section == "match_parameters":
         value["tasks"] = {"match_wikipedia_identity": {"parameters": extra}}
+    elif section == "assess_parameters":
+        value["tasks"] = {"assess_article": {"parameters": extra}}
     else:
         value["tasks"] = {"detect_people": {"parameters": extra}}
 
@@ -489,6 +525,45 @@ def test_match_wikipedia_identity_rejects_out_of_range_bounds(
 
 def test_match_wikipedia_identity_has_no_secret_fields() -> None:
     fields = set(MatchWikipediaIdentityConfig.model_fields)
+    forbidden = ("api_key", "secret", "password", "credential", "auth_token")
+    for name in fields:
+        lowered = name.lower()
+        for fragment in forbidden:
+            assert fragment not in lowered
+
+
+def test_assess_article_rejects_assess_ineligible_true() -> None:
+    with pytest.raises(ValidationError, match="assess_ineligible"):
+        AssessArticleConfig.model_validate({"assess_ineligible": True})
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"max_input_tokens": 0},
+        {"max_completion_tokens": 0},
+        {"max_input_tokens": 1024, "max_completion_tokens": 1024},
+        {"max_title_characters": 1000, "max_summary_characters": 999},
+        {"retrieval_target": 0},
+        {"retrieval_target": 21},
+        {"max_offsets_per_form": -1},
+        {"max_offsets_per_form": 6},
+        {"max_passage_characters": 499},
+        {"max_passage_blocks": 3},
+        {"max_passage_blocks": 65},
+        {"opening_block_count": 11},
+        {"coverage_refresh_interval_hours": 0},
+    ],
+)
+def test_assess_article_rejects_out_of_range_or_incompatible_bounds(
+    values: dict[str, int],
+) -> None:
+    with pytest.raises(ValidationError):
+        AssessArticleConfig.model_validate(values)
+
+
+def test_assess_article_has_no_secret_fields() -> None:
+    fields = set(AssessArticleConfig.model_fields)
     forbidden = ("api_key", "secret", "password", "credential", "auth_token")
     for name in fields:
         lowered = name.lower()

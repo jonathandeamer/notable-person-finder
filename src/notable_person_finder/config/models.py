@@ -351,12 +351,65 @@ class MatchWikipediaIdentityConfig(_StrictConfigurationModel):
         return self
 
 
+class AssessArticleConfig(_StrictConfigurationModel):
+    """Assess-article model plus every coverage bound in material fingerprints (K33).
+
+    Plan-level knobs such as ``coverage_refresh_interval_hours`` live here because
+    they co-locate with the fingerprint field list — not because refresh is
+    assessment-specific.
+    """
+
+    model: str = "openai/gpt-5.4-mini"
+    max_input_tokens: int = Field(default=4096, strict=True, ge=1, le=1_000_000)
+    max_completion_tokens: int = Field(default=1024, strict=True, ge=1, le=100_000)
+    parameters: GenerationParameters = GenerationParameters()
+    max_title_characters: int = Field(default=500, strict=True, ge=1, le=2000)
+    max_summary_characters: int = Field(default=4000, strict=True, ge=1, le=20_000)
+    retrieval_target: int = Field(default=5, strict=True, ge=1, le=20)
+    max_exact_forms: int = Field(default=4, strict=True, ge=1, le=16)
+    max_alias_forms: int = Field(default=4, strict=True, ge=0, le=16)
+    max_context_forms: int = Field(default=1, strict=True, ge=0, le=2)
+    search_count: int = Field(default=10, strict=True, ge=1, le=20)
+    # Additional pages after the first; 0 = first page only (offset_in=0).
+    max_offsets_per_form: int = Field(default=0, strict=True, ge=0, le=5)
+    max_results_per_form: int = Field(default=20, strict=True, ge=1, le=100)
+    max_eligible_fetches: int = Field(default=8, strict=True, ge=1, le=32)
+    max_unclassified_fetches: int = Field(default=2, strict=True, ge=0, le=16)
+    max_passage_characters: int = Field(default=6000, strict=True, ge=500, le=50_000)
+    max_passage_blocks: int = Field(default=24, strict=True, ge=4, le=64)
+    opening_block_count: int = Field(default=2, strict=True, ge=0, le=10)
+    coverage_refresh_interval_hours: int = Field(
+        default=720, strict=True, ge=1, le=87_600
+    )
+    reject_altered_query: bool = False
+    # m5 reserves only false; true rejected at validation (K33).
+    assess_ineligible: bool = False
+
+    @field_validator("model")
+    @classmethod
+    def exact_model_slug(cls, value: str) -> str:
+        return _exact_model_slug(value)
+
+    @model_validator(mode="after")
+    def bounds_are_compatible(self) -> AssessArticleConfig:
+        if self.max_completion_tokens >= self.max_input_tokens:
+            raise ValueError("max_completion_tokens must be less than max_input_tokens")
+        if self.max_summary_characters < self.max_title_characters:
+            raise ValueError(
+                "max_summary_characters must be at least max_title_characters"
+            )
+        if self.assess_ineligible:
+            raise ValueError("assess_ineligible must be false in m5")
+        return self
+
+
 class TasksConfig(_StrictConfigurationModel):
     detect_people: DetectPeopleConfig = DetectPeopleConfig()
     resolve_person_entity: ResolvePersonEntityConfig = ResolvePersonEntityConfig()
     match_wikipedia_identity: MatchWikipediaIdentityConfig = (
         MatchWikipediaIdentityConfig()
     )
+    assess_article: AssessArticleConfig = AssessArticleConfig()
 
 
 class DigestConfig(StrictModel):
