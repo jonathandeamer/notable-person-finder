@@ -48,6 +48,7 @@ from notable_person_finder.people.service import (
     is_resolution_eligible_mention,
     models_needed_for_run,
     routing_fingerprint,
+    task_types_for_model,
 )
 from notable_person_finder.providers.failures import FailureCategory, ProviderFailure
 from notable_person_finder.providers.openrouter import (
@@ -1225,6 +1226,24 @@ def test_skipped_and_failed_only_corpus_skips_resolve_model_inspect(
     assert pending == 0
 
 
+def test_task_types_for_model_maps_detect_and_resolve_separately() -> None:
+    """Kills dropping resolve/reconsider from the task→model map (K23 wiring)."""
+    shared = _main_config(model=MODEL, resolve_model=MODEL)
+    assert task_types_for_model(shared, MODEL) == (
+        DETECT_PEOPLE_TASK_TYPE,
+        RESOLVE_PERSON_ENTITY_TASK_TYPE,
+        RECONSIDER_PERSON_ENTITY_TASK_TYPE,
+    )
+
+    split = _main_config(model=MODEL, resolve_model=RESOLVE_MODEL)
+    assert task_types_for_model(split, MODEL) == (DETECT_PEOPLE_TASK_TYPE,)
+    assert task_types_for_model(split, RESOLVE_MODEL) == (
+        RESOLVE_PERSON_ENTITY_TASK_TYPE,
+        RECONSIDER_PERSON_ENTITY_TASK_TYPE,
+    )
+    assert task_types_for_model(split, "openai/gpt-other") == ()
+
+
 def test_permanent_resolve_preflight_writes_failed_er_with_inspection_attempt(
     connection: sqlite3.Connection,
 ) -> None:
@@ -1410,6 +1429,256 @@ def test_permanent_resolve_preflight_writes_failed_er_with_inspection_attempt(
             (GENERATE_OPERATION,),
         ).fetchone()["n"]
         == 1  # the historical detection attempt from _seed_triaged_mention
+    )
+
+
+def test_handler_permanent_resolve_preflight_settles_resolve_not_detect(
+    connection: sqlite3.Connection,
+) -> None:
+    """K23 through real inspect handler: resolve model fail must not settle detect.
+
+    Kills regressions that drop resolve types from ``task_types_for_model`` or
+    ``_settle_dependents`` while still calling the repository settler in unit
+    tests — resolve work would stay pending forever under permanent preflight.
+    """
+    bootstrap = insert_run(connection)
+    detect_item_id = _seed_source_item(
+        connection,
+        run_id=bootstrap,
+        source_entry_id="detect-live",
+        key="feed-detect-live",
+        title_text="Untriaged item still needs detection",
+        summary_text="Keep detect model in models_needed.",
+    )
+    _triaged_item, mention_id = _seed_triaged_mention(
+        connection,
+        run_id=bootstrap,
+        exact_name="Alex Smith",
+        source_entry_id="resolve-subject",
+        key="feed-resolve-subject",
+    )
+    config = _main_config(resolve_model=RESOLVE_MODEL)
+    resolve_fp = _mention_fingerprint(
+        person_mention_id=mention_id, exact_name="Alex Smith", config=config
+    )
+    resolve_hashes = resolution_prompt_and_schema_hashes()
+
+    with immediate(connection):
+        person_a = insert_person(
+            connection,
+            run_id=bootstrap,
+            display_name="Alex Smith",
+            identity_fingerprint="c" * 64,
+            created_at=NOW,
+        )
+        person_b = insert_person(
+            connection,
+            run_id=bootstrap,
+            display_name="Alex Other",
+            identity_fingerprint="d" * 64,
+            created_at=NOW,
+        )
+        first_pass_er = insert_entity_resolution_observation(
+            connection,
+            person_mention_id=mention_id,
+            person_relation_id=None,
+            run_id=bootstrap,
+            attempt_id=None,
+            model_inspection_id=None,
+            disposition="completed",
+            semantic_outcome="created_new",
+            selected_person_id=None,
+            created_person_id=person_a,
+            candidate_person_ids_json="[]",
+            canonical_supplied_input_json="{}",
+            validated_output_json='{"outcome":"created_new"}',
+            prompt_hash=resolve_hashes[0],
+            schema_hash=resolve_hashes[1],
+            schema_version=resolve_hashes[2],
+            task_fingerprint="e" * 64,
+            rationale="created",
+            observed_at=NOW,
+        )
+        relation_id = upsert_active_possible_same_person(
+            connection,
+            person_id_a=person_a,
+            person_id_b=person_b,
+            run_id=bootstrap,
+            created_by_observation_id=first_pass_er,
+            now=NOW,
+        )
+    reconsider_fp = "f" * 64
+
+    class SelectiveInspectClient(FakeLlmClient):
+        def inspect_model(
+            self, request: ModelInspectionRequest
+        ) -> ModelInspectionResult:
+            self.inspect_calls.append(request)
+            if request.model_id == RESOLVE_MODEL:
+                raise ProviderFailure(
+                    FailureCategory.AUTHENTICATION,
+                    provider=PROVIDER,
+                    operation=INSPECT_OPERATION,
+                    detail="resolve model unauthorized",
+                )
+            return _compatible_inspection(model_id=request.model_id)
+
+    client = SelectiveInspectClient()
+    inspection_handler = build_inspection_handler(
+        connection, client=client, config=config
+    )
+    generation_calls: list[int] = []
+
+    detection_handler = TaskHandler(
+        task_type=DETECT_PEOPLE_TASK_TYPE,
+        provider=PROVIDER,
+        operation=GENERATE_OPERATION,
+        execute=lambda work, ordinal, prepared: (
+            generation_calls.append(1)
+            or TaskOutcome(state=WorkState.SUCCEEDED, reason=None)
+        ),
+        pool=WorkerPool.LLM,
+        ready=lambda claimed_run_id: inspection_ready(
+            connection,
+            run_id=claimed_run_id,
+            config=config,
+            model_id=MODEL,
+        ),
+        reserved_nano_usd=0,
+    )
+
+    def seed(run_id: int) -> None:
+        now = moment()
+        # Domain work first so ensure sees both detect and resolve dependents.
+        _schedule_detect(
+            connection,
+            run_id=run_id,
+            source_item_id=detect_item_id,
+            fingerprint="1" * 64,
+        )
+        repository.schedule_work(
+            connection,
+            task_type=RESOLVE_PERSON_ENTITY_TASK_TYPE,
+            subject_kind="person_mention",
+            subject_id=mention_id,
+            fingerprint=resolve_fp,
+            required=True,
+            priority=40,
+            eligible_at=now,
+            run_id=run_id,
+            now=now,
+        )
+        repository.schedule_work(
+            connection,
+            task_type=RECONSIDER_PERSON_ENTITY_TASK_TYPE,
+            subject_kind="person_relation",
+            subject_id=relation_id,
+            fingerprint=reconsider_fp,
+            required=True,
+            priority=40,
+            eligible_at=now,
+            run_id=run_id,
+            now=now,
+        )
+        ensure_model_inspections_for_run(
+            connection, run_id=run_id, config=config, now=now
+        )
+
+    run_id = _run_engine(
+        connection,
+        {
+            INSPECT_MODEL_TASK_TYPE: inspection_handler,
+            DETECT_PEOPLE_TASK_TYPE: detection_handler,
+        },
+        seed=seed,
+        snapshot_fingerprint="r" * 64,
+    )
+
+    inspected = {call.model_id for call in client.inspect_calls}
+    assert MODEL in inspected
+    assert RESOLVE_MODEL in inspected
+
+    resolve_row = connection.execute(
+        """
+        SELECT state FROM work_item
+         WHERE task_type = ? AND subject_id = ?
+        """,
+        (RESOLVE_PERSON_ENTITY_TASK_TYPE, mention_id),
+    ).fetchone()
+    assert resolve_row["state"] == "failed_permanent"
+
+    reconsider_row = connection.execute(
+        """
+        SELECT state FROM work_item
+         WHERE task_type = ? AND subject_id = ?
+        """,
+        (RECONSIDER_PERSON_ENTITY_TASK_TYPE, relation_id),
+    ).fetchone()
+    assert reconsider_row["state"] == "failed_permanent"
+
+    detect_row = connection.execute(
+        """
+        SELECT state FROM work_item
+         WHERE task_type = ? AND subject_id = ?
+        """,
+        (DETECT_PEOPLE_TASK_TYPE, detect_item_id),
+    ).fetchone()
+    assert detect_row["state"] != "failed_permanent"
+
+    inspection_attempt = connection.execute(
+        """
+        SELECT a.id AS attempt_id
+          FROM attempt AS a
+          JOIN work_item AS w ON w.id = a.work_item_id
+         WHERE a.run_id = ?
+           AND a.operation = ?
+           AND a.outcome = 'failed'
+           AND a.failure_category = 'authentication'
+         ORDER BY a.id DESC
+         LIMIT 1
+        """,
+        (run_id, INSPECT_OPERATION),
+    ).fetchone()
+    assert inspection_attempt is not None
+    inspection_attempt_id = int(inspection_attempt["attempt_id"])
+
+    er = load_er_by_mention_fingerprint(
+        connection, person_mention_id=mention_id, task_fingerprint=resolve_fp
+    )
+    assert er is not None
+    assert er.disposition == "failed"
+    assert er.attempt_id == inspection_attempt_id
+    assert er.failure_category == "authentication"
+
+    rel_er = load_er_by_relation_fingerprint(
+        connection, person_relation_id=relation_id, task_fingerprint=reconsider_fp
+    )
+    assert rel_er is not None
+    assert rel_er.disposition == "failed"
+    assert rel_er.attempt_id == inspection_attempt_id
+
+    # Detect model preflight succeeded; generation may have run.
+    assert inspection_ready(connection, run_id=run_id, config=config, model_id=MODEL)
+    assert not inspection_ready(
+        connection, run_id=run_id, config=config, model_id=RESOLVE_MODEL
+    )
+    # No generate_structured for resolve/reconsider (no handlers registered).
+    assert (
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM attempt
+             WHERE operation = ? AND work_item_id IN (
+                SELECT id FROM work_item
+                 WHERE task_type IN (?, ?)
+             )
+            """,
+            (
+                GENERATE_OPERATION,
+                RESOLVE_PERSON_ENTITY_TASK_TYPE,
+                RECONSIDER_PERSON_ENTITY_TASK_TYPE,
+            ),
+        ).fetchone()["n"]
+        == 0
     )
 
 
