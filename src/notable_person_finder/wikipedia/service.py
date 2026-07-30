@@ -345,6 +345,21 @@ def has_wikipedia_match_eligible_people(
     now: str,
 ) -> bool:
     """True when any canonical person is K17-eligible at ``now``."""
+    return count_wikipedia_match_eligible(connection, config=config, now=now) > 0
+
+
+def count_wikipedia_match_eligible(
+    connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
+    now: str,
+) -> int:
+    """Count of canonical people where ``is_wikipedia_match_eligible`` is true.
+
+    Shared by seed arming, digest ``Wikipedia eligible remaining``, and status
+    (design K17). Includes refresh-due people who already hold a current
+    completed observation.
+    """
     rows = connection.execute(
         """
         SELECT id
@@ -353,15 +368,16 @@ def has_wikipedia_match_eligible_people(
          ORDER BY id
         """
     ).fetchall()
-    for row in rows:
+    return sum(
+        1
+        for row in rows
         if is_wikipedia_match_eligible(
             connection,
             person_id=int(row["id"]),
             config=config,
             now=now,
-        ):
-            return True
-    return False
+        )
+    )
 
 
 def is_wikipedia_match_eligible(

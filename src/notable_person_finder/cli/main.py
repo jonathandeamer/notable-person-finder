@@ -48,6 +48,7 @@ from notable_person_finder.people.service import (
     seed_untriaged,
 )
 from notable_person_finder.providers.feeds import FeedparserClient
+from notable_person_finder.providers.mediawiki import HttpxMediaWikiClient
 from notable_person_finder.providers.openrouter import OpenRouterClient
 from notable_person_finder.providers.pacing import build_pacing_gate
 from notable_person_finder.providers.safety import SystemHostResolver
@@ -58,6 +59,7 @@ from notable_person_finder.reporting.digest import (
     IdentityRunSummary,
     IngestionSummary,
     PeopleRunSummary,
+    WikipediaRunSummary,
     write_digest,
 )
 from notable_person_finder.runs import repository
@@ -75,7 +77,20 @@ from notable_person_finder.runs.scheduler import (
     SchedulerSet,
     WorkerPool,
 )
-from notable_person_finder.wikipedia.service import seed_wikipedia_identity
+from notable_person_finder.wikipedia.repository import (
+    wikipedia_corpus_counts,
+    wikipedia_run_counts,
+)
+from notable_person_finder.wikipedia.service import (
+    MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE,
+    MEDIAWIKI_PAGE_FACTS_TASK_TYPE,
+    MEDIAWIKI_SEARCH_TASK_TYPE,
+    build_match_wikipedia_handler,
+    build_mediawiki_page_facts_handler,
+    build_mediawiki_search_handler,
+    count_wikipedia_match_eligible,
+    seed_wikipedia_identity,
+)
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -279,6 +294,16 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                     if _identity_schema_present(connection)
                     else None
                 )
+                wikipedia = (
+                    _wikipedia_summary(
+                        connection,
+                        report,
+                        config=loaded.main,
+                        now=utc_timestamp(clock.now()),
+                    )
+                    if _wikipedia_schema_present(connection)
+                    else None
+                )
                 try:
                     written = write_digest(
                         loaded.paths.digests,
@@ -288,6 +313,7 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                         ingestion=ingestion,
                         people=people,
                         identity=identity,
+                        wikipedia=wikipedia,
                     )
                 except DigestWriteError:
                     # `cli.` prefix, not `run.`: the engine already emits
@@ -347,6 +373,15 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                 ) as scheduler,
             ):
                 feed_client = FeedparserClient(transport)
+                match_cfg = loaded.main.tasks.match_wikipedia_identity
+                mediawiki_client = HttpxMediaWikiClient(
+                    transport,
+                    config=loaded.main.mediawiki,
+                    srlimit=match_cfg.search_srlimit,
+                    max_extract_characters=match_cfg.max_extract_characters,
+                    max_categories_per_page=match_cfg.max_categories_per_page,
+                    clock=clock,
+                )
                 on_source_items = _on_source_items_callback(
                     connection,
                     config=loaded.main,
@@ -358,6 +393,16 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                         client=feed_client,
                         feeds=loaded.feeds,
                         on_source_items=on_source_items,
+                    ),
+                    MEDIAWIKI_SEARCH_TASK_TYPE: build_mediawiki_search_handler(
+                        connection,
+                        client=mediawiki_client,
+                        config=loaded.main,
+                    ),
+                    MEDIAWIKI_PAGE_FACTS_TASK_TYPE: build_mediawiki_page_facts_handler(
+                        connection,
+                        client=mediawiki_client,
+                        config=loaded.main,
                     ),
                     INSPECT_MODEL_TASK_TYPE: build_inspection_handler(
                         connection, client=llm_client, config=loaded.main
@@ -379,6 +424,11 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                         client=llm_client,
                         config=loaded.main,
                         profile=loaded.domain_profile,
+                    ),
+                    MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE: build_match_wikipedia_handler(
+                        connection,
+                        client=llm_client,
+                        config=loaded.main,
                     ),
                 }
                 seed = _compose_seed(connection, loaded=loaded, clock=clock)
@@ -467,6 +517,16 @@ def _identity_schema_present(connection: sqlite3.Connection) -> bool:
     return (
         connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'person'"
+        ).fetchone()
+        is not None
+    )
+
+
+def _wikipedia_schema_present(connection: sqlite3.Connection) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'wikipedia_identity_observation'"
         ).fetchone()
         is not None
     )
@@ -566,6 +626,36 @@ def _identity_summary(
         confirmed_merges=counts.confirmed_merges,
         resolution_model_deferred=counts.resolution_model_deferred,
         resolution_model_failed=counts.resolution_model_failed,
+    )
+
+
+def _wikipedia_summary(
+    connection: sqlite3.Connection,
+    report: RunReport,
+    *,
+    config: MainConfig,
+    now: str,
+) -> WikipediaRunSummary | None:
+    """Counts for the digest's Wikipedia identity section, or None pre-0006."""
+    if not _wikipedia_schema_present(connection):
+        return None
+    run_counts = wikipedia_run_counts(connection, run_id=report.run_id)
+    corpus = wikipedia_corpus_counts(connection)
+    eligible = count_wikipedia_match_eligible(connection, config=config, now=now)
+    return WikipediaRunSummary(
+        matching_this_run=run_counts.matching_this_run,
+        no_match_this_run=run_counts.no_match_this_run,
+        uncertain_this_run=run_counts.uncertain_this_run,
+        deterministic_no_match_this_run=run_counts.deterministic_no_match_this_run,
+        current_matching=corpus.current_matching,
+        current_no_match=corpus.current_no_match,
+        current_uncertain=corpus.current_uncertain,
+        eligible_remaining=eligible,
+        without_pointer=corpus.without_pointer,
+        mediawiki_deferred=run_counts.mediawiki_deferred,
+        mediawiki_failed=run_counts.mediawiki_failed,
+        match_model_deferred=run_counts.match_model_deferred,
+        match_model_failed=run_counts.match_model_failed,
     )
 
 
@@ -714,6 +804,18 @@ def command_status(config_file: Path | None) -> int:
                 f"{identity.active_possible_same_person}"
             )
             print(f"mentions linked to people: {identity.mentions_linked_to_people}")
+        if _wikipedia_schema_present(connection):
+            wiki = wikipedia_corpus_counts(connection)
+            print(f"people with current matching page: {wiki.current_matching}")
+            print(f"people with current no-match: {wiki.current_no_match}")
+            print(f"people with current uncertain identity: {wiki.current_uncertain}")
+            wiki_eligible = count_wikipedia_match_eligible(
+                connection,
+                config=loaded.main,
+                now=utc_timestamp(SystemClock().now()),
+            )
+            print(f"wikipedia eligible remaining: {wiki_eligible}")
+            print(f"canonical people without wikipedia pointer: {wiki.without_pointer}")
         # Digest backlog, queue tiers, and the oldest pending candidate arrive
         # with the digest queue in the lead-assessment milestone.
         return EXIT_OK

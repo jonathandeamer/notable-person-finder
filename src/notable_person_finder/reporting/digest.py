@@ -104,6 +104,30 @@ class IdentityRunSummary:
     resolution_model_failed: int
 
 
+@dataclass(frozen=True, slots=True)
+class WikipediaRunSummary:
+    """Counts rendered in the digest's Wikipedia identity section.
+
+    Corpus and eligibility fields share definitions with ``notable status``.
+    OpenRouter cost stays on the person-detection line only. Coverage-skipped
+    counters are deliberately absent (K11).
+    """
+
+    matching_this_run: int
+    no_match_this_run: int
+    uncertain_this_run: int
+    deterministic_no_match_this_run: int
+    current_matching: int
+    current_no_match: int
+    current_uncertain: int
+    eligible_remaining: int
+    without_pointer: int
+    mediawiki_deferred: int
+    mediawiki_failed: int
+    match_model_deferred: int
+    match_model_failed: int
+
+
 def render_digest(
     report: RunReport,
     *,
@@ -111,6 +135,7 @@ def render_digest(
     ingestion: IngestionSummary | None = None,
     people: PeopleRunSummary | None = None,
     identity: IdentityRunSummary | None = None,
+    wikipedia: WikipediaRunSummary | None = None,
 ) -> str:
     lines = [f"# Notable Person Finder — {local_date}", ""]
 
@@ -278,6 +303,30 @@ def render_digest(
             f"{identity.resolution_model_failed}",
         ]
 
+    if wikipedia is not None:
+        lines += [
+            "",
+            "### Wikipedia identity",
+            "",
+            f"- Matching page found (this run): {wikipedia.matching_this_run}",
+            f"- No matching page (this run): {wikipedia.no_match_this_run}",
+            f"- Uncertain identity (this run): {wikipedia.uncertain_this_run}",
+            f"- Deterministic no-match (empty complete search): "
+            f"{wikipedia.deterministic_no_match_this_run}",
+            f"- People with current matching page (corpus): "
+            f"{wikipedia.current_matching}",
+            f"- People with current no-match (corpus): {wikipedia.current_no_match}",
+            f"- People with current uncertain identity (corpus): "
+            f"{wikipedia.current_uncertain}",
+            f"- Wikipedia eligible remaining: {wikipedia.eligible_remaining}",
+            f"- Canonical people without Wikipedia pointer: "
+            f"{wikipedia.without_pointer}",
+            f"- MediaWiki work deferred: {wikipedia.mediawiki_deferred}",
+            f"- MediaWiki work permanently failed: {wikipedia.mediawiki_failed}",
+            f"- Match model deferred: {wikipedia.match_model_deferred}",
+            f"- Match model permanently failed: {wikipedia.match_model_failed}",
+        ]
+
     return "\n".join(lines) + "\n"
 
 
@@ -385,6 +434,7 @@ def write_digest(
     ingestion: IngestionSummary | None = None,
     people: PeopleRunSummary | None = None,
     identity: IdentityRunSummary | None = None,
+    wikipedia: WikipediaRunSummary | None = None,
 ) -> DigestRecord:
     """Atomically persist the immutable dated digest and the latest copy.
 
@@ -401,6 +451,7 @@ def write_digest(
         ingestion=ingestion,
         people=people,
         identity=identity,
+        wikipedia=wikipedia,
     )
     try:
         digests_dir.mkdir(parents=True, exist_ok=True)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from notable_person_finder.wikipedia.models import (
@@ -19,6 +20,11 @@ from notable_person_finder.wikipedia.models import (
     WikipediaPageFactsBatchRecord,
     WikipediaQueryFormRecord,
 )
+
+# Work-item task types used only for counter attribution (mirror service constants).
+_MEDIAWIKI_SEARCH_TASK = "mediawiki_search"
+_MEDIAWIKI_PAGE_FACTS_TASK = "mediawiki_page_facts"
+_MATCH_WIKIPEDIA_TASK = "match_wikipedia_identity"
 
 
 def _last_row_id(cursor: sqlite3.Cursor) -> int:
@@ -1016,3 +1022,158 @@ def covered_fact_page_ids(connection: sqlite3.Connection, *, plan_id: int) -> se
                 if isinstance(item, int):
                     covered.add(item)
     return covered
+
+
+@dataclass(frozen=True, slots=True)
+class WikipediaCorpusCounts:
+    """Whole-corpus Wikipedia identity totals for digest and ``notable status``."""
+
+    current_matching: int
+    current_no_match: int
+    current_uncertain: int
+    without_pointer: int
+
+
+@dataclass(frozen=True, slots=True)
+class WikipediaRunCounts:
+    """This-run Wikipedia identity totals for the daily digest section."""
+
+    matching_this_run: int
+    no_match_this_run: int
+    uncertain_this_run: int
+    deterministic_no_match_this_run: int
+    mediawiki_deferred: int
+    mediawiki_failed: int
+    match_model_deferred: int
+    match_model_failed: int
+
+
+def wikipedia_corpus_counts(connection: sqlite3.Connection) -> WikipediaCorpusCounts:
+    """Durable current-pointer outcomes and without-pointer total.
+
+    Definitions match design §Status/digest surface:
+
+    * current matching / no-match / uncertain — canonical people whose
+      ``current_wikipedia_identity_observation_id`` points at a completed
+      observation with that semantic outcome (K25: failed never points);
+    * without_pointer — ``merged_into_person_id IS NULL AND
+      current_wikipedia_identity_observation_id IS NULL``.
+    """
+    rows = connection.execute(
+        """
+        SELECT o.semantic_outcome AS outcome, COUNT(*) AS n
+          FROM person AS p
+          JOIN wikipedia_identity_observation AS o
+            ON o.id = p.current_wikipedia_identity_observation_id
+         WHERE p.merged_into_person_id IS NULL
+         GROUP BY o.semantic_outcome
+        """
+    ).fetchall()
+    by_outcome = {
+        str(row["outcome"]): int(row["n"]) for row in rows if row["outcome"] is not None
+    }
+    without_pointer = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n
+              FROM person
+             WHERE merged_into_person_id IS NULL
+               AND current_wikipedia_identity_observation_id IS NULL
+            """
+        ).fetchone()["n"]
+    )
+    return WikipediaCorpusCounts(
+        current_matching=by_outcome.get("matching_page_found", 0),
+        current_no_match=by_outcome.get("no_matching_page_found", 0),
+        current_uncertain=by_outcome.get("uncertain_identity", 0),
+        without_pointer=without_pointer,
+    )
+
+
+def wikipedia_run_counts(
+    connection: sqlite3.Connection, *, run_id: int
+) -> WikipediaRunCounts:
+    """Wikipedia totals written or settled during one run (digest section)."""
+    outcome_rows = connection.execute(
+        """
+        SELECT semantic_outcome, COUNT(*) AS n
+          FROM wikipedia_identity_observation
+         WHERE run_id = ?
+           AND disposition = 'completed'
+           AND semantic_outcome IS NOT NULL
+         GROUP BY semantic_outcome
+        """,
+        (run_id,),
+    ).fetchall()
+    by_outcome = {str(row["semantic_outcome"]): int(row["n"]) for row in outcome_rows}
+    deterministic_no_match = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n
+              FROM wikipedia_identity_observation
+             WHERE run_id = ?
+               AND disposition = 'completed'
+               AND semantic_outcome = 'no_matching_page_found'
+               AND attempt_id IS NULL
+            """,
+            (run_id,),
+        ).fetchone()["n"]
+    )
+    mediawiki_deferred = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n
+              FROM work_item
+             WHERE task_type IN (?, ?)
+               AND state = 'deferred'
+               AND completed_by_run_id = ?
+            """,
+            (_MEDIAWIKI_SEARCH_TASK, _MEDIAWIKI_PAGE_FACTS_TASK, run_id),
+        ).fetchone()["n"]
+    )
+    mediawiki_failed = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n
+              FROM work_item
+             WHERE task_type IN (?, ?)
+               AND state = 'failed_permanent'
+               AND completed_by_run_id = ?
+            """,
+            (_MEDIAWIKI_SEARCH_TASK, _MEDIAWIKI_PAGE_FACTS_TASK, run_id),
+        ).fetchone()["n"]
+    )
+    match_model_deferred = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n
+              FROM work_item
+             WHERE task_type = ?
+               AND state = 'deferred'
+               AND completed_by_run_id = ?
+            """,
+            (_MATCH_WIKIPEDIA_TASK, run_id),
+        ).fetchone()["n"]
+    )
+    match_model_failed = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n
+              FROM work_item
+             WHERE task_type = ?
+               AND state = 'failed_permanent'
+               AND completed_by_run_id = ?
+            """,
+            (_MATCH_WIKIPEDIA_TASK, run_id),
+        ).fetchone()["n"]
+    )
+    return WikipediaRunCounts(
+        matching_this_run=by_outcome.get("matching_page_found", 0),
+        no_match_this_run=by_outcome.get("no_matching_page_found", 0),
+        uncertain_this_run=by_outcome.get("uncertain_identity", 0),
+        deterministic_no_match_this_run=deterministic_no_match,
+        mediawiki_deferred=mediawiki_deferred,
+        mediawiki_failed=mediawiki_failed,
+        match_model_deferred=match_model_deferred,
+        match_model_failed=match_model_failed,
+    )

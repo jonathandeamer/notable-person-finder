@@ -41,7 +41,16 @@ from tests.run_engine.helpers import ENVIRONMENT
 
 FIXTURES = Path(__file__).parent / "fixtures"
 INGESTION_FIXTURES = Path(__file__).resolve().parents[1] / "ingestion" / "fixtures"
-RESOLVER = StaticHostResolver({"example.com": ("93.184.216.34",)})
+WIKIPEDIA_FIXTURES = Path(__file__).resolve().parents[1] / "wikipedia" / "fixtures"
+RESOLVER = StaticHostResolver(
+    {
+        "example.com": ("93.184.216.34",),
+        "en.wikipedia.org": ("208.80.154.224",),
+    }
+)
+EMPTY_MEDIAWIKI_SEARCH = (
+    WIKIPEDIA_FIXTURES / "mediawiki_search_empty.json"
+).read_bytes()
 
 ZERO_MENTIONS_JSON = json.dumps(
     {
@@ -449,11 +458,37 @@ def _build_transport_patch(
     return _patch
 
 
+def _is_mediawiki_request(request: httpx.Request) -> bool:
+    host = request.url.host or ""
+    return host.endswith("wikipedia.org") or str(request.url.path).endswith("api.php")
+
+
 def _rss_handler(payload: bytes) -> Callable[[httpx.Request], httpx.Response]:
+    """Serve RSS for feeds and empty MediaWiki search for Wikipedia API hosts."""
+
     def handler(request: httpx.Request) -> httpx.Response:
+        if _is_mediawiki_request(request):
+            return httpx.Response(
+                200,
+                content=streaming_body(EMPTY_MEDIAWIKI_SEARCH),
+                headers={"content-type": "application/json"},
+            )
         return httpx.Response(200, content=streaming_body(payload))
 
     return handler
+
+
+def _not_modified_or_empty_mediawiki(
+    request: httpx.Request,
+) -> httpx.Response:
+    """304 for feeds; empty complete MediaWiki search for Wikipedia (K4 path)."""
+    if _is_mediawiki_request(request):
+        return httpx.Response(
+            200,
+            content=streaming_body(EMPTY_MEDIAWIKI_SEARCH),
+            headers={"content-type": "application/json"},
+        )
+    return httpx.Response(304, content=streaming_body(b""))
 
 
 def _wire(
@@ -534,11 +569,10 @@ def test_existing_backlog_is_seeded_without_new_feed_items(
     first_generations = len(client.instances[-1].generate_calls)
 
     # Second run: 304, no new items; backlog already triaged so no generation.
-    def not_modified(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(304, content=streaming_body(b""))
-
     monkeypatch.setattr(
-        cli_main, "build_transport", _build_transport_patch(not_modified)
+        cli_main,
+        "build_transport",
+        _build_transport_patch(_not_modified_or_empty_mediawiki),
     )
     second = ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,))
     monkeypatch.setattr(cli_main, "OpenRouterClient", second.factory)
@@ -704,11 +738,10 @@ def test_seed_untriaged_backfills_corpus_without_new_ingestion(
 
     monkeypatch.setattr(cli_main, "_on_source_items_callback", real_on_source_items)
 
-    def not_modified(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(304, content=streaming_body(b""))
-
     monkeypatch.setattr(
-        cli_main, "build_transport", _build_transport_patch(not_modified)
+        cli_main,
+        "build_transport",
+        _build_transport_patch(_not_modified_or_empty_mediawiki),
     )
     second = ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,))
     monkeypatch.setattr(cli_main, "OpenRouterClient", second.factory)
@@ -733,11 +766,10 @@ def test_second_run_reuses_completed_triage(
     assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
     first_client = client.instances[-1]
 
-    def not_modified(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(304, content=streaming_body(b""))
-
     monkeypatch.setattr(
-        cli_main, "build_transport", _build_transport_patch(not_modified)
+        cli_main,
+        "build_transport",
+        _build_transport_patch(_not_modified_or_empty_mediawiki),
     )
     second = ScriptedOpenRouterClient(generate_contents=('{"should":"not be used"}',))
     monkeypatch.setattr(cli_main, "OpenRouterClient", second.factory)
