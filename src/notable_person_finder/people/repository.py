@@ -1,4 +1,4 @@
-"""Transaction-neutral persistence for person-detection observations.
+"""Transaction-neutral persistence for person-detection and identity observations.
 
 Writers neither begin, commit, nor roll back: they join the caller's open
 transaction so a handler's domain rows and the settlement that justifies them
@@ -8,6 +8,10 @@ brief ``BEGIN IMMEDIATE`` are called out explicitly.
 Person identity writers and ``match_key`` live in ``people.identity`` and are
 re-exported here so callers have a single repository import path. Mentions may
 carry an optional durable ``person_id`` after entity resolution.
+
+Entity-resolution observation and ``person_relation`` writers live here. They
+respect the FK insert protocol (first-pass ER before edges; relation before
+reconsider ER) and the dual-branch disposition CHECK (K22).
 """
 
 from __future__ import annotations
@@ -227,6 +231,50 @@ class TriageRunCounts:
     overflow: int
     research_or_uncertain_mentions: int
     failed_by_category: Mapping[str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class EntityResolutionObservationRecord:
+    """Immutable entity-resolution observation (first-pass or reconsider)."""
+
+    id: int
+    person_mention_id: int | None
+    person_relation_id: int | None
+    run_id: int
+    attempt_id: int | None
+    model_inspection_id: int | None
+    disposition: str
+    semantic_outcome: str | None
+    selected_person_id: int | None
+    created_person_id: int | None
+    candidate_person_ids_json: str
+    canonical_supplied_input_json: str
+    validated_output_json: str | None
+    prompt_hash: str
+    schema_hash: str
+    schema_version: int
+    task_fingerprint: str
+    supporting_fact_ids_json: str | None
+    conflicting_fact_ids_json: str | None
+    rationale: str
+    failure_category: str | None
+    observed_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PersonRelationRecord:
+    """Directed-or-ordered edge between two people (possible same / merge)."""
+
+    id: int
+    kind: str
+    person_id_a: int
+    person_id_b: int
+    status: str
+    created_at: str
+    created_by_run_id: int
+    created_by_observation_id: int | None
+    closed_at: str | None
+    closed_by_observation_id: int | None
 
 
 def list_untriaged_source_item_ids(connection: sqlite3.Connection) -> tuple[int, ...]:
@@ -938,6 +986,367 @@ def settle_active_detect_people_after_permanent_preflight(
         if owns_transaction:
             connection.commit()
     return settled
+
+
+def insert_entity_resolution_observation(
+    connection: sqlite3.Connection,
+    *,
+    person_mention_id: int | None,
+    person_relation_id: int | None,
+    run_id: int,
+    attempt_id: int | None,
+    model_inspection_id: int | None,
+    disposition: str,
+    semantic_outcome: str | None,
+    selected_person_id: int | None,
+    created_person_id: int | None,
+    candidate_person_ids_json: str,
+    canonical_supplied_input_json: str,
+    validated_output_json: str | None,
+    prompt_hash: str,
+    schema_hash: str,
+    schema_version: int,
+    task_fingerprint: str,
+    supporting_fact_ids_json: str | None = None,
+    conflicting_fact_ids_json: str | None = None,
+    rationale: str,
+    failure_category: str | None = None,
+    observed_at: str,
+) -> int:
+    """Insert one entity-resolution observation, or reuse the material row.
+
+    Reuse is keyed by the partial unique indexes on
+    ``(person_mention_id, task_fingerprint)`` or
+    ``(person_relation_id, task_fingerprint)``. On conflict the existing row id
+    is returned and no second observation is written. Callers that create a
+    person must load first so a reused observation does not orphan a new person.
+
+    Failed rows require a non-null ``attempt_id`` (schema CHECK). Disposition
+    combinations must satisfy the dual-branch K22 CHECK.
+
+    **The caller must already hold an open transaction.**
+    """
+    _require_transaction(connection, "insert_entity_resolution_observation")
+    if person_mention_id is not None:
+        existing = load_er_by_mention_fingerprint(
+            connection,
+            person_mention_id=person_mention_id,
+            task_fingerprint=task_fingerprint,
+        )
+        if existing is not None:
+            return existing.id
+    if person_relation_id is not None:
+        existing = load_er_by_relation_fingerprint(
+            connection,
+            person_relation_id=person_relation_id,
+            task_fingerprint=task_fingerprint,
+        )
+        if existing is not None:
+            return existing.id
+
+    cursor = connection.execute(
+        """
+        INSERT INTO entity_resolution_observation (
+            person_mention_id, person_relation_id, run_id, attempt_id,
+            model_inspection_id, disposition, semantic_outcome,
+            selected_person_id, created_person_id, candidate_person_ids_json,
+            canonical_supplied_input_json, validated_output_json,
+            prompt_hash, schema_hash, schema_version, task_fingerprint,
+            supporting_fact_ids_json, conflicting_fact_ids_json,
+            rationale, failure_category, observed_at
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        """,
+        (
+            person_mention_id,
+            person_relation_id,
+            run_id,
+            attempt_id,
+            model_inspection_id,
+            disposition,
+            semantic_outcome,
+            selected_person_id,
+            created_person_id,
+            candidate_person_ids_json,
+            canonical_supplied_input_json,
+            validated_output_json,
+            prompt_hash,
+            schema_hash,
+            schema_version,
+            task_fingerprint,
+            supporting_fact_ids_json,
+            conflicting_fact_ids_json,
+            rationale,
+            failure_category,
+            observed_at,
+        ),
+    )
+    return _last_row_id(cursor)
+
+
+def load_er_by_mention_fingerprint(
+    connection: sqlite3.Connection,
+    *,
+    person_mention_id: int,
+    task_fingerprint: str,
+) -> EntityResolutionObservationRecord | None:
+    """Load the ER observation for a mention and material fingerprint, if any."""
+    row = connection.execute(
+        """
+        SELECT *
+          FROM entity_resolution_observation
+         WHERE person_mention_id = ? AND task_fingerprint = ?
+        """,
+        (person_mention_id, task_fingerprint),
+    ).fetchone()
+    if row is None:
+        return None
+    return _entity_resolution_observation(row)
+
+
+def load_er_by_relation_fingerprint(
+    connection: sqlite3.Connection,
+    *,
+    person_relation_id: int,
+    task_fingerprint: str,
+) -> EntityResolutionObservationRecord | None:
+    """Load the ER observation for a relation and material fingerprint, if any."""
+    row = connection.execute(
+        """
+        SELECT *
+          FROM entity_resolution_observation
+         WHERE person_relation_id = ? AND task_fingerprint = ?
+        """,
+        (person_relation_id, task_fingerprint),
+    ).fetchone()
+    if row is None:
+        return None
+    return _entity_resolution_observation(row)
+
+
+def point_mention_current_er(
+    connection: sqlite3.Connection,
+    *,
+    person_mention_id: int,
+    observation_id: int,
+    person_id: int | None,
+) -> None:
+    """Point a mention at its current ER observation and optional person link.
+
+    Ownership triggers require the observation to be mention-scoped for this
+    mention (``person_mention_id = mention.id``). Relation-scoped rows cannot
+    become the current pointer.
+
+    **The caller must already hold an open transaction.**
+    """
+    _require_transaction(connection, "point_mention_current_er")
+    changed = connection.execute(
+        """
+        UPDATE person_mention
+           SET current_entity_resolution_observation_id = ?,
+               person_id = ?
+         WHERE id = ?
+        """,
+        (observation_id, person_id, person_mention_id),
+    ).rowcount
+    if changed != 1:
+        raise RuntimeError(
+            f"person_mention {person_mention_id} is missing; "
+            "cannot set current entity resolution"
+        )
+
+
+def upsert_active_possible_same_person(
+    connection: sqlite3.Connection,
+    *,
+    person_id_a: int,
+    person_id_b: int,
+    run_id: int,
+    created_by_observation_id: int,
+    now: str,
+) -> int:
+    """Insert or reuse an active ``possible_same_person`` edge.
+
+    Endpoints are stored with ``person_id_a < person_id_b``. When an active edge
+    already exists for the unordered pair, its id is returned without inserting.
+
+    **The caller must already hold an open transaction.** First-pass ER that
+    created the edge must already exist so ``created_by_observation_id`` FK
+    checks pass.
+    """
+    _require_transaction(connection, "upsert_active_possible_same_person")
+    if person_id_a == person_id_b:
+        raise ValueError("possible_same_person endpoints must differ")
+    low, high = sorted((person_id_a, person_id_b))
+    existing = connection.execute(
+        """
+        SELECT id
+          FROM person_relation
+         WHERE kind = 'possible_same_person'
+           AND status = 'active'
+           AND person_id_a = ?
+           AND person_id_b = ?
+         ORDER BY id
+         LIMIT 1
+        """,
+        (low, high),
+    ).fetchone()
+    if existing is not None:
+        return int(existing["id"])
+
+    cursor = connection.execute(
+        """
+        INSERT INTO person_relation (
+            kind, person_id_a, person_id_b, status, created_at,
+            created_by_run_id, created_by_observation_id
+        ) VALUES (
+            'possible_same_person', ?, ?, 'active', ?, ?, ?
+        )
+        """,
+        (low, high, now, run_id, created_by_observation_id),
+    )
+    return _last_row_id(cursor)
+
+
+def dismiss_relation(
+    connection: sqlite3.Connection,
+    *,
+    relation_id: int,
+    closed_by_observation_id: int,
+    closed_at: str,
+) -> None:
+    """Mark a ``possible_same_person`` edge dismissed (reconsider different_people).
+
+    **The caller must already hold an open transaction.**
+    """
+    _require_transaction(connection, "dismiss_relation")
+    changed = connection.execute(
+        """
+        UPDATE person_relation
+           SET status = 'dismissed',
+               closed_at = ?,
+               closed_by_observation_id = ?
+         WHERE id = ?
+        """,
+        (closed_at, closed_by_observation_id, relation_id),
+    ).rowcount
+    if changed != 1:
+        raise RuntimeError(f"person_relation {relation_id} is missing; cannot dismiss")
+
+
+def supersede_relation(
+    connection: sqlite3.Connection,
+    *,
+    relation_id: int,
+    closed_by_observation_id: int,
+    closed_at: str,
+) -> None:
+    """Mark a ``possible_same_person`` edge superseded by a confirmed merge.
+
+    **The caller must already hold an open transaction.**
+    """
+    _require_transaction(connection, "supersede_relation")
+    changed = connection.execute(
+        """
+        UPDATE person_relation
+           SET status = 'superseded_by_merge',
+               closed_at = ?,
+               closed_by_observation_id = ?
+         WHERE id = ?
+        """,
+        (closed_at, closed_by_observation_id, relation_id),
+    ).rowcount
+    if changed != 1:
+        raise RuntimeError(
+            f"person_relation {relation_id} is missing; cannot supersede"
+        )
+
+
+def list_active_possible_same_person_for(
+    connection: sqlite3.Connection, person_id: int
+) -> tuple[PersonRelationRecord, ...]:
+    """Active ``possible_same_person`` edges that include ``person_id``."""
+    rows = connection.execute(
+        """
+        SELECT *
+          FROM person_relation
+         WHERE kind = 'possible_same_person'
+           AND status = 'active'
+           AND (person_id_a = ? OR person_id_b = ?)
+         ORDER BY id
+        """,
+        (person_id, person_id),
+    ).fetchall()
+    return tuple(_person_relation(row) for row in rows)
+
+
+def _entity_resolution_observation(
+    row: sqlite3.Row,
+) -> EntityResolutionObservationRecord:
+    return EntityResolutionObservationRecord(
+        id=int(row["id"]),
+        person_mention_id=(
+            None if row["person_mention_id"] is None else int(row["person_mention_id"])
+        ),
+        person_relation_id=(
+            None
+            if row["person_relation_id"] is None
+            else int(row["person_relation_id"])
+        ),
+        run_id=int(row["run_id"]),
+        attempt_id=None if row["attempt_id"] is None else int(row["attempt_id"]),
+        model_inspection_id=(
+            None
+            if row["model_inspection_id"] is None
+            else int(row["model_inspection_id"])
+        ),
+        disposition=row["disposition"],
+        semantic_outcome=row["semantic_outcome"],
+        selected_person_id=(
+            None
+            if row["selected_person_id"] is None
+            else int(row["selected_person_id"])
+        ),
+        created_person_id=(
+            None if row["created_person_id"] is None else int(row["created_person_id"])
+        ),
+        candidate_person_ids_json=row["candidate_person_ids_json"],
+        canonical_supplied_input_json=row["canonical_supplied_input_json"],
+        validated_output_json=row["validated_output_json"],
+        prompt_hash=row["prompt_hash"],
+        schema_hash=row["schema_hash"],
+        schema_version=int(row["schema_version"]),
+        task_fingerprint=row["task_fingerprint"],
+        supporting_fact_ids_json=row["supporting_fact_ids_json"],
+        conflicting_fact_ids_json=row["conflicting_fact_ids_json"],
+        rationale=row["rationale"],
+        failure_category=row["failure_category"],
+        observed_at=row["observed_at"],
+    )
+
+
+def _person_relation(row: sqlite3.Row) -> PersonRelationRecord:
+    return PersonRelationRecord(
+        id=int(row["id"]),
+        kind=row["kind"],
+        person_id_a=int(row["person_id_a"]),
+        person_id_b=int(row["person_id_b"]),
+        status=row["status"],
+        created_at=row["created_at"],
+        created_by_run_id=int(row["created_by_run_id"]),
+        created_by_observation_id=(
+            None
+            if row["created_by_observation_id"] is None
+            else int(row["created_by_observation_id"])
+        ),
+        closed_at=row["closed_at"],
+        closed_by_observation_id=(
+            None
+            if row["closed_by_observation_id"] is None
+            else int(row["closed_by_observation_id"])
+        ),
+    )
 
 
 def _set_current_triage_observation(
