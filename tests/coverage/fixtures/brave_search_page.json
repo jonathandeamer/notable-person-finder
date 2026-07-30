@@ -1,0 +1,72 @@
+{
+  "type": "search",
+  "query": {
+    "original": "Ada Lovelace",
+    "show_strict_warning": false,
+    "is_navigational": false,
+    "is_news_breaking": false,
+    "spellcheck_off": true,
+    "country": "ALL",
+    "bad_results": false,
+    "should_fallback": false,
+    "postal_code": "",
+    "city": "",
+    "header_country": "",
+    "more_results_available": true,
+    "state": ""
+  },
+  "web": {
+    "type": "search",
+    "results": [
+      {
+        "title": "Ada Lovelace - Wikipedia",
+        "url": "https://en.wikipedia.org/wiki/Ada_Lovelace",
+        "is_source_local": false,
+        "is_source_both": false,
+        "description": "Augusta Ada King, Countess of Lovelace was an English mathematician.",
+        "page_age": "2026-01-10T12:00:00",
+        "profile": {
+          "name": "Wikipedia",
+          "url": "https://en.wikipedia.org/wiki/Ada_Lovelace",
+          "long_name": "en.wikipedia.org",
+          "img": "https://example.com/wiki.png"
+        },
+        "language": "en",
+        "family_friendly": true,
+        "type": "search_result",
+        "subtype": "generic",
+        "is_live": false,
+        "meta_url": {
+          "scheme": "https",
+          "netloc": "en.wikipedia.org",
+          "hostname": "en.wikipedia.org",
+          "favicon": "https://example.com/favicon.ico",
+          "path": "› wiki › Ada_Lovelace"
+        },
+        "extra_snippets": [
+          "She is often regarded as the first computer programmer.",
+          "Her notes on the Analytical Engine include an algorithm."
+        ]
+      },
+      {
+        "title": "Ada Lovelace Day",
+        "url": "https://findingada.com/",
+        "is_source_local": false,
+        "is_source_both": false,
+        "description": "An international celebration of the achievements of women in STEM.",
+        "language": "en",
+        "family_friendly": true,
+        "type": "search_result",
+        "subtype": "generic",
+        "meta_url": {
+          "scheme": "https",
+          "netloc": "findingada.com",
+          "hostname": "findingada.com",
+          "favicon": "https://example.com/favicon2.ico",
+          "path": "›"
+        }
+      }
+    ],
+    "family_friendly": true
+  }
+}

@@ -2,6 +2,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from notable_person_finder.config.models import (
+    BraveConfig,
     DetectPeopleConfig,
     DomainProfileConfig,
     FeedsConfig,
@@ -36,6 +37,8 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
     assert config.mediawiki == MediaWikiConfig.model_validate({})
     assert config.mediawiki.endpoint == "https://en.wikipedia.org/w/api.php"
     assert config.mediawiki.maxlag_seconds == 5
+    assert config.brave == BraveConfig.model_validate({})
+    assert config.brave.endpoint == "https://api.search.brave.com/res/v1/web/search"
     assert config.tasks.detect_people.model == "openai/gpt-5.4-mini"
     assert config.tasks.detect_people.max_input_tokens == 4096
     assert config.tasks.detect_people.max_completion_tokens == 1024
@@ -92,6 +95,7 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
     [
         (OpenRouterConfig(), "endpoint"),
         (MediaWikiConfig(), "endpoint"),
+        (BraveConfig(), "endpoint"),
         (ProviderRoutingConfig(), "allow_fallbacks"),
         (GenerationParameters(), "temperature"),
         (DetectPeopleConfig(), "model"),
@@ -112,6 +116,7 @@ def test_model_configuration_models_are_frozen(value: object, field_name: str) -
     [
         ("openrouter", {"response_healing": True}),
         ("mediawiki", {"api_key": "secret"}),
+        ("brave", {"api_key": "secret"}),
         ("routing", {"require_parameters": False}),
         ("tasks", {"compose_lead_summary": {}}),
         ("detect_people", {"max_tokens": 1024}),
@@ -128,6 +133,7 @@ def test_model_configuration_rejects_unknown_fields(
     value = _minimal_main()
     value["openrouter"] = {}
     value["mediawiki"] = {}
+    value["brave"] = {}
     value["tasks"] = {
         "detect_people": {},
         "resolve_person_entity": {},
@@ -137,6 +143,8 @@ def test_model_configuration_rejects_unknown_fields(
         value["openrouter"] = extra
     elif section == "mediawiki":
         value["mediawiki"] = extra
+    elif section == "brave":
+        value["brave"] = extra
     elif section == "routing":
         value["openrouter"] = {"routing": extra}
     elif section == "tasks":
@@ -198,6 +206,26 @@ def test_mediawiki_endpoint_requires_a_clean_public_https_url(endpoint: str) -> 
         MediaWikiConfig(endpoint=endpoint)
 
 
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://api.search.brave.com/res/v1/web/search",
+        "https://localhost/res/v1/web/search",
+        "https://127.0.0.1/res/v1/web/search",
+        "https://user:password@api.search.brave.com/res/v1/web/search",
+        "https://api.search.brave.com/res/v1/web/search?key=secret",
+        "https://api.search.brave.com/res/v1/web/search#fragment",
+        " https://api.search.brave.com/res/v1/web/search",
+        "https://api.search.brave.com/res/v1/web/search\n",
+        "https://api.search.brave.com:abc/res/v1/web/search",
+        "https://api.search.brave.com:70000/res/v1/web/search",
+    ],
+)
+def test_brave_endpoint_requires_a_clean_public_https_url(endpoint: str) -> None:
+    with pytest.raises(ValidationError):
+        BraveConfig(endpoint=endpoint)
+
+
 @pytest.mark.parametrize("maxlag_seconds", [-1, 121, 0.5, "5"])
 def test_mediawiki_maxlag_seconds_bounds(maxlag_seconds: object) -> None:
     with pytest.raises(ValidationError):
@@ -213,6 +241,15 @@ def test_mediawiki_config_has_no_secret_fields() -> None:
         assert "token" not in name
 
 
+def test_brave_config_has_no_secret_fields() -> None:
+    fields = set(BraveConfig.model_fields)
+    assert fields == {"endpoint"}
+    for name in fields:
+        assert "key" not in name
+        assert "secret" not in name
+        assert "token" not in name
+
+
 @pytest.mark.parametrize(
     ("model_type", "value"),
     [
@@ -221,6 +258,7 @@ def test_mediawiki_config_has_no_secret_fields() -> None:
         (OpenRouterConfig, {"endpoint": b"https://openrouter.ai/api/v1"}),
         (MediaWikiConfig, {"endpoint": b"https://en.wikipedia.org/w/api.php"}),
         (MediaWikiConfig, {"maxlag_seconds": "5"}),
+        (BraveConfig, {"endpoint": b"https://api.search.brave.com/res/v1/web/search"}),
         (GenerationParameters, {"temperature": True}),
         (GenerationParameters, {"top_p": "1.0"}),
         (DetectPeopleConfig, {"model": b"openai/gpt-5.4-mini"}),

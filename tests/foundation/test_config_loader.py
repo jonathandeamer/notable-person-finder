@@ -57,6 +57,10 @@ def test_model_settings_are_complete_in_the_redacted_snapshot(tmp_path: Path) ->
         "maxlag_seconds": 5,
     }
     assert "api_key" not in snapshot["main"]["mediawiki"]
+    assert snapshot["main"]["brave"] == {
+        "endpoint": "https://api.search.brave.com/res/v1/web/search",
+    }
+    assert "api_key" not in snapshot["main"]["brave"]
     assert snapshot["main"]["tasks"]["detect_people"] == {
         "model": "openai/gpt-5.4-mini",
         "max_input_tokens": 4096,
@@ -193,6 +197,29 @@ def test_each_mediawiki_setting_changes_the_configuration_fingerprint(
     first = load_config(first_file, environ=environment)
     first_file.write_text(
         first_file.read_text(encoding="utf-8").replace(old, new),
+        encoding="utf-8",
+    )
+
+    second = load_config(first_file, environ=environment)
+
+    assert first.fingerprint != second.fingerprint
+
+
+def test_brave_endpoint_changes_the_configuration_fingerprint(tmp_path: Path) -> None:
+    first_file = write_graph(tmp_path)
+    text = first_file.read_text(encoding="utf-8")
+    if "[brave]" not in text:
+        text = text + (
+            '\n[brave]\nendpoint = "https://api.search.brave.com/res/v1/web/search"\n'
+        )
+        first_file.write_text(text, encoding="utf-8")
+    environment = {"TEST_OPENROUTER": "first-key", "TEST_BRAVE": "brave-key"}
+    first = load_config(first_file, environ=environment)
+    first_file.write_text(
+        first_file.read_text(encoding="utf-8").replace(
+            'endpoint = "https://api.search.brave.com/res/v1/web/search"',
+            'endpoint = "https://api.search.example.com/res/v1/web/search"',
+        ),
         encoding="utf-8",
     )
 

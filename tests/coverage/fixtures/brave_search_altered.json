@@ -1,0 +1,37 @@
+{
+  "type": "search",
+  "query": {
+    "original": "Ada Lovalace",
+    "altered": "Ada Lovelace",
+    "show_strict_warning": false,
+    "is_navigational": false,
+    "is_news_breaking": false,
+    "spellcheck_off": false,
+    "country": "ALL",
+    "bad_results": false,
+    "should_fallback": false,
+    "more_results_available": false
+  },
+  "web": {
+    "type": "search",
+    "results": [
+      {
+        "title": "Ada Lovelace",
+        "url": "https://en.wikipedia.org/wiki/Ada_Lovelace",
+        "description": "English mathematician and writer.",
+        "language": "en",
+        "family_friendly": true,
+        "type": "search_result",
+        "subtype": "generic",
+        "meta_url": {
+          "scheme": "https",
+          "netloc": "en.wikipedia.org",
+          "hostname": "en.wikipedia.org",
+          "favicon": "https://example.com/favicon.ico",
+          "path": "› wiki › Ada_Lovelace"
+        }
+      }
+    ],
+    "family_friendly": true
+  }
+}

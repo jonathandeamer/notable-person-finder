@@ -1,0 +1,19 @@
+{
+  "type": "search",
+  "query": {
+    "original": "zzznobody12345",
+    "show_strict_warning": false,
+    "is_navigational": false,
+    "is_news_breaking": false,
+    "spellcheck_off": true,
+    "country": "ALL",
+    "bad_results": false,
+    "should_fallback": false,
+    "more_results_available": false
+  },
+  "web": {
+    "type": "search",
+    "results": [],
+    "family_friendly": true
+  }
+}

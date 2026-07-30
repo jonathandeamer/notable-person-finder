@@ -217,6 +217,29 @@ class MediaWikiConfig(_StrictConfigurationModel):
         return value
 
 
+class BraveConfig(_StrictConfigurationModel):
+    """Brave Web Search API endpoint only; auth is ``BRAVE_API_KEY`` from the env."""
+
+    endpoint: str = "https://api.search.brave.com/res/v1/web/search"
+
+    @field_validator("endpoint")
+    @classmethod
+    def public_https_endpoint(cls, value: str) -> str:
+        if any(character.isspace() for character in value):
+            raise ValueError("endpoint must not contain whitespace")
+        validate_public_http_url(value)
+        parsed = urlsplit(value)
+        try:
+            _ = parsed.port
+        except ValueError as error:
+            raise ValueError("endpoint must contain a valid port") from error
+        if parsed.scheme != "https":
+            raise ValueError("must use HTTPS")
+        if parsed.query or parsed.fragment:
+            raise ValueError("endpoint must not contain a query or fragment")
+        return value
+
+
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
 
 
@@ -359,6 +382,7 @@ class MainConfig(StrictModel):
     budget: BudgetConfig = BudgetConfig()
     openrouter: OpenRouterConfig = OpenRouterConfig()
     mediawiki: MediaWikiConfig = MediaWikiConfig()
+    brave: BraveConfig = BraveConfig()
     tasks: TasksConfig = TasksConfig()
     digest: DigestConfig = DigestConfig()
     logging: LoggingConfig = LoggingConfig()
