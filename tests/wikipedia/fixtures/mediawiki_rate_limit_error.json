@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "ratelimited",
+    "info": "You've exceeded your rate limit. Try again later. BODY_TOKEN=sk-secret-value"
+  }
+}

@@ -193,6 +193,30 @@ class OpenRouterConfig(_StrictConfigurationModel):
         return value
 
 
+class MediaWikiConfig(_StrictConfigurationModel):
+    """Public MediaWiki Action API endpoint settings (no authentication secret)."""
+
+    endpoint: str = "https://en.wikipedia.org/w/api.php"
+    maxlag_seconds: int = Field(default=5, strict=True, ge=0, le=120)
+
+    @field_validator("endpoint")
+    @classmethod
+    def public_https_endpoint(cls, value: str) -> str:
+        if any(character.isspace() for character in value):
+            raise ValueError("endpoint must not contain whitespace")
+        validate_public_http_url(value)
+        parsed = urlsplit(value)
+        try:
+            _ = parsed.port
+        except ValueError as error:
+            raise ValueError("endpoint must contain a valid port") from error
+        if parsed.scheme != "https":
+            raise ValueError("must use HTTPS")
+        if parsed.query or parsed.fragment:
+            raise ValueError("endpoint must not contain a query or fragment")
+        return value
+
+
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
 
 
@@ -294,6 +318,7 @@ class MainConfig(StrictModel):
     pacing: PacingConfig = PacingConfig()
     budget: BudgetConfig = BudgetConfig()
     openrouter: OpenRouterConfig = OpenRouterConfig()
+    mediawiki: MediaWikiConfig = MediaWikiConfig()
     tasks: TasksConfig = TasksConfig()
     digest: DigestConfig = DigestConfig()
     logging: LoggingConfig = LoggingConfig()

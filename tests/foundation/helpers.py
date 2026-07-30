@@ -25,6 +25,10 @@ allow_fallbacks = true
 data_collection = "deny"
 zdr = true
 
+[mediawiki]
+endpoint = "https://en.wikipedia.org/w/api.php"
+maxlag_seconds = 5
+
 [tasks.detect_people]
 model = "openai/gpt-5.4-mini"
 max_input_tokens = 4096

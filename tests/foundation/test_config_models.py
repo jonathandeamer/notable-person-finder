@@ -7,6 +7,7 @@ from notable_person_finder.config.models import (
     FeedsConfig,
     GenerationParameters,
     MainConfig,
+    MediaWikiConfig,
     OpenRouterConfig,
     ProviderRoutingConfig,
     ResolvePersonEntityConfig,
@@ -31,6 +32,9 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
     assert config.openrouter.routing.allow_fallbacks is True
     assert config.openrouter.routing.data_collection == "deny"
     assert config.openrouter.routing.zdr is True
+    assert config.mediawiki == MediaWikiConfig.model_validate({})
+    assert config.mediawiki.endpoint == "https://en.wikipedia.org/w/api.php"
+    assert config.mediawiki.maxlag_seconds == 5
     assert config.tasks.detect_people.model == "openai/gpt-5.4-mini"
     assert config.tasks.detect_people.max_input_tokens == 4096
     assert config.tasks.detect_people.max_completion_tokens == 1024
@@ -62,6 +66,7 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
     ("value", "field_name"),
     [
         (OpenRouterConfig(), "endpoint"),
+        (MediaWikiConfig(), "endpoint"),
         (ProviderRoutingConfig(), "allow_fallbacks"),
         (GenerationParameters(), "temperature"),
         (DetectPeopleConfig(), "model"),
@@ -79,6 +84,7 @@ def test_model_configuration_models_are_frozen(value: object, field_name: str) -
     ("section", "extra"),
     [
         ("openrouter", {"response_healing": True}),
+        ("mediawiki", {"api_key": "secret"}),
         ("routing", {"require_parameters": False}),
         ("tasks", {"compose_lead_summary": {}}),
         ("detect_people", {"max_tokens": 1024}),
@@ -92,9 +98,12 @@ def test_model_configuration_rejects_unknown_fields(
 ) -> None:
     value = _minimal_main()
     value["openrouter"] = {}
+    value["mediawiki"] = {}
     value["tasks"] = {"detect_people": {}, "resolve_person_entity": {}}
     if section == "openrouter":
         value["openrouter"] = extra
+    elif section == "mediawiki":
+        value["mediawiki"] = extra
     elif section == "routing":
         value["openrouter"] = {"routing": extra}
     elif section == "tasks":
@@ -133,11 +142,48 @@ def test_openrouter_endpoint_requires_a_clean_public_https_url(endpoint: str) ->
 
 
 @pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://en.wikipedia.org/w/api.php",
+        "https://localhost/w/api.php",
+        "https://127.0.0.1/w/api.php",
+        "https://user:password@en.wikipedia.org/w/api.php",
+        "https://en.wikipedia.org/w/api.php?key=secret",
+        "https://en.wikipedia.org/w/api.php#fragment",
+        " https://en.wikipedia.org/w/api.php",
+        "https://en.wikipedia.org/w/api.php\n",
+        "https://en.wikipedia.org:abc/w/api.php",
+        "https://en.wikipedia.org:70000/w/api.php",
+    ],
+)
+def test_mediawiki_endpoint_requires_a_clean_public_https_url(endpoint: str) -> None:
+    with pytest.raises(ValidationError):
+        MediaWikiConfig(endpoint=endpoint)
+
+
+@pytest.mark.parametrize("maxlag_seconds", [-1, 121, 0.5, "5"])
+def test_mediawiki_maxlag_seconds_bounds(maxlag_seconds: object) -> None:
+    with pytest.raises(ValidationError):
+        MediaWikiConfig.model_validate({"maxlag_seconds": maxlag_seconds})
+
+
+def test_mediawiki_config_has_no_secret_fields() -> None:
+    fields = set(MediaWikiConfig.model_fields)
+    assert fields == {"endpoint", "maxlag_seconds"}
+    for name in fields:
+        assert "key" not in name
+        assert "secret" not in name
+        assert "token" not in name
+
+
+@pytest.mark.parametrize(
     ("model_type", "value"),
     [
         (ProviderRoutingConfig, {"allow_fallbacks": 1}),
         (ProviderRoutingConfig, {"zdr": "false"}),
         (OpenRouterConfig, {"endpoint": b"https://openrouter.ai/api/v1"}),
+        (MediaWikiConfig, {"endpoint": b"https://en.wikipedia.org/w/api.php"}),
+        (MediaWikiConfig, {"maxlag_seconds": "5"}),
         (GenerationParameters, {"temperature": True}),
         (GenerationParameters, {"top_p": "1.0"}),
         (DetectPeopleConfig, {"model": b"openai/gpt-5.4-mini"}),

@@ -1,0 +1,83 @@
+{
+  "batchcomplete": true,
+  "query": {
+    "redirects": [
+      {
+        "from": "USA",
+        "fromid": 31873,
+        "to": "United States"
+      }
+    ],
+    "pages": [
+      {
+        "pageid": 3434750,
+        "ns": 0,
+        "title": "United States",
+        "contentmodel": "wikitext",
+        "fullurl": "https://en.wikipedia.org/wiki/United_States",
+        "canonicalurl": "https://en.wikipedia.org/wiki/United_States",
+        "pageprops": {
+          "wikibase-shortdesc": "Country primarily in North America"
+        },
+        "description": "Country primarily in North America",
+        "extract": "The United States of America is a country.",
+        "categories": [
+          {"ns": 14, "title": "Category:United States"},
+          {"ns": 14, "title": "Category:North American countries"}
+        ]
+      },
+      {
+        "pageid": 534366,
+        "ns": 0,
+        "title": "Barack Obama",
+        "contentmodel": "wikitext",
+        "fullurl": "https://en.wikipedia.org/wiki/Barack_Obama",
+        "canonicalurl": "https://en.wikipedia.org/wiki/Barack_Obama",
+        "pageprops": {
+          "defaultsort": "Obama, Barack",
+          "wikibase-shortdesc": "President of the United States from 2009 to 2017"
+        },
+        "description": "President of the United States from 2009 to 2017",
+        "extract": "Barack Hussein Obama II is an American former politician.",
+        "categories": [
+          {"ns": 14, "title": "Category:1961 births"},
+          {"ns": 14, "title": "Category:Living people"},
+          {"ns": 14, "title": "Category:Presidents of the United States"}
+        ]
+      },
+      {
+        "pageid": 2860127,
+        "ns": 0,
+        "title": "USA (disambiguation)",
+        "contentmodel": "wikitext",
+        "fullurl": "https://en.wikipedia.org/wiki/USA_(disambiguation)",
+        "canonicalurl": "https://en.wikipedia.org/wiki/USA_(disambiguation)",
+        "pageprops": {
+          "disambiguation": "",
+          "wikibase-shortdesc": "Topics referred to by the same term"
+        },
+        "description": "Topics referred to by the same term",
+        "extract": "USA is an abbreviation and country code.",
+        "categories": [
+          {"ns": 14, "title": "Category:Disambiguation pages"}
+        ]
+      },
+      {
+        "pageid": 4,
+        "ns": 4,
+        "title": "Wikipedia:About",
+        "contentmodel": "wikitext",
+        "fullurl": "https://en.wikipedia.org/wiki/Wikipedia:About",
+        "canonicalurl": "https://en.wikipedia.org/wiki/Wikipedia:About",
+        "pageprops": {},
+        "description": null,
+        "extract": "Wikipedia is a free online encyclopedia.",
+        "categories": []
+      },
+      {
+        "pageid": 999999999,
+        "missing": true
+      }
+    ]
+  }
+}

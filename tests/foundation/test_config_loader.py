@@ -52,6 +52,11 @@ def test_model_settings_are_complete_in_the_redacted_snapshot(tmp_path: Path) ->
             "zdr": True,
         },
     }
+    assert snapshot["main"]["mediawiki"] == {
+        "endpoint": "https://en.wikipedia.org/w/api.php",
+        "maxlag_seconds": 5,
+    }
+    assert "api_key" not in snapshot["main"]["mediawiki"]
     assert snapshot["main"]["tasks"]["detect_people"] == {
         "model": "openai/gpt-5.4-mini",
         "max_input_tokens": 4096,
@@ -112,6 +117,41 @@ def test_each_model_setting_changes_the_configuration_fingerprint(
     tmp_path: Path, old: str, new: str
 ) -> None:
     first_file = write_graph(tmp_path)
+    environment = {"TEST_OPENROUTER": "first-key", "TEST_BRAVE": "brave-key"}
+    first = load_config(first_file, environ=environment)
+    first_file.write_text(
+        first_file.read_text(encoding="utf-8").replace(old, new),
+        encoding="utf-8",
+    )
+
+    second = load_config(first_file, environ=environment)
+
+    assert first.fingerprint != second.fingerprint
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            'endpoint = "https://en.wikipedia.org/w/api.php"',
+            'endpoint = "https://wiki.example/w/api.php"',
+        ),
+        ("maxlag_seconds = 5", "maxlag_seconds = 9"),
+    ],
+)
+def test_each_mediawiki_setting_changes_the_configuration_fingerprint(
+    tmp_path: Path, old: str, new: str
+) -> None:
+    first_file = write_graph(tmp_path)
+    # Defaults are implicit; materialise the section so replacements bind.
+    text = first_file.read_text(encoding="utf-8")
+    if "[mediawiki]" not in text:
+        text = text + (
+            "\n[mediawiki]\n"
+            'endpoint = "https://en.wikipedia.org/w/api.php"\n'
+            "maxlag_seconds = 5\n"
+        )
+        first_file.write_text(text, encoding="utf-8")
     environment = {"TEST_OPENROUTER": "first-key", "TEST_BRAVE": "brave-key"}
     first = load_config(first_file, environ=environment)
     first_file.write_text(
