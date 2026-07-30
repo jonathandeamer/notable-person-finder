@@ -48,6 +48,7 @@ from notable_person_finder.people.detection import (
 from notable_person_finder.people.identity import (
     canonical_person_id,
     create_person_for_mention,
+    mentions_for_canonical_person,
     recompute_identity_fingerprint,
     select_display_name,
     upsert_sourced_names_for_mention,
@@ -75,14 +76,17 @@ from notable_person_finder.people.repository import (
     RECONSIDER_PERSON_ENTITY_TASK_TYPE,
     RESOLVE_PERSON_ENTITY_TASK_TYPE,
     SourceItemRecord,
+    dismiss_relation,
     insert_completed_observation,
     insert_entity_resolution_observation,
     insert_failed_observation,
     insert_insufficient_input_observation,
     insert_model_inspection,
+    list_active_possible_same_person_for,
     list_untriaged_source_item_ids,
     load_current_triage_observation,
     load_er_by_mention_fingerprint,
+    load_er_by_relation_fingerprint,
     load_model_inspection,
     load_person_mentions,
     load_source_item_record,
@@ -97,6 +101,7 @@ from notable_person_finder.people.resolution import (
     build_resolve_input,
     first_pass_canonical_supplied_input_json,
     first_pass_task_fingerprint,
+    reconsider_task_fingerprint,
     render_resolution_request,
     resolution_prompt_and_schema_hashes,
     validate_resolution_output,
@@ -128,12 +133,17 @@ DETECT_PEOPLE_PRIORITY = 30
 DETECTION_SCHEMA_NAME = "detect_people"
 
 RESOLVE_PERSON_PRIORITY = 40
+RECONSIDER_PERSON_PRIORITY = 40
 RESOLUTION_SCHEMA_NAME = "resolve_person_entity"
 CREATED_NEW_VALIDATED_OUTPUT_JSON = '{"outcome":"created_new"}'
 SKIPPED_MATCH_KEY_RATIONALE = "insufficient_identity_match_key"
 MALFORMED_RESOLUTION_DETAIL = "invalid resolution output"
 MISSING_MENTION_DETAIL = "person mention is missing"
+MISSING_RELATION_DETAIL = "person relation is missing"
 RESOLVE_PREPARE_REFUSED_PREFIX = "resolve_prepare_refused:"
+SUPERSEDED_RECONSIDER_REASON = "stale reconsideration material"
+MERGE_GUARDRAILS_FAILED_NOTE = " [merge_guardrails_failed]"
+READY_TO_MERGE_NOTE = " [ready_to_merge]"
 
 # Re-export resolution task type constants for handlers and tests.
 assert RESOLVE_PERSON_ENTITY_TASK_TYPE == "resolve_person_entity"
@@ -1942,6 +1952,9 @@ def _write_created_new(
         observation_id=er_id,
         person_id=person_id,
     )
+    # New person: no pre-existing edges (K21 — peer edges opened below do not
+    # schedule reconsider in this settlement).
+    pre_existing_relation_ids: frozenset[int] = frozenset()
     _apply_peer_edges(
         connection,
         person_id=person_id,
@@ -1949,6 +1962,14 @@ def _write_created_new(
         creating_mention_id=person_mention_id,
         run_id=run_id,
         observation_id=er_id,
+        config=config,
+        now=now,
+    )
+    maybe_schedule_reconsideration_for_person(
+        connection,
+        person_id=person_id,
+        pre_existing_relation_ids=pre_existing_relation_ids,
+        run_id=run_id,
         config=config,
         now=now,
     )
@@ -2348,6 +2369,13 @@ def _persist_resolution_for(
             if output.selected_person_id is None:
                 raise RuntimeError("same_person output missing selected_person_id")
             selected = canonical_person_id(connection, output.selected_person_id)
+            # Capture edges that pre-exist this material attach (K21).
+            pre_existing_relation_ids = frozenset(
+                relation.id
+                for relation in list_active_possible_same_person_for(
+                    connection, selected
+                )
+            )
             mention_row = connection.execute(
                 "SELECT exact_name FROM person_mention WHERE id = ?",
                 (payload.person_mention_id,),
@@ -2407,6 +2435,14 @@ def _persist_resolution_for(
                 observation_id=er_id,
                 person_id=selected,
             )
+            maybe_schedule_reconsideration_for_person(
+                connection,
+                person_id=selected,
+                pre_existing_relation_ids=pre_existing_relation_ids,
+                run_id=run_id,
+                config=config,
+                now=observed_at,
+            )
             return
 
         # different_people or uncertain: create a new person.
@@ -2447,6 +2483,8 @@ def _persist_resolution_for(
             person_id=person_id,
         )
 
+        # New person has no edges before this settlement (K21).
+        pre_existing_relation_ids: frozenset[int] = frozenset()
         reject_set: set[int] = set()
         if output.outcome == "uncertain":
             # K4: edges to all code-supplied candidates; peer scan reject empty.
@@ -2474,7 +2512,14 @@ def _persist_resolution_for(
             config=config,
             now=observed_at,
         )
-        # K21: do not schedule reconsider_person_entity for edges opened here.
+        maybe_schedule_reconsideration_for_person(
+            connection,
+            person_id=person_id,
+            pre_existing_relation_ids=pre_existing_relation_ids,
+            run_id=run_id,
+            config=config,
+            now=observed_at,
+        )
 
     return persist
 
@@ -2715,3 +2760,798 @@ def _observed_at_for_prepare(connection: sqlite3.Connection, work_item_id: int) 
     if row is not None and row["updated_at"]:
         return str(row["updated_at"])
     return utc_timestamp(datetime.now(tz=UTC))
+
+
+# ---------------------------------------------------------------------------
+# Reconsideration of possible_same_person edges (K18 / K21 / K22)
+# ---------------------------------------------------------------------------
+
+
+def _person_identity_fingerprint(
+    connection: sqlite3.Connection, person_id: int
+) -> str | None:
+    row = connection.execute(
+        "SELECT identity_fingerprint FROM person WHERE id = ?",
+        (person_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row["identity_fingerprint"])
+
+
+def _latest_linked_mention_id(
+    connection: sqlite3.Connection, *, person_id: int
+) -> int | None:
+    mentions = mentions_for_canonical_person(connection, person_id)
+    if not mentions:
+        return None
+    return max(mention.id for mention in mentions)
+
+
+def _peer_endpoint(person_id_a: int, person_id_b: int, person_id: int) -> int:
+    if person_id == person_id_a:
+        return person_id_b
+    if person_id == person_id_b:
+        return person_id_a
+    raise ValueError(f"person {person_id} is not an endpoint of the relation")
+
+
+def _canonical_has_non_name_identity_fact(
+    connection: sqlite3.Connection, person_id: int
+) -> bool:
+    for mention in mentions_for_canonical_person(connection, person_id):
+        for fact in mention.identity_facts:
+            if fact.kind != "name":
+                return True
+    return False
+
+
+def merge_guardrails_pass(
+    connection: sqlite3.Connection,
+    *,
+    relation_id: int,
+    subject_person_id: int,
+    peer_person_id: int,
+    output: ResolvePersonEntityOutput,
+    resolve_input: ResolvePersonEntityInput,
+) -> bool:
+    """K18 automatic-merge guardrails. All must hold.
+
+    Does not perform the merge. Task 8 owns ``confirm_person_merge``.
+    """
+    relation = connection.execute(
+        """
+        SELECT kind, status, person_id_a, person_id_b
+          FROM person_relation
+         WHERE id = ?
+        """,
+        (relation_id,),
+    ).fetchone()
+    if relation is None:
+        return False
+    if relation["kind"] != "possible_same_person" or relation["status"] != "active":
+        return False
+
+    subject_canonical = canonical_person_id(connection, subject_person_id)
+    peer_canonical = canonical_person_id(connection, peer_person_id)
+    if subject_canonical != subject_person_id or peer_canonical != peer_person_id:
+        # Endpoints must still be canonical (merged_into IS NULL).
+        return False
+    if subject_canonical == peer_canonical:
+        return False
+
+    if output.selected_person_id is None:
+        return False
+    selected_canonical = canonical_person_id(connection, output.selected_person_id)
+    if selected_canonical != peer_canonical:
+        return False
+
+    if not output.supporting_fact_ids:
+        return False
+    allowed_fact_ids = {fact.local_id for fact in resolve_input.identity_facts}
+    for candidate in resolve_input.candidates:
+        allowed_fact_ids.update(fact.local_id for fact in candidate.identity_facts)
+    for fact_id in output.supporting_fact_ids:
+        if fact_id not in allowed_fact_ids:
+            return False
+
+    if not _canonical_has_non_name_identity_fact(connection, subject_canonical):
+        return False
+    return _canonical_has_non_name_identity_fact(connection, peer_canonical)
+
+
+def maybe_schedule_reconsideration_for_person(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    pre_existing_relation_ids: frozenset[int] | set[int] | Sequence[int],
+    run_id: int,
+    config: MainConfig,
+    now: str,
+) -> int:
+    """Schedule reconsider work for pre-existing active edges involving person_id.
+
+    **K21:** Only relation ids present in ``pre_existing_relation_ids`` are
+    eligible. Edges opened in the same settlement must be omitted from that set.
+
+    Returns the number of work items scheduled (including idempotent reuses of
+    already-active work with the same fingerprint).
+    """
+    allowed = frozenset(pre_existing_relation_ids)
+    if not allowed:
+        return 0
+
+    resolve = config.tasks.resolve_person_entity
+    prompt_hash, schema_hash, schema_version = resolution_prompt_and_schema_hashes()
+    subject_fp = _person_identity_fingerprint(connection, person_id)
+    if subject_fp is None:
+        return 0
+
+    scheduled = 0
+    for relation in list_active_possible_same_person_for(connection, person_id):
+        if relation.id not in allowed:
+            continue
+        try:
+            peer_id = _peer_endpoint(
+                relation.person_id_a, relation.person_id_b, person_id
+            )
+        except ValueError:
+            continue
+        peer_fp = _person_identity_fingerprint(connection, peer_id)
+        if peer_fp is None:
+            continue
+        fingerprint = reconsider_task_fingerprint(
+            person_relation_id=relation.id,
+            subject_identity_fingerprint=subject_fp,
+            peer_identity_fingerprint=peer_fp,
+            config=resolve,
+            prompt_hash=prompt_hash,
+            schema_hash=schema_hash,
+            schema_version=schema_version,
+        )
+        existing_er = load_er_by_relation_fingerprint(
+            connection,
+            person_relation_id=relation.id,
+            task_fingerprint=fingerprint,
+        )
+        if existing_er is not None:
+            continue
+
+        # Supersede other active reconsider fingerprints for this relation.
+        stale = connection.execute(
+            """
+            SELECT fingerprint
+              FROM work_item
+             WHERE task_type = ?
+               AND subject_kind = ?
+               AND subject_id = ?
+               AND state IN ('pending', 'deferred')
+               AND fingerprint != ?
+             ORDER BY id
+            """,
+            (
+                RECONSIDER_PERSON_ENTITY_TASK_TYPE,
+                SUBJECT_KIND_PERSON_RELATION,
+                relation.id,
+                fingerprint,
+            ),
+        ).fetchall()
+        for row in stale:
+            repository.supersede_work(
+                connection,
+                task_type=RECONSIDER_PERSON_ENTITY_TASK_TYPE,
+                fingerprint=row["fingerprint"],
+                run_id=run_id,
+                now=now,
+                reason=SUPERSEDED_RECONSIDER_REASON,
+            )
+
+        repository.schedule_work(
+            connection,
+            task_type=RECONSIDER_PERSON_ENTITY_TASK_TYPE,
+            subject_kind=SUBJECT_KIND_PERSON_RELATION,
+            subject_id=relation.id,
+            fingerprint=fingerprint,
+            required=True,
+            priority=RECONSIDER_PERSON_PRIORITY,
+            eligible_at=now,
+            run_id=run_id,
+            now=now,
+        )
+        scheduled += 1
+    return scheduled
+
+
+def _load_candidate_person(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    config: MainConfig,
+) -> CandidatePerson:
+    resolve = config.tasks.resolve_person_entity
+    # Import the shared projection builder without expanding candidates.py API.
+    from notable_person_finder.people.candidates import (  # noqa: PLC0415
+        _build_candidate,
+    )
+
+    return _build_candidate(
+        connection,
+        person_id=person_id,
+        score=0,
+        max_facts=resolve.max_facts_per_candidate,
+        max_names=resolve.max_names_per_candidate,
+    )
+
+
+def _resolve_reconsider_sides_for_relation(
+    connection: sqlite3.Connection,
+    *,
+    relation_id: int,
+    person_id_a: int,
+    person_id_b: int,
+    work_fingerprint: str,
+    config: MainConfig,
+) -> tuple[int, int]:
+    """Return (subject_person_id, peer_person_id) matching the work fingerprint.
+
+    Prefer the ordering whose identity fingerprints reproduce the scheduled
+    fingerprint (subject = fingerprint-changed side at schedule time). When both
+    orderings match (identical fingerprints) or neither does, use the lower
+    person id as subject (design determinism rule).
+    """
+    resolve = config.tasks.resolve_person_entity
+    prompt_hash, schema_hash, schema_version = resolution_prompt_and_schema_hashes()
+    lower, higher = sorted((person_id_a, person_id_b))
+    matched: list[tuple[int, int]] = []
+    for subject_id, peer_id in ((lower, higher), (higher, lower)):
+        subject_fp = _person_identity_fingerprint(connection, subject_id)
+        peer_fp = _person_identity_fingerprint(connection, peer_id)
+        if subject_fp is None or peer_fp is None:
+            continue
+        candidate_fp = reconsider_task_fingerprint(
+            person_relation_id=relation_id,
+            subject_identity_fingerprint=subject_fp,
+            peer_identity_fingerprint=peer_fp,
+            config=resolve,
+            prompt_hash=prompt_hash,
+            schema_hash=schema_hash,
+            schema_version=schema_version,
+        )
+        if candidate_fp == work_fingerprint:
+            matched.append((subject_id, peer_id))
+    if len(matched) == 1:
+        return matched[0]
+    # Both or neither: lower person id is subject.
+    return lower, higher
+
+
+@dataclass(frozen=True, slots=True)
+class _ReconsiderCall:
+    """Application-thread inputs for worker-thread reconsider generation."""
+
+    request: StructuredGenerationRequest
+    resolve_input: ResolvePersonEntityInput
+    person_relation_id: int
+    subject_person_id: int
+    peer_person_id: int
+    model_inspection_id: int
+    canonical_supplied_input_json: str
+    prompt_hash: str
+    schema_hash: str
+    schema_version: int
+    task_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ReconsiderPersist:
+    """Prevalidated reconsider output and provenance for application-thread persist."""
+
+    output: ResolvePersonEntityOutput
+    person_relation_id: int
+    subject_person_id: int
+    peer_person_id: int
+    model_inspection_id: int
+    canonical_supplied_input_json: str
+    prompt_hash: str
+    schema_hash: str
+    schema_version: int
+    task_fingerprint: str
+    resolve_input: ResolvePersonEntityInput
+
+
+def _execute_reconsideration_for(
+    client: LlmClient,
+) -> Callable[[WorkItem, int, object], TaskOutcome]:
+    """Worker-thread generation + domain validation; no SQLite in freevars."""
+
+    def execute(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
+        if not isinstance(prepared, _ReconsiderCall):
+            raise ProviderFailure(
+                FailureCategory.INTERNAL,
+                provider=PROVIDER,
+                operation=GENERATE_OPERATION,
+                detail=f"prepared value was {type(prepared).__name__}",
+            )
+        result = client.generate_structured(prepared.request)
+        raw_text = result.raw_text
+        if result.refusal:
+            del raw_text, result
+            raise ProviderFailure(
+                FailureCategory.MALFORMED_RESPONSE,
+                provider=PROVIDER,
+                operation=GENERATE_OPERATION,
+                retryable=True,
+                detail=MALFORMED_RESOLUTION_DETAIL,
+            )
+        try:
+            output = validate_resolution_output(raw_text, prepared.resolve_input)
+        except ResolutionValidationError:
+            del raw_text, result
+            raise ProviderFailure(
+                FailureCategory.MALFORMED_RESPONSE,
+                provider=PROVIDER,
+                operation=GENERATE_OPERATION,
+                retryable=True,
+                detail=MALFORMED_RESOLUTION_DETAIL,
+            ) from None
+        del raw_text
+        payload = _ReconsiderPersist(
+            output=output,
+            person_relation_id=prepared.person_relation_id,
+            subject_person_id=prepared.subject_person_id,
+            peer_person_id=prepared.peer_person_id,
+            model_inspection_id=prepared.model_inspection_id,
+            canonical_supplied_input_json=prepared.canonical_supplied_input_json,
+            prompt_hash=prepared.prompt_hash,
+            schema_hash=prepared.schema_hash,
+            schema_version=prepared.schema_version,
+            task_fingerprint=prepared.task_fingerprint,
+            resolve_input=prepared.resolve_input,
+        )
+        return TaskOutcome(
+            state=WorkState.SUCCEEDED,
+            reason=None,
+            payload=payload,
+            response_bytes=len(result.raw_text.encode("utf-8")),
+            provider_request_id=result.provider_request_id,
+            actual_nano_usd=result.actual_nano_usd,
+        )
+
+    return execute
+
+
+def _attempt_confirm_person_merge(
+    connection: sqlite3.Connection,
+    *,
+    loser_id: int,
+    survivor_id: int,
+    run_id: int,
+    observation_id: int,
+    now: str,
+) -> bool:
+    """Call Task 8 merge when present; otherwise leave edge for later."""
+    import importlib
+    import importlib.util
+
+    if importlib.util.find_spec("notable_person_finder.people.merge") is None:
+        return False
+    merge_mod = importlib.import_module("notable_person_finder.people.merge")
+    confirm = getattr(merge_mod, "confirm_person_merge", None)
+    if confirm is None:
+        return False
+    confirm(
+        connection,
+        loser_id=loser_id,
+        survivor_id=survivor_id,
+        run_id=run_id,
+        observation_id=observation_id,
+        now=now,
+    )
+    return True
+
+
+def _persist_reconsideration_for(
+    connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
+) -> Callable[[WorkItem, TaskOutcome], None]:
+    def persist(work_item: WorkItem, outcome: TaskOutcome) -> None:
+        payload = outcome.payload
+        if not isinstance(payload, _ReconsiderPersist):
+            raise RuntimeError(
+                f"unexpected reconsideration payload type: {type(payload).__name__}"
+            )
+        attempt_id, run_id, observed_at = _attempt_context(connection, work_item.id)
+        existing = load_er_by_relation_fingerprint(
+            connection,
+            person_relation_id=payload.person_relation_id,
+            task_fingerprint=payload.task_fingerprint,
+        )
+        if existing is not None:
+            return
+
+        output = payload.output
+        validated_json = output.model_dump_json()
+        supporting_json = json.dumps(
+            list(output.supporting_fact_ids), separators=(",", ":")
+        )
+        conflicting_json = json.dumps(
+            list(output.conflicting_fact_ids), separators=(",", ":")
+        )
+        candidates_json = _candidate_ids_json((payload.peer_person_id,))
+        selected: int | None = None
+        rationale = output.rationale
+
+        if output.outcome == "same_person":
+            if output.selected_person_id is None:
+                raise RuntimeError("same_person output missing selected_person_id")
+            selected = canonical_person_id(connection, output.selected_person_id)
+            guardrails_ok = merge_guardrails_pass(
+                connection,
+                relation_id=payload.person_relation_id,
+                subject_person_id=payload.subject_person_id,
+                peer_person_id=payload.peer_person_id,
+                output=output,
+                resolve_input=payload.resolve_input,
+            )
+            if not guardrails_ok:
+                rationale = f"{rationale}{MERGE_GUARDRAILS_FAILED_NOTE}"
+            else:
+                rationale = f"{rationale}{READY_TO_MERGE_NOTE}"
+
+        er_id = insert_entity_resolution_observation(
+            connection,
+            person_mention_id=None,
+            person_relation_id=payload.person_relation_id,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            model_inspection_id=payload.model_inspection_id,
+            disposition="completed",
+            semantic_outcome=output.outcome,
+            selected_person_id=selected,
+            created_person_id=None,
+            candidate_person_ids_json=candidates_json,
+            canonical_supplied_input_json=payload.canonical_supplied_input_json,
+            validated_output_json=validated_json,
+            prompt_hash=payload.prompt_hash,
+            schema_hash=payload.schema_hash,
+            schema_version=payload.schema_version,
+            task_fingerprint=payload.task_fingerprint,
+            supporting_fact_ids_json=supporting_json,
+            conflicting_fact_ids_json=conflicting_json,
+            rationale=rationale,
+            failure_category=None,
+            observed_at=observed_at,
+        )
+
+        if output.outcome == "different_people":
+            dismiss_relation(
+                connection,
+                relation_id=payload.person_relation_id,
+                closed_by_observation_id=er_id,
+                closed_at=observed_at,
+            )
+            return
+
+        if output.outcome == "uncertain":
+            # Leave edge active; no reschedule until fingerprint changes.
+            return
+
+        # same_person: attempt merge when Task 8 is present and guardrails pass.
+        if MERGE_GUARDRAILS_FAILED_NOTE in rationale:
+            return
+        subject = payload.subject_person_id
+        peer = payload.peer_person_id
+        survivor_id = min(subject, peer)
+        loser_id = max(subject, peer)
+        merged = _attempt_confirm_person_merge(
+            connection,
+            loser_id=loser_id,
+            survivor_id=survivor_id,
+            run_id=run_id,
+            observation_id=er_id,
+            now=observed_at,
+        )
+        if not merged:
+            # Edge stays active until Task 8 merge lands or a later fingerprint
+            # change re-arms reconsideration.
+            return
+
+    return persist
+
+
+def _persist_reconsideration_failure_for(
+    connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
+) -> Callable[[WorkItem, ProviderFailure], None]:
+    def persist_failure(work_item: WorkItem, failure: ProviderFailure) -> None:
+        state_row = connection.execute(
+            "SELECT state, subject_id, fingerprint FROM work_item WHERE id = ?",
+            (work_item.id,),
+        ).fetchone()
+        if state_row is None or state_row["state"] != "failed_permanent":
+            return
+        if state_row["subject_id"] is None:
+            return
+        person_relation_id = int(state_row["subject_id"])
+        task_fingerprint = state_row["fingerprint"]
+        existing = load_er_by_relation_fingerprint(
+            connection,
+            person_relation_id=person_relation_id,
+            task_fingerprint=task_fingerprint,
+        )
+        if existing is not None:
+            return
+
+        attempt_id, run_id, observed_at = _attempt_context(connection, work_item.id)
+        prompt_hash, schema_hash, schema_version = resolution_prompt_and_schema_hashes()
+        routing_fp = routing_fingerprint(config.openrouter.routing)
+        inspection = load_model_inspection(
+            connection,
+            run_id=run_id,
+            configured_model_id=config.tasks.resolve_person_entity.model,
+            routing_fingerprint=routing_fp,
+        )
+        model_inspection_id = None if inspection is None else inspection.id
+        insert_entity_resolution_observation(
+            connection,
+            person_mention_id=None,
+            person_relation_id=person_relation_id,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            model_inspection_id=model_inspection_id,
+            disposition="failed",
+            semantic_outcome=None,
+            selected_person_id=None,
+            created_person_id=None,
+            candidate_person_ids_json="[]",
+            canonical_supplied_input_json="{}",
+            validated_output_json=None,
+            prompt_hash=prompt_hash,
+            schema_hash=schema_hash,
+            schema_version=schema_version,
+            task_fingerprint=task_fingerprint,
+            rationale=str(failure.category),
+            failure_category=str(failure.category),
+            observed_at=observed_at,
+        )
+        # Edge stays active (design: leave relation status unchanged on failed).
+
+    return persist_failure
+
+
+def build_reconsideration_handler(
+    connection: sqlite3.Connection,
+    *,
+    client: LlmClient,
+    config: MainConfig,
+    profile: DomainProfileConfig,
+) -> TaskHandler:
+    """The ``reconsider_person_entity`` handler (relation-scoped; K18/K21/K22)."""
+    del profile  # reserved for future domain-profile bounds
+    resolve = config.tasks.resolve_person_entity
+    model_id = resolve.model
+    routing_fp = routing_fingerprint(config.openrouter.routing)
+    hard_budget = config.budget.openrouter_nano_usd_per_run() is not None
+    endpoint_host = urlsplit(config.openrouter.endpoint).hostname
+    parameters = resolve.parameters
+
+    def ready(claimed_run_id: int) -> bool:
+        return inspection_ready(
+            connection,
+            run_id=claimed_run_id,
+            config=config,
+            model_id=model_id,
+        )
+
+    def prepare(work_item: WorkItem) -> TaskPreparation:
+        if work_item.subject_id is None:
+            raise ValueError(MISSING_RELATION_DETAIL)
+        person_relation_id = work_item.subject_id
+        relation = connection.execute(
+            """
+            SELECT id, kind, status, person_id_a, person_id_b
+              FROM person_relation
+             WHERE id = ?
+            """,
+            (person_relation_id,),
+        ).fetchone()
+        if relation is None:
+            raise ValueError(
+                f"{RESOLVE_PREPARE_REFUSED_PREFIX}missing_relation {person_relation_id}"
+            )
+        if relation["kind"] != "possible_same_person" or relation["status"] != "active":
+            raise ValueError(
+                f"{RESOLVE_PREPARE_REFUSED_PREFIX}inactive_relation "
+                f"{person_relation_id}"
+            )
+
+        person_id_a = int(relation["person_id_a"])
+        person_id_b = int(relation["person_id_b"])
+
+        # Resolve endpoints to canonical form; refuse if either side is gone
+        # or both collapse to the same canonical person mid-flight.
+        try:
+            canon_a = canonical_person_id(connection, person_id_a)
+            canon_b = canonical_person_id(connection, person_id_b)
+        except LookupError as exc:
+            raise ValueError(
+                f"{RESOLVE_PREPARE_REFUSED_PREFIX}missing_peer {person_relation_id}"
+            ) from exc
+        if canon_a == canon_b:
+            raise ValueError(
+                f"{RESOLVE_PREPARE_REFUSED_PREFIX}merged_endpoints {person_relation_id}"
+            )
+
+        # Prefer stored endpoints when still canonical; otherwise use canons.
+        endpoint_a = person_id_a if canon_a == person_id_a else canon_a
+        endpoint_b = person_id_b if canon_b == person_id_b else canon_b
+
+        existing_er = load_er_by_relation_fingerprint(
+            connection,
+            person_relation_id=person_relation_id,
+            task_fingerprint=work_item.fingerprint,
+        )
+        if existing_er is not None:
+            raise ValueError(
+                f"{RESOLVE_PREPARE_REFUSED_PREFIX}already_settled_relation "
+                f"{person_relation_id}"
+            )
+
+        subject_person_id, peer_person_id = _resolve_reconsider_sides_for_relation(
+            connection,
+            relation_id=person_relation_id,
+            person_id_a=endpoint_a,
+            person_id_b=endpoint_b,
+            work_fingerprint=work_item.fingerprint,
+            config=config,
+        )
+
+        subject_mention_id = _latest_linked_mention_id(
+            connection, person_id=subject_person_id
+        )
+        if subject_mention_id is None:
+            # Fallback: lower-id side (design).
+            fallback_subject = min(endpoint_a, endpoint_b)
+            fallback_peer = max(endpoint_a, endpoint_b)
+            subject_person_id = fallback_subject
+            peer_person_id = fallback_peer
+            subject_mention_id = _latest_linked_mention_id(
+                connection, person_id=subject_person_id
+            )
+        if subject_mention_id is None:
+            raise ValueError(
+                f"{RESOLVE_PREPARE_REFUSED_PREFIX}missing_subject_mention "
+                f"{person_relation_id}"
+            )
+
+        mention = connection.execute(
+            """
+            SELECT exact_name, search_name, outcome, person_id
+              FROM person_mention
+             WHERE id = ?
+            """,
+            (subject_mention_id,),
+        ).fetchone()
+        if mention is None:
+            raise ValueError(
+                f"{RESOLVE_PREPARE_REFUSED_PREFIX}missing_subject_mention "
+                f"{person_relation_id}"
+            )
+        outcome = str(mention["outcome"])
+        if outcome not in {"research", "uncertain"}:
+            raise ValueError(
+                f"{RESOLVE_PREPARE_REFUSED_PREFIX}ineligible_subject_mention "
+                f"{person_relation_id}"
+            )
+
+        run_id = _claimed_run_id(connection, work_item.id)
+        inspection = load_model_inspection(
+            connection,
+            run_id=run_id,
+            configured_model_id=model_id,
+            routing_fingerprint=routing_fp,
+        )
+        if inspection is None or inspection.compatibility != "compatible":
+            raise ValueError(MISSING_INSPECTION_DETAIL)
+
+        peer_row = connection.execute(
+            "SELECT id FROM person WHERE id = ?",
+            (peer_person_id,),
+        ).fetchone()
+        if peer_row is None:
+            raise ValueError(
+                f"{RESOLVE_PREPARE_REFUSED_PREFIX}missing_peer {person_relation_id}"
+            )
+
+        exact_name = str(mention["exact_name"])
+        search_name = (
+            str(mention["search_name"])
+            if mention["search_name"] is not None
+            else exact_name
+        )
+        source_item_id = _source_item_id_for_mention(
+            connection, person_mention_id=subject_mention_id
+        )
+        peer_candidate = _load_candidate_person(
+            connection, person_id=peer_person_id, config=config
+        )
+        resolve_input = build_resolve_input(
+            person_mention_id=subject_mention_id,
+            source_item_id=source_item_id,
+            exact_name=exact_name,
+            search_name=search_name,
+            mention_outcome=outcome,
+            passages=_passages_for_source_item(
+                connection, source_item_id=source_item_id, config=config
+            ),
+            identity_facts=_identity_facts_for_mention(
+                connection, person_mention_id=subject_mention_id
+            ),
+            signals=_signals_for_mention(
+                connection, person_mention_id=subject_mention_id
+            ),
+            candidates=_to_resolve_candidates((peer_candidate,)),
+            config=resolve,
+        )
+        rendered = render_resolution_request(resolve_input)
+        request = StructuredGenerationRequest(
+            model_id=model_id,
+            system_prompt=rendered.system_prompt,
+            user_content=rendered.user_input_json,
+            json_schema=rendered.schema,
+            schema_name=RESOLUTION_SCHEMA_NAME,
+            max_completion_tokens=resolve.max_completion_tokens,
+            temperature=parameters.temperature,
+            top_p=parameters.top_p,
+            reasoning_effort=parameters.reasoning_effort,
+        )
+        call = _ReconsiderCall(
+            request=request,
+            resolve_input=resolve_input,
+            person_relation_id=person_relation_id,
+            subject_person_id=subject_person_id,
+            peer_person_id=peer_person_id,
+            model_inspection_id=inspection.id,
+            canonical_supplied_input_json=rendered.canonical_input_json,
+            prompt_hash=rendered.prompt_hash,
+            schema_hash=rendered.schema_hash,
+            schema_version=rendered.schema_version,
+            task_fingerprint=work_item.fingerprint,
+        )
+        if not hard_budget:
+            return TaskPreparation(payload=call, reserved_nano_usd=0)
+
+        prompt_price = inspection.prompt_unit_price_nano_usd
+        completion_price = inspection.completion_unit_price_nano_usd
+        if (
+            not inspection.pricing_usable
+            or prompt_price is None
+            or completion_price is None
+        ):
+            raise ValueError(MISSING_PRICING_DETAIL)
+        reserved = _worst_case_reservation_nano_usd(
+            prompt_unit_price_nano_usd=prompt_price,
+            completion_unit_price_nano_usd=completion_price,
+            max_input_tokens=resolve.max_input_tokens,
+            max_completion_tokens=resolve.max_completion_tokens,
+        )
+        return TaskPreparation(payload=call, reserved_nano_usd=reserved)
+
+    def destination_host(work_item: WorkItem) -> str | None:
+        return endpoint_host
+
+    return TaskHandler(
+        task_type=RECONSIDER_PERSON_ENTITY_TASK_TYPE,
+        provider=PROVIDER,
+        operation=GENERATE_OPERATION,
+        execute=_execute_reconsideration_for(client),
+        prepare=prepare,
+        persist=_persist_reconsideration_for(connection, config=config),
+        persist_failure=_persist_reconsideration_failure_for(connection, config=config),
+        destination_host=destination_host,
+        reserved_nano_usd=0,
+        pool=WorkerPool.LLM,
+        ready=ready,
+    )

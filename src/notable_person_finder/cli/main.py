@@ -27,6 +27,7 @@ from notable_person_finder.ingestion.service import (
 )
 from notable_person_finder.obs.logging import configure_logging, log_event
 from notable_person_finder.people.repository import (
+    RECONSIDER_PERSON_ENTITY_TASK_TYPE,
     RESOLVE_PERSON_ENTITY_TASK_TYPE,
     triage_corpus_counts,
     triage_run_counts,
@@ -36,6 +37,7 @@ from notable_person_finder.people.service import (
     INSPECT_MODEL_TASK_TYPE,
     build_detection_handler,
     build_inspection_handler,
+    build_reconsideration_handler,
     build_resolution_handler,
     ensure_model_inspections_for_run,
     schedule_source_items,
@@ -350,6 +352,12 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                         profile=loaded.domain_profile,
                     ),
                     RESOLVE_PERSON_ENTITY_TASK_TYPE: build_resolution_handler(
+                        connection,
+                        client=llm_client,
+                        config=loaded.main,
+                        profile=loaded.domain_profile,
+                    ),
+                    RECONSIDER_PERSON_ENTITY_TASK_TYPE: build_reconsideration_handler(
                         connection,
                         client=llm_client,
                         config=loaded.main,
