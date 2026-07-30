@@ -410,6 +410,28 @@ def test_upsert_sourced_name_refreshes_last_observed_at(
 def test_canonical_projection_follows_merge_and_includes_loser_mentions(
     connection: sqlite3.Connection,
 ) -> None:
+    """Fingerprint must use operational closure (survivor + merged-away).
+
+    Discriminates the closure rule: if names/facts queries only use the
+    canonical person id (not the loser), before/after hashes and the golden
+    payload digests below stay equal or miss loser material.
+    """
+    import hashlib
+    import json
+
+    def _golden(names: list[str], facts: list[tuple[str, str]]) -> str:
+        payload = {
+            "facts": sorted(
+                [{"kind": kind, "match_key": key} for kind, key in facts],
+                key=lambda item: (item["kind"], item["match_key"]),
+            ),
+            "names": sorted(names),
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
     run_id_a, mention_a = _seed_mention(
         connection,
         exact_name="Alex Smith",
@@ -419,10 +441,19 @@ def test_canonical_projection_follows_merge_and_includes_loser_mentions(
         survivor = create_person_for_mention(
             connection, run_id=run_id_a, mention_id=mention_a, now=moment()
         )
+
+    # Survivor-only projection: name + profession fact; no loser material.
+    survivor_only = compute_identity_fingerprint(connection, survivor)
+    assert survivor_only == _golden(
+        ["alex smith"],
+        [("profession_or_role", "composer")],
+    )
+
+    with immediate(connection):
         loser = insert_person(
             connection,
             run_id=run_id_a,
-            display_name="A. Smith",
+            display_name="Unique Loser Name",
             identity_fingerprint=_OTHER_HASH,
             created_at=moment(),
             merged_into_person_id=None,
@@ -430,32 +461,23 @@ def test_canonical_projection_follows_merge_and_includes_loser_mentions(
         upsert_sourced_name(
             connection,
             person_id=loser,
-            exact_name="A. Smith",
+            exact_name="Unique Loser Name",
             kind="alias",
             origin_kind="manual",
             origin_mention_id=None,
             observed_at=moment(),
         )
-        # Attach a second mention to the loser, then redirect.
         _run2, mention_b = _seed_second_mention(
-            connection, run_id=run_id_a, exact_name="A. Smith"
+            connection, run_id=run_id_a, exact_name="Unique Loser Name"
         )
         connection.execute(
             "UPDATE person_mention SET person_id = ? WHERE id = ?",
             (loser, mention_b),
         )
+        # Redirect without yet attaching the loser's non-name fact.
         connection.execute(
             "UPDATE person SET merged_into_person_id = ? WHERE id = ?",
             (survivor, loser),
-        )
-        connection.execute(
-            """
-            INSERT INTO mention_identity_fact (
-                person_mention_id, local_id, kind, value,
-                supporting_passage_ids_json
-            ) VALUES (?, 'place-1', 'place', 'Paris', '[]')
-            """,
-            (mention_b,),
         )
 
     assert canonical_person_id(connection, loser) == survivor
@@ -467,11 +489,42 @@ def test_canonical_projection_follows_merge_and_includes_loser_mentions(
     assert mention_a in mention_ids
     assert mention_b in mention_ids
 
+    # Closure names query must pull the loser's sourced match_key.
+    after_name_merge = compute_identity_fingerprint(connection, survivor)
+    assert after_name_merge != survivor_only
+    assert after_name_merge == _golden(
+        ["alex smith", "unique loser name"],
+        [("profession_or_role", "composer")],
+    )
+
     with immediate(connection):
+        connection.execute(
+            """
+            INSERT INTO mention_identity_fact (
+                person_mention_id, local_id, kind, value,
+                supporting_passage_ids_json
+            ) VALUES (?, 'place-1', 'place', 'Paris', '[]')
+            """,
+            (mention_b,),
+        )
         fingerprint = recompute_identity_fingerprint(connection, survivor)
-    assert len(fingerprint) == 64
-    # Fingerprint must include non-name facts from both sides of the closure.
+
+    # Closure facts query must pull the non-name fact still stored on the loser.
+    assert fingerprint != after_name_merge
+    assert fingerprint != survivor_only
+    assert fingerprint == _golden(
+        ["alex smith", "unique loser name"],
+        [
+            ("place", "paris"),
+            ("profession_or_role", "composer"),
+        ],
+    )
     assert fingerprint == compute_identity_fingerprint(connection, survivor)
+    stored = connection.execute(
+        "SELECT identity_fingerprint FROM person WHERE id = ?",
+        (survivor,),
+    ).fetchone()["identity_fingerprint"]
+    assert stored == fingerprint
 
 
 def _seed_second_mention(
