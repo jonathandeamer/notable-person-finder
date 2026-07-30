@@ -373,6 +373,7 @@ class MainConfig(StrictModel):
     timezone: str
     feeds_file: Path
     domain_profile_file: Path
+    source_policy_file: Path
     paths: PathsConfig = PathsConfig()
     secrets: SecretEnvConfig = SecretEnvConfig()
     transport: TransportConfig = TransportConfig()

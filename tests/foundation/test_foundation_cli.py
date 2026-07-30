@@ -124,7 +124,9 @@ def test_checked_in_example_configuration_is_structurally_valid(
 
     config_root = tmp_path / "config"
     profile_root = config_root / "discovery_profiles"
+    policy_root = config_root / "source_policies"
     profile_root.mkdir(parents=True)
+    policy_root.mkdir(parents=True)
     examples = REPOSITORY_ROOT / "config"
     shutil.copyfile(examples / "notable.example.toml", config_root / "notable.toml")
     shutil.copyfile(
@@ -134,6 +136,10 @@ def test_checked_in_example_configuration_is_structurally_valid(
     shutil.copyfile(
         examples / "discovery_profiles" / "art.example.toml",
         profile_root / "art.toml",
+    )
+    shutil.copyfile(
+        examples / "source_policies" / "visual_arts.example.toml",
+        policy_root / "visual_arts.toml",
     )
     completed = run_cli(
         config_root / "notable.toml",

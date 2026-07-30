@@ -2,6 +2,8 @@ schema_version = 1
 timezone = "Europe/Paris"
 feeds_file = "discovery-feeds.toml"
 domain_profile_file = "discovery_profiles/art.toml"
+# Required: versioned publisher screening policy (relative to this config file).
+source_policy_file = "source_policies/visual_arts.toml"
 
 [secrets]
 openrouter_api_key = "OPENROUTER_API_KEY"

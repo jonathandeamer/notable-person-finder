@@ -23,6 +23,7 @@ def _minimal_main() -> dict[str, object]:
         "timezone": "Europe/Paris",
         "feeds_file": "feeds.toml",
         "domain_profile_file": "profile.toml",
+        "source_policy_file": "source_policies/visual_arts.toml",
     }
 
 
@@ -503,6 +504,7 @@ def test_main_config_rejects_unknown_fields() -> None:
                 "timezone": "Europe/Paris",
                 "feeds_file": "feeds.toml",
                 "domain_profile_file": "profile.toml",
+                "source_policy_file": "source_policies/visual_arts.toml",
                 "unexpected": True,
             }
         )

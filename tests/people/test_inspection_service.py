@@ -107,6 +107,7 @@ def _main_config(
         timezone="Europe/Paris",
         feeds_file=Path("feeds.toml"),
         domain_profile_file=Path("profiles/art.toml"),
+        source_policy_file=Path("source_policies/visual_arts.toml"),
         budget=BudgetConfig(openrouter_usd_per_run="1.00" if hard_budget else None),
         openrouter=OpenRouterConfig(
             routing=routing if routing is not None else ProviderRoutingConfig()
@@ -1287,6 +1288,7 @@ def test_multi_model_inspect_when_only_wikipedia_backlog(
         timezone="Europe/Paris",
         feeds_file=Path("feeds.toml"),
         domain_profile_file=Path("profiles/art.toml"),
+        source_policy_file=Path("source_policies/visual_arts.toml"),
         budget=BudgetConfig(openrouter_usd_per_run=None),
         openrouter=OpenRouterConfig(routing=ProviderRoutingConfig()),
         mediawiki=MediaWikiConfig(),

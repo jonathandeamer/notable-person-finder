@@ -306,6 +306,33 @@ def test_missing_files_and_secrets_are_actionable(tmp_path: Path) -> None:
     assert "TEST_BRAVE" in "\n".join(captured.value.errors)
 
 
+def test_missing_or_invalid_source_policy_fails_config_load(tmp_path: Path) -> None:
+    config_file = write_graph(tmp_path)
+    (tmp_path / "source_policies" / "visual_arts.toml").unlink()
+
+    with pytest.raises(ConfigLoadError) as captured:
+        load_config(
+            config_file,
+            environ={"TEST_OPENROUTER": "k", "TEST_BRAVE": "b"},
+            require_secrets=False,
+        )
+    assert any("source_policies" in error for error in captured.value.errors)
+
+    # Recreate as unsupported schema_version
+    (tmp_path / "source_policies" / "visual_arts.toml").write_text(
+        'schema_version = 99\nkey = "x"\nlabel = "y"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigLoadError) as captured_schema:
+        load_config(
+            config_file,
+            environ={"TEST_OPENROUTER": "k", "TEST_BRAVE": "b"},
+            require_secrets=False,
+        )
+    joined = "\n".join(captured_schema.value.errors)
+    assert "source_policies" in joined or "schema_version" in joined
+
+
 def test_literal_secret_selector_is_rejected_without_disclosure(tmp_path: Path) -> None:
     config_file = write_graph(tmp_path)
     literal_secret = "sk-or-v1.pasted-secret-value"
