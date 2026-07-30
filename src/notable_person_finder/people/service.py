@@ -2400,13 +2400,6 @@ def _persist_resolution_for(
             if output.selected_person_id is None:
                 raise RuntimeError("same_person output missing selected_person_id")
             selected = canonical_person_id(connection, output.selected_person_id)
-            # Capture edges that pre-exist this material attach (K21).
-            pre_existing_relation_ids = frozenset(
-                relation.id
-                for relation in list_active_possible_same_person_for(
-                    connection, selected
-                )
-            )
             mention_row = connection.execute(
                 "SELECT exact_name FROM person_mention WHERE id = ?",
                 (payload.person_mention_id,),
@@ -2425,16 +2418,6 @@ def _persist_resolution_for(
                     connection, person_mention_id=payload.person_mention_id
                 ),
                 observed_at=observed_at,
-            )
-            display_name = select_display_name(connection, selected)
-            fingerprint = recompute_identity_fingerprint(connection, selected)
-            connection.execute(
-                """
-                UPDATE person
-                   SET display_name = ?, identity_fingerprint = ?
-                 WHERE id = ?
-                """,
-                (display_name, fingerprint, selected),
             )
             er_id = insert_entity_resolution_observation(
                 connection,
@@ -2460,12 +2443,57 @@ def _persist_resolution_for(
                 failure_category=None,
                 observed_at=observed_at,
             )
+            # Link person_id before fingerprint recompute: operational projection
+            # reads non-name facts only from mentions with person_id set (C1).
             point_mention_current_er(
                 connection,
                 person_mention_id=payload.person_mention_id,
                 observation_id=er_id,
                 person_id=selected,
             )
+            display_name = select_display_name(connection, selected)
+            fingerprint = recompute_identity_fingerprint(connection, selected)
+            connection.execute(
+                """
+                UPDATE person
+                   SET display_name = ?, identity_fingerprint = ?
+                 WHERE id = ?
+                """,
+                (display_name, fingerprint, selected),
+            )
+            # Capture edges that pre-exist peer scan so same-settlement edges
+            # are not reconsidered (K21).
+            pre_existing_relation_ids = frozenset(
+                relation.id
+                for relation in list_active_possible_same_person_for(
+                    connection, selected
+                )
+            )
+            # K17: non-name material attach re-opens name-matched peer edges.
+            attaching_has_non_name = (
+                connection.execute(
+                    """
+                    SELECT 1
+                      FROM mention_identity_fact
+                     WHERE person_mention_id = ?
+                       AND kind != 'name'
+                     LIMIT 1
+                    """,
+                    (payload.person_mention_id,),
+                ).fetchone()
+                is not None
+            )
+            if attaching_has_non_name:
+                _apply_peer_edges(
+                    connection,
+                    person_id=selected,
+                    reject_set=set(),
+                    creating_mention_id=payload.person_mention_id,
+                    run_id=run_id,
+                    observation_id=er_id,
+                    config=config,
+                    now=observed_at,
+                )
             maybe_schedule_reconsideration_for_person(
                 connection,
                 person_id=selected,

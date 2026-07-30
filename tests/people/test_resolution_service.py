@@ -21,11 +21,17 @@ from notable_person_finder.config.models import (
     RetryConfig,
     TasksConfig,
 )
-from notable_person_finder.people.identity import insert_person, upsert_sourced_name
+from notable_person_finder.people.identity import (
+    compute_identity_fingerprint,
+    insert_person,
+    upsert_sourced_name,
+)
 from notable_person_finder.people.repository import (
     RECONSIDER_PERSON_ENTITY_TASK_TYPE,
     RESOLVE_PERSON_ENTITY_TASK_TYPE,
+    insert_entity_resolution_observation,
     mechanical_search_name,
+    upsert_active_possible_same_person,
 )
 from notable_person_finder.people.resolution import first_pass_task_fingerprint
 from notable_person_finder.people.service import (
@@ -984,6 +990,351 @@ def test_model_same_person_links_selected(
     assert er["created_person_id"] is None
     assert er["attempt_id"] is not None
     assert len(client.generate_calls) == 1
+
+
+def test_same_person_non_name_attach_changes_fingerprint(
+    connection: sqlite3.Connection,
+) -> None:
+    """C1: same_person recompute must see the linked mention's non-name facts.
+
+    Operational fingerprint reads facts only from mentions with person_id set.
+    Recompute-before-link would leave the fingerprint at name-only and this
+    assertion fails.
+    """
+    run_id, _a, _i, mention_id = _seed_mention_graph(
+        connection,
+        exact_name="Alex Smith",
+        non_name_facts=(("profession_or_role", "sculptor"),),
+    )
+    peer = _prepare_resolve_work(connection, run_id=run_id, mention_id=mention_id)
+    with immediate(connection):
+        fp_before = compute_identity_fingerprint(connection, peer)
+        connection.execute(
+            "UPDATE person SET identity_fingerprint = ? WHERE id = ?",
+            (fp_before, peer),
+        )
+    config = _main_config()
+    profile = _profile()
+    client = ScriptedLlmClient(
+        inspection=_compatible_inspection(),
+        generate_results=[
+            _generation_result(
+                _resolve_output(outcome="same_person", selected_person_id=peer)
+            )
+        ],
+    )
+
+    def seed(engine_run_id: int) -> None:
+        from notable_person_finder.people.service import (
+            ensure_model_inspections_for_run,
+        )
+
+        ensure_model_inspections_for_run(
+            connection, run_id=engine_run_id, config=config, now=NOW
+        )
+
+    _run_engine(connection, _handlers(connection, client, config, profile), seed=seed)
+    person = connection.execute(
+        "SELECT identity_fingerprint FROM person WHERE id = ?", (peer,)
+    ).fetchone()
+    assert person is not None
+    assert person["identity_fingerprint"] != fp_before
+    with immediate(connection):
+        # Linked mention must contribute the non-name fact to the projection.
+        assert (
+            compute_identity_fingerprint(connection, peer)
+            == person["identity_fingerprint"]
+        )
+        mention = connection.execute(
+            "SELECT person_id FROM person_mention WHERE id = ?", (mention_id,)
+        ).fetchone()
+    assert mention is not None
+    assert mention["person_id"] == peer
+
+
+def test_same_person_non_name_with_preexisting_edge_schedules_reconsider(
+    connection: sqlite3.Connection,
+) -> None:
+    """C1+K21: non-name attach changes fingerprint and re-arms pre-existing edges."""
+    run_id, attempt_id, inspection_id, seed_mention = _seed_mention_graph(
+        connection,
+        exact_name="Alex Smith",
+        source_entry_id="entry-seed",
+    )
+    # Attaching mention carries a new non-name fact not yet on selected.
+    attach_mention = connection.execute(
+        """
+        INSERT INTO person_mention (
+            triage_observation_id, ordinal, exact_name, search_name,
+            outcome, supporting_passage_ids_json, rationale
+        )
+        SELECT triage_observation_id, 2, exact_name, search_name,
+               'research', '["p1"]', 'attach'
+          FROM person_mention WHERE id = ?
+        """,
+        (seed_mention,),
+    ).lastrowid
+    assert attach_mention is not None
+    connection.execute(
+        """
+        INSERT INTO mention_identity_fact (
+            person_mention_id, local_id, kind, value,
+            supporting_passage_ids_json
+        ) VALUES (?, 'f-place', 'place', 'Paris', '["p1"]')
+        """,
+        (attach_mention,),
+    )
+    connection.commit()
+
+    with immediate(connection):
+        selected = insert_person(
+            connection,
+            run_id=run_id,
+            display_name="Alex Smith",
+            identity_fingerprint=_HASH,
+            created_at=NOW,
+        )
+        upsert_sourced_name(
+            connection,
+            person_id=selected,
+            exact_name="Alex Smith",
+            kind="display",
+            origin_kind="person_mention",
+            origin_mention_id=seed_mention,
+            observed_at=NOW,
+        )
+        peer = insert_person(
+            connection,
+            run_id=run_id,
+            display_name="Alex Smith",
+            identity_fingerprint=_OTHER,
+            created_at=NOW,
+        )
+        upsert_sourced_name(
+            connection,
+            person_id=peer,
+            exact_name="Alex Smith",
+            kind="display",
+            origin_kind="manual",
+            origin_mention_id=None,
+            observed_at=NOW,
+        )
+        del attempt_id, inspection_id  # created_new is schedule-time (no attempt)
+        er_seed = insert_entity_resolution_observation(
+            connection,
+            person_mention_id=seed_mention,
+            person_relation_id=None,
+            run_id=run_id,
+            attempt_id=None,
+            model_inspection_id=None,
+            disposition="completed",
+            semantic_outcome="created_new",
+            selected_person_id=None,
+            created_person_id=selected,
+            candidate_person_ids_json="[]",
+            canonical_supplied_input_json="{}",
+            validated_output_json=CREATED_NEW_VALIDATED_OUTPUT_JSON,
+            prompt_hash=_PROMPT,
+            schema_hash=_SCHEMA,
+            schema_version=1,
+            task_fingerprint=_HASH,
+            rationale="seed link",
+            failure_category=None,
+            observed_at=NOW,
+        )
+        connection.execute(
+            """
+            UPDATE person_mention
+               SET person_id = ?,
+                   current_entity_resolution_observation_id = ?
+             WHERE id = ?
+            """,
+            (selected, er_seed, seed_mention),
+        )
+        relation_id = upsert_active_possible_same_person(
+            connection,
+            person_id_a=selected,
+            person_id_b=peer,
+            run_id=run_id,
+            created_by_observation_id=er_seed,
+            now=NOW,
+        )
+        fp_before = compute_identity_fingerprint(connection, selected)
+        connection.execute(
+            "UPDATE person SET identity_fingerprint = ? WHERE id = ?",
+            (fp_before, selected),
+        )
+
+    config = _main_config()
+    profile = _profile()
+    result = ensure_resolution_for_mention(
+        connection,
+        person_mention_id=attach_mention,
+        run_id=run_id,
+        config=config,
+        profile=profile,
+        now=NOW,
+    )
+    assert result == "scheduled"
+    client = ScriptedLlmClient(
+        inspection=_compatible_inspection(),
+        generate_results=[
+            _generation_result(
+                _resolve_output(outcome="same_person", selected_person_id=selected)
+            )
+        ],
+    )
+
+    def seed(engine_run_id: int) -> None:
+        from notable_person_finder.people.service import (
+            ensure_model_inspections_for_run,
+        )
+
+        ensure_model_inspections_for_run(
+            connection, run_id=engine_run_id, config=config, now=NOW
+        )
+
+    _run_engine(connection, _handlers(connection, client, config, profile), seed=seed)
+
+    person = connection.execute(
+        "SELECT identity_fingerprint FROM person WHERE id = ?", (selected,)
+    ).fetchone()
+    assert person is not None
+    assert person["identity_fingerprint"] != fp_before
+    reconsider = connection.execute(
+        """
+        SELECT subject_id, state FROM work_item
+         WHERE task_type = ? AND subject_id = ?
+        """,
+        (RECONSIDER_PERSON_ENTITY_TASK_TYPE, relation_id),
+    ).fetchone()
+    assert reconsider is not None
+    assert reconsider["state"] in {
+        "pending",
+        "succeeded",
+        "failed_permanent",
+        "running",
+        "deferred",
+    }
+
+
+def test_same_person_name_only_attach_does_not_peer_scan_name_only_peers(
+    connection: sqlite3.Connection,
+) -> None:
+    """I1: name-only same_person attach must not open edges to name-only peers."""
+    run_id, _a, _i, mention_id = _seed_mention_graph(
+        connection, exact_name="Alex Smith"
+    )  # name-only attach
+    selected = _prepare_resolve_work(connection, run_id=run_id, mention_id=mention_id)
+    with immediate(connection):
+        name_only_peer = insert_person(
+            connection,
+            run_id=run_id,
+            display_name="Alex Smith",
+            identity_fingerprint="c" * 64,
+            created_at=NOW,
+        )
+        upsert_sourced_name(
+            connection,
+            person_id=name_only_peer,
+            exact_name="Alex Smith",
+            kind="display",
+            origin_kind="manual",
+            origin_mention_id=None,
+            observed_at=NOW,
+        )
+    config = _main_config()
+    profile = _profile()
+    client = ScriptedLlmClient(
+        inspection=_compatible_inspection(),
+        generate_results=[
+            _generation_result(
+                _resolve_output(outcome="same_person", selected_person_id=selected)
+            )
+        ],
+    )
+
+    def seed(engine_run_id: int) -> None:
+        from notable_person_finder.people.service import (
+            ensure_model_inspections_for_run,
+        )
+
+        ensure_model_inspections_for_run(
+            connection, run_id=engine_run_id, config=config, now=NOW
+        )
+
+    _run_engine(connection, _handlers(connection, client, config, profile), seed=seed)
+    edges = connection.execute(
+        """
+        SELECT COUNT(*) AS n FROM person_relation
+         WHERE kind = 'possible_same_person' AND status = 'active'
+        """
+    ).fetchone()
+    assert edges is not None
+    assert edges["n"] == 0
+
+
+def test_same_person_non_name_attach_opens_peer_edges(
+    connection: sqlite3.Connection,
+) -> None:
+    """I1: non-name same_person attach peer-scans name-matched eligible peers."""
+    run_id, _a, _i, mention_id = _seed_mention_graph(
+        connection,
+        exact_name="Alex Smith",
+        non_name_facts=(("profession_or_role", "sculptor"),),
+    )
+    selected = _prepare_resolve_work(connection, run_id=run_id, mention_id=mention_id)
+    with immediate(connection):
+        # Name-matched peer that is not the selected person; creating mention
+        # has non-name so K17 allows the edge even if peer is name-only.
+        peer = insert_person(
+            connection,
+            run_id=run_id,
+            display_name="Alex Smith",
+            identity_fingerprint="c" * 64,
+            created_at=NOW,
+        )
+        upsert_sourced_name(
+            connection,
+            person_id=peer,
+            exact_name="Alex Smith",
+            kind="display",
+            origin_kind="manual",
+            origin_mention_id=None,
+            observed_at=NOW,
+        )
+    config = _main_config()
+    profile = _profile()
+    client = ScriptedLlmClient(
+        inspection=_compatible_inspection(),
+        generate_results=[
+            _generation_result(
+                _resolve_output(outcome="same_person", selected_person_id=selected)
+            )
+        ],
+    )
+
+    def seed(engine_run_id: int) -> None:
+        from notable_person_finder.people.service import (
+            ensure_model_inspections_for_run,
+        )
+
+        ensure_model_inspections_for_run(
+            connection, run_id=engine_run_id, config=config, now=NOW
+        )
+
+    _run_engine(connection, _handlers(connection, client, config, profile), seed=seed)
+    edges = connection.execute(
+        """
+        SELECT person_id_a, person_id_b FROM person_relation
+         WHERE kind = 'possible_same_person' AND status = 'active'
+        """
+    ).fetchall()
+    assert len(edges) == 1
+    ends = {int(edges[0]["person_id_a"]), int(edges[0]["person_id_b"])}
+    assert ends == {selected, peer}
+    # K21: peer edges opened in this settlement must not schedule reconsider.
+    assert _count_work(connection, task_type=RECONSIDER_PERSON_ENTITY_TASK_TYPE) == 0
 
 
 def test_model_different_people_creates_without_edges(
