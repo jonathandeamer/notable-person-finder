@@ -17,6 +17,11 @@ from notable_person_finder.config.loader import (
     load_config,
 )
 from notable_person_finder.config.models import DomainProfileConfig, MainConfig
+from notable_person_finder.coverage.screening import load_source_policy
+from notable_person_finder.coverage.service import (
+    BRAVE_WEB_SEARCH_TASK_TYPE,
+    build_brave_web_search_handler,
+)
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.db.migrate import MigrationError, apply_migrations
 from notable_person_finder.ingestion.repository import source_item_counts
@@ -47,6 +52,7 @@ from notable_person_finder.people.service import (
     seed_unresolved_mentions,
     seed_untriaged,
 )
+from notable_person_finder.providers.brave import HttpxBraveWebSearchClient
 from notable_person_finder.providers.feeds import FeedparserClient
 from notable_person_finder.providers.mediawiki import HttpxMediaWikiClient
 from notable_person_finder.providers.openrouter import OpenRouterClient
@@ -346,6 +352,12 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                 # require_secrets=True already refuses a missing key; this
                 # narrows the type for the client constructor.
                 raise ConfigLoadError(("openrouter_api_key is required for run",))
+            brave_key = loaded.credentials.brave_api_key
+            if brave_key is None:
+                raise ConfigLoadError(("brave_api_key is required for run",))
+            # Task 6a: Brave search handler only. fetch_article / assess_article
+            # register in Tasks 6b/7. Coverage seed lands in Task 8.
+            source_policy = load_source_policy(loaded.main.source_policy_file)
             with (
                 build_transport(
                     loaded.main.transport,
@@ -382,6 +394,12 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                     max_categories_per_page=match_cfg.max_categories_per_page,
                     clock=clock,
                 )
+                brave_client = HttpxBraveWebSearchClient(
+                    transport,
+                    config=loaded.main.brave,
+                    api_key=brave_key,
+                    clock=clock,
+                )
                 on_source_items = _on_source_items_callback(
                     connection,
                     config=loaded.main,
@@ -403,6 +421,12 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                         connection,
                         client=mediawiki_client,
                         config=loaded.main,
+                    ),
+                    BRAVE_WEB_SEARCH_TASK_TYPE: build_brave_web_search_handler(
+                        connection,
+                        client=brave_client,
+                        config=loaded.main,
+                        policy=source_policy,
                     ),
                     INSPECT_MODEL_TASK_TYPE: build_inspection_handler(
                         connection, client=llm_client, config=loaded.main

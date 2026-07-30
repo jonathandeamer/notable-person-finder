@@ -12,8 +12,8 @@
 | 2 | Brave WebSearchClient | complete |
 | 3 | ArticleFetcher + Trafilatura | complete |
 | 4 | Policy, selection, queries, eligibility | complete |
-| 5 | PassageSelector + assess contract + config | pending |
-| 6a | Plan lifecycle + brave_web_search | pending |
+| 5 | PassageSelector + assess contract + config | complete |
+| 6a | Plan lifecycle + brave_web_search | complete |
 | 6b | fetch_article + views | pending |
 | 7 | assess_article + multi-model inspect | pending |
 | 8 | Seed, supersede, merge | pending |
@@ -42,3 +42,14 @@ Task 3: complete (commits b71df3c..d1f27ad, review clean)
 Task 4: complete — screening/selection/queries/eligibility pure modules;
 source_policy_file required on MainConfig; K5 matrix + K10/K34 unit tests;
 mutation evidence in task-4-report.md
+
+Task 4: fix round 1/5 (2 addressed, 0 open; commits 7f31e9c..66b524d)
+Task 4: complete (commits d1f27ad..66b524d, review clean)
+
+Task 5: fix round 1/5 (2 addressed, 0 open; commits af7f8bd..618b856)
+Task 5: complete (commits 66b524d..618b856, review clean)
+
+Task 6a: complete — plan open (K10 discovery + exact forms), brave_web_search
+handler (one search_web / UNIQUE attempt), offset semantics, maybe_advance
+stages + T1–T11 terminalize; CLI registers Brave only (fetch/assess later);
+mutation evidence in task-6a-report.md

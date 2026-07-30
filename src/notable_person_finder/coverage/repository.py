@@ -752,6 +752,73 @@ def load_coverage_discovery_article(
     )
 
 
+def list_coverage_discovery_articles_for_plan(
+    connection: sqlite3.Connection, *, plan_id: int
+) -> tuple[CoverageDiscoveryArticleRecord, ...]:
+    rows = connection.execute(
+        """
+        SELECT *
+          FROM coverage_discovery_article
+         WHERE plan_id = ?
+         ORDER BY id
+        """,
+        (plan_id,),
+    ).fetchall()
+    return tuple(
+        CoverageDiscoveryArticleRecord(
+            id=int(row["id"]),
+            plan_id=int(row["plan_id"]),
+            canonical_article_id=int(row["canonical_article_id"]),
+            source_item_id=int(row["source_item_id"]),
+            person_mention_id=(
+                int(row["person_mention_id"])
+                if row["person_mention_id"] is not None
+                else None
+            ),
+            screening_id=int(row["screening_id"]),
+        )
+        for row in rows
+    )
+
+
+def list_coverage_article_targets_for_plan(
+    connection: sqlite3.Connection, *, plan_id: int
+) -> tuple[CoverageArticleTargetRecord, ...]:
+    rows = connection.execute(
+        """
+        SELECT *
+          FROM coverage_article_target
+         WHERE plan_id = ?
+         ORDER BY id
+        """,
+        (plan_id,),
+    ).fetchall()
+    return tuple(
+        CoverageArticleTargetRecord(
+            id=int(row["id"]),
+            plan_id=int(row["plan_id"]),
+            canonical_article_id=int(row["canonical_article_id"]),
+            request_url=str(row["request_url"]),
+            selection_reason=str(row["selection_reason"]),
+            status=str(row["status"]),
+            article_view_id=(
+                int(row["article_view_id"])
+                if row["article_view_id"] is not None
+                else None
+            ),
+            attempt_id=(
+                int(row["attempt_id"]) if row["attempt_id"] is not None else None
+            ),
+            failure_category=(
+                str(row["failure_category"])
+                if row["failure_category"] is not None
+                else None
+            ),
+        )
+        for row in rows
+    )
+
+
 def insert_coverage_article_target(
     connection: sqlite3.Connection,
     *,
