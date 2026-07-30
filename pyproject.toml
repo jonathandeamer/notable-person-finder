@@ -17,6 +17,7 @@ dependencies = [
   "portalocker>=3.1,<4",
   "pydantic>=2.11,<3",
   "python-dotenv>=1.1,<2",
+  "trafilatura>=2.0,<3",
   "tzdata>=2025.2",
 ]
 
