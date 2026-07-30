@@ -98,7 +98,6 @@ LOCAL_FAILED_SUPPLIED_INPUT_JSON = (
 _PRIMARY_VARIANT_KINDS = frozenset({"exact", "comma_swap"})
 _ACCENT_VARIANT_KIND = "accent_fallback"
 _TERMINAL_PLAN_STATUSES = frozenset({"superseded", "completed", "failed"})
-_PRIMARY_VARIANTS_WITHOUT_ACCENT = _PRIMARY_VARIANT_KINDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -577,12 +576,13 @@ def _persist_search_for(
             observed_at=observed_at,
         )
         if is_new_observation:
+            # Ranks are global within the form across continuation pages.
             insert_search_hits(
                 connection,
                 search_observation_id=observation_id,
                 hits=tuple(
                     {
-                        "rank": index,
+                        "rank": prior_hits + index,
                         "page_id": hit.page_id,
                         "title": hit.title,
                     }
@@ -1090,7 +1090,9 @@ def _assemble_and_terminalize(
     # Failed facts batches also make retrieval incomplete for negatives.
     batches = list_page_facts_batches_for_plan(connection, plan_id=plan_id)
     any_batch_failed = any(batch.status == "failed" for batch in batches)
-    # Re-detect unresolved redirect trails under hop/page budget.
+    # Unresolved redirect trails only (hop/page budget left targets unfetched).
+    # Do not treat plan.truncated_unsafe alone as redirect budget — batch failure
+    # also sets that flag and must surface as unsafe_truncation (not redirect).
     unresolved_redirect = any(
         page.redirect_to_page_id is not None
         and page.redirect_to_page_id not in pages_records
@@ -1098,8 +1100,11 @@ def _assemble_and_terminalize(
     )
 
     partial_retrieval = any_form_failed or bool(plan.partial_retrieval)
-    search_incomplete = any_form_truncated or any_batch_failed
-    redirect_exhausted = unresolved_redirect or bool(plan.truncated_unsafe_for_negative)
+    search_incomplete = (
+        any_form_truncated
+        or any_batch_failed
+        or (bool(plan.truncated_unsafe_for_negative) and not unresolved_redirect)
+    )
 
     assembly = assemble_biography_candidates(
         hits,
@@ -1107,7 +1112,7 @@ def _assemble_and_terminalize(
         max_candidates=match_config.max_candidates,
         max_redirect_hops=match_config.max_redirect_hops,
         search_incomplete=search_incomplete,
-        redirect_budget_exhausted=redirect_exhausted and not any_form_failed,
+        redirect_budget_exhausted=unresolved_redirect,
         partial_retrieval=partial_retrieval,
     )
 
@@ -1116,7 +1121,7 @@ def _assemble_and_terminalize(
         if (
             not truncated_unsafe
             and not partial_retrieval
-            and not redirect_exhausted
+            and not unresolved_redirect
             and not any_form_failed
             and not any_batch_failed
         ):
@@ -1131,12 +1136,22 @@ def _assemble_and_terminalize(
             )
             return
 
+        # Prefer explicit domain categories: partial > real redirect trails >
+        # generic unsafe (batch fail, form truncation, fact-page cap, etc.).
         failure_category = assembly.failure_category_if_empty
         if failure_category is None:
             if partial_retrieval or any_form_failed:
                 failure_category = "partial_retrieval_empty"
-            elif redirect_exhausted:
+            elif unresolved_redirect:
                 failure_category = "redirect_budget_exhausted"
+            else:
+                failure_category = "unsafe_truncation"
+        elif (
+            failure_category == "redirect_budget_exhausted" and not unresolved_redirect
+        ):
+            # Assembly may inherit redirect_budget from a stale flag; reclassify.
+            if partial_retrieval or any_form_failed:
+                failure_category = "partial_retrieval_empty"
             else:
                 failure_category = "unsafe_truncation"
         _write_local_failed(
@@ -1146,7 +1161,7 @@ def _assemble_and_terminalize(
             material_fingerprint=plan.material_fingerprint,
             run_id=run_id,
             failure_category=failure_category,
-            truncated_unsafe=truncated_unsafe or redirect_exhausted,
+            truncated_unsafe=truncated_unsafe or unresolved_redirect,
             partial_retrieval=partial_retrieval,
             now=now,
         )
@@ -1499,7 +1514,3 @@ def _canonical_json(value: object) -> str:
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-# Silence unused primary-variant alias warning in type checkers if any.
-_ = _PRIMARY_VARIANTS_WITHOUT_ACCENT

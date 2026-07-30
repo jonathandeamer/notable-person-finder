@@ -919,9 +919,13 @@ def mark_plan_status(
 def list_search_hit_page_ids_for_completed_forms(
     connection: sqlite3.Connection, *, plan_id: int
 ) -> tuple[tuple[int, int], ...]:
-    """Return ``(page_id, best_rank)`` for hits on completed forms of a plan.
+    """Return ``(page_id, best_rank)`` for hits on terminal forms of a plan.
 
-    Rank is global-best (lowest) across forms; hits without a page id are dropped.
+    Includes successful search observations on ``completed`` forms **and** on
+    ``failed`` forms that already stored hits (page-0 success then continuation
+    permanent fail). Pending forms are excluded so mid-continuation state does
+    not assemble early. Rank is global-best (lowest) across forms; hits without
+    a page id are dropped.
     """
     rows = connection.execute(
         """
@@ -935,7 +939,7 @@ def list_search_hit_page_ids_for_completed_forms(
           JOIN wikipedia_query_form AS f
             ON f.id = o.query_form_id
          WHERE f.plan_id = ?
-           AND f.status = 'completed'
+           AND f.status IN ('completed', 'failed')
            AND h.page_id IS NOT NULL
          GROUP BY h.page_id
          ORDER BY best_rank, h.page_id

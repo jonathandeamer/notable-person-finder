@@ -593,6 +593,23 @@ def test_search_continuation_within_bound(
     assert form.hit_count == 2
     assert form.truncated is False
 
+    # Ranks are global within the form (continuation page does not restart at 1).
+    ranks = connection.execute(
+        """
+        SELECT h.rank, h.page_id
+          FROM mediawiki_search_hit AS h
+          JOIN mediawiki_search_observation AS o
+            ON o.id = h.search_observation_id
+         WHERE o.query_form_id = ?
+         ORDER BY h.rank
+        """,
+        (form_ids[0],),
+    ).fetchall()
+    assert [(int(r["rank"]), int(r["page_id"])) for r in ranks] == [
+        (1, 100),
+        (2, 101),
+    ]
+
     batches = list_page_facts_batches_for_plan(connection, plan_id=plan_id)
     assert len(batches) == 1
     assert batches[0].status == "pending"
@@ -608,6 +625,153 @@ def test_search_continuation_within_bound(
     assert plan.status == "ready_for_match"
     assert _active_match_count(connection) == 1
     assert client.search_calls == [("Alex Smith", None), ("Alex Smith", "10")]
+
+
+def test_page0_hits_retained_when_continuation_permanently_fails(
+    connection: sqlite3.Connection,
+) -> None:
+    """Successful page-0 hits must survive form permanent fail (K22 partial)."""
+    config = _main_config(max_continuations_per_form=1)
+    run_id = insert_run(connection)
+    person_id = _person(connection, run_id=run_id)
+    plan_id, form_ids = _open_plan_with_forms(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        forms=(("exact", "Alex Smith"),),
+    )
+    client = ScriptedMediaWikiClient(
+        search_results=[
+            _search_page(((50, "Alex Smith"),), continuation="10", more=True),
+        ],
+        facts_results=[MediaWikiPageFactsBatch(pages=(_page(50, "Alex Smith"),))],
+    )
+    _run_search(
+        connection,
+        client=client,
+        config=config,
+        form_id=form_ids[0],
+        material_fingerprint=_HASH,
+        run_id=run_id,
+    )
+    form = list_query_forms_for_plan(connection, plan_id=plan_id)[0]
+    assert form.status == "pending"
+    assert form.hit_count == 1
+
+    # Permanent-fail the scheduled continuation.
+    cont = connection.execute(
+        """
+        SELECT id FROM work_item
+         WHERE task_type = ? AND subject_id = ? AND state = 'pending'
+         ORDER BY id DESC LIMIT 1
+        """,
+        (MEDIAWIKI_SEARCH_TASK_TYPE, form_ids[0]),
+    ).fetchone()
+    assert cont is not None
+    work_id = int(cont["id"])
+    work = _work_item_row(connection, work_id=work_id)
+    _insert_running_attempt(connection, work_id=work_id, run_id=run_id)
+    _settle_work_failed_permanent(connection, work_id=work_id)
+    handler = build_mediawiki_search_handler(connection, client=client, config=config)
+    assert handler.persist_failure is not None
+    with immediate(connection):
+        handler.persist_failure(
+            work,
+            ProviderFailure(
+                FailureCategory.CONFIGURATION,
+                provider=PROVIDER,
+                operation=SEARCH_OPERATION,
+                detail="continuation died",
+            ),
+        )
+
+    form = list_query_forms_for_plan(connection, plan_id=plan_id)[0]
+    assert form.status == "failed"
+    # Page-0 hit must still drive facts + match (not empty-fail).
+    batches = list_page_facts_batches_for_plan(connection, plan_id=plan_id)
+    assert len(batches) == 1
+    assert json.loads(batches[0].page_ids_json) == [50]
+    _run_facts(
+        connection,
+        client=client,
+        config=config,
+        batch_id=batches[0].id,
+        run_id=run_id,
+    )
+    plan = load_plan(connection, plan_id=plan_id)
+    assert plan is not None
+    assert plan.status == "ready_for_match"
+    assert plan.partial_retrieval is True
+    assert _active_match_count(connection) == 1
+    obs = _obs_for_person(connection, person_id)
+    assert obs is None  # match not yet run; no empty-fail obs
+
+
+def test_failed_facts_batch_empty_uses_unsafe_truncation_not_redirect(
+    connection: sqlite3.Connection,
+) -> None:
+    config = _main_config()
+    run_id = insert_run(connection)
+    person_id = _person(connection, run_id=run_id)
+    plan_id, form_ids = _open_plan_with_forms(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        forms=(("exact", "Alex"),),
+    )
+    client = ScriptedMediaWikiClient(
+        search_results=[_search_page(((9, "Alex"),))],
+    )
+    _run_search(
+        connection,
+        client=client,
+        config=config,
+        form_id=form_ids[0],
+        material_fingerprint=_HASH,
+        run_id=run_id,
+    )
+    batches = list_page_facts_batches_for_plan(connection, plan_id=plan_id)
+    assert len(batches) == 1
+    batch_id = batches[0].id
+    row = connection.execute(
+        """
+        SELECT id FROM work_item
+         WHERE task_type = ? AND subject_id = ? AND state = 'pending'
+        """,
+        (MEDIAWIKI_PAGE_FACTS_TASK_TYPE, batch_id),
+    ).fetchone()
+    assert row is not None
+    work_id = int(row["id"])
+    work = _work_item_row(connection, work_id=work_id)
+    _insert_running_attempt(
+        connection,
+        work_id=work_id,
+        run_id=run_id,
+        operation=PAGE_FACTS_OPERATION,
+    )
+    _settle_work_failed_permanent(connection, work_id=work_id)
+    handler = build_mediawiki_page_facts_handler(
+        connection, client=client, config=config
+    )
+    assert handler.persist_failure is not None
+    with immediate(connection):
+        handler.persist_failure(
+            work,
+            ProviderFailure(
+                FailureCategory.CONFIGURATION,
+                provider=PROVIDER,
+                operation=PAGE_FACTS_OPERATION,
+            ),
+        )
+    plan = load_plan(connection, plan_id=plan_id)
+    assert plan is not None
+    assert plan.status == "failed"
+    obs = _obs_for_person(connection, person_id)
+    assert obs is not None
+    assert obs["disposition"] == "failed"
+    assert obs["failure_category"] == "unsafe_truncation"
+    assert obs["failure_category"] != "redirect_budget_exhausted"
+    assert _active_match_count(connection) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1074,30 +1238,22 @@ def test_k23_empty_primaries_insert_accent_once(
 def test_double_settle_same_attempt_does_not_duplicate_hits(
     connection: sqlite3.Connection,
 ) -> None:
-    config = _main_config()
+    """At-least-once re-persist while form still pending must not re-insert hits."""
+    config = _main_config(max_continuations_per_form=1)
     run_id = insert_run(connection)
     person_id = _person(connection, run_id=run_id)
     plan_id, form_ids = _open_plan_with_forms(
         connection,
         person_id=person_id,
         run_id=run_id,
-        forms=(
-            ("exact", "Alex"),
-            ("comma_swap", "X"),
-        ),
+        forms=(("exact", "Alex"),),
     )
     client = ScriptedMediaWikiClient(
         search_results=[
-            _search_page(
-                (
-                    (1, "Alex"),
-                    (2, "Alex Jr"),
-                )
-            ),
-            _search_page(()),
+            # more=True keeps form pending after page-0 (continuation scheduled).
+            _search_page(((1, "Alex"), (2, "Alex Jr")), continuation="10", more=True),
         ]
     )
-    # Manual first settle so we can re-persist same attempt.
     with immediate(connection) as conn:
         work_id = schedule_mediawiki_search(
             conn,
@@ -1108,6 +1264,7 @@ def test_double_settle_same_attempt_does_not_duplicate_hits(
             now=NOW,
         )
     work = _work_item_row(connection, work_id=work_id)
+    assert work.priority == 50
     _insert_running_attempt(connection, work_id=work_id, run_id=run_id)
     handler = build_mediawiki_search_handler(connection, client=client, config=config)
     assert handler.prepare is not None and handler.persist is not None
@@ -1115,6 +1272,8 @@ def test_double_settle_same_attempt_does_not_duplicate_hits(
     outcome = handler.execute(work, 1, prepared.payload)
     with immediate(connection):
         handler.persist(work, outcome)
+    form = list_query_forms_for_plan(connection, plan_id=plan_id)[0]
+    assert form.status == "pending"
     hits1 = connection.execute(
         "SELECT COUNT(*) AS n FROM mediawiki_search_hit"
     ).fetchone()
@@ -1122,25 +1281,18 @@ def test_double_settle_same_attempt_does_not_duplicate_hits(
     count1 = int(hits1["n"])
     assert count1 == 2
 
-    # Second persist same attempt (at-least-once).
+    # Second persist same attempt (at-least-once); form still pending.
     with immediate(connection):
         handler.persist(work, outcome)
+    form = list_query_forms_for_plan(connection, plan_id=plan_id)[0]
+    assert form.status == "pending"
+    assert form.hit_count == 2
     hits2 = connection.execute(
         "SELECT COUNT(*) AS n FROM mediawiki_search_hit"
     ).fetchone()
     assert hits2 is not None
     assert int(hits2["n"]) == count1
-
-    # Complete second form so plan can advance without hanging on pending.
-    _run_search(
-        connection,
-        client=client,
-        config=config,
-        form_id=form_ids[1],
-        material_fingerprint=_HASH,
-        run_id=run_id,
-    )
-    del plan_id
+    del person_id
 
 
 def test_superseded_plan_persist_is_noop(
@@ -1233,6 +1385,8 @@ def test_maybe_advance_waits_while_form_pending(
 def test_handlers_use_http_pool_priority_and_no_budget(
     connection: sqlite3.Connection,
 ) -> None:
+    from notable_person_finder.wikipedia.service import MEDIAWIKI_HTTP_PRIORITY
+
     config = _main_config()
     client = ScriptedMediaWikiClient()
     search = build_mediawiki_search_handler(connection, client=client, config=config)
@@ -1245,3 +1399,24 @@ def test_handlers_use_http_pool_priority_and_no_budget(
     assert facts.operation == PAGE_FACTS_OPERATION
     assert facts.reserved_nano_usd == 0
     assert facts.task_type == MEDIAWIKI_PAGE_FACTS_TASK_TYPE
+
+    run_id = insert_run(connection)
+    person_id = _person(connection, run_id=run_id)
+    _plan_id, form_ids = _open_plan_with_forms(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        forms=(("exact", "Alex"),),
+    )
+    with immediate(connection) as conn:
+        work_id = schedule_mediawiki_search(
+            conn,
+            form_id=form_ids[0],
+            material_fingerprint=_HASH,
+            continuation_in=None,
+            run_id=run_id,
+            now=NOW,
+        )
+    work = _work_item_row(connection, work_id=work_id)
+    assert work.priority == MEDIAWIKI_HTTP_PRIORITY
+    assert work.priority == 50
