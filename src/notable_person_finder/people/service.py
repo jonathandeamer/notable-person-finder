@@ -1846,6 +1846,28 @@ def _passages_for_source_item(
     return tuple(passages)
 
 
+def _schedule_wikipedia_after_person_ready(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    run_id: int,
+    config: MainConfig,
+    now: str,
+) -> None:
+    """Lazy join to Wikipedia ensure after person create/link (avoids import cycle)."""
+    from notable_person_finder.wikipedia.service import (
+        schedule_wikipedia_after_person_ready,
+    )
+
+    schedule_wikipedia_after_person_ready(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        config=config,
+        now=now,
+    )
+
+
 def _apply_peer_edges(
     connection: sqlite3.Connection,
     *,
@@ -2018,6 +2040,13 @@ def _write_created_new(
         connection,
         person_id=person_id,
         pre_existing_relation_ids=pre_existing_relation_ids,
+        run_id=run_id,
+        config=config,
+        now=now,
+    )
+    _schedule_wikipedia_after_person_ready(
+        connection,
+        person_id=person_id,
         run_id=run_id,
         config=config,
         now=now,
@@ -2520,6 +2549,13 @@ def _persist_resolution_for(
                 config=config,
                 now=observed_at,
             )
+            _schedule_wikipedia_after_person_ready(
+                connection,
+                person_id=selected,
+                run_id=run_id,
+                config=config,
+                now=observed_at,
+            )
             return
 
         # different_people or uncertain: create a new person.
@@ -2593,6 +2629,13 @@ def _persist_resolution_for(
             connection,
             person_id=person_id,
             pre_existing_relation_ids=pre_existing_relation_ids,
+            run_id=run_id,
+            config=config,
+            now=observed_at,
+        )
+        _schedule_wikipedia_after_person_ready(
+            connection,
+            person_id=person_id,
             run_id=run_id,
             config=config,
             now=observed_at,
@@ -3205,6 +3248,7 @@ def _attempt_confirm_person_merge(
     run_id: int,
     observation_id: int,
     now: str,
+    config: MainConfig,
 ) -> bool:
     """Run ``confirm_person_merge`` and report that a merge was attempted."""
     confirm_person_merge(
@@ -3214,6 +3258,7 @@ def _attempt_confirm_person_merge(
         run_id=run_id,
         observation_id=observation_id,
         now=now,
+        config=config,
     )
     return True
 
@@ -3319,6 +3364,7 @@ def _persist_reconsideration_for(
             run_id=run_id,
             observation_id=er_id,
             now=observed_at,
+            config=config,
         )
         if not merged:
             # Edge stays active if merge is unavailable; fingerprint change

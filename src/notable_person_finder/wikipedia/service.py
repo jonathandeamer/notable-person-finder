@@ -17,7 +17,7 @@ import json
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -72,9 +72,11 @@ from notable_person_finder.wikipedia.candidates import (
 )
 from notable_person_finder.wikipedia.matching import (
     MatchValidationError,
+    base_material_fingerprint,
     build_match_input,
     map_model_outcome_to_semantic,
     match_prompt_and_schema_hashes,
+    observation_matches_live_material,
     render_match_request,
     validate_match_output,
 )
@@ -84,8 +86,12 @@ from notable_person_finder.wikipedia.models import (
     MatchWikiCandidate,
     MatchWikipediaIdentityInput,
     MatchWikipediaIdentityOutput,
+    WikipediaPersonMaterialView,
 )
-from notable_person_finder.wikipedia.queries import generate_accent_fallback_forms
+from notable_person_finder.wikipedia.queries import (
+    generate_accent_fallback_forms,
+    generate_primary_query_forms,
+)
 from notable_person_finder.wikipedia.repository import (
     covered_fact_page_ids,
     insert_or_load_search_observation_by_attempt,
@@ -110,7 +116,9 @@ from notable_person_finder.wikipedia.repository import (
     mark_query_form_progress,
     next_batch_ordinal,
     next_form_ordinal,
+    open_plan,
     point_person_current_wikipedia_observation,
+    supersede_plan,
     update_plan_retrieval_flags,
     upsert_mediawiki_page,
 )
@@ -127,6 +135,10 @@ MEDIAWIKI_HTTP_PRIORITY = 50
 MATCH_WIKIPEDIA_PRIORITY = 55
 
 DEFAULT_WIKI_ID = "enwiki"
+
+STALE_WIKIPEDIA_MATERIAL_REASON = "stale_wikipedia_material"
+MERGED_AWAY_WIKIPEDIA_REASON = "merged_away"
+SUPERSEDED_WIKIPEDIA_PLAN_REASON = "stale_wikipedia_plan"
 
 NO_MATCH_VALIDATED_OUTPUT_JSON = '{"outcome":"no_matching_page_found"}'
 NO_MATCH_RATIONALE = "empty complete search"
@@ -304,60 +316,648 @@ def schedule_match_wikipedia_identity(
 
 
 def wikipedia_match_model_needed(
-    connection: sqlite3.Connection, *, config: MainConfig
+    connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
+    now: str | None = None,
 ) -> bool:
     """K21: whether the match model needs current-run inspection.
 
     Arms when K17-eligible people exist, active match work exists, an active
     Wikipedia plan is retrieving/ready_for_match, or MediaWiki HTTP work for
-    a Wikipedia plan is active. Full K17 eligibility lands in Task 7; until
-    then the eligible arm is a thin provisional scan.
+    a Wikipedia plan is active.
     """
-    del config  # reserved for full is_wikipedia_match_eligible (Task 7)
+    effective_now = now if now is not None else utc_timestamp(datetime.now(tz=UTC))
     return (
-        _has_wikipedia_match_eligible_people_provisional(connection)
+        has_wikipedia_match_eligible_people(
+            connection, config=config, now=effective_now
+        )
         or _has_active_match_wikipedia_work(connection)
         or _has_active_wikipedia_plan(connection)
         or _has_active_mediawiki_wikipedia_http_work(connection)
     )
 
 
-def _has_wikipedia_match_eligible_people_provisional(
+def has_wikipedia_match_eligible_people(
     connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
+    now: str,
 ) -> bool:
-    """Provisional K17 arm until Task 7 ships ``is_wikipedia_match_eligible``.
+    """True when any canonical person is K17-eligible at ``now``."""
+    rows = connection.execute(
+        """
+        SELECT id
+          FROM person
+         WHERE merged_into_person_id IS NULL
+         ORDER BY id
+        """
+    ).fetchall()
+    for row in rows:
+        if is_wikipedia_match_eligible(
+            connection,
+            person_id=int(row["id"]),
+            config=config,
+            now=now,
+        ):
+            return True
+    return False
 
-    True when a canonical person has sourced names and no current Wikipedia
-    pointer and no terminal observation yet — enough for multi-model inspect
-    when only a Wikipedia backlog remains before seed opens plans.
+
+def is_wikipedia_match_eligible(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    config: MainConfig,
+    now: str,
+) -> bool:
+    """Shared K17 eligibility (seed, digest remaining, status, K21 arm)."""
+    target = _resolve_wikipedia_live_target(
+        connection,
+        person_id=person_id,
+        config=config,
+        now=now,
+    )
+    if target is None:
+        return False
+    live_fp, _refresh_of, canonical_id = target
+    if _has_terminal_obs(connection, person_id=canonical_id, task_fingerprint=live_fp):
+        return False
+    return not _has_active_plan_fp(
+        connection, person_id=canonical_id, material_fingerprint=live_fp
+    )
+
+
+def ensure_wikipedia_identity(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    run_id: int,
+    config: MainConfig,
+    now: str,
+) -> str:
+    """Open primary-form retrieval for an eligible person, or no-op.
+
+    Returns ``scheduled``, ``reused``, ``ineligible``, or ``completed_empty``.
+    Joins an open caller transaction when present; otherwise opens a brief
+    ``BEGIN IMMEDIATE``.
     """
+    owns_transaction = not connection.in_transaction
+    if owns_transaction:
+        connection.execute("BEGIN IMMEDIATE")
+    try:
+        result = _ensure_wikipedia_identity_body(
+            connection,
+            person_id=person_id,
+            run_id=run_id,
+            config=config,
+            now=now,
+        )
+    except BaseException:
+        if owns_transaction:
+            connection.rollback()
+        raise
+    else:
+        if owns_transaction:
+            connection.commit()
+        return result
+
+
+def schedule_wikipedia_after_person_ready(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    run_id: int,
+    config: MainConfig,
+    now: str,
+) -> None:
+    """Txn-neutral join: ensure Wikipedia identity after person create/link."""
+    ensure_wikipedia_identity(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        config=config,
+        now=now,
+    )
+
+
+def seed_wikipedia_identity(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    config: MainConfig,
+    now: str,
+) -> int:
+    """Backfill Wikipedia identity plans for every K17-eligible person.
+
+    Returns the count of people for which ensure returned a non-ineligible
+    result (``scheduled``, ``reused``, or ``completed_empty``).
+    """
+    rows = connection.execute(
+        """
+        SELECT id
+          FROM person
+         WHERE merged_into_person_id IS NULL
+         ORDER BY id
+        """
+    ).fetchall()
+    acted = 0
+    for row in rows:
+        result = ensure_wikipedia_identity(
+            connection,
+            person_id=int(row["id"]),
+            run_id=run_id,
+            config=config,
+            now=now,
+        )
+        if result != "ineligible":
+            acted += 1
+    return acted
+
+
+def _ensure_wikipedia_identity_body(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    run_id: int,
+    config: MainConfig,
+    now: str,
+) -> str:
+    target = _resolve_wikipedia_live_target(
+        connection,
+        person_id=person_id,
+        config=config,
+        now=now,
+    )
+    if target is None:
+        return "ineligible"
+    live_fp, refresh_of, canonical_id = target
+
+    active = load_active_plan_for_fingerprint(
+        connection,
+        person_id=canonical_id,
+        material_fingerprint=live_fp,
+    )
+    if active is not None:
+        return "reused"
+
+    existing = load_wikipedia_identity_observation_by_fingerprint(
+        connection,
+        person_id=canonical_id,
+        task_fingerprint=live_fp,
+    )
+    if existing is not None:
+        return "reused"
+
+    match_config = config.tasks.match_wikipedia_identity
+    name_texts = _operational_query_name_texts(connection, person_id=canonical_id)
+    primary_forms = generate_primary_query_forms(
+        name_texts,
+        max_forms=match_config.max_query_forms,
+    )
+    if not primary_forms:
+        return "completed_empty"
+
+    _supersede_stale_active_plans_for_person(
+        connection,
+        person_id=canonical_id,
+        keep_material_fingerprint=live_fp,
+        run_id=run_id,
+        now=now,
+    )
+
+    plan_id = open_plan(
+        connection,
+        person_id=canonical_id,
+        run_id=run_id,
+        material_fingerprint=live_fp,
+        created_at=now,
+        refresh_of_observation_id=refresh_of,
+    )
+    form_payloads = [
+        {
+            "ordinal": index,
+            "variant_kind": spec.variant_kind,
+            "query_text": spec.query_text,
+        }
+        for index, spec in enumerate(primary_forms, start=1)
+    ]
+    form_ids = insert_query_forms(
+        connection,
+        plan_id=plan_id,
+        forms=form_payloads,
+    )
+    for form_id in form_ids:
+        schedule_mediawiki_search(
+            connection,
+            form_id=form_id,
+            material_fingerprint=live_fp,
+            continuation_in=None,
+            run_id=run_id,
+            now=now,
+        )
+    return "scheduled"
+
+
+def _resolve_wikipedia_live_target(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    config: MainConfig,
+    now: str,
+) -> tuple[str, int | None, int] | None:
+    """Return ``(live_fp, refresh_of, canonical_id)`` for the work target.
+
+    Implements design K17 branch selection for ``live_fp`` / ``refresh_of``.
+    Does not apply terminal/active-plan gates (those differ for eligibility
+    vs ensure reuse). Returns None when no Wikipedia work should open.
+    """
+    person_row = connection.execute(
+        """
+        SELECT id, merged_into_person_id, identity_fingerprint,
+               current_wikipedia_identity_observation_id
+          FROM person
+         WHERE id = ?
+        """,
+        (person_id,),
+    ).fetchone()
+    if person_row is None:
+        return None
+    if person_row["merged_into_person_id"] is not None:
+        return None
+
+    canonical_id = int(person_row["id"])
+    if not _has_operational_match_key_name(connection, person_id=canonical_id):
+        return None
+
+    match_config = config.tasks.match_wikipedia_identity
+    person_view = WikipediaPersonMaterialView(
+        person_id=canonical_id,
+        identity_fingerprint=str(person_row["identity_fingerprint"]),
+    )
+    base_fp = base_material_fingerprint(
+        person_view,
+        match_config,
+        refresh_of_observation_id=None,
+    )
+
+    cur_id = person_row["current_wikipedia_identity_observation_id"]
+    cur = (
+        _load_wikipedia_observation(connection, observation_id=int(cur_id))
+        if cur_id is not None
+        else None
+    )
+
+    # Branch 1: current completed still matches live material.
+    if cur is not None and _observation_matches_live(
+        connection,
+        observation=cur,
+        person_view=person_view,
+        match_config=match_config,
+    ):
+        if not _refresh_interval_elapsed(
+            observed_at=str(cur["observed_at"]),
+            now=now,
+            hours=match_config.refresh_interval_hours,
+        ):
+            return None
+        live_fp = base_material_fingerprint(
+            person_view,
+            match_config,
+            refresh_of_observation_id=int(cur["id"]),
+        )
+        return live_fp, int(cur["id"]), canonical_id
+
+    # Branch 2: material changed / no matching current → base_fp work.
+    terminal = load_wikipedia_identity_observation_by_fingerprint(
+        connection,
+        person_id=canonical_id,
+        task_fingerprint=base_fp,
+    )
+    if terminal is not None:
+        if terminal.disposition == "failed":
+            return None
+        if terminal.disposition == "completed":
+            if not _refresh_interval_elapsed(
+                observed_at=terminal.observed_at,
+                now=now,
+                hours=match_config.refresh_interval_hours,
+            ):
+                return None
+            live_fp = base_material_fingerprint(
+                person_view,
+                match_config,
+                refresh_of_observation_id=terminal.id,
+            )
+            return live_fp, terminal.id, canonical_id
+
+    # No terminal for base_fp: live work is base_fp (refresh_of null).
+    return base_fp, None, canonical_id
+
+
+def _has_operational_match_key_name(
+    connection: sqlite3.Connection, *, person_id: int
+) -> bool:
+    closure = person_id_closure_for_canonical(connection, person_id)
+    if not closure:
+        return False
+    placeholders = ",".join("?" for _ in closure)
     row = connection.execute(
-        """
+        f"""
         SELECT 1 AS present
-          FROM person AS p
-         WHERE p.merged_into_person_id IS NULL
-           AND p.current_wikipedia_identity_observation_id IS NULL
-           AND EXISTS (
-                SELECT 1
-                  FROM sourced_name AS sn
-                 WHERE sn.person_id = p.id
-                   AND length(sn.match_key) > 0
-           )
-           AND NOT EXISTS (
-                SELECT 1
-                  FROM wikipedia_identity_observation AS o
-                 WHERE o.person_id = p.id
-           )
-           AND NOT EXISTS (
-                SELECT 1
-                  FROM wikipedia_identity_plan AS pl
-                 WHERE pl.person_id = p.id
-                   AND pl.status IN ('retrieving', 'ready_for_match')
-           )
+          FROM sourced_name
+         WHERE person_id IN ({placeholders})
+           AND length(match_key) > 0
          LIMIT 1
-        """
+        """,
+        closure,
     ).fetchone()
     return row is not None
+
+
+def _operational_query_name_texts(
+    connection: sqlite3.Connection, *, person_id: int
+) -> list[str]:
+    """Ordered exact names for primary query forms (K27 operational projection)."""
+    closure = person_id_closure_for_canonical(connection, person_id)
+    if not closure:
+        return []
+    placeholders = ",".join("?" for _ in closure)
+    rows = connection.execute(
+        f"""
+        SELECT id, exact_name, match_key, kind
+          FROM sourced_name
+         WHERE person_id IN ({placeholders})
+           AND length(match_key) > 0
+         ORDER BY id
+        """,
+        closure,
+    ).fetchall()
+    sorted_rows = sorted(
+        rows,
+        key=lambda row: (
+            _NAME_KIND_ORDER.get(str(row["kind"]), 99),
+            int(row["id"]),
+        ),
+    )
+    texts: list[str] = []
+    seen: set[str] = set()
+    for row in sorted_rows:
+        exact = str(row["exact_name"])
+        if not exact or exact in seen:
+            continue
+        seen.add(exact)
+        texts.append(exact)
+    return texts
+
+
+def _load_wikipedia_observation(
+    connection: sqlite3.Connection, *, observation_id: int
+) -> sqlite3.Row | None:
+    return connection.execute(
+        "SELECT * FROM wikipedia_identity_observation WHERE id = ?",
+        (observation_id,),
+    ).fetchone()
+
+
+def _observation_matches_live(
+    connection: sqlite3.Connection,
+    *,
+    observation: sqlite3.Row,
+    person_view: WikipediaPersonMaterialView,
+    match_config: MatchWikipediaIdentityConfig,
+) -> bool:
+    plan_id = observation["plan_id"]
+    if plan_id is None:
+        return False
+    plan = load_plan(connection, plan_id=int(plan_id))
+    if plan is None:
+        return False
+    return observation_matches_live_material(
+        observation_task_fingerprint=str(observation["task_fingerprint"]),
+        plan_id=plan.id,
+        plan_refresh_of_observation_id=plan.refresh_of_observation_id,
+        person=person_view,
+        config=match_config,
+    )
+
+
+def _has_terminal_obs(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    task_fingerprint: str,
+) -> bool:
+    obs = load_wikipedia_identity_observation_by_fingerprint(
+        connection,
+        person_id=person_id,
+        task_fingerprint=task_fingerprint,
+    )
+    return obs is not None and obs.disposition in {"completed", "failed"}
+
+
+def _has_active_plan_fp(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    material_fingerprint: str,
+) -> bool:
+    return (
+        load_active_plan_for_fingerprint(
+            connection,
+            person_id=person_id,
+            material_fingerprint=material_fingerprint,
+        )
+        is not None
+    )
+
+
+def _refresh_interval_elapsed(*, observed_at: str, now: str, hours: int) -> bool:
+    observed_dt = _parse_utc_timestamp(observed_at)
+    now_dt = _parse_utc_timestamp(now)
+    return now_dt - observed_dt >= timedelta(hours=hours)
+
+
+def _parse_utc_timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _supersede_stale_active_plans_for_person(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    keep_material_fingerprint: str,
+    run_id: int,
+    now: str,
+) -> None:
+    """K19: supersede active plans (and their work) for other fingerprints."""
+    rows = connection.execute(
+        """
+        SELECT id, material_fingerprint
+          FROM wikipedia_identity_plan
+         WHERE person_id = ?
+           AND status IN ('retrieving', 'ready_for_match')
+           AND material_fingerprint != ?
+         ORDER BY id
+        """,
+        (person_id, keep_material_fingerprint),
+    ).fetchall()
+    for row in rows:
+        _supersede_plan_and_work(
+            connection,
+            plan_id=int(row["id"]),
+            material_fingerprint=str(row["material_fingerprint"]),
+            person_id=person_id,
+            run_id=run_id,
+            now=now,
+            reason=STALE_WIKIPEDIA_MATERIAL_REASON,
+        )
+
+
+def supersede_wikipedia_work_for_person(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    run_id: int,
+    now: str,
+    reason: str = MERGED_AWAY_WIKIPEDIA_REASON,
+) -> None:
+    """Supersede active Wikipedia plans and work for a person (K16 loser path).
+
+    **The caller must already hold an open transaction.**
+    """
+    plan_rows = connection.execute(
+        """
+        SELECT id, material_fingerprint
+          FROM wikipedia_identity_plan
+         WHERE person_id = ?
+           AND status IN ('retrieving', 'ready_for_match')
+         ORDER BY id
+        """,
+        (person_id,),
+    ).fetchall()
+    for row in plan_rows:
+        _supersede_plan_and_work(
+            connection,
+            plan_id=int(row["id"]),
+            material_fingerprint=str(row["material_fingerprint"]),
+            person_id=person_id,
+            run_id=run_id,
+            now=now,
+            reason=reason,
+        )
+    # Belt-and-braces: person-subject match work not covered by a plan row.
+    connection.execute(
+        """
+        UPDATE work_item
+           SET state = 'superseded', reason = ?, completed_by_run_id = ?,
+               updated_at = ?
+         WHERE task_type = ?
+           AND subject_kind = ?
+           AND subject_id = ?
+           AND state IN ('pending', 'deferred')
+        """,
+        (
+            reason,
+            run_id,
+            now,
+            MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE,
+            SUBJECT_KIND_PERSON,
+            person_id,
+        ),
+    )
+
+
+def _supersede_plan_and_work(
+    connection: sqlite3.Connection,
+    *,
+    plan_id: int,
+    material_fingerprint: str,
+    person_id: int,
+    run_id: int,
+    now: str,
+    reason: str,
+) -> None:
+    form_ids = [
+        int(row["id"])
+        for row in connection.execute(
+            "SELECT id FROM wikipedia_query_form WHERE plan_id = ?",
+            (plan_id,),
+        )
+    ]
+    if form_ids:
+        placeholders = ",".join("?" for _ in form_ids)
+        connection.execute(
+            f"""
+            UPDATE work_item
+               SET state = 'superseded', reason = ?, completed_by_run_id = ?,
+                   updated_at = ?
+             WHERE task_type = ?
+               AND subject_kind = ?
+               AND subject_id IN ({placeholders})
+               AND state IN ('pending', 'deferred')
+            """,
+            (
+                reason,
+                run_id,
+                now,
+                MEDIAWIKI_SEARCH_TASK_TYPE,
+                SUBJECT_KIND_WIKIPEDIA_QUERY_FORM,
+                *form_ids,
+            ),
+        )
+
+    batch_ids = [
+        int(row["id"])
+        for row in connection.execute(
+            "SELECT id FROM wikipedia_page_facts_batch WHERE plan_id = ?",
+            (plan_id,),
+        )
+    ]
+    if batch_ids:
+        placeholders = ",".join("?" for _ in batch_ids)
+        connection.execute(
+            f"""
+            UPDATE work_item
+               SET state = 'superseded', reason = ?, completed_by_run_id = ?,
+                   updated_at = ?
+             WHERE task_type = ?
+               AND subject_kind = ?
+               AND subject_id IN ({placeholders})
+               AND state IN ('pending', 'deferred')
+            """,
+            (
+                reason,
+                run_id,
+                now,
+                MEDIAWIKI_PAGE_FACTS_TASK_TYPE,
+                SUBJECT_KIND_WIKIPEDIA_PAGE_FACTS_BATCH,
+                *batch_ids,
+            ),
+        )
+
+    connection.execute(
+        """
+        UPDATE work_item
+           SET state = 'superseded', reason = ?, completed_by_run_id = ?,
+               updated_at = ?
+         WHERE task_type = ?
+           AND subject_kind = ?
+           AND subject_id = ?
+           AND fingerprint = ?
+           AND state IN ('pending', 'deferred')
+        """,
+        (
+            reason,
+            run_id,
+            now,
+            MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE,
+            SUBJECT_KIND_PERSON,
+            person_id,
+            material_fingerprint,
+        ),
+    )
+    supersede_plan(connection, plan_id=plan_id, completed_at=now)
 
 
 def _has_active_match_wikipedia_work(connection: sqlite3.Connection) -> bool:

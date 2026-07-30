@@ -75,6 +75,7 @@ from notable_person_finder.runs.scheduler import (
     SchedulerSet,
     WorkerPool,
 )
+from notable_person_finder.wikipedia.service import seed_wikipedia_identity
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -189,6 +190,12 @@ def _compose_seed(
             run_id=run_id,
             config=config,
             profile=profile,
+            now=now,
+        )
+        seed_wikipedia_identity(
+            connection,
+            run_id=run_id,
+            config=config,
             now=now,
         )
         ensure_model_inspections_for_run(

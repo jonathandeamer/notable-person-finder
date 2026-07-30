@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from notable_person_finder.config.models import MainConfig
 from notable_person_finder.people.identity import (
     canonical_person_id,
     recompute_identity_fingerprint,
@@ -49,6 +50,7 @@ def confirm_person_merge(
     run_id: int,
     observation_id: int | None,
     now: str,
+    config: MainConfig | None = None,
 ) -> int:
     """Confirm a directed merge. Returns the canonical survivor id.
 
@@ -59,6 +61,9 @@ def confirm_person_merge(
     both arguments already resolve to one person). Rejects self-links that would
     set ``merged_into_person_id = id`` and cycles that cannot be flattened to a
     single lower-id survivor.
+
+    When ``config`` is provided, Wikipedia merge reconciliation (K16) runs after
+    work-item reconcile. Production callers always pass config.
     """
     _require_transaction(connection, "confirm_person_merge")
 
@@ -195,6 +200,19 @@ def confirm_person_merge(
         loser_id=actual_loser,
         now=now,
     )
+    if config is not None:
+        # Lazy import keeps people.merge free of wikipedia import cycles at
+        # module load; production reconsider path always supplies config (K16).
+        from notable_person_finder.wikipedia.merge_hooks import reconcile_on_merge
+
+        reconcile_on_merge(
+            connection,
+            survivor_id=actual_survivor,
+            loser_id=actual_loser,
+            run_id=run_id,
+            config=config,
+            now=now,
+        )
     return actual_survivor
 
 
