@@ -910,18 +910,15 @@ def test_one_get_per_execute(
     assert fetcher.calls == [url]
 
 
-def test_permanent_failure_marks_target_failed(
+def _run_permanent_fetch_failure(
     connection: sqlite3.Connection,
-) -> None:
-    url = "https://example.com/timeout"
-    plan_id, _person_id, run_id, config, policy = _plan_with_search_hits(
-        connection,
-        urls=(url,),
-        titles=("Timeout title",),
-        snippets=("Timeout snippet text",),
-        config=_main_config(retrieval_target=1),
-    )
-    target = list_coverage_article_targets_for_plan(connection, plan_id=plan_id)[0]
+    *,
+    target_id: int,
+    run_id: int,
+    config: MainConfig,
+    policy,
+) -> WorkItem:
+    """Execute raises ProviderFailure; settle permanent; run persist_failure."""
     fetcher = FakeArticleFetcher(
         results=[
             ProviderFailure(
@@ -943,7 +940,7 @@ def test_permanent_failure_marks_target_failed(
     with immediate(connection) as conn:
         work_id = schedule_fetch_article(
             conn,
-            target_id=target.id,
+            target_id=target_id,
             material_fingerprint=_HASH,
             run_id=run_id,
             now=NOW,
@@ -972,10 +969,113 @@ def test_permanent_failure_marks_target_failed(
                 detail="timeout",
             ),
         )
+    return work
+
+
+def test_permanent_failure_with_search_text_is_snippets_only(
+    connection: sqlite3.Connection,
+) -> None:
+    """K28: permanent fail + search title/snippets → snippets_only + view + assess."""
+    url = "https://example.com/timeout-with-text"
+    plan_id, person_id, run_id, config, policy = _plan_with_search_hits(
+        connection,
+        urls=(url,),
+        titles=("Timeout title",),
+        snippets=("Timeout snippet text",),
+        config=_main_config(retrieval_target=1),
+    )
+    target = list_coverage_article_targets_for_plan(connection, plan_id=plan_id)[0]
+    _run_permanent_fetch_failure(
+        connection,
+        target_id=target.id,
+        run_id=run_id,
+        config=config,
+        policy=policy,
+    )
+
     target = load_coverage_article_target(connection, target_id=target.id)
     assert target is not None
-    assert target.status in {"failed", "snippets_only"}
-    assert target.failure_category is not None
+    assert target.status == "snippets_only"
+    assert target.failure_category == "timeout"
+    assert target.article_view_id is not None
+
+    view = load_article_view(connection, view_id=target.article_view_id)
+    assert view is not None
+    assert view.access_kind == "snippets"
+    assert view.title == "Timeout title"
+    snippets = json.loads(view.snippets_json)
+    assert any("Timeout snippet text" in s for s in snippets)
+    assert json.loads(view.main_text_blocks_json) == []
+
+    pa = load_person_article_by_pair(
+        connection,
+        person_id=person_id,
+        canonical_article_id=target.canonical_article_id,
+    )
+    assert pa is not None
+    assess = connection.execute(
+        """
+        SELECT COUNT(*) AS n FROM work_item
+         WHERE task_type = ? AND subject_id = ? AND state = 'pending'
+        """,
+        (ASSESS_ARTICLE_TASK_TYPE, pa.id),
+    ).fetchone()
+    assert assess is not None
+    assert int(assess["n"]) == 1
+
+
+def test_permanent_failure_without_text_is_failed(
+    connection: sqlite3.Connection,
+) -> None:
+    """K28 positive control: permanent fail with no title/snippets → failed."""
+    url = "https://example.com/timeout-no-text"
+    plan_id, person_id, run_id, config, policy = _plan_with_search_hits(
+        connection,
+        urls=(url,),
+        titles=("",),
+        snippets=("",),
+        config=_main_config(retrieval_target=1),
+    )
+    target = list_coverage_article_targets_for_plan(connection, plan_id=plan_id)[0]
+    _run_permanent_fetch_failure(
+        connection,
+        target_id=target.id,
+        run_id=run_id,
+        config=config,
+        policy=policy,
+    )
+
+    target = load_coverage_article_target(connection, target_id=target.id)
+    assert target is not None
+    assert target.status == "failed"
+    assert target.failure_category == "timeout"
+    assert target.article_view_id is None
+
+    views = connection.execute(
+        """
+        SELECT COUNT(*) AS n FROM article_view
+         WHERE canonical_article_id = ?
+        """,
+        (target.canonical_article_id,),
+    ).fetchone()
+    assert views is not None
+    assert int(views["n"]) == 0
+
+    pa = load_person_article_by_pair(
+        connection,
+        person_id=person_id,
+        canonical_article_id=target.canonical_article_id,
+    )
+    assert pa is not None
+    assess = connection.execute(
+        """
+        SELECT COUNT(*) AS n FROM work_item
+         WHERE task_type = ? AND subject_id = ?
+        """,
+        (ASSESS_ARTICLE_TASK_TYPE, pa.id),
+    ).fetchone()
+    assert assess is not None
+    assert int(assess["n"]) == 0
 
 
 def test_handler_uses_http_pool_and_article_provider(
