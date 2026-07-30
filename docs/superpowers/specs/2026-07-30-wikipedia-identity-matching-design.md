@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Approved for implementation planning (revision 3) |
+| **Status** | Implemented (revision 3) |
 | **Date** | 2026-07-30 |
 | **Author** | (design agent) |
 | **Branch** | `feat/wikipedia-identity-matching` (proposed) |
