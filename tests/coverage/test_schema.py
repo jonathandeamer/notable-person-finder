@@ -734,10 +734,14 @@ def test_article_view_attempt_id_unique_when_set_allows_multiple_null(
 def test_discovery_article_requires_screening_id_not_null(
     connection: sqlite3.Connection,
 ) -> None:
+    """K10: screening_id NOT NULL — must not be masked by UNIQUE(plan, article)."""
     run_id = insert_run(connection)
     person_id = _person(connection, run_id=run_id)
     plan_id = _plan(connection, person_id=person_id, run_id=run_id)
-    article_id = _canonical_article(connection)
+    article_id = _canonical_article(connection, url="https://example.com/a")
+    other_article_id = _canonical_article(
+        connection, url="https://example.com/other-discovery"
+    )
     screening_id = _screening(
         connection,
         plan_id=plan_id,
@@ -753,7 +757,8 @@ def test_discovery_article_requires_screening_id_not_null(
         """,
         (plan_id, article_id, screening_id),
     )
-    # Named rule: screening_id NOT NULL (K10).
+    # Named rule: screening_id NOT NULL (K10). Use a *different* canonical
+    # article so UNIQUE (plan_id, canonical_article_id) cannot produce the error.
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
             """
@@ -761,7 +766,7 @@ def test_discovery_article_requires_screening_id_not_null(
                 plan_id, canonical_article_id, source_item_id, screening_id
             ) VALUES (?, ?, 2, NULL)
             """,
-            (plan_id, article_id),
+            (plan_id, other_article_id),
         )
 
 
@@ -888,9 +893,40 @@ def test_assessment_completed_truth_table_accepts_valid_row(
     assert assessment_id > 0
 
 
-def test_assessment_completed_truth_table_rejects_missing_semantic_fields(
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"person_relation": None},
+        {"coverage_depth": None},
+        {"subject_relationship": None},
+        {"content_types_json": None},
+        {"validated_output_json": None},
+        {"attempt_id": None},
+        {"model_inspection_id": None},
+        {"prompt_hash": None},
+        {"schema_hash": None},
+        {"schema_version": None},
+        {"failure_category": "permanent_provider"},
+    ],
+    ids=[
+        "null_person_relation",
+        "null_coverage_depth",
+        "null_subject_relationship",
+        "null_content_types_json",
+        "null_validated_output_json",
+        "null_attempt_id",
+        "null_model_inspection_id",
+        "null_prompt_hash",
+        "null_schema_hash",
+        "null_schema_version",
+        "failure_category_set",
+    ],
+)
+def test_assessment_completed_truth_table_rejects_illegal_fields(
     connection: sqlite3.Connection,
+    override: dict[str, object],
 ) -> None:
+    """Each completed CHECK clause is independently rejected (one field wrong)."""
     run_id = insert_run(connection)
     person_id = _person(connection, run_id=run_id)
     article_id = _canonical_article(connection)
@@ -907,26 +943,28 @@ def test_assessment_completed_truth_table_rejects_missing_semantic_fields(
     view_id = _article_view(
         connection, run_id=run_id, canonical_article_id=article_id, attempt_id=None
     )
+    kwargs: dict[str, object] = {
+        "person_article_id": pa_id,
+        "person_id": person_id,
+        "canonical_article_id": article_id,
+        "article_view_id": view_id,
+        "run_id": run_id,
+        "disposition": "completed",
+        "attempt_id": gen_attempt,
+        "model_inspection_id": inspection_id,
+        "person_relation": "same_person",
+        "coverage_depth": "significant",
+        "content_types_json": '["reporting"]',
+        "subject_relationship": "editorially_independent",
+        "validated_output_json": '{"ok":true}',
+        "prompt_hash": _PROMPT_HASH,
+        "schema_hash": _SCHEMA_HASH,
+        "schema_version": 1,
+        "failure_category": None,
+    }
+    kwargs.update(override)
     with pytest.raises(sqlite3.IntegrityError):
-        _insert_assessment(
-            connection,
-            person_article_id=pa_id,
-            person_id=person_id,
-            canonical_article_id=article_id,
-            article_view_id=view_id,
-            run_id=run_id,
-            disposition="completed",
-            attempt_id=gen_attempt,
-            model_inspection_id=inspection_id,
-            person_relation=None,
-            coverage_depth="significant",
-            content_types_json='["reporting"]',
-            subject_relationship="editorially_independent",
-            validated_output_json='{"ok":true}',
-            prompt_hash=_PROMPT_HASH,
-            schema_hash=_SCHEMA_HASH,
-            schema_version=1,
-        )
+        _insert_assessment(connection, **kwargs)  # type: ignore[arg-type]
 
 
 def test_assessment_failed_truth_table_paths(
@@ -1013,6 +1051,58 @@ def test_assessment_failed_truth_table_paths(
             person_relation="same_person",
             failure_category="permanent_provider",
             task_fingerprint="f" * 64,
+        )
+
+
+def test_person_article_current_assessment_fk_rejects_delete_of_pointed_assessment(
+    connection: sqlite3.Connection,
+) -> None:
+    """SQL FK on current_assessment_id blocks DELETE of the pointed assessment."""
+    run_id = insert_run(connection)
+    person_id = _person(connection, run_id=run_id)
+    article_id = _canonical_article(connection)
+    pa_id = _person_article(
+        connection, person_id=person_id, canonical_article_id=article_id
+    )
+    gen_attempt = _attempt(
+        connection,
+        run_id=run_id,
+        provider="openrouter",
+        operation="generate_structured",
+    )
+    inspection_id = _inspection(connection, run_id=run_id, attempt_id=gen_attempt)
+    view_id = _article_view(
+        connection, run_id=run_id, canonical_article_id=article_id, attempt_id=None
+    )
+    completed_id = _insert_assessment(
+        connection,
+        person_article_id=pa_id,
+        person_id=person_id,
+        canonical_article_id=article_id,
+        article_view_id=view_id,
+        run_id=run_id,
+        disposition="completed",
+        attempt_id=gen_attempt,
+        model_inspection_id=inspection_id,
+        person_relation="same_person",
+        coverage_depth="passing",
+        content_types_json='["profile"]',
+        subject_relationship="uncertain",
+        validated_output_json='{"ok":true}',
+        prompt_hash=_PROMPT_HASH,
+        schema_hash=_SCHEMA_HASH,
+        schema_version=1,
+        task_fingerprint=_HASH,
+    )
+    connection.execute(
+        "UPDATE person_article SET current_assessment_id = ? WHERE id = ?",
+        (completed_id, pa_id),
+    )
+    # foreign_keys is ON via connect_database; pointed assessment cannot be deleted.
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "DELETE FROM person_article_assessment WHERE id = ?",
+            (completed_id,),
         )
 
 

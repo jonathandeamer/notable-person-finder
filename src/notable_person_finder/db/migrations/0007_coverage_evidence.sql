@@ -267,13 +267,13 @@ CREATE INDEX coverage_article_target_by_view
     ON coverage_article_target(article_view_id)
     WHERE article_view_id IS NOT NULL;
 
+-- person_article is created without current_assessment_id so the pointer can
+-- REFERENCES person_article_assessment after that table exists (m3/m4 pattern).
 CREATE TABLE person_article (
     id INTEGER PRIMARY KEY,
     person_id INTEGER NOT NULL REFERENCES person(id),
     canonical_article_id INTEGER NOT NULL REFERENCES canonical_article(id),
-    first_plan_id INTEGER REFERENCES person_coverage_plan(id),
-    current_assessment_id INTEGER,
-    UNIQUE (person_id, canonical_article_id)
+    first_plan_id INTEGER REFERENCES person_coverage_plan(id)
 );
 
 CREATE UNIQUE INDEX person_article_by_person_article
@@ -379,8 +379,10 @@ CREATE INDEX person_article_assessment_by_plan
     ON person_article_assessment(plan_id, id)
     WHERE plan_id IS NOT NULL;
 
--- current_assessment_id ownership is enforced by triggers below (SQLite has no
--- post-create FK attachment for this mutual reference pattern).
+-- Current pointer FK (design + m3/m4): attach after assessment table exists.
+ALTER TABLE person_article
+    ADD COLUMN current_assessment_id INTEGER
+        REFERENCES person_article_assessment(id);
 
 CREATE TABLE article_assessment_signal (
     id INTEGER PRIMARY KEY,
