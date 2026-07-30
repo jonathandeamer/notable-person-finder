@@ -2817,7 +2817,7 @@ def merge_guardrails_pass(
 ) -> bool:
     """K18 automatic-merge guardrails. All must hold.
 
-    Does not perform the merge. Task 8 owns ``confirm_person_merge``.
+    Does not perform the merge; ``confirm_person_merge`` owns the write path.
     """
     relation = connection.execute(
         """
@@ -3129,7 +3129,7 @@ def _attempt_confirm_person_merge(
     observation_id: int,
     now: str,
 ) -> bool:
-    """Call Task 8 merge when present; otherwise leave edge for later."""
+    """Run ``confirm_person_merge`` when the merge module is importable."""
     import importlib
     import importlib.util
 
@@ -3237,7 +3237,7 @@ def _persist_reconsideration_for(
             # Leave edge active; no reschedule until fingerprint changes.
             return
 
-        # same_person: attempt merge when Task 8 is present and guardrails pass.
+        # same_person: confirm merge when guardrails pass (K7 lower-id survivor).
         if MERGE_GUARDRAILS_FAILED_NOTE in rationale:
             return
         subject = payload.subject_person_id
@@ -3253,8 +3253,8 @@ def _persist_reconsideration_for(
             now=observed_at,
         )
         if not merged:
-            # Edge stays active until Task 8 merge lands or a later fingerprint
-            # change re-arms reconsideration.
+            # Edge stays active if merge is unavailable; fingerprint change
+            # re-arms reconsideration later.
             return
 
     return persist

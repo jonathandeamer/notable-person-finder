@@ -1144,14 +1144,14 @@ def test_same_person_guardrails_fail_leaves_edge_active(
     )
 
 
-def test_same_person_guardrails_pass_ready_to_merge(
+def test_same_person_guardrails_pass_confirms_merge(
     connection: sqlite3.Connection,
 ) -> None:
-    """K18 positive path: guardrails pass ⇒ ready-to-merge note; edge stays active.
+    """K18 positive path: guardrails pass ⇒ merge; edge superseded_by_merge.
 
     Both sides have non-name facts; model returns same_person for the peer with
-    a validated supporting fact id. Task 8 merge is not present, so no merge
-    relation is written and created_person_id stays NULL (K22).
+    a validated supporting fact id. Task 8 merge lands: lower id survives,
+    created_person_id stays NULL (K22).
     """
     (
         run_id,
@@ -1162,6 +1162,7 @@ def test_same_person_guardrails_pass_ready_to_merge(
         person_b,
         relation_id,
     ) = _two_people_with_edge(connection)
+    assert person_a < person_b
     config = _main_config()
     profile = _profile()
     with immediate(connection):
@@ -1201,7 +1202,7 @@ def test_same_person_guardrails_pass_ready_to_merge(
         "SELECT status FROM person_relation WHERE id = ?", (relation_id,)
     ).fetchone()
     assert relation is not None
-    assert relation["status"] == "active"
+    assert relation["status"] == "superseded_by_merge"
     er = connection.execute(
         """
         SELECT semantic_outcome, created_person_id, rationale, selected_person_id,
@@ -1219,20 +1220,32 @@ def test_same_person_guardrails_pass_ready_to_merge(
     assert er["selected_person_id"] == person_b
     assert READY_TO_MERGE_NOTE.strip() in er["rationale"]
     assert MERGE_GUARDRAILS_FAILED_NOTE not in er["rationale"]
+    merge_row = connection.execute(
+        """
+        SELECT person_id_a, person_id_b, status
+          FROM person_relation
+         WHERE kind = 'merge'
+        """
+    ).fetchone()
+    assert merge_row is not None
+    assert merge_row["person_id_a"] == person_b
+    assert merge_row["person_id_b"] == person_a
+    assert merge_row["status"] == "active"
+    # Lower id is survivor; higher is merged-away.
     assert (
         connection.execute(
-            "SELECT COUNT(*) AS n FROM person_relation WHERE kind = 'merge'"
-        ).fetchone()["n"]
-        == 0
-    )
-    # Both people remain canonical (no merge applied).
-    for person_id in (person_a, person_b):
-        row = connection.execute(
             "SELECT merged_into_person_id FROM person WHERE id = ?",
-            (person_id,),
-        ).fetchone()
-        assert row is not None
-        assert row["merged_into_person_id"] is None
+            (person_a,),
+        ).fetchone()["merged_into_person_id"]
+        is None
+    )
+    assert (
+        connection.execute(
+            "SELECT merged_into_person_id FROM person WHERE id = ?",
+            (person_b,),
+        ).fetchone()["merged_into_person_id"]
+        == person_a
+    )
 
 
 def test_missing_peer_prepare_refuse(connection: sqlite3.Connection) -> None:
