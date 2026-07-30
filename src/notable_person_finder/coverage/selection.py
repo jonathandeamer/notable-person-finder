@@ -20,7 +20,6 @@ SelectionReason = Literal[
 
 _ELIGIBLE = "curated_eligible"
 _UNCLASSIFIED = "unclassified"
-_INELIGIBLE = frozenset({"curated_ineligible", "unusable"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,10 +95,10 @@ def final_selection(
     if max_unclassified_fetches < 0:
         raise ValueError("max_unclassified_fetches must be >= 0")
 
+    # curated_ineligible / unusable / unknown statuses are omitted by these
+    # partitions (never create coverage_article_target rows in m5).
     eligible = [c for c in candidates if c.rule_status == _ELIGIBLE]
     unclassified = [c for c in candidates if c.rule_status == _UNCLASSIFIED]
-    # Explicitly ignore ineligible / unusable — and any unknown status.
-    _ = [c for c in candidates if c.rule_status in _INELIGIBLE]
 
     selected: list[SelectedArticle] = []
     seen: set[int] = set()

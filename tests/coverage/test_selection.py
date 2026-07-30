@@ -131,6 +131,32 @@ def test_unclassified_fallback_only_when_below_retrieval_target() -> None:
     assert selected_fallback[1].selection_reason == "search_unclassified_fallback"
 
 
+def test_max_unclassified_fetches_caps_surplus_fallback() -> None:
+    """K11: surplus unclassified truncated to max_unclassified_fetches."""
+    candidates = (
+        _c(1, status="curated_eligible", discovery=False, rank=1),
+        _c(10, status="unclassified", discovery=False, rank=1),
+        _c(11, status="unclassified", discovery=False, rank=2),
+        _c(12, status="unclassified", discovery=False, rank=3),
+        _c(13, status="unclassified", discovery=False, rank=4),
+    )
+    selected = final_selection(
+        candidates,
+        retrieval_target=5,
+        max_eligible_fetches=8,
+        max_unclassified_fetches=2,
+    )
+    # 1 eligible + 2 unclassified (cap), not all four unclassified.
+    assert len(selected) == 3
+    assert [item.canonical_article_id for item in selected] == [1, 10, 11]
+    assert selected[0].selection_reason == "search_curated_eligible"
+    assert selected[1].selection_reason == "search_unclassified_fallback"
+    assert selected[2].selection_reason == "search_unclassified_fallback"
+    assert all(item.selection_reason in _K34 for item in selected)
+    assert 12 not in {item.canonical_article_id for item in selected}
+    assert 13 not in {item.canonical_article_id for item in selected}
+
+
 def test_eligible_selected_count_ignores_unclassified() -> None:
     candidates = (
         _c(1, status="curated_eligible", discovery=True),

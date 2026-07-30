@@ -73,6 +73,67 @@ def test_fingerprint_stable_across_mapping_reload() -> None:
     assert len(first.fingerprint) == 64
 
 
+def test_fingerprint_changes_when_policy_rules_change() -> None:
+    """Content-sensitive: rule body/order enter the fingerprint (not key alone)."""
+    base = source_policy_from_mapping(_minimal_policy_mapping())
+    # Same key/label, different rule status → must rehash.
+    status_changed = source_policy_from_mapping(
+        _minimal_policy_mapping(
+            rules=[
+                {
+                    "id": "eligible.example",
+                    "status": "curated_ineligible",
+                    "match": {"host_suffix": "example.com"},
+                    "rationale": "test eligible",
+                    "review_date": "2026-07-24",
+                },
+                {
+                    "id": "ineligible.social",
+                    "status": "curated_ineligible",
+                    "match": {"host_suffix": "twitter.com"},
+                    "rationale": "social",
+                    "review_date": "2026-07-24",
+                },
+            ]
+        )
+    )
+    # Append an extra rule (same key/label).
+    appended = source_policy_from_mapping(
+        _minimal_policy_mapping(
+            rules=[
+                {
+                    "id": "eligible.example",
+                    "status": "curated_eligible",
+                    "match": {"host_suffix": "example.com"},
+                    "rationale": "test eligible",
+                    "review_date": "2026-07-24",
+                },
+                {
+                    "id": "ineligible.social",
+                    "status": "curated_ineligible",
+                    "match": {"host_suffix": "twitter.com"},
+                    "rationale": "social",
+                    "review_date": "2026-07-24",
+                },
+                {
+                    "id": "eligible.extra",
+                    "status": "curated_eligible",
+                    "match": {"host_suffix": "extra.example"},
+                    "rationale": "extra",
+                    "review_date": "2026-07-24",
+                },
+            ]
+        )
+    )
+    assert len(base.fingerprint) == 64
+    assert all(c in "0123456789abcdef" for c in base.fingerprint)
+    assert status_changed.fingerprint != base.fingerprint
+    assert appended.fingerprint != base.fingerprint
+    assert status_changed.fingerprint != appended.fingerprint
+    assert len(status_changed.fingerprint) == 64
+    assert len(appended.fingerprint) == 64
+
+
 def test_first_match_wins_over_later_broader_rule() -> None:
     policy = source_policy_from_mapping(
         _minimal_policy_mapping(
