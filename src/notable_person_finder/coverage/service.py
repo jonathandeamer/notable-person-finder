@@ -518,18 +518,26 @@ def maybe_advance_coverage_plan(
             update_plan_status(connection, plan_id=plan_id, status="selecting")
         return
 
-    # 9–10. Assess pending / views: Task 7; for now wait if assess work active.
+    # 9–10. Assess pending / views (design steps 9–10). Active assess work
+    # blocks terminalize. Targets that are ``fetched`` without a terminal
+    # assessment still need assess (Task 7); do not complete the plan yet.
     if _has_active_assess_work(connection, plan_id=plan_id):
         if plan is not None and plan.status in {"retrieving", "selecting"}:
             update_plan_status(connection, plan_id=plan_id, status="assessing")
         return
 
-    # Paths still mid-flight (fetched but assess not yet terminal) wait only if
-    # assessments are expected. Task 6a terminalizes when no pending targets and
-    # no active assess work; incomplete assess paths are settled by Task 7.
-    # If targets exist but none pending and no assess work/rows, still terminalize
-    # so empty-select and failed-fetch-without-assess tests can close plans.
-    # Prefer assessing when any assessment row is still outstanding is N/A here.
+    if targets and not _selected_paths_ready_to_terminalize(
+        connection, plan_id=plan_id, person_id=plan.person_id, targets=targets
+    ):
+        # Mid-flight after fetch: stay selecting/assessing until assess lands
+        # or the path is permanently dead without a view (failed/snippets_only).
+        if (
+            any(t.status == "fetched" for t in targets)
+            and plan is not None
+            and plan.status in {"retrieving", "selecting"}
+        ):
+            update_plan_status(connection, plan_id=plan_id, status="assessing")
+        return
 
     # 11. Apply terminal truth table.
     plan = load_plan(connection, plan_id=plan_id)
@@ -1186,14 +1194,16 @@ def _terminalize_plan(
         )
         return
 
+    # Selected paths must already be ready (caller). ``fetched`` without an
+    # assessment never reaches here.
+
     # T10: no usable search occurrences; discovery/unclassified path terminal
     if (
         not usable_search
         and selected_count >= 1
         and all(t.status != "pending" for t in targets)
         and (
-            any_assess
-            or all(t.status in {"failed", "snippets_only", "fetched"} for t in targets)
+            any_assess or all(t.status in {"failed", "snippets_only"} for t in targets)
         )
     ):
         # Discovery-only salvage (or unclassified-only salvage) completes with
@@ -1208,9 +1218,15 @@ def _terminalize_plan(
         )
         return
 
-    # T5 / T8: partial form failure with selections/assessments
-    if any_form_failed and selected_count >= 1 and (any_assess or selected_count >= 1):
-        # Targets terminal already (caller). Prefer completed with partial_retrieval.
+    # T5 / T8: partial form failure with selections and terminal assess paths
+    # (or permanent fetch death without assess: failed/snippets_only).
+    if (
+        any_form_failed
+        and selected_count >= 1
+        and (
+            any_assess or all(t.status in {"failed", "snippets_only"} for t in targets)
+        )
+    ):
         update_plan_status(
             connection,
             plan_id=plan.id,
@@ -1292,14 +1308,30 @@ def _terminalize_plan(
                 truncated_unsafe=False,
             )
             return
-        # T2
-        update_plan_status(
-            connection,
-            plan_id=plan.id,
-            status="completed",
-            completed_at=now,
-            failure_category=None,
-        )
+        # T2: selected paths finished with assessments (caller enforced readiness).
+        if selected_count >= 1 and any_assess:
+            update_plan_status(
+                connection,
+                plan_id=plan.id,
+                status="completed",
+                completed_at=now,
+                failure_category=None,
+            )
+            return
+        # Selected but no assessments yet (e.g. only failed targets without
+        # assess rows): still complete when every path is permanent fetch death.
+        if selected_count >= 1 and all(
+            t.status in {"failed", "snippets_only"} for t in targets
+        ):
+            update_plan_status(
+                connection,
+                plan_id=plan.id,
+                status="completed",
+                completed_at=now,
+                failure_category=None,
+                partial_retrieval=True,
+            )
+            return
         return
 
     # Fallback: prefer failed if any form failed, else completed/incomplete.
@@ -1460,6 +1492,11 @@ def _discovery_mention_urls(
 def _operational_name_texts(
     connection: sqlite3.Connection, *, person_id: int
 ) -> list[str]:
+    """Stage-1 exact-name inputs: non-alias operational sourced names (K6).
+
+    Alias kinds are reserved for stage-2 ``generate_alias_forms`` so they are
+    only scheduled when exact (+ discovery) remains under the retrieval target.
+    """
     closure = person_id_closure_for_canonical(connection, person_id)
     if not closure:
         return []
@@ -1470,6 +1507,7 @@ def _operational_name_texts(
           FROM sourced_name
          WHERE person_id IN ({placeholders})
            AND length(match_key) > 0
+           AND kind != 'alias'
          ORDER BY id
         """,
         closure,
@@ -1618,6 +1656,73 @@ def _assessment_stats(
         if disposition in stats:
             stats[disposition] = int(row["n"])
     return stats
+
+
+def _target_has_terminal_assessment(
+    connection: sqlite3.Connection,
+    *,
+    plan_id: int,
+    person_id: int,
+    canonical_article_id: int,
+) -> bool:
+    """True when a completed/failed assessment exists for this person–article."""
+    row = connection.execute(
+        """
+        SELECT 1
+          FROM person_article_assessment AS a
+          JOIN person_article AS pa ON pa.id = a.person_article_id
+         WHERE a.plan_id = ?
+           AND pa.person_id = ?
+           AND pa.canonical_article_id = ?
+           AND a.disposition IN ('completed', 'failed')
+         LIMIT 1
+        """,
+        (plan_id, person_id, canonical_article_id),
+    ).fetchone()
+    return row is not None
+
+
+def _selected_paths_ready_to_terminalize(
+    connection: sqlite3.Connection,
+    *,
+    plan_id: int,
+    person_id: int,
+    targets: Sequence[Any],
+) -> bool:
+    """Design steps 9–11: every selected path is assess-terminal or fetch-dead.
+
+    - ``pending``: not ready (caller should have returned earlier).
+    - ``fetched``: requires completed/failed assessment (view alone is not enough).
+    - ``failed`` / ``snippets_only``: interim permanent fetch death without assess
+      (allowed so T10 salvage can close before Task 7 wires snippets→assess).
+    - other non-pending: require terminal assessment.
+    """
+    if not targets:
+        return True
+    for target in targets:
+        status = str(target.status)
+        if status == "pending":
+            return False
+        if status in {"failed", "snippets_only", "superseded"}:
+            continue
+        if status == "fetched":
+            if not _target_has_terminal_assessment(
+                connection,
+                plan_id=plan_id,
+                person_id=person_id,
+                canonical_article_id=int(target.canonical_article_id),
+            ):
+                return False
+            continue
+        # Unknown / future statuses: require assessment.
+        if not _target_has_terminal_assessment(
+            connection,
+            plan_id=plan_id,
+            person_id=person_id,
+            canonical_article_id=int(target.canonical_article_id),
+        ):
+            return False
+    return True
 
 
 def _has_active_assess_work(connection: sqlite3.Connection, *, plan_id: int) -> bool:

@@ -1040,10 +1040,10 @@ def test_t10_discovery_salvage_completed_partial_retrieval(
             client=FakeWebSearchClient(
                 pages=[
                     ProviderFailure(
-                        FailureCategory.RATE_LIMIT,
+                        FailureCategory.AUTHENTICATION,
                         provider=PROVIDER,
                         operation=OPERATION_SEARCH_WEB,
-                        detail="quota",
+                        detail="auth",
                     )
                 ]
             ),
@@ -1060,10 +1060,10 @@ def test_t10_discovery_salvage_completed_partial_retrieval(
             handler.persist_failure(
                 work,
                 ProviderFailure(
-                    FailureCategory.RATE_LIMIT,
+                    FailureCategory.AUTHENTICATION,
                     provider=PROVIDER,
                     operation=OPERATION_SEARCH_WEB,
-                    detail="quota",
+                    detail="auth",
                 ),
             )
 
@@ -1253,6 +1253,260 @@ def test_alias_gated_when_exact_meets_target_via_discovery(
         )
     forms_after = list_query_forms_for_plan(connection, plan_id=plan_id)
     assert not any(f.variant_kind == "alias" for f in forms_after)
+
+
+def test_alias_scheduled_when_exact_and_discovery_under_target(
+    connection: sqlite3.Connection,
+) -> None:
+    """Positive gate: under retrieval_target after empty exact → stage-2 alias."""
+    policy = _policy()
+    config = _main_config(
+        retrieval_target=5,
+        max_alias_forms=2,
+        max_context_forms=0,
+    )
+    run_id = insert_run(connection)
+    person_id = _person(connection, run_id=run_id)
+    _add_alias(connection, person_id=person_id, alias="A. Smith")
+    # No discovery URL → eligible_selected_count stays 0 after empty exact.
+    plan_id = _open_plan(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        config=config,
+        policy=policy,
+    )
+    forms = list_query_forms_for_plan(connection, plan_id=plan_id)
+    assert all(f.stage == 1 for f in forms)
+    assert not any(f.variant_kind == "alias" for f in forms)
+    client = FakeWebSearchClient(
+        pages=[sample_search_page(query=f.query_text, results=()) for f in forms]
+    )
+    for form in forms:
+        _run_brave(
+            connection,
+            client=client,
+            config=config,
+            policy=policy,
+            form_id=form.id,
+            material_fingerprint=_HASH,
+            run_id=run_id,
+        )
+    forms_after = list_query_forms_for_plan(connection, plan_id=plan_id)
+    alias_forms = [f for f in forms_after if f.variant_kind == "alias"]
+    assert alias_forms, "alias forms must open when under retrieval_target"
+    assert all(f.stage == 2 and f.status == "pending" for f in alias_forms)
+    pending_alias_work = connection.execute(
+        """
+        SELECT COUNT(*) AS n FROM work_item
+         WHERE task_type = ? AND state = 'pending'
+           AND subject_id IN ({})
+        """.format(",".join("?" for _ in alias_forms)),
+        (BRAVE_WEB_SEARCH_TASK_TYPE, *(f.id for f in alias_forms)),
+    ).fetchone()
+    assert pending_alias_work is not None
+    assert int(pending_alias_work["n"]) == len(alias_forms)
+    plan = load_plan(connection, plan_id=plan_id)
+    assert plan is not None
+    assert plan.status == "retrieving"
+
+
+def test_context_scheduled_when_still_under_target_without_aliases(
+    connection: sqlite3.Connection,
+) -> None:
+    """Positive gate: no aliases, empty exact → one context form when facts exist."""
+    policy = _policy()
+    config = _main_config(
+        retrieval_target=5,
+        max_alias_forms=0,
+        max_context_forms=1,
+    )
+    run_id = insert_run(connection)
+    person_id = _person(connection, run_id=run_id)
+    # Context terms come from operational identity facts (profession).
+    _seed_mention_with_url(
+        connection,
+        run_id=run_id,
+        person_id=person_id,
+        original_url=None,
+        exact_name="Alex Smith",
+    )
+    mention_id = connection.execute(
+        "SELECT id FROM person_mention WHERE person_id = ? ORDER BY id LIMIT 1",
+        (person_id,),
+    ).fetchone()
+    assert mention_id is not None
+    connection.execute(
+        """
+        INSERT INTO mention_identity_fact (
+            person_mention_id, local_id, kind, value,
+            supporting_passage_ids_json
+        ) VALUES (?, 'prof-1', 'profession_or_role', 'painter', '[]')
+        """,
+        (int(mention_id["id"]),),
+    )
+    connection.commit()
+    plan_id = _open_plan(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        config=config,
+        policy=policy,
+    )
+    forms = list_query_forms_for_plan(connection, plan_id=plan_id)
+    assert all(f.stage == 1 for f in forms)
+    client = FakeWebSearchClient(
+        pages=[sample_search_page(query=f.query_text, results=()) for f in forms]
+    )
+    for form in forms:
+        _run_brave(
+            connection,
+            client=client,
+            config=config,
+            policy=policy,
+            form_id=form.id,
+            material_fingerprint=_HASH,
+            run_id=run_id,
+        )
+    forms_after = list_query_forms_for_plan(connection, plan_id=plan_id)
+    context_forms = [f for f in forms_after if f.variant_kind == "context"]
+    assert len(context_forms) == 1
+    assert context_forms[0].stage == 3
+    assert context_forms[0].status == "pending"
+    assert "painter" in context_forms[0].query_text
+
+
+def test_fetched_target_without_assessment_does_not_terminalize(
+    connection: sqlite3.Connection,
+) -> None:
+    """Design 9–11: ``fetched`` alone is not path-terminal (assess still required)."""
+    policy = _policy()
+    config = _main_config(max_alias_forms=0, max_context_forms=0)
+    run_id = insert_run(connection)
+    person_id = _person(connection, run_id=run_id)
+    plan_id = _open_plan(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        config=config,
+        policy=policy,
+    )
+    forms = list_query_forms_for_plan(connection, plan_id=plan_id)
+    form = forms[0]
+    client = FakeWebSearchClient(
+        pages=[
+            sample_search_page(
+                query=form.query_text,
+                results=(
+                    SearchResult(
+                        rank=1,
+                        url="https://example.com/needs-assess",
+                        title="Hit",
+                        snippet="s",
+                        extra_snippets=(),
+                        language="en",
+                        provider_result_id=None,
+                    ),
+                ),
+            )
+        ]
+    )
+    _run_brave(
+        connection,
+        client=client,
+        config=config,
+        policy=policy,
+        form_id=form.id,
+        material_fingerprint=_HASH,
+        run_id=run_id,
+    )
+    targets = list_coverage_article_targets_for_plan(connection, plan_id=plan_id)
+    assert len(targets) == 1
+    with immediate(connection) as conn:
+        update_coverage_article_target(conn, target_id=targets[0].id, status="fetched")
+        maybe_advance_coverage_plan(
+            conn,
+            plan_id=plan_id,
+            run_id=run_id,
+            config=config,
+            policy=policy,
+            now=moment(2),
+        )
+    plan = load_plan(connection, plan_id=plan_id)
+    assert plan is not None
+    assert plan.status not in {"completed", "failed", "incomplete", "superseded"}
+    assert plan.status in {"selecting", "assessing", "retrieving"}
+    assert plan.completed_at is None
+
+
+def test_persist_idempotent_on_same_attempt_does_not_double_occurrences(
+    connection: sqlite3.Connection,
+) -> None:
+    """UNIQUE(attempt_id): re-persist same attempt does not re-insert occurrences."""
+    policy = _policy()
+    config = _main_config(max_alias_forms=0, max_context_forms=0)
+    run_id = insert_run(connection)
+    person_id = _person(connection, run_id=run_id)
+    plan_id = _open_plan(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        config=config,
+        policy=policy,
+    )
+    forms = list_query_forms_for_plan(connection, plan_id=plan_id)
+    form = forms[0]
+    page = sample_search_page(
+        query=form.query_text,
+        results=(
+            SearchResult(
+                rank=1,
+                url="https://example.com/once",
+                title="Once",
+                snippet="s",
+                extra_snippets=(),
+                language="en",
+                provider_result_id=None,
+            ),
+        ),
+    )
+    client = FakeWebSearchClient(pages=[page])
+    with immediate(connection) as conn:
+        work_id = schedule_brave_web_search(
+            conn,
+            form_id=form.id,
+            material_fingerprint=_HASH,
+            offset_in=0,
+            run_id=run_id,
+            now=NOW,
+        )
+    work = _work_item_row(connection, work_id=work_id)
+    _insert_running_attempt(connection, work_id=work_id, run_id=run_id)
+    handler = build_brave_web_search_handler(
+        connection, client=client, config=config, policy=policy
+    )
+    assert handler.prepare is not None
+    assert handler.persist is not None
+    prepared = handler.prepare(work)
+    outcome = handler.execute(work, 1, prepared.payload)
+    with immediate(connection):
+        handler.persist(work, outcome)
+    _settle_work_succeeded(connection, work_id=work_id)
+    first_count = connection.execute(
+        "SELECT COUNT(*) AS n FROM brave_search_result_occurrence"
+    ).fetchone()
+    assert first_count is not None
+    assert int(first_count["n"]) == 1
+    # Re-settle with the same attempt (at-least-once window): no second page call,
+    # no second occurrence row.
+    with immediate(connection):
+        handler.persist(work, outcome)
+    second_count = connection.execute(
+        "SELECT COUNT(*) AS n FROM brave_search_result_occurrence"
+    ).fetchone()
+    assert second_count is not None
+    assert int(second_count["n"]) == 1
+    assert len(client.calls) == 1
 
 
 def test_service_does_not_define_second_canonicalize(
