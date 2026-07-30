@@ -7,6 +7,7 @@ import sqlite3
 
 import pytest
 
+from notable_person_finder.people.identity import insert_person
 from notable_person_finder.people.models import (
     AttentionCategory,
     CautionCategory,
@@ -22,7 +23,12 @@ from notable_person_finder.people.models import (
 )
 from notable_person_finder.people.repository import (
     DETECT_PEOPLE_TASK_TYPE,
+    RECONSIDER_PERSON_ENTITY_TASK_TYPE,
+    RESOLVE_PERSON_ENTITY_TASK_TYPE,
+    identity_corpus_counts,
+    identity_run_counts,
     insert_completed_observation,
+    insert_entity_resolution_observation,
     insert_failed_observation,
     insert_insufficient_input_observation,
     insert_model_inspection,
@@ -33,9 +39,11 @@ from notable_person_finder.people.repository import (
     load_source_item_record,
     load_triage_observation_by_fingerprint,
     mechanical_search_name,
+    point_mention_current_er,
     settle_active_detect_people_after_permanent_preflight,
     triage_corpus_counts,
     triage_run_counts,
+    upsert_active_possible_same_person,
 )
 from tests.ingestion.helpers import immediate, insert_run, moment
 
@@ -842,6 +850,363 @@ def test_triage_aggregate_counts(
     assert run_counts.overflow == 0
     assert run_counts.research_or_uncertain_mentions == 2
     assert untriaged in list_untriaged_source_item_ids(connection)
+
+
+# ---------------------------------------------------------------------------
+# Identity aggregates for status and digest
+# ---------------------------------------------------------------------------
+
+
+def _identity_mention_graph(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    exact_name: str = "Alex Smith",
+    source_entry_id: str = "id-a",
+    key: str = "feed-identity",
+    material_fingerprint: str = _HASH,
+) -> int:
+    """Seed one research mention; return person_mention id."""
+    _, item_id = _seed_feed_and_item(
+        connection,
+        run_id=run_id,
+        source_entry_id=source_entry_id,
+        title_text=f"{exact_name} wins",
+        key=key,
+    )
+    work_id = _work_item(
+        connection,
+        run_id=run_id,
+        subject_id=item_id,
+        fingerprint=material_fingerprint,
+        state="running",
+    )
+    attempt_id = _attempt(connection, run_id=run_id, work_item_id=work_id)
+    with immediate(connection):
+        inspection_id = insert_model_inspection(
+            connection,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            configured_model_id="openai/gpt-test",
+            resolved_model_id="openai/gpt-test",
+            routing_fingerprint=material_fingerprint,
+            supported_parameters_json="[]",
+            supports_strict_structured_output=True,
+            pricing_usable=False,
+            prompt_unit_price_nano_usd=None,
+            completion_unit_price_nano_usd=None,
+            compatibility="compatible",
+            inspected_at=moment(),
+        )
+        insert_completed_observation(
+            connection,
+            source_item_id=item_id,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            model_inspection_id=inspection_id,
+            output=_sample_output(names=(exact_name,)),
+            canonical_supplied_input_json="{}",
+            prompt_hash=_PROMPT_HASH,
+            schema_hash=_SCHEMA_HASH,
+            schema_version=1,
+            task_fingerprint=material_fingerprint,
+            input_truncated=False,
+            observed_at=moment(),
+        )
+    mention_id = int(
+        connection.execute(
+            """
+            SELECT m.id FROM person_mention AS m
+              JOIN triage_observation AS t ON t.id = m.triage_observation_id
+             WHERE t.source_item_id = ?
+            """,
+            (item_id,),
+        ).fetchone()["id"]
+    )
+    return mention_id
+
+
+def test_identity_aggregate_counts_split_outcomes_and_corpus(
+    connection: sqlite3.Connection,
+) -> None:
+    run_id = insert_run(connection)
+    mention_a = _identity_mention_graph(
+        connection,
+        run_id=run_id,
+        exact_name="Alex Smith",
+        source_entry_id="a",
+        material_fingerprint="a" * 64,
+    )
+    mention_b = _identity_mention_graph(
+        connection,
+        run_id=run_id,
+        exact_name="Jordan Lee",
+        source_entry_id="b",
+        key="feed-b",
+        material_fingerprint="b" * 64,
+    )
+    mention_c = _identity_mention_graph(
+        connection,
+        run_id=run_id,
+        exact_name="Casey Ng",
+        source_entry_id="c",
+        key="feed-c",
+        material_fingerprint="c" * 64,
+    )
+    # Model-path ERs need attempt + inspection rows (CHECK).
+    resolve_work = connection.execute(
+        """
+        INSERT INTO work_item (
+            task_type, subject_kind, subject_id, fingerprint, required,
+            priority, eligible_at, state, created_by_run_id, created_at, updated_at
+        ) VALUES (
+            ?, 'person_mention', ?, ?, 1, 40, ?, 'running', ?, ?, ?
+        )
+        """,
+        (
+            RESOLVE_PERSON_ENTITY_TASK_TYPE,
+            mention_b,
+            "d" * 64,
+            moment(),
+            run_id,
+            moment(),
+            moment(),
+        ),
+    ).lastrowid
+    assert resolve_work is not None
+    resolve_attempt = connection.execute(
+        """
+        INSERT INTO attempt (
+            run_id, work_item_id, provider, operation, ordinal, started_at,
+            finished_at, outcome, request_fingerprint
+        ) VALUES (?, ?, 'openrouter', 'generate_structured', 1, ?, ?, 'succeeded', ?)
+        """,
+        (run_id, resolve_work, moment(), moment(1), "d" * 64),
+    ).lastrowid
+    assert resolve_attempt is not None
+    resolve_inspection = connection.execute(
+        """
+        INSERT INTO model_inspection (
+            run_id, attempt_id, configured_model_id, resolved_model_id,
+            routing_fingerprint, supported_parameters_json,
+            supports_strict_structured_output, pricing_usable,
+            prompt_unit_price_nano_usd, completion_unit_price_nano_usd,
+            compatibility, inspected_at
+        ) VALUES (?, ?, 'openai/gpt-test', 'openai/gpt-test', ?,
+                  '["response_format"]', 1, 1, 100, 200, 'compatible', ?)
+        """,
+        (run_id, resolve_attempt, "d" * 64, moment()),
+    ).lastrowid
+    assert resolve_inspection is not None
+    connection.commit()
+
+    with immediate(connection):
+        person_a = insert_person(
+            connection,
+            run_id=run_id,
+            display_name="Alex Smith",
+            identity_fingerprint=_HASH,
+            created_at=moment(),
+        )
+        person_b = insert_person(
+            connection,
+            run_id=run_id,
+            display_name="Jordan Lee",
+            identity_fingerprint=_OTHER_HASH,
+            created_at=moment(),
+        )
+        person_c = insert_person(
+            connection,
+            run_id=run_id,
+            display_name="Casey Ng",
+            identity_fingerprint=_THIRD_HASH,
+            created_at=moment(),
+        )
+        er_created = insert_entity_resolution_observation(
+            connection,
+            person_mention_id=mention_a,
+            person_relation_id=None,
+            run_id=run_id,
+            attempt_id=None,
+            model_inspection_id=None,
+            disposition="completed",
+            semantic_outcome="created_new",
+            selected_person_id=None,
+            created_person_id=person_a,
+            candidate_person_ids_json="[]",
+            canonical_supplied_input_json="{}",
+            validated_output_json='{"outcome":"created_new"}',
+            prompt_hash=_PROMPT_HASH,
+            schema_hash=_SCHEMA_HASH,
+            schema_version=1,
+            task_fingerprint="e" * 64,
+            supporting_fact_ids_json=None,
+            conflicting_fact_ids_json=None,
+            rationale="empty candidates",
+            failure_category=None,
+            observed_at=moment(),
+        )
+        point_mention_current_er(
+            connection,
+            person_mention_id=mention_a,
+            observation_id=er_created,
+            person_id=person_a,
+        )
+        er_same = insert_entity_resolution_observation(
+            connection,
+            person_mention_id=mention_b,
+            person_relation_id=None,
+            run_id=run_id,
+            attempt_id=resolve_attempt,
+            model_inspection_id=resolve_inspection,
+            disposition="completed",
+            semantic_outcome="same_person",
+            selected_person_id=person_a,
+            created_person_id=None,
+            candidate_person_ids_json=f"[{person_a}]",
+            canonical_supplied_input_json="{}",
+            validated_output_json='{"outcome":"same_person"}',
+            prompt_hash=_PROMPT_HASH,
+            schema_hash=_SCHEMA_HASH,
+            schema_version=1,
+            task_fingerprint="f" * 64,
+            supporting_fact_ids_json="[]",
+            conflicting_fact_ids_json="[]",
+            rationale="same",
+            failure_category=None,
+            observed_at=moment(),
+        )
+        point_mention_current_er(
+            connection,
+            person_mention_id=mention_b,
+            observation_id=er_same,
+            person_id=person_a,
+        )
+        er_diff = insert_entity_resolution_observation(
+            connection,
+            person_mention_id=mention_c,
+            person_relation_id=None,
+            run_id=run_id,
+            attempt_id=resolve_attempt,
+            model_inspection_id=resolve_inspection,
+            disposition="completed",
+            semantic_outcome="different_people",
+            selected_person_id=None,
+            created_person_id=person_c,
+            candidate_person_ids_json=f"[{person_a}]",
+            canonical_supplied_input_json="{}",
+            validated_output_json='{"outcome":"different_people"}',
+            prompt_hash=_PROMPT_HASH,
+            schema_hash=_SCHEMA_HASH,
+            schema_version=1,
+            task_fingerprint="0" * 64,
+            supporting_fact_ids_json="[]",
+            conflicting_fact_ids_json="[]",
+            rationale="different",
+            failure_category=None,
+            observed_at=moment(),
+        )
+        point_mention_current_er(
+            connection,
+            person_mention_id=mention_c,
+            observation_id=er_diff,
+            person_id=person_c,
+        )
+        # Uncertain path opens an active edge; person_b is the created peer.
+        edge_id = upsert_active_possible_same_person(
+            connection,
+            person_id_a=person_a,
+            person_id_b=person_b,
+            run_id=run_id,
+            created_by_observation_id=er_created,
+            now=moment(),
+        )
+        assert edge_id > 0
+        # Confirmed merge relation (person_b into person_a conceptually).
+        connection.execute(
+            """
+            INSERT INTO person_relation (
+                kind, person_id_a, person_id_b, status, created_at,
+                created_by_run_id, created_by_observation_id
+            ) VALUES (
+                'merge', ?, ?, 'active', ?, ?, ?
+            )
+            """,
+            (person_a, person_b, moment(), run_id, er_same),
+        )
+        connection.execute(
+            """
+            UPDATE person SET merged_into_person_id = ? WHERE id = ?
+            """,
+            (person_a, person_b),
+        )
+        # Deferred + permanently failed resolve work attributed to this run.
+        for state, fingerprint in (
+            ("deferred", "1" * 64),
+            ("failed_permanent", "2" * 64),
+        ):
+            connection.execute(
+                """
+                INSERT INTO work_item (
+                    task_type, subject_kind, subject_id, fingerprint, required,
+                    priority, eligible_at, state, created_by_run_id, created_at,
+                    updated_at, completed_by_run_id
+                ) VALUES (
+                    ?, 'person_mention', ?, ?, 1, 40, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    RESOLVE_PERSON_ENTITY_TASK_TYPE,
+                    mention_a,
+                    fingerprint,
+                    moment(),
+                    state,
+                    run_id,
+                    moment(),
+                    moment(),
+                    run_id,
+                ),
+            )
+        # Reconsider deferred must also count.
+        connection.execute(
+            """
+            INSERT INTO work_item (
+                task_type, subject_kind, subject_id, fingerprint, required,
+                priority, eligible_at, state, created_by_run_id, created_at,
+                updated_at, completed_by_run_id
+            ) VALUES (
+                ?, 'person_relation', ?, ?, 1, 40, ?, 'deferred', ?, ?, ?, ?
+            )
+            """,
+            (
+                RECONSIDER_PERSON_ENTITY_TASK_TYPE,
+                edge_id,
+                "3" * 64,
+                moment(),
+                run_id,
+                moment(),
+                moment(),
+                run_id,
+            ),
+        )
+
+    run_counts = identity_run_counts(connection, run_id=run_id)
+    assert run_counts.people_created == 3
+    assert run_counts.linked_same_person == 1
+    assert run_counts.created_via_different_people == 1
+    assert run_counts.created_via_created_new == 1
+    assert run_counts.uncertain == 0
+    assert run_counts.mentions_resolved == 3
+    assert run_counts.active_possible_same_person == 1
+    assert run_counts.confirmed_merges == 1
+    assert run_counts.resolution_model_deferred == 2
+    assert run_counts.resolution_model_failed == 1
+
+    corpus = identity_corpus_counts(connection)
+    assert corpus.canonical_people == 2  # person_b merged away
+    assert corpus.merged_away_people == 1
+    assert corpus.active_possible_same_person == 1
+    assert corpus.mentions_linked_to_people == 3
 
 
 # ---------------------------------------------------------------------------

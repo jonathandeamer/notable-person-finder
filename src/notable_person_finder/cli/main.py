@@ -29,6 +29,8 @@ from notable_person_finder.obs.logging import configure_logging, log_event
 from notable_person_finder.people.repository import (
     RECONSIDER_PERSON_ENTITY_TASK_TYPE,
     RESOLVE_PERSON_ENTITY_TASK_TYPE,
+    identity_corpus_counts,
+    identity_run_counts,
     triage_corpus_counts,
     triage_run_counts,
 )
@@ -39,6 +41,7 @@ from notable_person_finder.people.service import (
     build_inspection_handler,
     build_reconsideration_handler,
     build_resolution_handler,
+    count_resolution_eligible_mentions,
     ensure_model_inspections_for_run,
     schedule_source_items,
     seed_unresolved_mentions,
@@ -52,6 +55,7 @@ from notable_person_finder.providers.transport import build_transport
 from notable_person_finder.reporting.digest import (
     DigestRecord,
     DigestWriteError,
+    IdentityRunSummary,
     IngestionSummary,
     PeopleRunSummary,
     write_digest,
@@ -263,6 +267,11 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                     if _people_schema_present(connection)
                     else None
                 )
+                identity = (
+                    _identity_summary(connection, report, config=loaded.main)
+                    if _identity_schema_present(connection)
+                    else None
+                )
                 try:
                     written = write_digest(
                         loaded.paths.digests,
@@ -271,6 +280,7 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                         config=loaded.main.digest,
                         ingestion=ingestion,
                         people=people,
+                        identity=identity,
                     )
                 except DigestWriteError:
                     # `cli.` prefix, not `run.`: the engine already emits
@@ -446,6 +456,15 @@ def _people_schema_present(connection: sqlite3.Connection) -> bool:
     )
 
 
+def _identity_schema_present(connection: sqlite3.Connection) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'person'"
+        ).fetchone()
+        is not None
+    )
+
+
 def _model_work_counts(
     connection: sqlite3.Connection, *, run_id: int
 ) -> tuple[int, int]:
@@ -514,6 +533,32 @@ def _people_summary(
         budget_limit_nano_usd=report.budget_limit_nano_usd,
         budget_reserved_nano_usd=report.budget_reserved_nano_usd,
         budget_actual_nano_usd=report.budget_actual_nano_usd,
+    )
+
+
+def _identity_summary(
+    connection: sqlite3.Connection,
+    report: RunReport,
+    *,
+    config: MainConfig,
+) -> IdentityRunSummary | None:
+    """Counts for the digest's person-identity section, or None pre-migration."""
+    if not _identity_schema_present(connection):
+        return None
+    counts = identity_run_counts(connection, run_id=report.run_id)
+    unresolved_eligible = count_resolution_eligible_mentions(connection, config=config)
+    return IdentityRunSummary(
+        people_created=counts.people_created,
+        mentions_resolved=counts.mentions_resolved,
+        linked_same_person=counts.linked_same_person,
+        created_via_different_people=counts.created_via_different_people,
+        created_via_created_new=counts.created_via_created_new,
+        uncertain=counts.uncertain,
+        unresolved_eligible_mentions=unresolved_eligible,
+        active_possible_same_person=counts.active_possible_same_person,
+        confirmed_merges=counts.confirmed_merges,
+        resolution_model_deferred=counts.resolution_model_deferred,
+        resolution_model_failed=counts.resolution_model_failed,
     )
 
 
@@ -649,6 +694,19 @@ def command_status(config_file: Path | None) -> int:
                 "unresolved research or uncertain mentions: "
                 f"{triage.research_or_uncertain_mentions}"
             )
+        if _identity_schema_present(connection):
+            identity = identity_corpus_counts(connection)
+            print(f"canonical people: {identity.canonical_people}")
+            print(f"merged-away people: {identity.merged_away_people}")
+            eligible = count_resolution_eligible_mentions(
+                connection, config=loaded.main
+            )
+            print(f"unresolved eligible mentions: {eligible}")
+            print(
+                "active possible_same_person relations: "
+                f"{identity.active_possible_same_person}"
+            )
+            print(f"mentions linked to people: {identity.mentions_linked_to_people}")
         # Digest backlog, queue tiers, and the oldest pending candidate arrive
         # with the digest queue in the lead-assessment milestone.
         return EXIT_OK

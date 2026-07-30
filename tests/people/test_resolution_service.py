@@ -104,6 +104,9 @@ def _seed_mention_graph(
     non_name_facts: tuple[tuple[str, str], ...] = (),
     title: str = "Alex Smith wins award",
     summary: str = "A prize ceremony.",
+    feed_key: str = "feed-a",
+    source_entry_id: str = "entry-a",
+    material_fingerprint: str = _HASH,
 ) -> tuple[int, int, int, int]:
     """Return (run_id, attempt_id, inspection_id, mention_id)."""
     run_id = insert_run(connection)
@@ -115,7 +118,7 @@ def _seed_mention_graph(
         )
         VALUES ('detect_people', 'source_item', 1, ?, 1, 30, ?, 'running', ?, ?, ?)
         """,
-        (_HASH, NOW, run_id, NOW, NOW),
+        (material_fingerprint, NOW, run_id, NOW, NOW),
     ).lastrowid
     assert work is not None
     attempt_id = connection.execute(
@@ -126,16 +129,16 @@ def _seed_mention_graph(
         )
         VALUES (?, ?, 'openrouter', 'generate_structured', 1, ?, ?, 'succeeded', ?)
         """,
-        (run_id, work, NOW, moment(1), _HASH),
+        (run_id, work, NOW, moment(1), material_fingerprint),
     ).lastrowid
     assert attempt_id is not None
     feed = connection.execute(
         """
         INSERT INTO feed_identity (
             key, current_label, current_url, first_seen_at, last_seen_at
-        ) VALUES ('feed-a', 'Feed A', 'https://example.com/feed', ?, ?)
+        ) VALUES (?, 'Feed A', 'https://example.com/feed', ?, ?)
         """,
-        (NOW, NOW),
+        (feed_key, NOW, NOW),
     ).lastrowid
     assert feed is not None
     fetch = connection.execute(
@@ -152,9 +155,9 @@ def _seed_mention_graph(
         INSERT INTO source_item (
             feed_identity_id, discovered_by_fetch_id, discovered_by_run_id,
             source_entry_id, title_text, summary_text, discovered_at
-        ) VALUES (?, ?, ?, 'entry-a', ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (feed, fetch, run_id, title, summary, NOW),
+        (feed, fetch, run_id, source_entry_id, title, summary, NOW),
     ).lastrowid
     assert source_item_id is not None
     inspection_id = connection.execute(
@@ -168,7 +171,7 @@ def _seed_mention_graph(
         ) VALUES (?, ?, ?, ?, ?,
                   '["response_format"]', 1, 1, 100, 200, 'compatible', ?)
         """,
-        (run_id, attempt_id, MODEL, MODEL, _HASH, NOW),
+        (run_id, attempt_id, MODEL, MODEL, material_fingerprint, NOW),
     ).lastrowid
     assert inspection_id is not None
     observation_id = connection.execute(
@@ -188,7 +191,7 @@ def _seed_mention_graph(
             inspection_id,
             _PROMPT,
             _SCHEMA,
-            _HASH,
+            material_fingerprint,
             NOW,
         ),
     ).lastrowid
@@ -481,6 +484,147 @@ def test_empty_match_key_skipped(
     ).fetchone()
     assert mention is not None
     assert mention["person_id"] is None
+
+
+def test_count_resolution_eligible_excludes_skipped_and_resolved(
+    connection: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K24 digest/status counter: skipped and resolved mentions are not eligible."""
+    from notable_person_finder.people.repository import (
+        insert_entity_resolution_observation,
+        point_mention_current_er,
+    )
+    from notable_person_finder.people.resolution import first_pass_task_fingerprint
+    from notable_person_finder.people.service import (
+        _identity_facts_for_mention,
+        _signals_for_mention,
+        count_resolution_eligible_mentions,
+        is_resolution_eligible_mention,
+    )
+    from tests.ingestion.helpers import immediate
+
+    run_id, _a, _i, open_mention = _seed_mention_graph(
+        connection,
+        exact_name="Open Person",
+        title="Open Person wins",
+        material_fingerprint="1" * 64,
+    )
+    run2, _a2, _i2, skip_mention = _seed_mention_graph(
+        connection,
+        exact_name="Skip Person",
+        title="Skip Person appears",
+        source_entry_id="entry-skip",
+        feed_key="feed-skip",
+        material_fingerprint="2" * 64,
+    )
+    config = _main_config()
+    profile = _profile()
+    assert count_resolution_eligible_mentions(connection, config=config) == 2
+    ensure_resolution_for_mention(
+        connection,
+        person_mention_id=open_mention,
+        run_id=run_id,
+        config=config,
+        profile=profile,
+        now=NOW,
+    )
+    # Closed via created_new: must not remain K24-eligible.
+    assert not is_resolution_eligible_mention(
+        connection,
+        person_mention_id=open_mention,
+        config=config,
+        profile=profile,
+    )
+    # Skipped ER for the second mention (empty match_key path).
+    monkeypatch.setattr(
+        "notable_person_finder.people.service.match_key", lambda _value: ""
+    )
+    skip_result = ensure_resolution_for_mention(
+        connection,
+        person_mention_id=skip_mention,
+        run_id=run2,
+        config=config,
+        profile=profile,
+        now=NOW,
+    )
+    assert skip_result == "skipped"
+    monkeypatch.undo()
+    # After restoring match_key, skipped disposition still closes eligibility.
+    assert not is_resolution_eligible_mention(
+        connection,
+        person_mention_id=skip_mention,
+        config=config,
+        profile=profile,
+    )
+    assert count_resolution_eligible_mentions(connection, config=config) == 0
+    # Positive control: a failed ER also closes eligibility for its fingerprint.
+    run3, attempt_id, inspection_id, failed_mention = _seed_mention_graph(
+        connection,
+        exact_name="Failed Person",
+        title="Failed Person noted",
+        source_entry_id="entry-fail",
+        feed_key="feed-fail",
+        material_fingerprint="3" * 64,
+    )
+    assert is_resolution_eligible_mention(
+        connection,
+        person_mention_id=failed_mention,
+        config=config,
+        profile=profile,
+    )
+    row = connection.execute(
+        "SELECT exact_name, search_name, outcome FROM person_mention WHERE id = ?",
+        (failed_mention,),
+    ).fetchone()
+    fp = first_pass_task_fingerprint(
+        person_mention_id=failed_mention,
+        mention_outcome=str(row["outcome"]),
+        exact_name=str(row["exact_name"]),
+        search_name=str(row["search_name"] or row["exact_name"]),
+        identity_facts=_identity_facts_for_mention(
+            connection, person_mention_id=failed_mention
+        ),
+        signals=_signals_for_mention(connection, person_mention_id=failed_mention),
+        config=config.tasks.resolve_person_entity,
+    )
+    with immediate(connection):
+        er_id = insert_entity_resolution_observation(
+            connection,
+            person_mention_id=failed_mention,
+            person_relation_id=None,
+            run_id=run3,
+            attempt_id=attempt_id,
+            model_inspection_id=inspection_id,
+            disposition="failed",
+            semantic_outcome=None,
+            selected_person_id=None,
+            created_person_id=None,
+            candidate_person_ids_json="[]",
+            canonical_supplied_input_json="{}",
+            validated_output_json=None,
+            prompt_hash=_PROMPT,
+            schema_hash=_SCHEMA,
+            schema_version=1,
+            task_fingerprint=fp,
+            supporting_fact_ids_json=None,
+            conflicting_fact_ids_json=None,
+            rationale="permanent failure",
+            failure_category="malformed_response",
+            observed_at=NOW,
+        )
+        point_mention_current_er(
+            connection,
+            person_mention_id=failed_mention,
+            observation_id=er_id,
+            person_id=None,
+        )
+    assert not is_resolution_eligible_mention(
+        connection,
+        person_mention_id=failed_mention,
+        config=config,
+        profile=profile,
+    )
+    assert count_resolution_eligible_mentions(connection, config=config) == 0
 
 
 def test_fingerprint_reuse(connection: sqlite3.Connection) -> None:

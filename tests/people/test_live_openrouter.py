@@ -29,6 +29,19 @@ from notable_person_finder.config.models import (
     DetectPeopleConfig,
     OpenRouterConfig,
     ProviderRoutingConfig,
+    ResolvePersonEntityConfig,
+)
+from notable_person_finder.people.models import (
+    DetectionPassage,
+    IdentityFact,
+    IdentityFactKind,
+    ResolveCandidate,
+    ResolveCandidateName,
+)
+from notable_person_finder.people.resolution import (
+    build_resolve_input,
+    render_resolution_request,
+    resolution_schema,
 )
 from notable_person_finder.providers.failures import FailureCategory, ProviderFailure
 from notable_person_finder.providers.openrouter import (
@@ -323,3 +336,100 @@ def test_smallest_strict_schema_generation_is_parseable() -> None:
     assert isinstance(payload, dict)
     assert set(payload) == {"ok"}
     assert isinstance(payload["ok"], bool)
+
+
+@pytest.mark.live
+def test_resolve_person_entity_inspect_and_generation_are_usable() -> None:
+    """Opt-in smoke: inspect the resolve model and one fixture-backed generation.
+
+    Does not assert on outcome semantics — only that the production resolve
+    schema and routing contract accept a real structured generation.
+    """
+    api_key = _require_api_key()
+    resolve = ResolvePersonEntityConfig()
+    routing = ProviderRoutingConfig()
+    assert routing.data_collection == "deny"
+    assert routing.zdr is True
+
+    resolve_input = build_resolve_input(
+        person_mention_id=1,
+        source_item_id=1,
+        exact_name="Alex Smith",
+        search_name="Alex Smith",
+        mention_outcome="research",
+        passages=(
+            DetectionPassage(
+                id="p1",
+                field="title",
+                text="Alex Smith wins prize",
+                truncated=False,
+            ),
+        ),
+        identity_facts=(
+            IdentityFact(
+                local_id="fact-1",
+                kind=IdentityFactKind.NAME,
+                value="Alex Smith",
+                supporting_passage_ids=("p1",),
+            ),
+        ),
+        signals=(),
+        candidates=(
+            ResolveCandidate(
+                person_id=42,
+                display_name="Alex Smith",
+                names=(
+                    ResolveCandidateName(
+                        exact_name="Alex Smith",
+                        search_name="Alex Smith",
+                        match_key="alex smith",
+                        kind="display",
+                    ),
+                ),
+                identity_facts=(),
+            ),
+        ),
+        config=resolve,
+    )
+    rendered = render_resolution_request(resolve_input)
+    schema = resolution_schema()
+    assert rendered.schema == schema
+
+    with _configured_client(api_key) as client:
+        inspection = _call_or_skip(
+            lambda: client.inspect_model(ModelInspectionRequest(model_id=resolve.model))
+        )
+        assert inspection.configured_model_id == resolve.model
+        assert inspection.supports_strict_structured_output is True
+        assert "response_format" in inspection.supported_parameters
+
+        result = _call_or_skip(
+            lambda: client.generate_structured(
+                StructuredGenerationRequest(
+                    model_id=resolve.model,
+                    system_prompt=rendered.system_prompt,
+                    user_content=rendered.user_input_json,
+                    json_schema=schema,
+                    schema_name="resolve_person_entity",
+                    max_completion_tokens=resolve.max_completion_tokens,
+                    temperature=resolve.parameters.temperature,
+                    top_p=resolve.parameters.top_p,
+                    reasoning_effort=resolve.parameters.reasoning_effort,
+                )
+            )
+        )
+
+    assert result.configured_model_id == resolve.model
+    assert isinstance(result.resolved_model_id, str) and result.resolved_model_id
+    assert isinstance(result.provider_request_id, str) and result.provider_request_id
+    assert result.usage is not None
+    assert result.usage.prompt_tokens >= 0
+    assert result.usage.completion_tokens >= 0
+    payload = json.loads(result.raw_text)
+    assert isinstance(payload, dict)
+    assert payload.get("outcome") in {
+        "same_person",
+        "different_people",
+        "uncertain",
+    }
+    assert isinstance(payload.get("rationale"), str) and payload["rationale"]

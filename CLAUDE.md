@@ -22,17 +22,21 @@ tasks already recorded complete.
 
 ## What Is Actually Built
 
-Four milestones are complete: the application foundation, the run engine and
-shared transport, feed ingestion, and the OpenRouter model gateway with person
-detection (3b1). A cold-starting agent should assume nothing beyond this list.
+Five milestones are complete: the application foundation, the run engine and
+shared transport, feed ingestion, the OpenRouter model gateway with person
+detection (3b1), and durable person identity with first-pass resolution,
+reconsideration, and confirmed merges (3b2). A cold-starting agent should
+assume nothing beyond this list.
 
 Delivered and usable:
 
 - `notable config validate`, `notable paths`, `notable db migrate`.
 - `notable run` — validates configuration, migrates, takes the mutation lock,
   sweeps interrupted predecessor runs, executes eligible work through the
-  scheduler, ingests enabled RSS and Atom feeds, inspects the configured
-  detection model, detects people in untriaged source items, writes a dated
+  scheduler, ingests enabled RSS and Atom feeds, inspects configured detection
+  and resolve models, detects people in untriaged source items, resolves
+  eligible mentions into durable people (empty-candidate create, model path,
+  `possible_same_person`, reconsideration, confirmed merges), writes a dated
   digest plus `latest.md`, and prints the same Markdown on standard output.
 - The shared HTTP transport with URL, DNS-preflight, redirect, timeout,
   response-size, concurrency, and pacing bounds; the retry coordinator; the
@@ -43,12 +47,13 @@ Delivered and usable:
 - The OpenRouter provider adapter (SDK-backed inspect and structured
   generation with SDK retries disabled so only the central coordinator may
   repeat a call), exact-model preflight inspection, dynamic per-generation
-  budget reservation under an optional hard USD cap, and person-detection
-  work items.
-- Triage observations and unresolved person mentions on source items. Mentions
-  retain exact names, mononyms, and professional names without inventing
-  durable people or identity links. Unresolved mentions intentionally have no
-  durable person row until milestone 3b2.
+  budget reservation under an optional hard USD cap, person-detection work
+  items, and `resolve_person_entity` / `reconsider_person_entity` work items.
+- Triage observations and person mentions on source items. Mentions retain
+  exact names, mononyms, and professional names. Eligible research/uncertain
+  mentions resolve to durable people, sourced names, entity-resolution
+  observations, optional `possible_same_person` edges, and confirmed merges
+  with lower-id survivors and canonical work reconciliation.
 - Separate bounded HTTP and LLM worker pools that may overlap; workers never
   access SQLite.
 
@@ -56,22 +61,25 @@ Delivered only in part — do not describe these as finished:
 
 - `notable status` reports the latest run, its digest, required pending and
   deferred counts, operational failures, corpus source-item and article totals,
-  each feed's latest successful fetch, and durable triage counters (triaged,
+  each feed's latest successful fetch, durable triage counters (triaged,
   untriaged, research, uncertain, do not research, insufficient input, failed
-  triage, and unresolved research or uncertain mentions). It has no digest
-  backlog, no oldest pending candidate, no queue tiers, and still no budget or
-  deferral-reason breakdown; those need later milestones.
+  triage, and unresolved research or uncertain mentions), and durable identity
+  counters (canonical people, merged-away people, unresolved eligible
+  mentions under K24, active `possible_same_person`, and mentions linked to
+  people). It has no digest backlog, no oldest pending candidate, no queue
+  tiers, and still no budget or deferral-reason breakdown; those need later
+  milestones.
 - The digest emits its header, banner, operational summary, per-run budget
-  line, deferral-reason breakdown, ingestion summary, and person-detection
-  summary (triage outcomes, unresolved mention counts, model deferred/failed,
-  OpenRouter cost). Its shortlist section is a placeholder: there is no
+  line, deferral-reason breakdown, ingestion summary, person-detection summary
+  (triage outcomes, unresolved mention counts, model deferred/failed,
+  OpenRouter cost), and person-identity summary (people created, mentions
+  resolved, outcome split including created_new vs different_people, K24
+  eligible remaining, active possible_same_person, confirmed merges, resolve
+  model deferred/failed). Its shortlist section is a placeholder: there is no
   ranking and no model synthesis yet.
 
 Not built at all, so do not document, import, or assume any of it:
 
-- Durable people, sourced names, entity resolution, person candidates,
-  `resolve_person_entity`, confirmed merges, or canonical work reconciliation
-  (milestone 3b2).
 - MediaWiki, web search, article fetch and extraction adapters.
 - Wikipedia observations, coverage research, assessments, ranking, synthesis,
   drafting, or the digest queue.
@@ -110,9 +118,9 @@ for regressions:
     the OpenRouter SDK.
   - `ingestion/` — feed seeding and handling, URL identity, domain models, and
     transaction-neutral persistence helpers for ingestion settlements.
-  - `people/` — detection scheduling and handlers, triage and mention
-    persistence, detection prompts, and domain validation. Creates no durable
-    people in this milestone.
+  - `people/` — detection and identity: triage, first-pass resolution,
+    reconsideration, confirmed merges, candidate retrieval, prompts, and
+    domain validation.
   - `obs/` — redacting structured logging.
   - `reporting/` — the daily digest writer.
 - `tests/foundation/` — application-foundation tests.
@@ -171,13 +179,15 @@ reviewable and executable.
 - For the completed run engine and shared transport, use
   `uv run pytest tests/run_engine`.
 - For completed feed ingestion, use `uv run pytest tests/ingestion`.
-- For completed model gateway and detection, use `uv run pytest tests/people`.
-- The four completed milestones together gate with
+- For completed model gateway, detection, and durable person identity, use
+  `uv run pytest tests/people`.
+- The five completed milestones together gate with
   `uv run pytest tests/foundation tests/run_engine tests/ingestion tests/people`.
   Run it from a real checkout: it needs the tracked `config/` directory.
   Default pytest `addopts` deselect `live`. Opt-in live smokes:
   - feeds: `uv run pytest tests/ingestion -m live -v`
-  - OpenRouter: `OPENROUTER_API_KEY=… uv run pytest tests/people -m live -v`
+  - OpenRouter (detect + resolve):
+    `OPENROUTER_API_KEY=… uv run pytest tests/people -m live -v`
 - Exercise the installed interface with `uv run notable ...`.
 - Keep default rewrite verification offline and isolate configuration and
   storage with temporary paths.

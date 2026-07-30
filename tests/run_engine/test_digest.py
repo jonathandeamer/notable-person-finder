@@ -8,7 +8,9 @@ import pytest
 from notable_person_finder.config.models import DigestConfig
 from notable_person_finder.reporting.digest import (
     DigestWriteError,
+    IdentityRunSummary,
     IngestionSummary,
+    PeopleRunSummary,
     render_digest,
     write_digest,
 )
@@ -251,6 +253,62 @@ def test_ingestion_subsection_does_not_capture_run_wide_operational_lines() -> N
     for line in run_wide_lines:
         assert line in markdown  # positive control: the condition is rendered
         assert line not in ingestion_section
+
+
+def test_person_identity_section_renders_every_counter_line() -> None:
+    """Each digest identity line has a positive control for non-zero values."""
+    identity = IdentityRunSummary(
+        people_created=4,
+        mentions_resolved=5,
+        linked_same_person=1,
+        created_via_different_people=2,
+        created_via_created_new=1,
+        uncertain=1,
+        unresolved_eligible_mentions=3,
+        active_possible_same_person=2,
+        confirmed_merges=1,
+        resolution_model_deferred=2,
+        resolution_model_failed=1,
+    )
+    people = PeopleRunSummary(
+        source_items_triaged=1,
+        research_people=1,
+        do_not_research=0,
+        uncertain=0,
+        research_or_uncertain_mentions=1,
+        overflow=0,
+        insufficient_input=0,
+        model_deferred=0,
+        model_failed=0,
+        model_failed_by_category={},
+        budget_limit_nano_usd=1_000_000_000,
+        budget_reserved_nano_usd=100,
+        budget_actual_nano_usd=50,
+    )
+    markdown = render_digest(
+        report(),
+        local_date="2026-07-25",
+        people=people,
+        identity=identity,
+    )
+    section = markdown.split("### Person identity\n\n", 1)[1]
+    for line in (
+        "People created this run: 4",
+        "Mentions resolved this run: 5",
+        "Linked same_person: 1",
+        "Created via different_people: 2",
+        "Created via created_new (no candidates): 1",
+        "Uncertain (possible same person): 1",
+        "Unresolved eligible mentions remaining: 3",
+        "Active possible_same_person relations (corpus): 2",
+        "Confirmed merges this run: 1",
+        "Resolution model deferred: 2",
+        "Resolution model permanently failed: 1",
+    ):
+        assert f"- {line}" in section
+    # Shared OpenRouter cost stays under Person detection only.
+    assert "OpenRouter cost:" in markdown.split("### Person identity", 1)[0]
+    assert "OpenRouter cost:" not in section
 
 
 def test_digest_ends_with_exactly_one_trailing_newline() -> None:

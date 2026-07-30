@@ -67,8 +67,9 @@ class IngestionSummary:
 class PeopleRunSummary:
     """Counts rendered in the digest's person-detection section.
 
-    Mentions remain unresolved and no person identities are listed. Cost
-    fields are integer nano-USD, matching the run engine's budget ledger.
+    Cost fields are integer nano-USD, matching the run engine's budget
+    ledger. OpenRouter cost is the single shared budget line; identity does
+    not repeat it.
     """
 
     source_items_triaged: int
@@ -86,12 +87,30 @@ class PeopleRunSummary:
     budget_actual_nano_usd: int
 
 
+@dataclass(frozen=True, slots=True)
+class IdentityRunSummary:
+    """Counts rendered in the digest's person-identity section."""
+
+    people_created: int
+    mentions_resolved: int
+    linked_same_person: int
+    created_via_different_people: int
+    created_via_created_new: int
+    uncertain: int
+    unresolved_eligible_mentions: int
+    active_possible_same_person: int
+    confirmed_merges: int
+    resolution_model_deferred: int
+    resolution_model_failed: int
+
+
 def render_digest(
     report: RunReport,
     *,
     local_date: str,
     ingestion: IngestionSummary | None = None,
     people: PeopleRunSummary | None = None,
+    identity: IdentityRunSummary | None = None,
 ) -> str:
     lines = [f"# Notable Person Finder — {local_date}", ""]
 
@@ -237,6 +256,28 @@ def render_digest(
                 f"spent {_format_nano_usd(people.budget_actual_nano_usd)}"
             )
 
+    if identity is not None:
+        lines += [
+            "",
+            "### Person identity",
+            "",
+            f"- People created this run: {identity.people_created}",
+            f"- Mentions resolved this run: {identity.mentions_resolved}",
+            f"- Linked same_person: {identity.linked_same_person}",
+            f"- Created via different_people: {identity.created_via_different_people}",
+            f"- Created via created_new (no candidates): "
+            f"{identity.created_via_created_new}",
+            f"- Uncertain (possible same person): {identity.uncertain}",
+            f"- Unresolved eligible mentions remaining: "
+            f"{identity.unresolved_eligible_mentions}",
+            f"- Active possible_same_person relations (corpus): "
+            f"{identity.active_possible_same_person}",
+            f"- Confirmed merges this run: {identity.confirmed_merges}",
+            f"- Resolution model deferred: {identity.resolution_model_deferred}",
+            f"- Resolution model permanently failed: "
+            f"{identity.resolution_model_failed}",
+        ]
+
     return "\n".join(lines) + "\n"
 
 
@@ -343,6 +384,7 @@ def write_digest(
     config: DigestConfig,
     ingestion: IngestionSummary | None = None,
     people: PeopleRunSummary | None = None,
+    identity: IdentityRunSummary | None = None,
 ) -> DigestRecord:
     """Atomically persist the immutable dated digest and the latest copy.
 
@@ -354,7 +396,11 @@ def write_digest(
     having no digest at all.
     """
     markdown = render_digest(
-        report, local_date=local_date, ingestion=ingestion, people=people
+        report,
+        local_date=local_date,
+        ingestion=ingestion,
+        people=people,
+        identity=identity,
     )
     try:
         digests_dir.mkdir(parents=True, exist_ok=True)

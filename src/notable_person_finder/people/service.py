@@ -53,6 +53,7 @@ from notable_person_finder.people.identity import (
     select_display_name,
     upsert_sourced_names_for_mention,
 )
+from notable_person_finder.people.merge import confirm_person_merge
 from notable_person_finder.people.models import (
     AttentionCategory,
     CautionCategory,
@@ -427,6 +428,36 @@ def _has_resolution_eligible_mentions(
         ):
             return True
     return False
+
+
+def count_resolution_eligible_mentions(
+    connection: sqlite3.Connection, *, config: MainConfig
+) -> int:
+    """Corpus count of mentions still K24-eligible for first-pass resolution.
+
+    Skipped and permanently failed ERs close eligibility for their fingerprint;
+    they are not counted even when ``person_id`` remains NULL.
+    """
+    rows = connection.execute(
+        """
+        SELECT id
+          FROM person_mention
+         WHERE outcome IN ('research', 'uncertain')
+           AND length(trim(exact_name)) > 0
+         ORDER BY id
+        """
+    ).fetchall()
+    profile = _unused_profile_for_eligibility()
+    total = 0
+    for row in rows:
+        if is_resolution_eligible_mention(
+            connection,
+            person_mention_id=int(row["id"]),
+            config=config,
+            profile=profile,
+        ):
+            total += 1
+    return total
 
 
 def _unused_profile_for_eligibility() -> DomainProfileConfig:
@@ -3129,17 +3160,8 @@ def _attempt_confirm_person_merge(
     observation_id: int,
     now: str,
 ) -> bool:
-    """Run ``confirm_person_merge`` when the merge module is importable."""
-    import importlib
-    import importlib.util
-
-    if importlib.util.find_spec("notable_person_finder.people.merge") is None:
-        return False
-    merge_mod = importlib.import_module("notable_person_finder.people.merge")
-    confirm = getattr(merge_mod, "confirm_person_merge", None)
-    if confirm is None:
-        return False
-    confirm(
+    """Run ``confirm_person_merge`` and report that a merge was attempted."""
+    confirm_person_merge(
         connection,
         loser_id=loser_id,
         survivor_id=survivor_id,

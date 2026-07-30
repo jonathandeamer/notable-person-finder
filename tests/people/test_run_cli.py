@@ -504,6 +504,19 @@ def test_fresh_run_triages_ingested_items(
     assert "Research: 1" in digest
     assert "Unresolved research or uncertain mentions: 1" in digest
     assert "OpenRouter cost:" in digest
+    # Empty-candidate path: one person via created_new; K24 remaining is zero.
+    assert "### Person identity" in digest
+    identity = digest.split("### Person identity\n\n", 1)[1]
+    assert "People created this run: 1" in identity
+    assert "Mentions resolved this run: 1" in identity
+    assert "Created via created_new (no candidates): 1" in identity
+    assert "Linked same_person: 0" in identity
+    assert "Created via different_people: 0" in identity
+    assert "Unresolved eligible mentions remaining: 0" in identity
+    assert "Active possible_same_person relations (corpus): 0" in identity
+    assert "Confirmed merges this run: 0" in identity
+    assert "Resolution model deferred: 0" in identity
+    assert "OpenRouter cost:" not in identity
     assert ENVIRONMENT["TEST_OPENROUTER"] not in digest
 
 
@@ -772,6 +785,12 @@ def test_status_reports_durable_triage_counts(
     assert "research: 1" in output
     assert "do not research: 1" in output
     assert "unresolved research or uncertain mentions: 2" in output
+    # MULTI_JSON: research + uncertain mentions; both resolve via created_new.
+    assert "canonical people: 2" in output
+    assert "merged-away people: 0" in output
+    assert "unresolved eligible mentions: 0" in output
+    assert "active possible_same_person relations: 0" in output
+    assert "mentions linked to people: 2" in output
     assert ENVIRONMENT["TEST_OPENROUTER"] not in output
     assert "brave-secret-value" not in output
 

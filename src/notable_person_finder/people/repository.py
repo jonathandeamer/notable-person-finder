@@ -877,6 +877,189 @@ def triage_run_counts(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class IdentityCorpusCounts:
+    """Whole-corpus durable person-identity totals for ``notable status``."""
+
+    canonical_people: int
+    merged_away_people: int
+    active_possible_same_person: int
+    mentions_linked_to_people: int
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityRunCounts:
+    """This-run identity totals for the daily digest's Person identity section.
+
+    Outcome breakdowns count first-pass ER rows only (``person_mention_id``
+    set). Corpus snapshot fields (active edges) are included so the digest can
+    render remaining-work figures without a second query. Unresolved eligible
+    mention counts are K24 and live in the service layer (fingerprint-aware).
+    """
+
+    people_created: int
+    mentions_resolved: int
+    linked_same_person: int
+    created_via_different_people: int
+    created_via_created_new: int
+    uncertain: int
+    active_possible_same_person: int
+    confirmed_merges: int
+    resolution_model_deferred: int
+    resolution_model_failed: int
+
+
+def identity_corpus_counts(connection: sqlite3.Connection) -> IdentityCorpusCounts:
+    """Durable people / relation / link totals based on current rows."""
+    canonical_people = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM person
+             WHERE merged_into_person_id IS NULL
+            """
+        ).fetchone()["n"]
+    )
+    merged_away_people = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM person
+             WHERE merged_into_person_id IS NOT NULL
+            """
+        ).fetchone()["n"]
+    )
+    active_possible_same_person = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM person_relation
+             WHERE kind = 'possible_same_person'
+               AND status = 'active'
+            """
+        ).fetchone()["n"]
+    )
+    mentions_linked_to_people = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM person_mention
+             WHERE person_id IS NOT NULL
+            """
+        ).fetchone()["n"]
+    )
+    return IdentityCorpusCounts(
+        canonical_people=canonical_people,
+        merged_away_people=merged_away_people,
+        active_possible_same_person=active_possible_same_person,
+        mentions_linked_to_people=mentions_linked_to_people,
+    )
+
+
+def identity_run_counts(
+    connection: sqlite3.Connection, *, run_id: int
+) -> IdentityRunCounts:
+    """Identity totals written or settled during one run (digest section)."""
+    people_created = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM person
+             WHERE created_by_run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()["n"]
+    )
+
+    outcome_rows = connection.execute(
+        """
+        SELECT semantic_outcome, COUNT(*) AS n
+          FROM entity_resolution_observation
+         WHERE run_id = ?
+           AND person_mention_id IS NOT NULL
+           AND disposition = 'completed'
+           AND semantic_outcome IS NOT NULL
+         GROUP BY semantic_outcome
+        """,
+        (run_id,),
+    ).fetchall()
+    by_outcome = {str(row["semantic_outcome"]): int(row["n"]) for row in outcome_rows}
+    linked_same_person = by_outcome.get("same_person", 0)
+    created_via_different_people = by_outcome.get("different_people", 0)
+    created_via_created_new = by_outcome.get("created_new", 0)
+    uncertain = by_outcome.get("uncertain", 0)
+    # First-pass completed outcomes that assign a durable person_id.
+    mentions_resolved = (
+        linked_same_person
+        + created_via_different_people
+        + created_via_created_new
+        + uncertain
+    )
+
+    active_possible_same_person = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM person_relation
+             WHERE kind = 'possible_same_person'
+               AND status = 'active'
+            """
+        ).fetchone()["n"]
+    )
+    confirmed_merges = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM person_relation
+             WHERE kind = 'merge'
+               AND created_by_run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()["n"]
+    )
+
+    # ``complete_work`` stamps completed_by_run_id for deferred and permanent
+    # failure, matching detection model work attribution.
+    resolution_model_deferred = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n
+              FROM work_item
+             WHERE task_type IN (?, ?)
+               AND state = 'deferred'
+               AND completed_by_run_id = ?
+            """,
+            (
+                RESOLVE_PERSON_ENTITY_TASK_TYPE,
+                RECONSIDER_PERSON_ENTITY_TASK_TYPE,
+                run_id,
+            ),
+        ).fetchone()["n"]
+    )
+    resolution_model_failed = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n
+              FROM work_item
+             WHERE task_type IN (?, ?)
+               AND state = 'failed_permanent'
+               AND completed_by_run_id = ?
+            """,
+            (
+                RESOLVE_PERSON_ENTITY_TASK_TYPE,
+                RECONSIDER_PERSON_ENTITY_TASK_TYPE,
+                run_id,
+            ),
+        ).fetchone()["n"]
+    )
+
+    return IdentityRunCounts(
+        people_created=people_created,
+        mentions_resolved=mentions_resolved,
+        linked_same_person=linked_same_person,
+        created_via_different_people=created_via_different_people,
+        created_via_created_new=created_via_created_new,
+        uncertain=uncertain,
+        active_possible_same_person=active_possible_same_person,
+        confirmed_merges=confirmed_merges,
+        resolution_model_deferred=resolution_model_deferred,
+        resolution_model_failed=resolution_model_failed,
+    )
+
+
 def settle_active_tasks_after_permanent_preflight(
     connection: sqlite3.Connection,
     *,
