@@ -888,15 +888,53 @@ def test_model_different_people_creates_without_edges(
     assert edge_to_peer["n"] == 0
 
 
-def test_model_uncertain_edges_all_candidates_zero_reconsider(
+def test_model_uncertain_k4_edges_all_candidates_name_only_zero_reconsider(
     connection: sqlite3.Connection,
 ) -> None:
+    """K4: uncertain opens edges to every supplied candidate even when peer scan cannot.
+
+    Name-only mention + name-only candidates: K17 peer scan must not open edges
+    (name-only↔name-only). Edges that appear must come from the K4 uncertain
+    loop. N≥2 candidates so deleting the loop cannot leave a single peer-scan
+    edge as a false positive.
+    """
     run_id, _a, _i, mention_id = _seed_mention_graph(
-        connection, non_name_facts=(("profession_or_role", "sculptor"),)
-    )
-    peer = _prepare_resolve_work(connection, run_id=run_id, mention_id=mention_id)
+        connection, exact_name="Alex Smith"
+    )  # no non-name facts
+    candidate_ids: list[int] = []
+    with immediate(connection):
+        for index in range(2):
+            peer = insert_person(
+                connection,
+                run_id=run_id,
+                display_name="Alex Smith",
+                identity_fingerprint=f"{index:064x}",
+                created_at=NOW,
+            )
+            upsert_sourced_name(
+                connection,
+                person_id=peer,
+                exact_name="Alex Smith",
+                kind="display",
+                origin_kind="manual",
+                origin_mention_id=None,
+                observed_at=NOW,
+            )
+            candidate_ids.append(peer)
+
     config = _main_config()
     profile = _profile()
+    result = ensure_resolution_for_mention(
+        connection,
+        person_mention_id=mention_id,
+        run_id=run_id,
+        config=config,
+        profile=profile,
+        now=NOW,
+    )
+    assert result == "scheduled"
+    assert len(candidate_ids) >= 2
+
     client = ScriptedLlmClient(
         inspection=_compatible_inspection(),
         generate_results=[_generation_result(_resolve_output(outcome="uncertain"))],
@@ -912,20 +950,30 @@ def test_model_uncertain_edges_all_candidates_zero_reconsider(
         )
 
     _run_engine(connection, _handlers(connection, client, config, profile), seed=seed)
-    edges = connection.execute(
-        """
-        SELECT person_id_a, person_id_b FROM person_relation
-         WHERE kind = 'possible_same_person' AND status = 'active'
-        """
-    ).fetchall()
-    assert len(edges) >= 1
-    ends = {edges[0]["person_id_a"], edges[0]["person_id_b"]}
+
     created = connection.execute(
         "SELECT person_id FROM person_mention WHERE id = ?", (mention_id,)
     ).fetchone()
     assert created is not None
-    assert peer in ends
-    assert created["person_id"] in ends
+    created_id = int(created["person_id"])
+    assert created_id not in candidate_ids
+
+    edges = connection.execute(
+        """
+        SELECT person_id_a, person_id_b FROM person_relation
+         WHERE kind = 'possible_same_person' AND status = 'active'
+         ORDER BY person_id_a, person_id_b
+        """
+    ).fetchall()
+    # Exactly N edges — one per code-supplied candidate (K4); peer scan adds none.
+    assert len(edges) == len(candidate_ids)
+    edge_peers: set[int] = set()
+    for row in edges:
+        ends = {int(row["person_id_a"]), int(row["person_id_b"])}
+        assert created_id in ends
+        peer = next(person_id for person_id in ends if person_id != created_id)
+        edge_peers.add(peer)
+    assert edge_peers == set(candidate_ids)
     # K21: zero reconsider work in this settlement.
     assert _count_work(connection, task_type=RECONSIDER_PERSON_ENTITY_TASK_TYPE) == 0
 
