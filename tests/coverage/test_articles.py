@@ -255,6 +255,21 @@ def test_http_404_is_not_found_typed_access_not_exception() -> None:
     assert "SECRET_404_BODY" not in str(result)
 
 
+def test_http_410_is_not_found_typed_access_not_exception() -> None:
+    """410 Gone is not_found; removing 410 from the status set must fail this test."""
+    body = b"<html><body>gone SECRET_410_BODY</body></html>"
+    fetcher = fetcher_for(body, status=410)
+
+    result = fetcher.fetch_article(ARTICLE_URL)
+
+    assert isinstance(result, ArticleAccessDenied)
+    assert result.kind == ArticleAccessKind.NOT_FOUND
+    assert result.status_code == 410
+    assert result.requested_url == ARTICLE_URL
+    assert "SECRET_410_BODY" not in (result.detail or "")
+    assert "SECRET_410_BODY" not in str(result)
+
+
 def test_http_401_is_authentication_required_typed_access() -> None:
     body = b'{"error":"login required LEAK_AUTH"}'
     fetcher = fetcher_for(
@@ -299,6 +314,59 @@ def test_unsupported_content_type_is_typed_access_without_body_in_detail() -> No
     assert "LEAK_PDF" not in (result.detail or "")
     assert "LEAK_PDF" not in str(result)
     assert "%PDF" not in (result.detail or "")
+
+
+def test_application_xhtml_xml_content_type_is_accepted() -> None:
+    """Design step 4: application/xhtml+xml is HTML-ish (not only text/html)."""
+    payload = fixture_bytes("article_full.html")
+    fetcher = fetcher_for(
+        payload,
+        headers={"content-type": "application/xhtml+xml; charset=utf-8"},
+    )
+
+    result = fetcher.fetch_article(ARTICLE_URL)
+
+    assert isinstance(result, ArticleFetchSuccess)
+    assert result.html == payload
+    assert result.content_type is not None
+    assert "application/xhtml+xml" in result.content_type
+
+
+def test_missing_content_type_accepts_body_that_looks_like_html() -> None:
+    """Missing Content-Type still succeeds when the body looks like HTML.
+
+    Use RecordingTransport so the adapter sees a true absent content-type;
+    httpx.Response may invent ``text/html`` when the body looks like HTML.
+    """
+    payload = fixture_bytes("article_full.html")
+    # Truthy headers map without content-type (``{}`` is falsy and would
+    # re-trigger http_response's text/html default).
+    transport = RecordingTransport(
+        response=http_response(payload, headers={"cache-control": "no-store"})
+    )
+    fetcher = HttpxArticleFetcher(transport, clock=FakeClock())
+
+    result = fetcher.fetch_article(ARTICLE_URL)
+
+    assert isinstance(result, ArticleFetchSuccess)
+    assert result.html == payload
+    assert result.content_type is None
+
+
+def test_text_plain_content_type_accepts_body_that_looks_like_html() -> None:
+    """Tolerant text/*: text/plain with HTML-shaped body is accepted."""
+    payload = fixture_bytes("article_full.html")
+    fetcher = fetcher_for(
+        payload,
+        headers={"content-type": "text/plain; charset=utf-8"},
+    )
+
+    result = fetcher.fetch_article(ARTICLE_URL)
+
+    assert isinstance(result, ArticleFetchSuccess)
+    assert result.html == payload
+    assert result.content_type is not None
+    assert result.content_type.startswith("text/plain")
 
 
 def test_response_too_large_is_typed_access_not_provider_failure() -> None:
