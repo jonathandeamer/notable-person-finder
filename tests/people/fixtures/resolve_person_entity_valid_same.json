@@ -1,0 +1,7 @@
+{
+  "outcome": "same_person",
+  "selected_person_id": 11,
+  "supporting_fact_ids": ["fact-1", "c11-f1"],
+  "conflicting_fact_ids": [],
+  "rationale": "Supplied facts align with the candidate sculptor record."
+}

@@ -9,6 +9,7 @@ from notable_person_finder.config.models import (
     MainConfig,
     OpenRouterConfig,
     ProviderRoutingConfig,
+    ResolvePersonEntityConfig,
     TasksConfig,
 )
 
@@ -41,6 +42,19 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
     assert config.tasks.detect_people.max_people == 8
     assert config.tasks.detect_people.max_title_characters == 500
     assert config.tasks.detect_people.max_summary_characters == 4000
+    assert config.tasks.resolve_person_entity.model == "openai/gpt-5.4-mini"
+    assert config.tasks.resolve_person_entity.max_input_tokens == 4096
+    assert config.tasks.resolve_person_entity.max_completion_tokens == 1024
+    assert config.tasks.resolve_person_entity.parameters == GenerationParameters(
+        temperature=0.0,
+        top_p=1.0,
+        reasoning_effort=None,
+    )
+    assert config.tasks.resolve_person_entity.max_candidates == 8
+    assert config.tasks.resolve_person_entity.max_facts_per_candidate == 12
+    assert config.tasks.resolve_person_entity.max_names_per_candidate == 8
+    assert config.tasks.resolve_person_entity.max_title_characters == 500
+    assert config.tasks.resolve_person_entity.max_summary_characters == 4000
     assert GenerationParameters(reasoning_effort=None).reasoning_effort is None
 
 
@@ -51,7 +65,9 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
         (ProviderRoutingConfig(), "allow_fallbacks"),
         (GenerationParameters(), "temperature"),
         (DetectPeopleConfig(), "model"),
+        (ResolvePersonEntityConfig(), "model"),
         (TasksConfig(), "detect_people"),
+        (TasksConfig(), "resolve_person_entity"),
     ],
 )
 def test_model_configuration_models_are_frozen(value: object, field_name: str) -> None:
@@ -66,7 +82,9 @@ def test_model_configuration_models_are_frozen(value: object, field_name: str) -
         ("routing", {"require_parameters": False}),
         ("tasks", {"compose_lead_summary": {}}),
         ("detect_people", {"max_tokens": 1024}),
+        ("resolve_person_entity", {"max_tokens": 1024}),
         ("parameters", {"seed": 7}),
+        ("resolve_parameters", {"seed": 7}),
     ],
 )
 def test_model_configuration_rejects_unknown_fields(
@@ -74,7 +92,7 @@ def test_model_configuration_rejects_unknown_fields(
 ) -> None:
     value = _minimal_main()
     value["openrouter"] = {}
-    value["tasks"] = {"detect_people": {}}
+    value["tasks"] = {"detect_people": {}, "resolve_person_entity": {}}
     if section == "openrouter":
         value["openrouter"] = extra
     elif section == "routing":
@@ -83,6 +101,10 @@ def test_model_configuration_rejects_unknown_fields(
         value["tasks"] = extra
     elif section == "detect_people":
         value["tasks"] = {"detect_people": extra}
+    elif section == "resolve_person_entity":
+        value["tasks"] = {"resolve_person_entity": extra}
+    elif section == "resolve_parameters":
+        value["tasks"] = {"resolve_person_entity": {"parameters": extra}}
     else:
         value["tasks"] = {"detect_people": {"parameters": extra}}
 
@@ -119,9 +141,14 @@ def test_openrouter_endpoint_requires_a_clean_public_https_url(endpoint: str) ->
         (GenerationParameters, {"temperature": True}),
         (GenerationParameters, {"top_p": "1.0"}),
         (DetectPeopleConfig, {"model": b"openai/gpt-5.4-mini"}),
+        (ResolvePersonEntityConfig, {"model": b"openai/gpt-5.4-mini"}),
         (
             TasksConfig,
             {"detect_people": {"parameters": {"temperature": True}}},
+        ),
+        (
+            TasksConfig,
+            {"resolve_person_entity": {"parameters": {"temperature": True}}},
         ),
     ],
 )
@@ -150,6 +177,23 @@ def test_detect_people_rejects_router_aliases_and_invalid_model_slugs(
 ) -> None:
     with pytest.raises(ValidationError, match="model"):
         DetectPeopleConfig(model=model)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "openrouter/auto",
+        "openai/gpt-5.4-mini,anthropic/claude-haiku-4.5",
+        "openai/gpt-5.4-mini:free",
+        "gpt-5.4-mini",
+        "OpenAI/gpt-5.4-mini",
+    ],
+)
+def test_resolve_person_entity_rejects_router_aliases_and_invalid_model_slugs(
+    model: str,
+) -> None:
+    with pytest.raises(ValidationError, match="model"):
+        ResolvePersonEntityConfig(model=model)
 
 
 @pytest.mark.parametrize(
@@ -203,6 +247,45 @@ def test_detect_people_rejects_out_of_range_mention_and_context_limits(
 ) -> None:
     with pytest.raises(ValidationError):
         DetectPeopleConfig.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"max_input_tokens": 0},
+        {"max_completion_tokens": 0},
+        {"max_input_tokens": 1024, "max_completion_tokens": 1024},
+        {"max_input_tokens": 1024, "max_completion_tokens": 2048},
+        {"max_title_characters": 1000, "max_summary_characters": 999},
+    ],
+)
+def test_resolve_person_entity_rejects_non_positive_or_incompatible_bounds(
+    values: dict[str, int],
+) -> None:
+    with pytest.raises(ValidationError):
+        ResolvePersonEntityConfig.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"max_candidates": 0},
+        {"max_candidates": 17},
+        {"max_facts_per_candidate": 0},
+        {"max_facts_per_candidate": 33},
+        {"max_names_per_candidate": 0},
+        {"max_names_per_candidate": 33},
+        {"max_title_characters": 0},
+        {"max_title_characters": 2001},
+        {"max_summary_characters": 0},
+        {"max_summary_characters": 20_001},
+    ],
+)
+def test_resolve_person_entity_rejects_out_of_range_candidate_and_context_limits(
+    values: dict[str, int],
+) -> None:
+    with pytest.raises(ValidationError):
+        ResolvePersonEntityConfig.model_validate(values)
 
 
 def test_main_config_rejects_unknown_fields() -> None:

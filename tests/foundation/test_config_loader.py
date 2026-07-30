@@ -65,6 +65,21 @@ def test_model_settings_are_complete_in_the_redacted_snapshot(tmp_path: Path) ->
         "max_title_characters": 500,
         "max_summary_characters": 4000,
     }
+    assert snapshot["main"]["tasks"]["resolve_person_entity"] == {
+        "model": "openai/gpt-5.4-mini",
+        "max_input_tokens": 4096,
+        "max_completion_tokens": 1024,
+        "parameters": {
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "reasoning_effort": "low",
+        },
+        "max_candidates": 8,
+        "max_facts_per_candidate": 12,
+        "max_names_per_candidate": 8,
+        "max_title_characters": 500,
+        "max_summary_characters": 4000,
+    }
     assert snapshot["secret_availability"]["TEST_OPENROUTER"] is True
     assert "snapshot-secret" not in loaded.snapshot_json
 
@@ -86,6 +101,9 @@ def test_model_settings_are_complete_in_the_redacted_snapshot(tmp_path: Path) ->
         ("top_p = 1.0", "top_p = 0.9"),
         ('reasoning_effort = "low"', 'reasoning_effort = "medium"'),
         ("max_people = 8", "max_people = 12"),
+        ("max_candidates = 8", "max_candidates = 12"),
+        ("max_facts_per_candidate = 12", "max_facts_per_candidate = 16"),
+        ("max_names_per_candidate = 8", "max_names_per_candidate = 12"),
         ("max_title_characters = 500", "max_title_characters = 600"),
         ("max_summary_characters = 4000", "max_summary_characters = 5000"),
     ],

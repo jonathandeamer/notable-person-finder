@@ -1,0 +1,7 @@
+{
+  "outcome": "uncertain",
+  "selected_person_id": null,
+  "supporting_fact_ids": [],
+  "conflicting_fact_ids": [],
+  "rationale": "Shared name only; supplied evidence does not decide identity."
+}

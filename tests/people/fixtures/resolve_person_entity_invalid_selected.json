@@ -1,0 +1,7 @@
+{
+  "outcome": "same_person",
+  "selected_person_id": 999,
+  "supporting_fact_ids": ["fact-1"],
+  "conflicting_fact_ids": [],
+  "rationale": "Selected an unseen person id that was not supplied."
+}

@@ -1,0 +1,7 @@
+{
+  "outcome": "different_people",
+  "selected_person_id": null,
+  "supporting_fact_ids": ["fact-2"],
+  "conflicting_fact_ids": ["c11-f1"],
+  "rationale": "Profession and prize evidence conflict with the supplied candidate."
+}

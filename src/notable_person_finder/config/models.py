@@ -207,6 +207,14 @@ _MODEL_SLUG_PATTERN = re.compile(
 )
 
 
+def _exact_model_slug(value: str) -> str:
+    if _MODEL_SLUG_PATTERN.fullmatch(value) is None:
+        raise ValueError("model must be one exact lowercase author/slug identifier")
+    if value.startswith("openrouter/"):
+        raise ValueError("model must not use an OpenRouter routing alias")
+    return value
+
+
 class DetectPeopleConfig(_StrictConfigurationModel):
     model: str = "openai/gpt-5.4-mini"
     max_input_tokens: int = Field(default=4096, strict=True, ge=1, le=1_000_000)
@@ -219,11 +227,7 @@ class DetectPeopleConfig(_StrictConfigurationModel):
     @field_validator("model")
     @classmethod
     def exact_model_slug(cls, value: str) -> str:
-        if _MODEL_SLUG_PATTERN.fullmatch(value) is None:
-            raise ValueError("model must be one exact lowercase author/slug identifier")
-        if value.startswith("openrouter/"):
-            raise ValueError("model must not use an OpenRouter routing alias")
-        return value
+        return _exact_model_slug(value)
 
     @model_validator(mode="after")
     def bounds_are_compatible(self) -> DetectPeopleConfig:
@@ -236,8 +240,36 @@ class DetectPeopleConfig(_StrictConfigurationModel):
         return self
 
 
+class ResolvePersonEntityConfig(_StrictConfigurationModel):
+    model: str = "openai/gpt-5.4-mini"
+    max_input_tokens: int = Field(default=4096, strict=True, ge=1, le=1_000_000)
+    max_completion_tokens: int = Field(default=1024, strict=True, ge=1, le=100_000)
+    parameters: GenerationParameters = GenerationParameters()
+    max_candidates: int = Field(default=8, strict=True, ge=1, le=16)
+    max_facts_per_candidate: int = Field(default=12, strict=True, ge=1, le=32)
+    max_names_per_candidate: int = Field(default=8, strict=True, ge=1, le=32)
+    max_title_characters: int = Field(default=500, strict=True, ge=1, le=2000)
+    max_summary_characters: int = Field(default=4000, strict=True, ge=1, le=20_000)
+
+    @field_validator("model")
+    @classmethod
+    def exact_model_slug(cls, value: str) -> str:
+        return _exact_model_slug(value)
+
+    @model_validator(mode="after")
+    def bounds_are_compatible(self) -> ResolvePersonEntityConfig:
+        if self.max_completion_tokens >= self.max_input_tokens:
+            raise ValueError("max_completion_tokens must be less than max_input_tokens")
+        if self.max_summary_characters < self.max_title_characters:
+            raise ValueError(
+                "max_summary_characters must be at least max_title_characters"
+            )
+        return self
+
+
 class TasksConfig(_StrictConfigurationModel):
     detect_people: DetectPeopleConfig = DetectPeopleConfig()
+    resolve_person_entity: ResolvePersonEntityConfig = ResolvePersonEntityConfig()
 
 
 class DigestConfig(StrictModel):
