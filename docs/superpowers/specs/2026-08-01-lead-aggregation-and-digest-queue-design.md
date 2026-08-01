@@ -153,6 +153,8 @@ CREATE TABLE queue_transition (
     id INTEGER PRIMARY KEY,
     person_id INTEGER NOT NULL REFERENCES person(id),
     run_id INTEGER NOT NULL REFERENCES run(id),
+    lead_assessment_id INTEGER NOT NULL REFERENCES lead_assessment(id),
+    tier TEXT NOT NULL CHECK (tier IN ('promising_lead', 'possible_lead')),
     from_status TEXT,                            -- NULL on first arrival
     to_status TEXT NOT NULL,
     reason TEXT NOT NULL,
@@ -207,6 +209,16 @@ projections are allowed because immutable domain observations preserve what
 matters." All arrival/emission/backlog/drain-rate metrics read
 `queue_transition`, never `digest_queue` history, because there is none to
 read.
+
+**K13 — `queue_transition` carries its own `tier` and `lead_assessment_id`,
+not just `person_id`/`reason`.** `digest_queue.tier` holds only the
+*current* tier; a promotion overwrites it. Backlog-by-tier and
+arrival/emission-rate-by-tier metrics (capability 6's "ending backlog split
+by lead tier") read history, so each transition row must record the tier
+that was true at that transition, not be forced into an ambiguous join
+against `lead_assessment` by timestamp. `lead_assessment_id` makes each
+transition traceable to the exact assessment that caused it, matching the
+same "immutable domain observations preserve what matters" rationale as K2.
 
 ## Work Item and Triggering
 
@@ -299,13 +311,22 @@ classifications milestone 5 already produces.
 
 ## Ranking
 
-Pure function `rank_key(queue_entry, lead_assessment) -> tuple`, implementing
-capability 5's exact lexicographic order:
+Pure function `rank_key(queue_entry, lead_assessment, starvation_cutoff) ->
+tuple`, implementing capability 5's exact lexicographic order. The
+starvation guard (capability 6: a long-pending entry moves ahead of newer
+entries **in the same lead tier**) is a leading factor within the outcome
+tier — it sits right after `_OUTCOME_RANK` and before every other
+tie-breaker, so a starved `possible_lead` still sorts behind every
+`promising_lead` but ahead of fresher `possible_lead` entries:
 
 ```python
-def rank_key(entry: QueueEntry, lead: LeadAssessment) -> tuple[object, ...]:
+def rank_key(
+    entry: QueueEntry, lead: LeadAssessment, starvation_cutoff: str
+) -> tuple[object, ...]:
+    is_starved = entry.first_pending_at < starvation_cutoff
     return (
         _OUTCOME_RANK[lead.outcome],                      # promising before possible
+        0 if is_starved else 1,                            # starved entries first, within tier
         _ELIGIBILITY_RANK[entry.eligibility_reason],       # new/promoted/strengthened before reminder
         _WIKIPEDIA_RANK[lead.wikipedia_outcome],           # no_matching_page_found before uncertain_identity
         -lead.qualifying_domain_count,                     # more domains, tie-break only
@@ -387,20 +408,31 @@ tiers").
 
 ## Merge Reconciliation
 
-Replace `people/merge.py`'s `reconcile_digest_queue_on_merge` no-op:
+Replace `people/merge.py`'s `reconcile_digest_queue_on_merge` no-op. Runs in
+this exact order:
 
-- If only the loser has a `digest_queue` row: move it to the survivor
-  (update `person_id`), inserting a `queue_transition` noting the merge.
-- If both have rows: keep the higher-priority one by `rank_key`
-  (deterministic; no "more evidence" heuristic, matching K7 of the
-  durable-person-identity design's survivor rule), transition the other to
-  `removed` with reason `merged_away`.
-- `lead_assessment` rows are immutable history and are **not** rewritten
-  onto the survivor's `person_id` — same non-rewrite-historical-FKs
-  invariant as K12 of the durable-person-identity design.
-  `person.current_lead_assessment_id` on the survivor is recomputed by one
-  fresh aggregation pass over the merged evidence (reusing the same handler
-  the settlement hooks call), not by picking one side's stale pointer.
+1. **Queue dedup.** If only the loser has a `digest_queue` row: move it to
+   the survivor (update `person_id`), inserting a `queue_transition` with
+   reason `merged`. If both have rows: keep the higher-priority one by
+   `rank_key` (deterministic; no "more evidence" heuristic, matching K7 of
+   the durable-person-identity design's survivor rule), transition the
+   other to `removed` with reason `merged_away`. This step's only job is
+   making sure exactly one queue row exists per surviving person before
+   aggregation runs — it does not attempt to compute a merged outcome.
+2. **Fresh aggregation.** Call the same `aggregate_person_lead` handler the
+   settlement hooks use, over the survivor's now-combined evidence. This
+   single pass both produces the survivor's new `lead_assessment` and — via
+   the normal Digest Queue Lifecycle rules above (new/promoted/strengthened
+   detection) — re-evaluates and updates the deduplicated queue row from
+   step 1 in place. There is no separate third "queue re-evaluation" step:
+   folding it into the settlement-hook handler means merge cannot drift
+   from the same promotion/resurfacing logic every other trigger uses.
+
+`lead_assessment` rows are immutable history and are **not** rewritten onto
+the survivor's `person_id` — same non-rewrite-historical-FKs invariant as
+K12 of the durable-person-identity design.
+`person.current_lead_assessment_id` on the survivor is set by step 2's fresh
+assessment, not by picking one side's stale pointer.
 
 ## Configuration Surface
 
