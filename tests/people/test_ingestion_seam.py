@@ -50,6 +50,7 @@ def _main_config() -> MainConfig:
         timezone="Europe/Paris",
         feeds_file=Path("feeds.toml"),
         domain_profile_file=Path("profiles/art.toml"),
+        source_policy_file=Path("source_policies/visual_arts.toml"),
         budget=BudgetConfig(openrouter_usd_per_run=None),
         openrouter=OpenRouterConfig(routing=ProviderRoutingConfig()),
         tasks=TasksConfig(

@@ -73,6 +73,7 @@ from notable_person_finder.people.models import (
     SourcedNameKind,
 )
 from notable_person_finder.people.repository import (
+    ASSESS_ARTICLE_TASK_TYPE,
     DETECT_PEOPLE_TASK_TYPE,
     MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE,
     RECONSIDER_PERSON_ENTITY_TASK_TYPE,
@@ -475,12 +476,13 @@ def _unused_profile_for_eligibility() -> DomainProfileConfig:
 def models_needed_for_run(
     connection: sqlite3.Connection, run_id: int, config: MainConfig
 ) -> tuple[str, ...]:
-    """Exact models that have dependent work this run (detect/resolve/match)."""
+    """Exact models that have dependent work this run (detect/resolve/match/assess)."""
     del run_id  # reserved: active-work queries are run-global for pending state
     needed: list[str] = []
     detect_model = config.tasks.detect_people.model
     resolve_model = config.tasks.resolve_person_entity.model
     match_model = config.tasks.match_wikipedia_identity.model
+    assess_model = config.tasks.assess_article.model
     if _has_usable_untriaged_source_item(connection) or _has_active_detect_work(
         connection
     ):
@@ -491,6 +493,8 @@ def models_needed_for_run(
         needed.append(resolve_model)
     if _wikipedia_match_model_needed(connection, config=config):
         needed.append(match_model)
+    if _coverage_assess_model_needed(connection, config=config):
+        needed.append(assess_model)
     return tuple(dict.fromkeys(needed))
 
 
@@ -505,6 +509,9 @@ def task_types_for_model(config: MainConfig, model_id: str) -> tuple[str, ...]:
     if config.tasks.match_wikipedia_identity.model == model_id:
         # HTTP MediaWiki kinds have no model ready gate (K21).
         types.append(MATCH_WIKIPEDIA_IDENTITY_TASK_TYPE)
+    if config.tasks.assess_article.model == model_id:
+        # HTTP Brave/fetch kinds have no model ready gate (K20).
+        types.append(ASSESS_ARTICLE_TASK_TYPE)
     return tuple(types)
 
 
@@ -516,6 +523,16 @@ def _wikipedia_match_model_needed(
     from notable_person_finder.wikipedia.service import wikipedia_match_model_needed
 
     return wikipedia_match_model_needed(connection, config=config)
+
+
+def _coverage_assess_model_needed(
+    connection: sqlite3.Connection, *, config: MainConfig
+) -> bool:
+    """K20 assess-model inspection arming (lazy import avoids package cycle)."""
+    # Import inside the call: coverage.service imports ensure_model_inspections.
+    from notable_person_finder.coverage.service import assess_model_needed
+
+    return assess_model_needed(connection, config=config)
 
 
 def ensure_model_inspections_for_run(
@@ -531,6 +548,13 @@ def ensure_model_inspections_for_run(
     active inspect work whose fingerprint is not among the currently needed
     set so prior-run or stale-model preflights do not linger. Returns the
     number of models for which inspection work is ensured.
+
+    A model this run has already inspected is skipped rather than rescheduled.
+    Mid-run arming (K20 plan advancement, K21b match scheduling) calls this
+    after the run's own ``inspect_model`` item has settled, and
+    :func:`repository.schedule_work` only deduplicates against *active* work,
+    so rescheduling would issue a second paid preflight whose persist violates
+    ``model_inspection_by_run_model_routing``.
     """
     needed = models_needed_for_run(connection, run_id, config)
     if not needed:
@@ -567,6 +591,16 @@ def ensure_model_inspections_for_run(
         )
 
     for model_id in needed:
+        if (
+            load_model_inspection(
+                connection,
+                run_id=run_id,
+                configured_model_id=model_id,
+                routing_fingerprint=routing_fp,
+            )
+            is not None
+        ):
+            continue
         fingerprint = _inspection_work_fingerprint(
             run_id=run_id, model_id=model_id, routing_fp=routing_fp
         )
@@ -834,6 +868,7 @@ def _model_id_for_inspection_work(
             config.tasks.detect_people.model,
             config.tasks.resolve_person_entity.model,
             config.tasks.match_wikipedia_identity.model,
+            config.tasks.assess_article.model,
         )
     )
     for model_id in candidates:

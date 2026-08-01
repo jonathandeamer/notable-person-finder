@@ -22,12 +22,22 @@ tasks already recorded complete.
 
 ## What Is Actually Built
 
-Six milestones are complete: the application foundation, the run engine and
+Seven milestones are complete: the application foundation, the run engine and
 shared transport, feed ingestion, the OpenRouter model gateway with person
 detection (3b1), durable person identity with first-pass resolution,
-reconsideration, and confirmed merges (3b2), and Wikipedia identity matching
-with MediaWiki retrieval and semantic match (milestone 4). A cold-starting
-agent should assume nothing beyond this list.
+reconsideration, and confirmed merges (3b2), Wikipedia identity matching
+with MediaWiki retrieval and semantic match (milestone 4), and coverage
+evidence — bounded Brave Web Search, article fetch and extraction, and
+per-article assessment (milestone 5). A cold-starting agent should assume
+nothing beyond this list.
+
+Milestone 5's authorities are
+`docs/superpowers/specs/2026-07-30-coverage-evidence-design.md` (locked
+decisions K1–K34, plus a 2026-08-01 amendment) and
+`docs/superpowers/plans/2026-07-30-coverage-evidence.md`. The 2026-08-01
+`coverage-research-design` spec and `coverage-discovery` plan are superseded
+and were never implemented; they contradict the locked decisions and must not
+be built from.
 
 Delivered and usable:
 
@@ -37,8 +47,12 @@ Delivered and usable:
   scheduler, ingests enabled RSS and Atom feeds, inspects configured detection
   and resolve models, detects people in untriaged source items, resolves
   eligible mentions into durable people (empty-candidate create, model path,
-  `possible_same_person`, reconsideration, confirmed merges), writes a dated
+  `possible_same_person`, reconsideration, confirmed merges), matches
+  Wikipedia identity, opens and advances bounded coverage plans (Brave search,
+  article fetch and extraction, per-article assessment), writes a dated
   digest plus `latest.md`, and prints the same Markdown on standard output.
+  `notable run` now requires `BRAVE_API_KEY` as well as `OPENROUTER_API_KEY`;
+  it refuses to start without either.
 - The shared HTTP transport with URL, DNS-preflight, redirect, timeout,
   response-size, concurrency, and pacing bounds; the retry coordinator; the
   per-run budget reservation; and redacting structured logging.
@@ -65,6 +79,27 @@ Delivered and usable:
   `mediawiki_search`, `mediawiki_page_facts`, and `match_wikipedia_identity`;
   deterministic empty complete search no-match; refresh, merge reconcile, and
   Wikipedia counters on digest and `notable status`.
+- Coverage evidence (milestone 5). Three work kinds and no more —
+  `brave_web_search`, `fetch_article`, and `assess_article` (K2) — each making
+  exactly one external call per execute. The Brave Web Search adapter
+  (`providers/brave.py`, endpoint-only config, `BRAVE_API_KEY` from the
+  environment, paced by `brave_min_interval_ms`); the article fetcher and the
+  Trafilatura extractor (`providers/articles.py`,
+  `providers/article_versions.py`) which persist cleaned article views and
+  never raw HTML. The `coverage/` package: the Wikipedia eligibility gate
+  (only `no_matching_page_found` and `uncertain_identity` people are
+  researched, so a current `matching_page_found` stops research), bounded
+  per-person coverage plans with deterministic query forms in four variants
+  (`exact`, `exact_obituary`, `alias`, `context`), deterministic publisher
+  screening against the versioned source
+  policy (`curated_eligible` / `curated_ineligible`, with absence of a
+  matching rule meaning `unclassified`; first matching rule wins over
+  `host_exact`, `host_suffix`, and `path_prefix`), deterministic article
+  selection with a bounded unclassified fallback, person-specific passage
+  selection, and immutable person–article assessments with their signals.
+  Merge reconciliation for coverage work, coverage material fingerprints and
+  refresh, and a "Coverage evidence" digest section plus `notable status`
+  coverage lines.
 
 Delivered only in part — do not describe these as finished:
 
@@ -75,23 +110,35 @@ Delivered only in part — do not describe these as finished:
   triage, and unresolved research or uncertain mentions), and durable identity
   counters (canonical people, merged-away people, unresolved eligible
   mentions under K24, active `possible_same_person`, and mentions linked to
-  people). It has no digest backlog, no oldest pending candidate, no queue
-  tiers, and still no budget or deferral-reason breakdown; those need later
-  milestones.
+  people), and — when the coverage schema is present — three coverage lines
+  (people with a completed assessment, coverage eligible remaining, and people
+  stopped because they match Wikipedia). It has no digest backlog, no oldest
+  pending candidate, no queue tiers, and still no budget or deferral-reason
+  breakdown; those need later milestones.
 - The digest emits its header, banner, operational summary, per-run budget
   line, deferral-reason breakdown, ingestion summary, person-detection summary
   (triage outcomes, unresolved mention counts, model deferred/failed,
   OpenRouter cost), and person-identity summary (people created, mentions
   resolved, outcome split including created_new vs different_people, K24
   eligible remaining, active possible_same_person, confirmed merges, resolve
-  model deferred/failed). Its shortlist section is a placeholder: there is no
-  ranking and no model synthesis yet.
+  model deferred/failed), and a "Coverage evidence" section (plans completed,
+  incomplete, and permanently failed this run; assessments completed this run;
+  people with a completed assessment; coverage eligible remaining; people
+  stopped because they match Wikipedia; assess model deferred and permanently
+  failed) emitted only when the coverage schema is present. Its shortlist
+  section is still a placeholder — "No candidates met the shortlist criteria
+  in this window." is printed unconditionally, because there is no ranking and
+  no model synthesis yet.
 
 Not built at all, so do not document, import, or assume any of it:
 
-- Brave web search, article fetch and extraction adapters.
-- Coverage research, assessments, ranking, synthesis, drafting, or the digest
-  queue.
+- Lead aggregation. Milestone 5 stops at the per-article assessment. There is
+  no lead assessment record, no person pointer to one, and no
+  `assess_person_lead` work item; the strings `promising_lead`,
+  `possible_lead`, `insufficient_evidence`, and `assessment_incomplete` appear
+  nowhere in `src/`, and K12 forbids inventing them. A person still has no
+  product verdict.
+- Ranking, the digest queue, the digest shortlist, synthesis, and drafting.
 - `notable digest show`, `notable audit run`, `notable audit person`.
 
 Known gaps carried forward, recorded so a later change does not mistake them
@@ -112,6 +159,41 @@ for regressions:
   real `OPENROUTER_API_KEY`. Offline gates deselect it. An operator must still
   run the live smoke and record model/provider/usage/cost/outcome (without
   secrets) before milestone cutover when a key is available.
+- **The six previously-stub `tests/coverage` files now have real bodies**
+  (`test_run_cli.py`, `test_seams.py`, `test_digest_status.py`, and the three
+  live smokes), so the CLI-registration, cross-component-seam, digest, and
+  status gaps once recorded here are closed. `test_run_cli.py` asserts
+  handler registration of all three coverage work kinds, seed ordering,
+  eligibility/stop-supersede behaviour (K5), no-double-work on unchanged
+  material, the digest section's presence, and Brave secret redaction.
+  `test_seams.py` is no longer `live`-marked — its Wikipedia-to-coverage
+  handoff, merge-reconcile, seed-composition, and package-layering (K1)
+  checks need no network, so they now run offline, which is why
+  `uv run pytest tests/coverage -m live` collects **three** tests, not four.
+  `test_digest_status.py` builds populated fixtures with nine distinct
+  counter values (1 through 9) and asserts each one's exact rendered line in
+  both the digest section and `notable status` output, catching a
+  swapped-field defect that the old all-zero version could not.
+- **Two of the three live smokes have been written but never executed
+  against a real provider.** No `BRAVE_API_KEY` or `OPENROUTER_API_KEY` is
+  available in this environment. Every field in `test_live_brave.py` and
+  `test_live_openrouter_assess.py` was checked against adapter source by two
+  independent agents, but static construction is not the same as a passing
+  live run. An operator must run both with real keys and record
+  model/provider/usage/cost/outcome (without secrets) before milestone 5
+  cutover. `test_live_article_fetch.py` is the exception: it is keyless, it
+  makes one real GET to `en.wikipedia.org`, and it currently passes — the
+  only one of the three genuinely verified so far.
+- **Fixed:** `config/loader.py`'s `load_config` previously resolved
+  `source_policy_file` to an absolute path only into a local variable and the
+  configuration snapshot dict, never into the `MainConfig` object itself, so
+  `wikipedia/service.py`'s `_schedule_coverage_after_wikipedia_settled` (and
+  `people/merge.py`'s `_reconcile_coverage_on_merge`) re-resolved the
+  unresolved relative path against the process CWD and silently no-op'd
+  outside the config directory. `load_config` now returns `MainConfig` with
+  `source_policy_file` already absolute
+  (`tests/foundation/test_review_findings.py::
+  test_source_policy_file_is_resolved_absolute_on_the_main_config`).
 
 ## Rewrite Structure
 
@@ -122,9 +204,10 @@ for regressions:
   - `runs/` — run engine, clock, repository, work-item scheduling, retry
     coordination, budget reservation, and the mutation lock.
   - `providers/` — the shared HTTP transport, request safety checks, pacing,
-    provider failure classification, the feedparser-backed feed adapter, the MediaWiki client, and the
-    OpenRouter client. This is the only package that may import `httpx` or
-    the OpenRouter SDK.
+    provider failure classification, the feedparser-backed feed adapter, the
+    MediaWiki client, the Brave Web Search client, the article fetcher and
+    Trafilatura extractor, and the OpenRouter client. This is the only package
+    that may import `httpx`, `trafilatura`, or the OpenRouter SDK.
   - `ingestion/` — feed seeding and handling, URL identity, domain models, and
     transaction-neutral persistence helpers for ingestion settlements.
   - `people/` — detection and identity: triage, first-pass resolution,
@@ -132,6 +215,10 @@ for regressions:
     domain validation.
   - `wikipedia/` — MediaWiki query plans, candidate assembly, identity
     observations, match handler, seed/merge hooks.
+  - `coverage/` — coverage research: the Wikipedia eligibility gate, coverage
+    plans and query forms, publisher screening against the source policy,
+    article selection, passage selection, the `assess_article` contract and
+    prompt, repository SQL, the three work-item handlers, and merge hooks.
   - `obs/` — redacting structured logging.
   - `reporting/` — the daily digest writer.
 - `tests/foundation/` — application-foundation tests.
@@ -143,11 +230,23 @@ for regressions:
 - `tests/wikipedia/` — MediaWiki adapter, schema, queries/candidates, match
   contract, HTTP and match handlers, seed/merge hooks, digest/status, CLI
   seams, and opt-in MediaWiki/OpenRouter live-smoke tests.
+- `tests/coverage/` — substantive coverage for the Brave and article adapters,
+  the coverage schema, eligibility, queries, screening, selection, passages,
+  the assessment contract, the HTTP/fetch/assess services, repository, merge
+  hooks, seed hooks, CLI registration and integration (`test_run_cli.py`),
+  cross-component seams (`test_seams.py`), and digest/status rendering
+  (`test_digest_status.py`), plus three opt-in live smokes. Two of the three
+  live smokes (Brave, OpenRouter assess) are written but not yet executed
+  against a real provider; see the known gaps above before treating a green
+  `-m live` run as proof for those two.
 - `docs/architecture/at-least-once-execution.md` — the operator-facing note on
   the crash windows in which a paid provider call can be repeated. Point at it
   rather than restating it.
 - `config/*.example.toml` — tracked, copyable configuration examples; local
   configuration variants remain untracked.
+- `config/source_policies/visual_arts.toml` — the curated publisher policy. It
+  is a tracked product artifact, not an example to copy: changes belong in a
+  reviewed diff, and every screening decision records its fingerprint.
 - `docs/superpowers/specs/` — approved architecture and policy.
 - `docs/superpowers/plans/` — executable milestone plans and completion gates.
 - `pyproject.toml` and `uv.lock` — package metadata and frozen dependency graph.
@@ -197,15 +296,24 @@ reviewable and executable.
   `uv run pytest tests/people`.
 - For completed Wikipedia identity matching, use
   `uv run pytest tests/wikipedia`.
-- The six completed milestones together gate with
-  `uv run pytest tests/foundation tests/run_engine tests/ingestion tests/people tests/wikipedia`.
-  Run it from a real checkout: it needs the tracked `config/` directory.
+- For completed coverage evidence, use `uv run pytest tests/coverage`.
+- The seven completed milestones together gate with
+  `uv run pytest tests/foundation tests/run_engine tests/ingestion tests/people tests/wikipedia tests/coverage`.
+  Run it from a real checkout: it needs the tracked `config/` directory,
+  including `config/source_policies/`.
   Default pytest `addopts` deselect `live`. Opt-in live smokes:
   - feeds: `uv run pytest tests/ingestion -m live -v`
   - OpenRouter (detect + resolve):
     `OPENROUTER_API_KEY=… uv run pytest tests/people -m live -v`
   - MediaWiki + match OpenRouter:
     `uv run pytest tests/wikipedia -m live -v` (OpenRouter key for match smoke)
+  - Brave + article fetch + assess OpenRouter:
+    `BRAVE_API_KEY=… OPENROUTER_API_KEY=… uv run pytest tests/coverage -m live -v`
+    — this collects three real tests. The article-fetch smoke is keyless and
+    currently passes against a live GET. The Brave and OpenRouter assess
+    smokes still need an operator run with real keys before cutover; they
+    have not been executed against a real provider in this environment. See
+    the known gaps above.
 - Exercise the installed interface with `uv run notable ...`.
 - Keep default rewrite verification offline and isolate configuration and
   storage with temporary paths.

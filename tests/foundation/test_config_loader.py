@@ -57,6 +57,11 @@ def test_model_settings_are_complete_in_the_redacted_snapshot(tmp_path: Path) ->
         "maxlag_seconds": 5,
     }
     assert "api_key" not in snapshot["main"]["mediawiki"]
+    assert snapshot["main"]["brave"] == {
+        "endpoint": "https://api.search.brave.com/res/v1/web/search",
+        "extra_snippets": False,
+    }
+    assert "api_key" not in snapshot["main"]["brave"]
     assert snapshot["main"]["tasks"]["detect_people"] == {
         "model": "openai/gpt-5.4-mini",
         "max_input_tokens": 4096,
@@ -201,6 +206,29 @@ def test_each_mediawiki_setting_changes_the_configuration_fingerprint(
     assert first.fingerprint != second.fingerprint
 
 
+def test_brave_endpoint_changes_the_configuration_fingerprint(tmp_path: Path) -> None:
+    first_file = write_graph(tmp_path)
+    text = first_file.read_text(encoding="utf-8")
+    if "[brave]" not in text:
+        text = text + (
+            '\n[brave]\nendpoint = "https://api.search.brave.com/res/v1/web/search"\n'
+        )
+        first_file.write_text(text, encoding="utf-8")
+    environment = {"TEST_OPENROUTER": "first-key", "TEST_BRAVE": "brave-key"}
+    first = load_config(first_file, environ=environment)
+    first_file.write_text(
+        first_file.read_text(encoding="utf-8").replace(
+            'endpoint = "https://api.search.brave.com/res/v1/web/search"',
+            'endpoint = "https://api.search.example.com/res/v1/web/search"',
+        ),
+        encoding="utf-8",
+    )
+
+    second = load_config(first_file, environ=environment)
+
+    assert first.fingerprint != second.fingerprint
+
+
 def test_secret_values_do_not_change_the_configuration_fingerprint(
     tmp_path: Path,
 ) -> None:
@@ -277,6 +305,33 @@ def test_missing_files_and_secrets_are_actionable(tmp_path: Path) -> None:
     assert "feeds.toml" in "\n".join(captured.value.errors)
     assert "TEST_OPENROUTER" in "\n".join(captured.value.errors)
     assert "TEST_BRAVE" in "\n".join(captured.value.errors)
+
+
+def test_missing_or_invalid_source_policy_fails_config_load(tmp_path: Path) -> None:
+    config_file = write_graph(tmp_path)
+    (tmp_path / "source_policies" / "visual_arts.toml").unlink()
+
+    with pytest.raises(ConfigLoadError) as captured:
+        load_config(
+            config_file,
+            environ={"TEST_OPENROUTER": "k", "TEST_BRAVE": "b"},
+            require_secrets=False,
+        )
+    assert any("source_policies" in error for error in captured.value.errors)
+
+    # Recreate as unsupported schema_version
+    (tmp_path / "source_policies" / "visual_arts.toml").write_text(
+        'schema_version = 99\nkey = "x"\nlabel = "y"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigLoadError) as captured_schema:
+        load_config(
+            config_file,
+            environ={"TEST_OPENROUTER": "k", "TEST_BRAVE": "b"},
+            require_secrets=False,
+        )
+    joined = "\n".join(captured_schema.value.errors)
+    assert "source_policies" in joined or "schema_version" in joined
 
 
 def test_literal_secret_selector_is_rejected_without_disclosure(tmp_path: Path) -> None:

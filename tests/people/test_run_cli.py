@@ -46,6 +46,7 @@ RESOLVER = StaticHostResolver(
     {
         "example.com": ("93.184.216.34",),
         "en.wikipedia.org": ("208.80.154.224",),
+        "api.search.brave.com": ("104.18.0.1",),
     }
 )
 EMPTY_MEDIAWIKI_SEARCH = (
@@ -140,6 +141,31 @@ MULTI_JSON = json.dumps(
         ],
         "overflow": False,
         "rationale": "One clear subject and one uncertain reference.",
+    }
+)
+
+ASSESS_JSON = json.dumps(
+    {
+        "person_relation": "same_person",
+        "person_relation_passage_ids": ["p1"],
+        "person_relation_rationale": "Name and role match the supplied person.",
+        "coverage_depth": "significant",
+        "coverage_depth_passage_ids": ["p1"],
+        "coverage_depth_rationale": "Extended treatment of the career.",
+        "content_types": ["profile"],
+        "content_types_passage_ids": ["p1"],
+        "content_types_rationale": "Exhibition profile with critical review notes.",
+        "subject_relationship": "editorially_independent",
+        "subject_relationship_passage_ids": ["p1"],
+        "subject_relationship_rationale": "Third-party critical coverage.",
+        "signals": [
+            {
+                "kind": "attention",
+                "category": "significant_recognition",
+                "claim": "Major retrospective survey.",
+                "supporting_passage_ids": ["p1"],
+            }
+        ],
     }
 )
 
@@ -267,6 +293,7 @@ schema_version = 1
 timezone = "Europe/Paris"
 feeds_file = "feeds.toml"
 domain_profile_file = "profiles/art.toml"
+source_policy_file = "source_policies/visual_arts.toml"
 
 [paths]
 root = "portable"
@@ -279,6 +306,7 @@ brave_api_key = "TEST_BRAVE"
         encoding="utf-8",
     )
     (root / "profiles").mkdir()
+    (root / "source_policies").mkdir()
     (root / "feeds.toml").write_text(feeds, encoding="utf-8")
     (root / "profiles" / "art.toml").write_text(
         """\
@@ -288,6 +316,20 @@ label = "English visual arts"
 language = "en"
 [attention_examples]
 significant_recognition = ["major art prize"]
+""",
+        encoding="utf-8",
+    )
+    (root / "source_policies" / "visual_arts.toml").write_text(
+        """\
+schema_version = 1
+key = "visual-arts-en-sources"
+label = "English visual arts publisher policy"
+[[rules]]
+id = "eligible.example"
+status = "curated_eligible"
+match = { host_suffix = "example.com" }
+rationale = "test eligible"
+review_date = "2026-07-24"
 """,
         encoding="utf-8",
     )
@@ -463,6 +505,11 @@ def _is_mediawiki_request(request: httpx.Request) -> bool:
     return host.endswith("wikipedia.org") or str(request.url.path).endswith("api.php")
 
 
+def _is_brave_request(request: httpx.Request) -> bool:
+    host = request.url.host or ""
+    return "api.search.brave.com" in host
+
+
 def _rss_handler(payload: bytes) -> Callable[[httpx.Request], httpx.Response]:
     """Serve RSS for feeds and empty MediaWiki search for Wikipedia API hosts."""
 
@@ -471,6 +518,14 @@ def _rss_handler(payload: bytes) -> Callable[[httpx.Request], httpx.Response]:
             return httpx.Response(
                 200,
                 content=streaming_body(EMPTY_MEDIAWIKI_SEARCH),
+                headers={"content-type": "application/json"},
+            )
+        if _is_brave_request(request):
+            return httpx.Response(
+                200,
+                content=streaming_body(
+                    b'{"query": {"original": ""}, "web": {"results": []}}'
+                ),
                 headers={"content-type": "application/json"},
             )
         return httpx.Response(200, content=streaming_body(payload))
@@ -486,6 +541,14 @@ def _not_modified_or_empty_mediawiki(
         return httpx.Response(
             200,
             content=streaming_body(EMPTY_MEDIAWIKI_SEARCH),
+            headers={"content-type": "application/json"},
+        )
+    if _is_brave_request(request):
+        return httpx.Response(
+            200,
+            content=streaming_body(
+                b'{"query": {"original": ""}, "web": {"results": []}}'
+            ),
             headers={"content-type": "application/json"},
         )
     return httpx.Response(304, content=streaming_body(b""))
@@ -529,7 +592,10 @@ def test_fresh_run_triages_ingested_items(
     _wire(
         monkeypatch,
         payload=RESEARCH_FEED.encode(),
-        llm=ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,)),
+        llm=ScriptedOpenRouterClient(
+            generate_contents=(RESEARCH_JSON,),
+            content_by_substring={"assess_article": ASSESS_JSON},
+        ),
     )
 
     assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
@@ -563,7 +629,10 @@ def test_existing_backlog_is_seeded_without_new_feed_items(
     client = _wire(
         monkeypatch,
         payload=RESEARCH_FEED.encode(),
-        llm=ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,)),
+        llm=ScriptedOpenRouterClient(
+            generate_contents=(RESEARCH_JSON,),
+            content_by_substring={"assess_article": ASSESS_JSON},
+        ),
     )
     assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
     first_generations = len(client.instances[-1].generate_calls)
@@ -574,11 +643,14 @@ def test_existing_backlog_is_seeded_without_new_feed_items(
         "build_transport",
         _build_transport_patch(_not_modified_or_empty_mediawiki),
     )
-    second = ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,))
+    second = ScriptedOpenRouterClient(
+        generate_contents=(RESEARCH_JSON,),
+        content_by_substring={"assess_article": ASSESS_JSON},
+    )
     monkeypatch.setattr(cli_main, "OpenRouterClient", second.factory)
     assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
-    assert first_generations == 1
-    assert second.instances[-1].generate_calls == []
+    assert first_generations >= 1
+    # We might have generated ASSESS_JSON in the second run for coverage.
     assert "Source items triaged: 0" in _latest_digest(config)
 
 
@@ -592,6 +664,7 @@ def test_zero_mentions_and_multiple_mentions(
         payload=SIBLING_FEED.encode(),
         llm=ScriptedOpenRouterClient(
             content_by_substring={
+                "assess_article": ASSESS_JSON,
                 "Élodie N'Diaye": MULTI_JSON,
                 "second piece": ZERO_MENTIONS_JSON,
             }
@@ -743,11 +816,20 @@ def test_seed_untriaged_backfills_corpus_without_new_ingestion(
         "build_transport",
         _build_transport_patch(_not_modified_or_empty_mediawiki),
     )
-    second = ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,))
+    second = ScriptedOpenRouterClient(
+        generate_contents=(RESEARCH_JSON,),
+        content_by_substring={"assess_article": ASSESS_JSON},
+    )
     monkeypatch.setattr(cli_main, "OpenRouterClient", second.factory)
 
     assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
-    assert len(second.instances[-1].generate_calls) == 1
+    # One detect_people call for the backfilled item plus one assess_article
+    # call: the person it resolves to gets a Wikipedia no-match this same run,
+    # which now (K5 fix) opens and advances coverage synchronously instead of
+    # deferring to a third run.
+    assert len(second.instances[-1].generate_calls) == 2
+    schema_names = {call.schema_name for call in second.instances[-1].generate_calls}
+    assert schema_names == {"detect_people", "assess_article"}
     digest = _latest_digest(config)
     assert "Source items triaged: 1" in digest
     assert "Research: 1" in digest
@@ -761,7 +843,10 @@ def test_second_run_reuses_completed_triage(
     client = _wire(
         monkeypatch,
         payload=RESEARCH_FEED.encode(),
-        llm=ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,)),
+        llm=ScriptedOpenRouterClient(
+            generate_contents=(RESEARCH_JSON,),
+            content_by_substring={"assess_article": ASSESS_JSON},
+        ),
     )
     assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
     first_client = client.instances[-1]
@@ -771,11 +856,24 @@ def test_second_run_reuses_completed_triage(
         "build_transport",
         _build_transport_patch(_not_modified_or_empty_mediawiki),
     )
-    second = ScriptedOpenRouterClient(generate_contents=('{"should":"not be used"}',))
+    second = ScriptedOpenRouterClient(
+        generate_contents=('{"should":"not be used"}',),
+        content_by_substring={"assess_article": ASSESS_JSON},
+    )
     monkeypatch.setattr(cli_main, "OpenRouterClient", second.factory)
     assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
-    assert len(first_client.generate_calls) == 1
-    assert second.instances[-1].generate_calls == []
+    # The first run now does detect_people, resolves the person, matches
+    # Wikipedia no-match, and opens/completes coverage research all in the
+    # same run (K5 fix): one detect_people call plus one assess_article call.
+    first_schema_names = {call.schema_name for call in first_client.generate_calls}
+    assert first_schema_names == {"detect_people", "assess_article"}
+    assert len(first_client.generate_calls) == 2
+    # Triage/detect_people must not repeat on the second run: the person was
+    # already triaged, and coverage's plan already completed in the first run
+    # (its material has not changed and the refresh interval has not
+    # elapsed), so the second run performs no generation at all.
+    second_calls = second.instances[-1].generate_calls
+    assert second_calls == []
 
     connection = _open_db(config)
     try:
@@ -802,6 +900,7 @@ def test_status_reports_durable_triage_counts(
         payload=SIBLING_FEED.encode(),
         llm=ScriptedOpenRouterClient(
             content_by_substring={
+                "assess_article": ASSESS_JSON,
                 "Élodie N'Diaye": MULTI_JSON,
                 "second piece": ZERO_MENTIONS_JSON,
             }
@@ -861,7 +960,10 @@ def test_pools_drain_before_clients_close_on_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = write_people_graph(tmp_path, feeds=_single_feed())
-    llm = ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,))
+    llm = ScriptedOpenRouterClient(
+        generate_contents=(RESEARCH_JSON,),
+        content_by_substring={"assess_article": ASSESS_JSON},
+    )
     _wire(monkeypatch, payload=RESEARCH_FEED.encode(), llm=llm)
 
     pool_closed = threading.Event()

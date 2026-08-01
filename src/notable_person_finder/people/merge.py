@@ -42,6 +42,49 @@ def reconcile_digest_queue_on_merge(
     del connection, survivor_id, loser_id, now
 
 
+def _reconcile_coverage_on_merge(
+    connection: sqlite3.Connection,
+    *,
+    survivor_id: int,
+    loser_id: int,
+    run_id: int,
+    config: MainConfig,
+    now: str,
+    coverage_policy: object | None,
+) -> None:
+    """Run coverage K18 reconcile when a source policy is available."""
+    from notable_person_finder.coverage.screening import (
+        SourcePolicy,
+        SourcePolicyError,
+        load_source_policy,
+    )
+
+    policy: SourcePolicy | None
+    if isinstance(coverage_policy, SourcePolicy):
+        policy = coverage_policy
+    else:
+        try:
+            policy = load_source_policy(config.source_policy_file)
+        except (SourcePolicyError, OSError):
+            policy = None
+    if policy is None:
+        return
+
+    from notable_person_finder.coverage.merge_hooks import (
+        reconcile_on_merge as reconcile_coverage_on_merge,
+    )
+
+    reconcile_coverage_on_merge(
+        connection,
+        survivor_id=survivor_id,
+        loser_id=loser_id,
+        run_id=run_id,
+        config=config,
+        policy=policy,
+        now=now,
+    )
+
+
 def confirm_person_merge(
     connection: sqlite3.Connection,
     *,
@@ -51,6 +94,7 @@ def confirm_person_merge(
     observation_id: int | None,
     now: str,
     config: MainConfig | None = None,
+    coverage_policy: object | None = None,
 ) -> int:
     """Confirm a directed merge. Returns the canonical survivor id.
 
@@ -63,7 +107,8 @@ def confirm_person_merge(
     single lower-id survivor.
 
     When ``config`` is provided, Wikipedia merge reconciliation (K16) runs after
-    work-item reconcile. Production callers always pass config.
+    work-item reconcile, then coverage reconcile (K18) when a source policy is
+    available. Production callers always pass config.
     """
     _require_transaction(connection, "confirm_person_merge")
 
@@ -201,17 +246,31 @@ def confirm_person_merge(
         now=now,
     )
     if config is not None:
-        # Lazy import keeps people.merge free of wikipedia import cycles at
+        # Lazy import keeps people.merge free of wikipedia/coverage cycles at
         # module load; production reconsider path always supplies config (K16).
-        from notable_person_finder.wikipedia.merge_hooks import reconcile_on_merge
+        from notable_person_finder.wikipedia.merge_hooks import (
+            reconcile_on_merge as reconcile_wikipedia_on_merge,
+        )
 
-        reconcile_on_merge(
+        reconcile_wikipedia_on_merge(
             connection,
             survivor_id=actual_survivor,
             loser_id=actual_loser,
             run_id=run_id,
             config=config,
             now=now,
+        )
+        # Coverage (K18) runs after Wikipedia: survivor ensure under combined
+        # identity fingerprint; optional policy when caller supplies it or the
+        # main config path is loadable.
+        _reconcile_coverage_on_merge(
+            connection,
+            survivor_id=actual_survivor,
+            loser_id=actual_loser,
+            run_id=run_id,
+            config=config,
+            now=now,
+            coverage_policy=coverage_policy,
         )
     return actual_survivor
 

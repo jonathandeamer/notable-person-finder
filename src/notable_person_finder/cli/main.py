@@ -17,6 +17,21 @@ from notable_person_finder.config.loader import (
     load_config,
 )
 from notable_person_finder.config.models import DomainProfileConfig, MainConfig
+from notable_person_finder.coverage.repository import (
+    coverage_corpus_counts,
+    coverage_run_counts,
+)
+from notable_person_finder.coverage.screening import SourcePolicy
+from notable_person_finder.coverage.service import (
+    ASSESS_ARTICLE_TASK_TYPE,
+    BRAVE_WEB_SEARCH_TASK_TYPE,
+    FETCH_ARTICLE_TASK_TYPE,
+    build_assess_article_handler,
+    build_brave_web_search_handler,
+    build_fetch_article_handler,
+    count_coverage_research_eligible,
+    seed_coverage_research,
+)
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.db.migrate import MigrationError, apply_migrations
 from notable_person_finder.ingestion.repository import source_item_counts
@@ -47,6 +62,11 @@ from notable_person_finder.people.service import (
     seed_unresolved_mentions,
     seed_untriaged,
 )
+from notable_person_finder.providers.articles import (
+    HttpxArticleFetcher,
+    TrafilaturaArticleExtractor,
+)
+from notable_person_finder.providers.brave import HttpxBraveWebSearchClient
 from notable_person_finder.providers.feeds import FeedparserClient
 from notable_person_finder.providers.mediawiki import HttpxMediaWikiClient
 from notable_person_finder.providers.openrouter import OpenRouterClient
@@ -54,6 +74,7 @@ from notable_person_finder.providers.pacing import build_pacing_gate
 from notable_person_finder.providers.safety import SystemHostResolver
 from notable_person_finder.providers.transport import build_transport
 from notable_person_finder.reporting.digest import (
+    CoverageSummary,
     DigestRecord,
     DigestWriteError,
     IdentityRunSummary,
@@ -183,6 +204,7 @@ def _compose_seed(
     connection: sqlite3.Connection,
     *,
     loaded: ResolvedConfig,
+    policy: SourcePolicy,
     clock: Clock,
 ) -> Callable[[int], None]:
     """Feed seeding plus People backfill of every still-untriaged source item."""
@@ -211,6 +233,13 @@ def _compose_seed(
             connection,
             run_id=run_id,
             config=config,
+            now=now,
+        )
+        seed_coverage_research(
+            connection,
+            run_id=run_id,
+            config=config,
+            policy=policy,
             now=now,
         )
         ensure_model_inspections_for_run(
@@ -304,6 +333,17 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                     if _wikipedia_schema_present(connection)
                     else None
                 )
+                coverage = (
+                    _coverage_summary(
+                        connection,
+                        report,
+                        config=loaded.main,
+                        policy=loaded.source_policy,
+                        now=utc_timestamp(clock.now()),
+                    )
+                    if _coverage_schema_present(connection)
+                    else None
+                )
                 try:
                     written = write_digest(
                         loaded.paths.digests,
@@ -314,6 +354,7 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                         people=people,
                         identity=identity,
                         wikipedia=wikipedia,
+                        coverage=coverage,
                     )
                 except DigestWriteError:
                     # `cli.` prefix, not `run.`: the engine already emits
@@ -346,6 +387,11 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                 # require_secrets=True already refuses a missing key; this
                 # narrows the type for the client constructor.
                 raise ConfigLoadError(("openrouter_api_key is required for run",))
+            brave_key = loaded.credentials.brave_api_key
+            if brave_key is None:
+                raise ConfigLoadError(("brave_api_key is required for run",))
+            # Task 6b: Brave search + fetch_article. assess_article / coverage
+            # seed land in Tasks 7–8.
             with (
                 build_transport(
                     loaded.main.transport,
@@ -382,6 +428,14 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                     max_categories_per_page=match_cfg.max_categories_per_page,
                     clock=clock,
                 )
+                brave_client = HttpxBraveWebSearchClient(
+                    transport,
+                    config=loaded.main.brave,
+                    api_key=brave_key,
+                    clock=clock,
+                )
+                article_fetcher = HttpxArticleFetcher(transport, clock=clock)
+                article_extractor = TrafilaturaArticleExtractor()
                 on_source_items = _on_source_items_callback(
                     connection,
                     config=loaded.main,
@@ -404,8 +458,27 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                         client=mediawiki_client,
                         config=loaded.main,
                     ),
+                    BRAVE_WEB_SEARCH_TASK_TYPE: build_brave_web_search_handler(
+                        connection,
+                        client=brave_client,
+                        config=loaded.main,
+                        policy=loaded.source_policy,
+                    ),
+                    FETCH_ARTICLE_TASK_TYPE: build_fetch_article_handler(
+                        connection,
+                        fetcher=article_fetcher,
+                        extractor=article_extractor,
+                        config=loaded.main,
+                        policy=loaded.source_policy,
+                    ),
                     INSPECT_MODEL_TASK_TYPE: build_inspection_handler(
                         connection, client=llm_client, config=loaded.main
+                    ),
+                    ASSESS_ARTICLE_TASK_TYPE: build_assess_article_handler(
+                        connection,
+                        client=llm_client,
+                        config=loaded.main,
+                        profile=loaded.domain_profile,
                     ),
                     DETECT_PEOPLE_TASK_TYPE: build_detection_handler(
                         connection,
@@ -431,7 +504,9 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                         config=loaded.main,
                     ),
                 }
-                seed = _compose_seed(connection, loaded=loaded, clock=clock)
+                seed = _compose_seed(
+                    connection, loaded=loaded, policy=loaded.source_policy, clock=clock
+                )
 
                 engine = RunEngine(
                     connection,
@@ -527,6 +602,16 @@ def _wikipedia_schema_present(connection: sqlite3.Connection) -> bool:
         connection.execute(
             "SELECT 1 FROM sqlite_master "
             "WHERE type = 'table' AND name = 'wikipedia_identity_observation'"
+        ).fetchone()
+        is not None
+    )
+
+
+def _coverage_schema_present(connection: sqlite3.Connection) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'person_coverage_plan'"
         ).fetchone()
         is not None
     )
@@ -656,6 +741,34 @@ def _wikipedia_summary(
         mediawiki_failed=run_counts.mediawiki_failed,
         match_model_deferred=run_counts.match_model_deferred,
         match_model_failed=run_counts.match_model_failed,
+    )
+
+
+def _coverage_summary(
+    connection: sqlite3.Connection,
+    report: RunReport,
+    *,
+    config: MainConfig,
+    policy: SourcePolicy,
+    now: str,
+) -> CoverageSummary | None:
+    if not _coverage_schema_present(connection):
+        return None
+    corpus = coverage_corpus_counts(connection)
+    run = coverage_run_counts(connection, run_id=report.run_id)
+    eligible = count_coverage_research_eligible(
+        connection, config=config, policy=policy, now=now
+    )
+    return CoverageSummary(
+        plans_completed=run.plans_completed,
+        plans_incomplete=run.plans_incomplete,
+        plans_failed=run.plans_failed,
+        assessments_completed_this_run=run.assessments_completed_this_run,
+        people_with_completed_assessment=corpus.people_with_completed_assessment,
+        eligible_remaining=eligible,
+        stopped_matching_wikipedia=corpus.stopped_matching_wikipedia,
+        model_deferred=run.model_deferred,
+        model_failed=run.model_failed,
     )
 
 
@@ -816,6 +929,22 @@ def command_status(config_file: Path | None) -> int:
             )
             print(f"wikipedia eligible remaining: {wiki_eligible}")
             print(f"canonical people without wikipedia pointer: {wiki.without_pointer}")
+        if _coverage_schema_present(connection):
+            cov_corpus = coverage_corpus_counts(connection)
+            cov_eligible = count_coverage_research_eligible(
+                connection,
+                config=loaded.main,
+                policy=loaded.source_policy,
+                now=utc_timestamp(SystemClock().now()),
+            )
+            print(
+                "people with completed assessment (corpus): "
+                f"{cov_corpus.people_with_completed_assessment}"
+            )
+            print(f"coverage eligible remaining: {cov_eligible}")
+            print(
+                f"stopped matching wikipedia: {cov_corpus.stopped_matching_wikipedia}"
+            )
         # Digest backlog, queue tiers, and the oldest pending candidate arrive
         # with the digest queue in the lead-assessment milestone.
         return EXIT_OK

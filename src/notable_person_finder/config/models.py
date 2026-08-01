@@ -217,6 +217,34 @@ class MediaWikiConfig(_StrictConfigurationModel):
         return value
 
 
+class BraveConfig(_StrictConfigurationModel):
+    """Brave Web Search API endpoint only; auth is ``BRAVE_API_KEY`` from the env."""
+
+    endpoint: str = "https://api.search.brave.com/res/v1/web/search"
+    # Brave rejects `extra_snippets` on the free and base tiers, and the 4xx
+    # classifies as CONFIGURATION -- permanent -- so every `brave_web_search`
+    # would fail on the first live run. Off by default so a free-tier key works
+    # out of the box; paid-plan operators may turn it on.
+    extra_snippets: bool = False
+
+    @field_validator("endpoint")
+    @classmethod
+    def public_https_endpoint(cls, value: str) -> str:
+        if any(character.isspace() for character in value):
+            raise ValueError("endpoint must not contain whitespace")
+        validate_public_http_url(value)
+        parsed = urlsplit(value)
+        try:
+            _ = parsed.port
+        except ValueError as error:
+            raise ValueError("endpoint must contain a valid port") from error
+        if parsed.scheme != "https":
+            raise ValueError("must use HTTPS")
+        if parsed.query or parsed.fragment:
+            raise ValueError("endpoint must not contain a query or fragment")
+        return value
+
+
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
 
 
@@ -229,6 +257,42 @@ class GenerationParameters(_StrictConfigurationModel):
 _MODEL_SLUG_PATTERN = re.compile(
     r"^[a-z0-9][a-z0-9._-]{0,63}/[a-z0-9][a-z0-9._-]{0,127}$"
 )
+
+
+# The prompt + schema + chat-framing floor every ``assess_article`` request
+# pays before a single character of article text. `assess_fixed_request_tokens`
+# in `coverage.assessment` renders the real value; this rounded-up copy exists
+# because configuration must not import the coverage package, and
+# `tests/coverage/test_assessment.py` pins the two together so the copy cannot
+# drift below the real floor.
+ASSESS_FIXED_REQUEST_TOKEN_FLOOR = 3_072
+
+# Names, identity facts, screening, view flags, byline, labels, and the domain
+# profile, each at its own model-level cap. Measured against the shipped
+# profile; an operator profile far larger than the shipped one can still
+# overflow at render time, which the handler records as a `local_refuse`
+# assessment rather than raising.
+ASSESS_BOUNDED_METADATA_TOKEN_ALLOWANCE = 16_384
+
+
+def assess_minimum_input_tokens(
+    *,
+    max_passage_characters: int,
+    max_title_characters: int,
+    max_summary_characters: int,
+) -> int:
+    """The smallest `max_input_tokens` that can carry these assess bounds.
+
+    Worst-case input is measured in UTF-8 bytes, not model tokens, so this is
+    a deliberately conservative floor.
+    """
+    return (
+        ASSESS_FIXED_REQUEST_TOKEN_FLOOR
+        + max_passage_characters
+        + max_title_characters
+        + max_summary_characters
+        + ASSESS_BOUNDED_METADATA_TOKEN_ALLOWANCE
+    )
 
 
 def _exact_model_slug(value: str) -> str:
@@ -328,12 +392,78 @@ class MatchWikipediaIdentityConfig(_StrictConfigurationModel):
         return self
 
 
+class AssessArticleConfig(_StrictConfigurationModel):
+    """Assess-article model plus every coverage bound in material fingerprints (K33).
+
+    Plan-level knobs such as ``coverage_refresh_interval_hours`` live here because
+    they co-locate with the fingerprint field list — not because refresh is
+    assessment-specific.
+    """
+
+    model: str = "openai/gpt-5.4-mini"
+    # Worst-case input is counted in UTF-8 bytes, so 32768 here is roughly 8k
+    # real tokens. 4096 could not fit the fixed prompt-and-schema floor plus a
+    # six-paragraph article, so no real article was assessable.
+    max_input_tokens: int = Field(default=32_768, strict=True, ge=1, le=1_000_000)
+    max_completion_tokens: int = Field(default=1024, strict=True, ge=1, le=100_000)
+    parameters: GenerationParameters = GenerationParameters()
+    max_title_characters: int = Field(default=500, strict=True, ge=1, le=2000)
+    max_summary_characters: int = Field(default=4000, strict=True, ge=1, le=20_000)
+    retrieval_target: int = Field(default=5, strict=True, ge=1, le=20)
+    max_exact_forms: int = Field(default=4, strict=True, ge=1, le=16)
+    max_alias_forms: int = Field(default=4, strict=True, ge=0, le=16)
+    max_context_forms: int = Field(default=1, strict=True, ge=0, le=2)
+    search_count: int = Field(default=10, strict=True, ge=1, le=20)
+    # Additional pages after the first; 0 = first page only (offset_in=0).
+    max_offsets_per_form: int = Field(default=0, strict=True, ge=0, le=5)
+    max_results_per_form: int = Field(default=20, strict=True, ge=1, le=100)
+    max_eligible_fetches: int = Field(default=8, strict=True, ge=1, le=32)
+    max_unclassified_fetches: int = Field(default=2, strict=True, ge=0, le=16)
+    max_passage_characters: int = Field(default=6000, strict=True, ge=500, le=50_000)
+    max_passage_blocks: int = Field(default=24, strict=True, ge=4, le=64)
+    opening_block_count: int = Field(default=2, strict=True, ge=0, le=10)
+    coverage_refresh_interval_hours: int = Field(
+        default=720, strict=True, ge=1, le=87_600
+    )
+    reject_altered_query: bool = False
+    # m5 reserves only false; true rejected at validation (K33).
+    assess_ineligible: bool = False
+
+    @field_validator("model")
+    @classmethod
+    def exact_model_slug(cls, value: str) -> str:
+        return _exact_model_slug(value)
+
+    @model_validator(mode="after")
+    def bounds_are_compatible(self) -> AssessArticleConfig:
+        if self.max_completion_tokens >= self.max_input_tokens:
+            raise ValueError("max_completion_tokens must be less than max_input_tokens")
+        if self.max_summary_characters < self.max_title_characters:
+            raise ValueError(
+                "max_summary_characters must be at least max_title_characters"
+            )
+        if self.assess_ineligible:
+            raise ValueError("assess_ineligible must be false in m5")
+        minimum = assess_minimum_input_tokens(
+            max_passage_characters=self.max_passage_characters,
+            max_title_characters=self.max_title_characters,
+            max_summary_characters=self.max_summary_characters,
+        )
+        if self.max_input_tokens < minimum:
+            raise ValueError(
+                "max_input_tokens must be at least "
+                f"{minimum} for these passage, title, and summary bounds"
+            )
+        return self
+
+
 class TasksConfig(_StrictConfigurationModel):
     detect_people: DetectPeopleConfig = DetectPeopleConfig()
     resolve_person_entity: ResolvePersonEntityConfig = ResolvePersonEntityConfig()
     match_wikipedia_identity: MatchWikipediaIdentityConfig = (
         MatchWikipediaIdentityConfig()
     )
+    assess_article: AssessArticleConfig = AssessArticleConfig()
 
 
 class DigestConfig(StrictModel):
@@ -350,6 +480,7 @@ class MainConfig(StrictModel):
     timezone: str
     feeds_file: Path
     domain_profile_file: Path
+    source_policy_file: Path
     paths: PathsConfig = PathsConfig()
     secrets: SecretEnvConfig = SecretEnvConfig()
     transport: TransportConfig = TransportConfig()
@@ -359,6 +490,7 @@ class MainConfig(StrictModel):
     budget: BudgetConfig = BudgetConfig()
     openrouter: OpenRouterConfig = OpenRouterConfig()
     mediawiki: MediaWikiConfig = MediaWikiConfig()
+    brave: BraveConfig = BraveConfig()
     tasks: TasksConfig = TasksConfig()
     digest: DigestConfig = DigestConfig()
     logging: LoggingConfig = LoggingConfig()

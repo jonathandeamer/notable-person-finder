@@ -368,7 +368,7 @@ def test_article_url_alias_kind_rejects_an_unlisted_value(
             INSERT INTO article_url_alias (
                 canonical_article_id, url, kind, first_seen_at
             )
-            VALUES (?, 'https://example.com/alias', 'search_result', ?)
+            VALUES (?, 'https://example.com/alias', 'magic_alias', ?)
             """,
             (article_id, moment()),
         )

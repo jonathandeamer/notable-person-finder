@@ -18,6 +18,11 @@ from notable_person_finder.config.models import (
     MainConfig,
 )
 from notable_person_finder.config.paths import ResolvedPaths, resolve_paths
+from notable_person_finder.coverage.screening import (
+    SourcePolicy,
+    SourcePolicyError,
+    load_source_policy,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +36,7 @@ class ResolvedConfig:
     main: MainConfig
     feeds: FeedsConfig
     domain_profile: DomainProfileConfig
+    source_policy: SourcePolicy
     credentials: Credentials
     paths: ResolvedPaths
     snapshot_json: str
@@ -63,6 +69,8 @@ def load_config(
 
     feeds_path = _source_path(main_path.parent, main.feeds_file)
     domain_profile_path = _source_path(main_path.parent, main.domain_profile_file)
+    source_policy_path = _source_path(main_path.parent, main.source_policy_file)
+    main = main.model_copy(update={"source_policy_file": source_policy_path})
     feeds_data = _read_toml(feeds_path, errors)
     domain_profile_data = _read_toml(domain_profile_path, errors)
 
@@ -76,6 +84,7 @@ def load_config(
         if domain_profile_data is not None
         else None
     )
+    source_policy = _load_source_policy(source_policy_path, errors)
 
     portable_root = _portable_root(main_path.parent, main.paths.root)
     paths = resolve_paths(main_path, portable_root)
@@ -88,14 +97,17 @@ def load_config(
 
     assert feeds is not None
     assert domain_profile is not None
+    assert source_policy is not None
     snapshot = _snapshot(
         main=main,
         feeds=feeds,
         domain_profile=domain_profile,
+        source_policy=source_policy,
         paths=paths,
         main_path=main_path,
         feeds_path=feeds_path,
         domain_profile_path=domain_profile_path,
+        source_policy_path=source_policy_path,
         secret_availability=_secret_availability(main, credentials),
     )
     snapshot_json = json.dumps(
@@ -108,11 +120,20 @@ def load_config(
         main=main,
         feeds=feeds,
         domain_profile=domain_profile,
+        source_policy=source_policy,
         credentials=credentials,
         paths=paths,
         snapshot_json=snapshot_json,
         fingerprint=hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest(),
     )
+
+
+def _load_source_policy(path: Path, errors: list[str]) -> SourcePolicy | None:
+    try:
+        return load_source_policy(path)
+    except SourcePolicyError as error:
+        errors.append(str(error))
+        return None
 
 
 def _read_toml(path: Path, errors: list[str]) -> dict[str, Any] | None:
@@ -221,15 +242,18 @@ def _snapshot(
     main: MainConfig,
     feeds: FeedsConfig,
     domain_profile: DomainProfileConfig,
+    source_policy: SourcePolicy,
     paths: ResolvedPaths,
     main_path: Path,
     feeds_path: Path,
     domain_profile_path: Path,
+    source_policy_path: Path,
     secret_availability: dict[str, bool],
 ) -> dict[str, Any]:
     main_settings = main.model_dump(mode="json")
     main_settings["feeds_file"] = str(feeds_path)
     main_settings["domain_profile_file"] = str(domain_profile_path)
+    main_settings["source_policy_file"] = str(source_policy_path)
     if main.paths.root is not None:
         main_settings["paths"]["root"] = str(
             _portable_root(main_path.parent, main.paths.root)
@@ -247,11 +271,19 @@ def _snapshot(
         "main": main_settings,
         "feeds": feeds_by_status,
         "domain_profile": domain_profile.model_dump(mode="json"),
+        "source_policy": {
+            "schema_version": source_policy.schema_version,
+            "key": source_policy.key,
+            "label": source_policy.label,
+            "fingerprint": source_policy.fingerprint,
+            "rule_count": len(source_policy.rules),
+        },
         "paths": {name: str(value) for name, value in asdict(paths).items()},
         "source_files": {
             "main": str(main_path),
             "feeds": str(feeds_path),
             "domain_profile": str(domain_profile_path),
+            "source_policy": str(source_policy_path),
         },
         "secret_availability": secret_availability,
     }

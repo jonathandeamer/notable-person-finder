@@ -1910,6 +1910,7 @@ def _assemble_and_terminalize(
                 material_fingerprint=plan.material_fingerprint,
                 run_id=run_id,
                 now=now,
+                config=config,
             )
             return
 
@@ -1977,6 +1978,7 @@ def _write_empty_no_match(
     material_fingerprint: str,
     run_id: int,
     now: str,
+    config: MainConfig | None = None,
 ) -> None:
     observation_id = insert_wikipedia_identity_observation(
         connection,
@@ -2012,6 +2014,14 @@ def _write_empty_no_match(
         truncated_unsafe_for_negative=False,
         partial_retrieval=False,
     )
+    if config is not None:
+        _schedule_coverage_after_wikipedia_settled(
+            connection,
+            person_id=person_id,
+            run_id=run_id,
+            config=config,
+            now=now,
+        )
 
 
 def _write_local_failed(
@@ -2376,6 +2386,8 @@ def build_match_wikipedia_handler(
                 existing_id=existing.id,
                 disposition=existing.disposition,
                 work_item_id=work_item.id,
+                run_id=run_id,
+                config=config,
             )
             raise ValueError(
                 f"{MATCH_PREPARE_REFUSED_PREFIX}already_settled person {person_id}"
@@ -2410,6 +2422,7 @@ def build_match_wikipedia_handler(
                 task_fingerprint=task_fingerprint,
                 run_id=run_id,
                 work_item_id=work_item.id,
+                config=config,
             )
             raise ValueError(
                 f"{MATCH_PREPARE_REFUSED_PREFIX}empty_candidates person {person_id}"
@@ -2494,7 +2507,7 @@ def build_match_wikipedia_handler(
         operation=GENERATE_OPERATION,
         execute=_execute_match_for(client),
         prepare=prepare,
-        persist=_persist_match_for(connection),
+        persist=_persist_match_for(connection, config=config),
         persist_failure=_persist_match_failure_for(connection, config=config),
         destination_host=destination_host,
         reserved_nano_usd=0,
@@ -2569,6 +2582,8 @@ def _execute_match_for(
 
 def _persist_match_for(
     connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
 ) -> Callable[[WorkItem, TaskOutcome], None]:
     def persist(work_item: WorkItem, outcome: TaskOutcome) -> None:
         payload = outcome.payload
@@ -2597,6 +2612,13 @@ def _persist_match_for(
                         status="completed",
                         completed_at=observed_at,
                     )
+                _schedule_coverage_after_wikipedia_settled(
+                    connection,
+                    person_id=payload.person_id,
+                    run_id=run_id,
+                    config=config,
+                    now=observed_at,
+                )
             return
 
         plan = load_plan(connection, plan_id=payload.plan_id)
@@ -2658,8 +2680,52 @@ def _persist_match_for(
             status="completed",
             completed_at=observed_at,
         )
+        _schedule_coverage_after_wikipedia_settled(
+            connection,
+            person_id=payload.person_id,
+            run_id=run_id,
+            config=config,
+            now=observed_at,
+        )
 
     return persist
+
+
+def _schedule_coverage_after_wikipedia_settled(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    run_id: int,
+    config: MainConfig,
+    now: str,
+) -> None:
+    """Best-effort coverage hook after completed Wikipedia identity (K5).
+
+    Loads the configured source policy when present. Missing policy is a no-op
+    so Wikipedia settlement remains robust in unit tests without policy files;
+    ``config.source_policy_file`` is expected to already be resolved to an
+    absolute path by ``load_config``.
+    """
+    from notable_person_finder.coverage.screening import (
+        SourcePolicyError,
+        load_source_policy,
+    )
+    from notable_person_finder.coverage.service import (
+        schedule_coverage_after_wikipedia_ready,
+    )
+
+    try:
+        policy = load_source_policy(config.source_policy_file)
+    except (SourcePolicyError, OSError):
+        return
+    schedule_coverage_after_wikipedia_ready(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        config=config,
+        policy=policy,
+        now=now,
+    )
 
 
 def _persist_match_failure_for(
@@ -2751,6 +2817,8 @@ def _prepare_reuse_existing_observation(
     existing_id: int,
     disposition: str,
     work_item_id: int,
+    run_id: int,
+    config: MainConfig,
 ) -> None:
     """Point / complete plan for an existing completed obs (prepare-time)."""
     if disposition != "completed":
@@ -2759,6 +2827,7 @@ def _prepare_reuse_existing_observation(
     if owns:
         connection.execute("BEGIN IMMEDIATE")
     try:
+        observed_at = _observed_at_for_prepare(connection, work_item_id)
         point_person_current_wikipedia_observation(
             connection,
             person_id=person_id,
@@ -2774,8 +2843,15 @@ def _prepare_reuse_existing_observation(
                 connection,
                 plan_id=plan.id,
                 status="completed",
-                completed_at=_observed_at_for_prepare(connection, work_item_id),
+                completed_at=observed_at,
             )
+        _schedule_coverage_after_wikipedia_settled(
+            connection,
+            person_id=person_id,
+            run_id=run_id,
+            config=config,
+            now=observed_at,
+        )
     except BaseException:
         if owns:
             connection.rollback()
@@ -2793,6 +2869,7 @@ def _prepare_empty_candidates_path(
     task_fingerprint: str,
     run_id: int,
     work_item_id: int,
+    config: MainConfig,
 ) -> None:
     """Deterministic empty race settlement owned by prepare (brief txn)."""
     now = _observed_at_for_prepare(connection, work_item_id)
@@ -2808,6 +2885,7 @@ def _prepare_empty_candidates_path(
                 material_fingerprint=task_fingerprint,
                 run_id=run_id,
                 now=now,
+                config=config,
             )
         else:
             _write_local_failed(

@@ -455,12 +455,10 @@ class OpenRouterClient:
                 {"role": "user", "content": request.user_content},
             ],
             "model": request.model_id,
-            "models": None,
             "max_completion_tokens": request.max_completion_tokens,
             "temperature": request.temperature,
             "top_p": request.top_p,
             "stream": False,
-            "plugins": None,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -473,8 +471,9 @@ class OpenRouterClient:
             "x_open_router_metadata": "enabled",
             "retries": self._retry,
             "timeout_ms": self._timeout_ms,
-            "reasoning_effort": request.reasoning_effort,
         }
+        if request.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = request.reasoning_effort
         try:
             response = self._sdk.chat.send(**kwargs)
             choices = getattr(response, "choices", None)

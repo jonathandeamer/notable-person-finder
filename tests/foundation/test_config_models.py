@@ -2,6 +2,8 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from notable_person_finder.config.models import (
+    AssessArticleConfig,
+    BraveConfig,
     DetectPeopleConfig,
     DomainProfileConfig,
     FeedsConfig,
@@ -22,6 +24,7 @@ def _minimal_main() -> dict[str, object]:
         "timezone": "Europe/Paris",
         "feeds_file": "feeds.toml",
         "domain_profile_file": "profile.toml",
+        "source_policy_file": "source_policies/visual_arts.toml",
     }
 
 
@@ -36,6 +39,8 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
     assert config.mediawiki == MediaWikiConfig.model_validate({})
     assert config.mediawiki.endpoint == "https://en.wikipedia.org/w/api.php"
     assert config.mediawiki.maxlag_seconds == 5
+    assert config.brave == BraveConfig.model_validate({})
+    assert config.brave.endpoint == "https://api.search.brave.com/res/v1/web/search"
     assert config.tasks.detect_people.model == "openai/gpt-5.4-mini"
     assert config.tasks.detect_people.max_input_tokens == 4096
     assert config.tasks.detect_people.max_completion_tokens == 1024
@@ -84,6 +89,34 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
     assert match.refresh_interval_hours == 720
     assert match.max_title_characters == 500
     assert match.max_summary_characters == 4000
+    assess = config.tasks.assess_article
+    assert assess.model == "openai/gpt-5.4-mini"
+    # Counted in UTF-8 bytes, so ~8k real tokens. It must clear the fixed
+    # prompt/schema floor plus the passage, title, and summary bounds.
+    assert assess.max_input_tokens == 32_768
+    assert assess.max_completion_tokens == 1024
+    assert assess.parameters == GenerationParameters(
+        temperature=0.0,
+        top_p=1.0,
+        reasoning_effort=None,
+    )
+    assert assess.retrieval_target == 5
+    assert assess.max_exact_forms == 4
+    assert assess.max_alias_forms == 4
+    assert assess.max_context_forms == 1
+    assert assess.search_count == 10
+    assert assess.max_offsets_per_form == 0
+    assert assess.max_results_per_form == 20
+    assert assess.max_eligible_fetches == 8
+    assert assess.max_unclassified_fetches == 2
+    assert assess.max_passage_characters == 6000
+    assert assess.max_passage_blocks == 24
+    assert assess.opening_block_count == 2
+    assert assess.coverage_refresh_interval_hours == 720
+    assert assess.reject_altered_query is False
+    assert assess.assess_ineligible is False
+    assert assess.max_title_characters == 500
+    assert assess.max_summary_characters == 4000
     assert GenerationParameters(reasoning_effort=None).reasoning_effort is None
 
 
@@ -92,14 +125,17 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
     [
         (OpenRouterConfig(), "endpoint"),
         (MediaWikiConfig(), "endpoint"),
+        (BraveConfig(), "endpoint"),
         (ProviderRoutingConfig(), "allow_fallbacks"),
         (GenerationParameters(), "temperature"),
         (DetectPeopleConfig(), "model"),
         (ResolvePersonEntityConfig(), "model"),
         (MatchWikipediaIdentityConfig(), "model"),
+        (AssessArticleConfig(), "model"),
         (TasksConfig(), "detect_people"),
         (TasksConfig(), "resolve_person_entity"),
         (TasksConfig(), "match_wikipedia_identity"),
+        (TasksConfig(), "assess_article"),
     ],
 )
 def test_model_configuration_models_are_frozen(value: object, field_name: str) -> None:
@@ -112,14 +148,17 @@ def test_model_configuration_models_are_frozen(value: object, field_name: str) -
     [
         ("openrouter", {"response_healing": True}),
         ("mediawiki", {"api_key": "secret"}),
+        ("brave", {"api_key": "secret"}),
         ("routing", {"require_parameters": False}),
         ("tasks", {"compose_lead_summary": {}}),
         ("detect_people", {"max_tokens": 1024}),
         ("resolve_person_entity", {"max_tokens": 1024}),
         ("match_wikipedia_identity", {"max_tokens": 1024}),
+        ("assess_article", {"max_tokens": 1024}),
         ("parameters", {"seed": 7}),
         ("resolve_parameters", {"seed": 7}),
         ("match_parameters", {"seed": 7}),
+        ("assess_parameters", {"seed": 7}),
     ],
 )
 def test_model_configuration_rejects_unknown_fields(
@@ -128,15 +167,19 @@ def test_model_configuration_rejects_unknown_fields(
     value = _minimal_main()
     value["openrouter"] = {}
     value["mediawiki"] = {}
+    value["brave"] = {}
     value["tasks"] = {
         "detect_people": {},
         "resolve_person_entity": {},
         "match_wikipedia_identity": {},
+        "assess_article": {},
     }
     if section == "openrouter":
         value["openrouter"] = extra
     elif section == "mediawiki":
         value["mediawiki"] = extra
+    elif section == "brave":
+        value["brave"] = extra
     elif section == "routing":
         value["openrouter"] = {"routing": extra}
     elif section == "tasks":
@@ -147,10 +190,14 @@ def test_model_configuration_rejects_unknown_fields(
         value["tasks"] = {"resolve_person_entity": extra}
     elif section == "match_wikipedia_identity":
         value["tasks"] = {"match_wikipedia_identity": extra}
+    elif section == "assess_article":
+        value["tasks"] = {"assess_article": extra}
     elif section == "resolve_parameters":
         value["tasks"] = {"resolve_person_entity": {"parameters": extra}}
     elif section == "match_parameters":
         value["tasks"] = {"match_wikipedia_identity": {"parameters": extra}}
+    elif section == "assess_parameters":
+        value["tasks"] = {"assess_article": {"parameters": extra}}
     else:
         value["tasks"] = {"detect_people": {"parameters": extra}}
 
@@ -198,6 +245,26 @@ def test_mediawiki_endpoint_requires_a_clean_public_https_url(endpoint: str) -> 
         MediaWikiConfig(endpoint=endpoint)
 
 
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://api.search.brave.com/res/v1/web/search",
+        "https://localhost/res/v1/web/search",
+        "https://127.0.0.1/res/v1/web/search",
+        "https://user:password@api.search.brave.com/res/v1/web/search",
+        "https://api.search.brave.com/res/v1/web/search?key=secret",
+        "https://api.search.brave.com/res/v1/web/search#fragment",
+        " https://api.search.brave.com/res/v1/web/search",
+        "https://api.search.brave.com/res/v1/web/search\n",
+        "https://api.search.brave.com:abc/res/v1/web/search",
+        "https://api.search.brave.com:70000/res/v1/web/search",
+    ],
+)
+def test_brave_endpoint_requires_a_clean_public_https_url(endpoint: str) -> None:
+    with pytest.raises(ValidationError):
+        BraveConfig(endpoint=endpoint)
+
+
 @pytest.mark.parametrize("maxlag_seconds", [-1, 121, 0.5, "5"])
 def test_mediawiki_maxlag_seconds_bounds(maxlag_seconds: object) -> None:
     with pytest.raises(ValidationError):
@@ -213,6 +280,17 @@ def test_mediawiki_config_has_no_secret_fields() -> None:
         assert "token" not in name
 
 
+def test_brave_config_has_no_secret_fields() -> None:
+    fields = set(BraveConfig.model_fields)
+    # `extra_snippets` is a plan flag, not a credential.
+    assert fields == {"endpoint", "extra_snippets"}
+    assert BraveConfig().extra_snippets is False
+    for name in fields:
+        assert "key" not in name
+        assert "secret" not in name
+        assert "token" not in name
+
+
 @pytest.mark.parametrize(
     ("model_type", "value"),
     [
@@ -221,6 +299,7 @@ def test_mediawiki_config_has_no_secret_fields() -> None:
         (OpenRouterConfig, {"endpoint": b"https://openrouter.ai/api/v1"}),
         (MediaWikiConfig, {"endpoint": b"https://en.wikipedia.org/w/api.php"}),
         (MediaWikiConfig, {"maxlag_seconds": "5"}),
+        (BraveConfig, {"endpoint": b"https://api.search.brave.com/res/v1/web/search"}),
         (GenerationParameters, {"temperature": True}),
         (GenerationParameters, {"top_p": "1.0"}),
         (DetectPeopleConfig, {"model": b"openai/gpt-5.4-mini"}),
@@ -457,6 +536,45 @@ def test_match_wikipedia_identity_has_no_secret_fields() -> None:
             assert fragment not in lowered
 
 
+def test_assess_article_rejects_assess_ineligible_true() -> None:
+    with pytest.raises(ValidationError, match="assess_ineligible"):
+        AssessArticleConfig.model_validate({"assess_ineligible": True})
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"max_input_tokens": 0},
+        {"max_completion_tokens": 0},
+        {"max_input_tokens": 1024, "max_completion_tokens": 1024},
+        {"max_title_characters": 1000, "max_summary_characters": 999},
+        {"retrieval_target": 0},
+        {"retrieval_target": 21},
+        {"max_offsets_per_form": -1},
+        {"max_offsets_per_form": 6},
+        {"max_passage_characters": 499},
+        {"max_passage_blocks": 3},
+        {"max_passage_blocks": 65},
+        {"opening_block_count": 11},
+        {"coverage_refresh_interval_hours": 0},
+    ],
+)
+def test_assess_article_rejects_out_of_range_or_incompatible_bounds(
+    values: dict[str, int],
+) -> None:
+    with pytest.raises(ValidationError):
+        AssessArticleConfig.model_validate(values)
+
+
+def test_assess_article_has_no_secret_fields() -> None:
+    fields = set(AssessArticleConfig.model_fields)
+    forbidden = ("api_key", "secret", "password", "credential", "auth_token")
+    for name in fields:
+        lowered = name.lower()
+        for fragment in forbidden:
+            assert fragment not in lowered
+
+
 def test_main_config_rejects_unknown_fields() -> None:
     with pytest.raises(ValidationError, match="extra_forbidden"):
         MainConfig.model_validate(
@@ -465,6 +583,7 @@ def test_main_config_rejects_unknown_fields() -> None:
                 "timezone": "Europe/Paris",
                 "feeds_file": "feeds.toml",
                 "domain_profile_file": "profile.toml",
+                "source_policy_file": "source_policies/visual_arts.toml",
                 "unexpected": True,
             }
         )

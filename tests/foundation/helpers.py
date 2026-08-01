@@ -9,6 +9,7 @@ schema_version = 1
 timezone = "Europe/Paris"
 feeds_file = "feeds.toml"
 domain_profile_file = "profiles/art.toml"
+source_policy_file = "source_policies/visual_arts.toml"
 
 [paths]
 root = "portable"
@@ -85,6 +86,7 @@ reasoning_effort = "low"
         encoding="utf-8",
     )
     (root / "profiles").mkdir()
+    (root / "source_policies").mkdir()
     (root / "feeds.toml").write_text(
         """\
 schema_version = 1
@@ -103,6 +105,20 @@ label = "English visual arts"
 language = "en"
 [attention_examples]
 significant_recognition = ["major art prize"]
+""",
+        encoding="utf-8",
+    )
+    (root / "source_policies" / "visual_arts.toml").write_text(
+        """\
+schema_version = 1
+key = "visual-arts-en-sources"
+label = "English visual arts publisher policy"
+[[rules]]
+id = "eligible.example"
+status = "curated_eligible"
+match = { host_suffix = "example.com" }
+rationale = "test eligible"
+review_date = "2026-07-24"
 """,
         encoding="utf-8",
     )

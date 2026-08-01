@@ -32,6 +32,7 @@ from notable_person_finder.wikipedia.service import (
     build_mediawiki_search_handler,
 )
 from tests.people.test_run_cli import (
+    ASSESS_JSON,
     RESEARCH_JSON,
     ScriptedOpenRouterClient,
     _single_feed,
@@ -49,6 +50,7 @@ RESOLVER = StaticHostResolver(
     {
         "example.com": ("93.184.216.34",),
         "en.wikipedia.org": ("208.80.154.224",),
+        "api.search.brave.com": ("104.18.0.1",),
     }
 )
 
@@ -86,6 +88,17 @@ def _http_handler(rss: bytes) -> Callable[[httpx.Request], httpx.Response]:
                 content=streaming_body(EMPTY_MEDIAWIKI_SEARCH),
                 headers={"content-type": "application/json"},
             )
+        if "api.search.brave.com" in host:
+            # K6's exact-name Brave forms schedule regardless of whether
+            # discovery already satisfies the retrieval target, so a plan
+            # opened this run always issues at least one real search call.
+            return httpx.Response(
+                200,
+                content=streaming_body(
+                    b'{"query": {"original": ""}, "web": {"results": []}}'
+                ),
+                headers={"content-type": "application/json"},
+            )
         return httpx.Response(200, content=streaming_body(rss))
 
     return handler
@@ -105,7 +118,10 @@ def _wire(
     monkeypatch.setattr(
         cli_main, "build_transport", _transport_patch(_http_handler(body))
     )
-    client = llm or ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,))
+    client = llm or ScriptedOpenRouterClient(
+        generate_contents=(RESEARCH_JSON,),
+        content_by_substring={"assess_article": ASSESS_JSON},
+    )
     monkeypatch.setattr(cli_main, "OpenRouterClient", client.factory)
     return client
 
@@ -125,15 +141,24 @@ def test_run_registers_three_wikipedia_handlers_and_settles_empty_search(
 
     assert "### Wikipedia identity" in digest
     wiki = digest.split("### Wikipedia identity\n\n", 1)[1]
+    if "### " in wiki:
+        wiki = wiki.split("### ", 1)[0]
     assert "Deterministic no-match (empty complete search): 1" in wiki
     assert "No matching page (this run): 1" in wiki
     assert "People with current no-match (corpus): 1" in wiki
     assert "Wikipedia eligible remaining: 0" in wiki
     assert "Canonical people without Wikipedia pointer: 0" in wiki
-    assert "coverage" not in wiki.lower()
     # K4: empty complete search never schedules match-model generation.
-    # Detect generation still happens once.
-    assert len(client.instances[-1].generate_calls) == 1
+    # Detect generation still happens once. The no-match outcome also makes
+    # this person coverage-eligible this same run (K5 fix): its originating
+    # article is curated_eligible in the test source policy, so coverage opens
+    # and completes with one assess_article generation alongside detect.
+    generate_calls = client.instances[-1].generate_calls
+    assert len(generate_calls) == 2
+    assert {call.schema_name for call in generate_calls} == {
+        "detect_people",
+        "assess_article",
+    }
 
     database = config.parent / "portable" / "data" / "notable.sqlite3"
     connection = connect_database(database, readonly=True)

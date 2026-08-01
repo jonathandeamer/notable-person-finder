@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from notable_person_finder.config.models import (
+    AssessArticleConfig,
     BudgetConfig,
     DetectPeopleConfig,
     DomainProfileConfig,
@@ -71,7 +72,7 @@ from notable_person_finder.runs.engine import (
     TaskOutcome,
     TaskPreparation,
 )
-from notable_person_finder.runs.models import WorkState
+from notable_person_finder.runs.models import WorkItem, WorkState
 from notable_person_finder.runs.retry import RetryPolicy
 from notable_person_finder.runs.scheduler import (
     BoundedScheduler,
@@ -107,6 +108,7 @@ def _main_config(
         timezone="Europe/Paris",
         feeds_file=Path("feeds.toml"),
         domain_profile_file=Path("profiles/art.toml"),
+        source_policy_file=Path("source_policies/visual_arts.toml"),
         budget=BudgetConfig(openrouter_usd_per_run="1.00" if hard_budget else None),
         openrouter=OpenRouterConfig(
             routing=routing if routing is not None else ProviderRoutingConfig()
@@ -450,6 +452,124 @@ def test_no_cross_run_freshness_reuse(connection: sqlite3.Connection) -> None:
     assert rows[1]["fingerprint"] != first_fp
     assert rows[1]["state"] == "pending"
     assert rows[1]["created_by_run_id"] == second_run
+
+
+def _four_task_model_config() -> MainConfig:
+    """All four configured task models (K20 added ``assess_article``)."""
+    return MainConfig(
+        schema_version=1,
+        timezone="Europe/Paris",
+        feeds_file=Path("feeds.toml"),
+        domain_profile_file=Path("profiles/art.toml"),
+        source_policy_file=Path("source_policies/visual_arts.toml"),
+        budget=BudgetConfig(openrouter_usd_per_run=None),
+        openrouter=OpenRouterConfig(routing=ProviderRoutingConfig()),
+        tasks=TasksConfig(
+            detect_people=DetectPeopleConfig(model=MODEL),
+            resolve_person_entity=ResolvePersonEntityConfig(model=MODEL),
+            match_wikipedia_identity=MatchWikipediaIdentityConfig(model=MODEL),
+            assess_article=AssessArticleConfig(model=MODEL),
+        ),
+    )
+
+
+def _rearming_detect_handler(
+    connection: sqlite3.Connection, config: MainConfig
+) -> TaskHandler:
+    """Stand-in for mid-run plan advancement that re-arms inspection.
+
+    Production shape: ``coverage.service.schedule_assess_article`` (K20) and
+    ``wikipedia.service`` match scheduling (K21b) both call
+    ``ensure_model_inspections_for_run`` from a settlement ``persist``, after
+    this run's ``inspect_model`` item has already succeeded.
+    """
+
+    def prepare(work_item: WorkItem) -> TaskPreparation:
+        return TaskPreparation(payload=None, reserved_nano_usd=0)
+
+    def execute(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
+        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None, payload=None)
+
+    def persist(work_item: WorkItem, outcome: TaskOutcome) -> None:
+        row = connection.execute(
+            "SELECT run_id FROM attempt WHERE work_item_id = ? ORDER BY id DESC"
+            " LIMIT 1",
+            (work_item.id,),
+        ).fetchone()
+        assert row is not None
+        ensure_model_inspections_for_run(
+            connection, run_id=int(row["run_id"]), config=config, now=moment()
+        )
+
+    return TaskHandler(
+        task_type=DETECT_PEOPLE_TASK_TYPE,
+        provider=PROVIDER,
+        operation=GENERATE_OPERATION,
+        execute=execute,
+        prepare=prepare,
+        persist=persist,
+        destination_host=lambda work_item: "openrouter.ai",
+        reserved_nano_usd=0,
+        pool=WorkerPool.LLM,
+        ready=None,
+    )
+
+
+def test_second_run_does_not_reinsert_an_existing_model_inspection(
+    connection: sqlite3.Connection,
+) -> None:
+    """A mid-run re-arm must not schedule a second inspection for one run.
+
+    Run one has no plan advancement, so inspection is armed once at seed. Run
+    two settles work that re-arms inspection (K20/K21b) after this run's
+    ``inspect_model`` item already succeeded. Rescheduling there would insert a
+    second ``model_inspection`` row for the same
+    ``(run_id, configured_model_id, routing_fingerprint)`` and violate
+    ``model_inspection_by_run_model_routing``.
+    """
+    bootstrap = insert_run(connection)
+    source_item_id = _seed_source_item(connection, run_id=bootstrap)
+    config = _four_task_model_config()
+    client = FakeLlmClient(inspection=_compatible_inspection())
+    inspection_handler = build_inspection_handler(
+        connection, client=client, config=config
+    )
+
+    first_run = _run_engine(
+        connection,
+        {INSPECT_MODEL_TASK_TYPE: inspection_handler},
+        seed=_inspection_seed(connection, config),
+    )
+    second_run = _run_engine(
+        connection,
+        {
+            INSPECT_MODEL_TASK_TYPE: inspection_handler,
+            DETECT_PEOPLE_TASK_TYPE: _rearming_detect_handler(connection, config),
+        },
+        seed=_inspection_seed(connection, config, also_detect=[source_item_id]),
+    )
+
+    inspect_items = connection.execute(
+        """
+        SELECT state, reason, created_by_run_id
+          FROM work_item WHERE task_type = ? ORDER BY id
+        """,
+        (INSPECT_MODEL_TASK_TYPE,),
+    ).fetchall()
+    assert [row["state"] for row in inspect_items] == ["succeeded", "succeeded"]
+    assert [row["reason"] for row in inspect_items] == [None, None]
+    assert [row["created_by_run_id"] for row in inspect_items] == [
+        first_run,
+        second_run,
+    ]
+
+    inspections = connection.execute(
+        "SELECT run_id FROM model_inspection ORDER BY id"
+    ).fetchall()
+    assert [row["run_id"] for row in inspections] == [first_run, second_run]
+    # One paid preflight call per run, not two in the second run.
+    assert len(client.inspect_calls) == 2
+    assert inspection_ready(connection, run_id=second_run, config=config) is True
 
 
 # ---------------------------------------------------------------------------
@@ -1287,6 +1407,7 @@ def test_multi_model_inspect_when_only_wikipedia_backlog(
         timezone="Europe/Paris",
         feeds_file=Path("feeds.toml"),
         domain_profile_file=Path("profiles/art.toml"),
+        source_policy_file=Path("source_policies/visual_arts.toml"),
         budget=BudgetConfig(openrouter_usd_per_run=None),
         openrouter=OpenRouterConfig(routing=ProviderRoutingConfig()),
         mediawiki=MediaWikiConfig(),
