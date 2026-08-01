@@ -1179,8 +1179,29 @@ def command_status(config_file: Path | None) -> int:
             print(
                 f"stopped matching wikipedia: {cov_corpus.stopped_matching_wikipedia}"
             )
-        # Digest backlog, queue tiers, and the oldest pending candidate arrive
-        # with the digest queue in the lead-assessment milestone.
+        if _leads_schema_present(connection):
+            backlog_rows = connection.execute(
+                """
+                SELECT tier, COUNT(*)
+                FROM digest_queue
+                WHERE status = 'pending'
+                GROUP BY tier
+                """
+            ).fetchall()
+            backlog_by_tier = {tier: count for tier, count in backlog_rows}
+            promising = backlog_by_tier.get("promising_lead", 0)
+            possible = backlog_by_tier.get("possible_lead", 0)
+            print(
+                f"digest backlog: {promising} promising_lead, {possible} possible_lead"
+            )
+            oldest_pending = connection.execute(
+                "SELECT MIN(first_pending_at) FROM digest_queue "
+                "WHERE status = 'pending'"
+            ).fetchone()[0]
+            if oldest_pending is None:
+                print("oldest pending candidate: none")
+            else:
+                print(f"oldest pending candidate: {oldest_pending}")
         return EXIT_OK
     finally:
         connection.close()

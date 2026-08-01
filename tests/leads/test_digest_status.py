@@ -10,6 +10,21 @@ kwargs -- it is copied here verbatim rather than referenced.
 
 from __future__ import annotations
 
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from notable_person_finder.cli import main as cli_main
+from notable_person_finder.config.loader import load_config
+from notable_person_finder.db.connection import connect_database
+from notable_person_finder.db.migrate import apply_migrations
+from notable_person_finder.leads.aggregation import LeadOutcome
+from notable_person_finder.leads.repository import (
+    insert_lead_assessment,
+    upsert_digest_queue,
+)
+from notable_person_finder.people.identity import insert_person, upsert_sourced_name
 from notable_person_finder.reporting.digest import (
     QueueFlowSummary,
     ShortlistEntry,
@@ -17,6 +32,10 @@ from notable_person_finder.reporting.digest import (
 )
 from notable_person_finder.runs.engine import RunReport
 from notable_person_finder.runs.models import RunCounters, RunState
+from tests.ingestion.helpers import immediate, insert_configuration_snapshot, moment
+from tests.people.test_run_cli import _single_feed, write_people_graph
+
+NOW = moment()
 
 
 def _report(run_id: int = 1) -> RunReport:
@@ -182,3 +201,145 @@ def test_queue_flow_arrival_and_emission_lines_are_independent() -> None:
     lines = output.splitlines()
     assert "- 7-day arrival rate: insufficient history" in lines
     assert "- 7-day emission rate: 3.5/day" in lines
+
+
+# ---------------------------------------------------------------------------
+# `notable status` prints digest-queue backlog-by-tier and oldest-pending
+# lines when the leads schema is present (Task 13).
+# ---------------------------------------------------------------------------
+
+
+def _insert_run(connection: sqlite3.Connection, *, started_at: str) -> int:
+    """Seed a `run` row at an explicit `started_at`; mirrors
+    tests/coverage/test_digest_status.py's helper of the same name."""
+    snapshot_id = insert_configuration_snapshot(connection)
+    cursor = connection.execute(
+        """
+        INSERT INTO run (
+            state, configuration_snapshot_id, timezone,
+            window_start, window_end, started_at
+        )
+        VALUES ('running', ?, 'Europe/Paris', ?, ?, ?)
+        """,
+        (snapshot_id, started_at, started_at, started_at),
+    )
+    assert cursor.lastrowid is not None
+    connection.commit()
+    return int(cursor.lastrowid)
+
+
+def _person(
+    connection: sqlite3.Connection, *, run_id: int, name: str, fingerprint: str
+) -> int:
+    with immediate(connection):
+        person_id = insert_person(
+            connection,
+            run_id=run_id,
+            display_name=name,
+            identity_fingerprint=fingerprint,
+            created_at=NOW,
+        )
+        upsert_sourced_name(
+            connection,
+            person_id=person_id,
+            exact_name=name,
+            kind="professional",
+            origin_kind="manual",
+            origin_mention_id=None,
+            observed_at=NOW,
+        )
+    return person_id
+
+
+def _queue_lead(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    run_id: int,
+    tier: str,
+    first_pending_at: str,
+) -> None:
+    lead_id = insert_lead_assessment(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        outcome=LeadOutcome(
+            outcome=tier,
+            qualifying_domain_count=1 if tier == "promising_lead" else 0,
+            qualifying_articles=(),
+            contributing_signals=(),
+            wikipedia_outcome="no_matching_page_found",
+        ),
+        lead_policy_fingerprint="a" * 64,
+        ordering_factors_json="{}",
+        decided_at=first_pending_at,
+    )
+    upsert_digest_queue(
+        connection,
+        person_id=person_id,
+        status="pending",
+        tier=tier,
+        eligibility_reason="new",
+        lead_assessment_id=lead_id,
+        first_pending_at=first_pending_at,
+        last_material_change_at=first_pending_at,
+    )
+    connection.commit()
+
+
+def test_notable_status_prints_backlog_by_tier(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_file = write_people_graph(tmp_path, feeds=_single_feed())
+    loaded = load_config(config_file, require_secrets=False)
+    database = loaded.paths.database
+    database.parent.mkdir(parents=True, exist_ok=True)
+
+    connection = connect_database(database)
+    try:
+        apply_migrations(connection, database, loaded.paths.backups)
+        run_id = _insert_run(connection, started_at=moment())
+
+        # Distinct counts (2 promising vs. 1 possible) so a swapped-field
+        # defect that transposed the two tier counts would be caught -- equal
+        # counts would let that mutation survive undetected.
+        promising_person_a = _person(
+            connection, run_id=run_id, name="Backlog Promising A", fingerprint="1" * 64
+        )
+        _queue_lead(
+            connection,
+            person_id=promising_person_a,
+            run_id=run_id,
+            tier="promising_lead",
+            first_pending_at="2026-07-28T00:00:00Z",
+        )
+
+        promising_person_b = _person(
+            connection, run_id=run_id, name="Backlog Promising B", fingerprint="3" * 64
+        )
+        _queue_lead(
+            connection,
+            person_id=promising_person_b,
+            run_id=run_id,
+            tier="promising_lead",
+            first_pending_at="2026-07-29T00:00:00Z",
+        )
+
+        possible_person = _person(
+            connection, run_id=run_id, name="Backlog Possible", fingerprint="2" * 64
+        )
+        _queue_lead(
+            connection,
+            person_id=possible_person,
+            run_id=run_id,
+            tier="possible_lead",
+            first_pending_at="2026-07-30T00:00:00Z",
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert cli_main.command_status(config_file) == cli_main.EXIT_OK
+    output = capsys.readouterr().out
+    assert "digest backlog: 2 promising_lead, 1 possible_lead" in output
+    assert "oldest pending candidate: 2026-07-28T00:00:00Z" in output
