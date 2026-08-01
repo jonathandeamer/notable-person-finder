@@ -82,7 +82,7 @@ tests/foundation/test_aggregate_lead_config.py
   int`, `digest_limit: int`, `starvation_days: int`,
   `reminder_interval_days: int`; `TasksConfig.aggregate_lead` field.
 
-- [ ] **Step 1: Locate the existing task-config test file**
+- [x] **Step 1: Locate the existing task-config test file**
 
 Run: `grep -rl "AssessArticleConfig\|TasksConfig" tests/foundation/`
 
@@ -90,7 +90,7 @@ Use whichever file that returns as the home for the new test; if none
 directly tests `TasksConfig` field composition, create
 `tests/foundation/test_aggregate_lead_config.py`.
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 ```python
 # tests/foundation/test_aggregate_lead_config.py
@@ -118,12 +118,12 @@ def test_aggregate_lead_config_rejects_zero_domain_threshold():
         AggregateLeadConfig(promising_domain_threshold=0)
 ```
 
-- [ ] **Step 3: Run test to verify it fails**
+- [x] **Step 3: Run test to verify it fails**
 
 Run: `uv run pytest tests/foundation/test_aggregate_lead_config.py -v`
 Expected: FAIL — `ImportError: cannot import name 'AggregateLeadConfig'`
 
-- [ ] **Step 4: Implement**
+- [x] **Step 4: Implement**
 
 In `src/notable_person_finder/config/models.py`, add near `AssessArticleConfig`
 (this task config has no generation parameters, so it derives from the same
@@ -154,12 +154,12 @@ class TasksConfig(_StrictConfigurationModel):
     aggregate_lead: AggregateLeadConfig = AggregateLeadConfig()
 ```
 
-- [ ] **Step 5: Run test to verify it passes**
+- [x] **Step 5: Run test to verify it passes**
 
 Run: `uv run pytest tests/foundation/test_aggregate_lead_config.py -v`
 Expected: PASS
 
-- [ ] **Step 6: Add the `[tasks.aggregate_lead]` example block**
+- [x] **Step 6: Add the `[tasks.aggregate_lead]` example block**
 
 Check `config/*.example.toml` for where `[tasks.assess_article]` is
 documented and add directly below it:
@@ -172,7 +172,7 @@ starvation_days = 14
 reminder_interval_days = 0
 ```
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/notable_person_finder/config/models.py tests/foundation/test_aggregate_lead_config.py config/*.example.toml
@@ -214,7 +214,7 @@ git commit -m "feat(config): add [tasks.aggregate_lead] section"
   - `insert_digest_entry(connection, *, digest_id, person_id,
     lead_assessment_id, queue_transition_id, ordinal) -> None`.
 
-- [ ] **Step 1: Write failing repository tests**
+- [x] **Step 1: Write failing repository tests**
 
 ```python
 # tests/leads/test_repository.py
@@ -375,12 +375,12 @@ def test_fetch_pending_queue_entries_excludes_removed(tmp_path):
     assert entries[0].person_id == 7
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `uv run pytest tests/leads/test_repository.py -v`
 Expected: FAIL — `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement `repository.py`**
+- [x] **Step 3: Implement `repository.py`**
 
 ```python
 # src/notable_person_finder/leads/repository.py
@@ -641,12 +641,12 @@ repositories use the same idiom (`grep -r "ON CONFLICT" src/`) and match
 column-list style if a convention differs (e.g. `ON CONFLICT(person_id)` vs.
 `ON CONFLICT (person_id)`).
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/leads/test_repository.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/notable_person_finder/leads/repository.py tests/leads/test_repository.py
@@ -678,7 +678,7 @@ git commit -m "feat(leads): repository SQL for lead/queue/digest tables"
     same-run hook, consumed by Task 8.
   - `_compute_material_fingerprint(...) -> str` (K6).
 
-- [ ] **Step 1: Write the failing handler tests**
+- [x] **Step 1: Write the failing handler tests**
 
 ```python
 # tests/leads/test_service.py
@@ -744,12 +744,12 @@ reuse its helper functions via import if they are already factored into a
 shared `tests/coverage/conftest.py` or `tests/wikipedia/conftest.py`
 fixture, rather than re-deriving fixture SQL from scratch).
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `uv run pytest tests/leads/test_service.py -v`
 Expected: FAIL — `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement `leads/service.py`**
+- [x] **Step 3: Implement `leads/service.py`**
 
 ```python
 # src/notable_person_finder/leads/service.py
@@ -1079,12 +1079,12 @@ confirm the real work-item-enqueue function name and signature (used by
 `coverage/service.py`) and match it exactly instead of the illustrative
 `enqueue_work_item` above.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/leads/test_service.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/notable_person_finder/leads/service.py tests/leads/test_service.py

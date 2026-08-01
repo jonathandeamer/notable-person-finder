@@ -76,7 +76,7 @@ tests/leads/
   `lead_assessment_signal`, `digest_queue`, `queue_transition`, `digest`,
   `digest_entry`; column `person.current_lead_assessment_id`.
 
-- [ ] **Step 1: Write the failing schema test**
+- [x] **Step 1: Write the failing schema test**
 
 ```python
 # tests/leads/test_schema.py
@@ -149,13 +149,13 @@ that masks the check under test. Confirm with:
 `sqlite3 :memory: ".read src/notable_person_finder/db/migrations/0001_*.sql" ".schema run"`
 run through each migration in order, or simply read the migrations directly.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `uv run pytest tests/leads/test_schema.py -v`
 Expected: FAIL — `0008_lead_aggregation.sql` does not exist, or table not
 found.
 
-- [ ] **Step 3: Write the migration**
+- [x] **Step 3: Write the migration**
 
 Follow the exact style of `0007_coverage_evidence.sql`: header comment block,
 `id INTEGER PRIMARY KEY`, `REFERENCES` FKs, `TEXT NOT NULL CHECK (col GLOB
@@ -262,12 +262,12 @@ CREATE TABLE digest_entry (
 CREATE INDEX ix_digest_entry_digest ON digest_entry(digest_id, ordinal);
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/leads/test_schema.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/notable_person_finder/db/migrations/0008_lead_aggregation.sql tests/leads/
@@ -292,7 +292,7 @@ git commit -m "feat(leads): add 0008 lead-aggregation migration"
 - Produces: `LeadOutcome`, `QualifyingArticle`, `aggregate_lead(...)` — used
   by Task 5's handler and Task 6's ranking.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/leads/test_aggregation.py
@@ -469,12 +469,12 @@ def test_grounded_transferable_signal_is_possible_lead():
     assert outcome.outcome == "possible_lead"
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `uv run pytest tests/leads/test_aggregation.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'notable_person_finder.leads.aggregation'`
 
-- [ ] **Step 3: Implement `aggregation.py`**
+- [x] **Step 3: Implement `aggregation.py`**
 
 ```python
 # src/notable_person_finder/leads/aggregation.py
@@ -606,12 +606,12 @@ def aggregate_lead(
     )
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/leads/test_aggregation.py -v`
 Expected: PASS (all 9 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/notable_person_finder/leads/ tests/leads/test_aggregation.py
@@ -631,7 +631,7 @@ git commit -m "feat(leads): deterministic aggregate_lead decision table"
   reused by Task 4).
 - Produces: `QueueEntry`, `rank_key(entry, lead, starvation_cutoff) -> tuple`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/leads/test_ranking.py
@@ -702,12 +702,12 @@ def test_person_id_is_final_deterministic_tiebreak():
     assert key_low < key_high
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `uv run pytest tests/leads/test_ranking.py -v`
 Expected: FAIL — `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement `ranking.py`**
+- [x] **Step 3: Implement `ranking.py`**
 
 ```python
 # src/notable_person_finder/leads/ranking.py
@@ -766,12 +766,12 @@ def rank_key(
     )
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/leads/test_ranking.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/notable_person_finder/leads/ranking.py tests/leads/test_ranking.py
@@ -793,7 +793,7 @@ git commit -m "feat(leads): rank_key with starvation guard (K11)"
   outcome, *, reminder_interval_days, now) -> QueueDecision`, consumed by
   Task 5's handler for the actual SQL write.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/leads/test_queue.py
@@ -896,12 +896,12 @@ def test_first_pending_at_preserved_across_updates():
     assert decision.first_pending_at == "2026-07-01T00:00:00Z"
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `uv run pytest tests/leads/test_queue.py -v`
 Expected: FAIL — `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement `queue.py`**
+- [x] **Step 3: Implement `queue.py`**
 
 ```python
 # src/notable_person_finder/leads/queue.py
@@ -1014,12 +1014,12 @@ def decide_queue_transition(
     )
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/leads/test_queue.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/notable_person_finder/leads/queue.py tests/leads/test_queue.py

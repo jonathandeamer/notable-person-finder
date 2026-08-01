@@ -84,7 +84,7 @@ tests/leads/
 - Consumes: `_schedule_lead_aggregation_after_settled` (Task 7).
 - Produces: two additional call sites; no new public interface.
 
-- [ ] **Step 1: Write the failing seam test**
+- [x] **Step 1: Write the failing seam test**
 
 ```python
 # tests/leads/test_seed_and_hooks.py
@@ -141,14 +141,14 @@ functions, e.g. `from tests.coverage.test_seams import
 _complete_a_coverage_plan` — adjust the actual helper name found by reading
 the file) so this task has no placeholder steps remaining before Step 2.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `uv run pytest tests/leads/test_seed_and_hooks.py -v`
 Expected: FAIL (either explicit assertion failure once fixtures are filled
 in, or the `pytest.skip` calls removed and a `sqlite3.OperationalError` /
 count-mismatch before the hook is wired).
 
-- [ ] **Step 3: Wire the coverage plan-completion call site**
+- [x] **Step 3: Wire the coverage plan-completion call site**
 
 In `coverage/service.py`, locate the point(s) where a plan transitions to
 `status='completed'` or a terminal incomplete state (per K13 of the
@@ -171,7 +171,7 @@ Use the exact `person_id`/`run_id`/`config`/`now` variable names already in
 scope at each call site (confirm from the actual function signature — do not
 introduce new parameters if the enclosing function already has these bound).
 
-- [ ] **Step 4: Wire the Wikipedia matching_page_found call site**
+- [x] **Step 4: Wire the Wikipedia matching_page_found call site**
 
 In `wikipedia/service.py`'s `_persist_match_for`, at both existing call
 sites of `_schedule_coverage_after_wikipedia_settled` (lines ~2615-2621 and
@@ -193,17 +193,17 @@ Per the design spec: this both closes a person's evidence with a final
 `lead_assessment` and lets the queue-lifecycle `matching_page_found` removal
 rule (Task 4) fire even for people who already had a `digest_queue` row.
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/leads/test_seed_and_hooks.py -v`
 Expected: PASS
 
-- [ ] **Step 6: Run the full coverage and wikipedia suites to guard against regressions**
+- [x] **Step 6: Run the full coverage and wikipedia suites to guard against regressions**
 
 Run: `uv run pytest tests/coverage tests/wikipedia -v`
 Expected: PASS (no existing test broken by the new import/call)
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/notable_person_finder/coverage/service.py src/notable_person_finder/wikipedia/service.py tests/leads/test_seed_and_hooks.py
@@ -230,7 +230,7 @@ git commit -m "feat(leads): schedule aggregate_person_lead from coverage/wikiped
 - Produces: `reconcile_on_merge(connection, *, survivor_id, loser_id,
   run_id, config, policy, now) -> None`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/leads/test_merge_hooks.py
@@ -381,12 +381,12 @@ def test_both_sides_have_queue_rows_higher_rank_key_wins(connection, empty_polic
     assert remaining == [(1,)]
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `uv run pytest tests/leads/test_merge_hooks.py -v`
 Expected: FAIL — `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement `leads/merge_hooks.py`**
+- [x] **Step 3: Implement `leads/merge_hooks.py`**
 
 ```python
 # src/notable_person_finder/leads/merge_hooks.py
@@ -520,7 +520,7 @@ engine's real `WorkItem` type is easy to construct directly (check its
 constructor in `runs/engine.py` or wherever `TaskHandler` is defined), prefer
 constructing a real instance over this shim.
 
-- [ ] **Step 4: Wire `people/merge.py`**
+- [x] **Step 4: Wire `people/merge.py`**
 
 Replace the no-op function (lines 34-42) — delete it entirely, since nothing
 else references `reconcile_digest_queue_on_merge` once this hook exists
@@ -560,12 +560,12 @@ Use the exact variable names already bound in `confirm_person_merge`
 that variable exists at this point — confirm by reading the surrounding
 function body before inserting).
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/leads/test_merge_hooks.py tests/people -v`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/notable_person_finder/leads/merge_hooks.py src/notable_person_finder/people/merge.py tests/leads/test_merge_hooks.py
@@ -587,7 +587,7 @@ git commit -m "feat(leads): merge reconciliation replaces digest_queue no-op"
   MainConfig, now: str) -> None` — same signature shape as
   `seed_coverage_research`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # append to tests/leads/test_seed_and_hooks.py
@@ -624,12 +624,12 @@ since the seed sweep's eligibility condition must find a person with
 completed evidence and no `current_lead_assessment_id`, not merely any
 person row.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/leads/test_seed_and_hooks.py -k seed_lead_aggregation -v`
 Expected: FAIL — `ImportError`.
 
-- [ ] **Step 3: Implement `seed_lead_aggregation`**
+- [x] **Step 3: Implement `seed_lead_aggregation`**
 
 Append to `leads/service.py`:
 
@@ -665,7 +665,7 @@ def seed_lead_aggregation(
 Confirm `enqueue_work_item`'s real name/signature the same way as Task 7 —
 copy from `coverage/service.py`'s `seed_coverage_research` verbatim.
 
-- [ ] **Step 4: Wire into `cli/main.py`'s `_compose_seed()`**
+- [x] **Step 4: Wire into `cli/main.py`'s `_compose_seed()`**
 
 After the existing `seed_coverage_research(...)` call, add:
 
@@ -675,12 +675,12 @@ After the existing `seed_coverage_research(...)` call, add:
     seed_lead_aggregation(connection, run_id=run_id, config=config, now=now)
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/leads/test_seed_and_hooks.py -v`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/notable_person_finder/leads/service.py src/notable_person_finder/cli/main.py tests/leads/test_seed_and_hooks.py
@@ -700,7 +700,7 @@ git commit -m "feat(leads): seed sweep for missed lead-aggregation hooks"
 - Consumes: `build_aggregate_person_lead_handler`, `AGGREGATE_PERSON_LEAD_TASK_TYPE`
   (Task 7).
 
-- [ ] **Step 1: Write the failing CLI registration test**
+- [x] **Step 1: Write the failing CLI registration test**
 
 ```python
 # tests/leads/test_run_cli.py
@@ -731,13 +731,13 @@ paths, env vars for `BRAVE_API_KEY`/`OPENROUTER_API_KEY` if the fixture
 needs them stubbed) rather than re-specifying them, since they were already
 verified working in milestone 5.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/leads/test_run_cli.py -v`
 Expected: FAIL until the skip is replaced; then FAIL with a registration
 error before Step 3.
 
-- [ ] **Step 3: Register the handler**
+- [x] **Step 3: Register the handler**
 
 In `cli/main.py`, add the import alongside the existing wikipedia/coverage
 imports (~line 105-114):
@@ -759,12 +759,12 @@ In the `handlers = {...}` dict (~line 444-506), add:
     ),
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/leads/test_run_cli.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/notable_person_finder/cli/main.py tests/leads/test_run_cli.py
