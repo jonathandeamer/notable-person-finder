@@ -548,6 +548,13 @@ def ensure_model_inspections_for_run(
     active inspect work whose fingerprint is not among the currently needed
     set so prior-run or stale-model preflights do not linger. Returns the
     number of models for which inspection work is ensured.
+
+    A model this run has already inspected is skipped rather than rescheduled.
+    Mid-run arming (K20 plan advancement, K21b match scheduling) calls this
+    after the run's own ``inspect_model`` item has settled, and
+    :func:`repository.schedule_work` only deduplicates against *active* work,
+    so rescheduling would issue a second paid preflight whose persist violates
+    ``model_inspection_by_run_model_routing``.
     """
     needed = models_needed_for_run(connection, run_id, config)
     if not needed:
@@ -584,6 +591,16 @@ def ensure_model_inspections_for_run(
         )
 
     for model_id in needed:
+        if (
+            load_model_inspection(
+                connection,
+                run_id=run_id,
+                configured_model_id=model_id,
+                routing_fingerprint=routing_fp,
+            )
+            is not None
+        ):
+            continue
         fingerprint = _inspection_work_fingerprint(
             run_id=run_id, model_id=model_id, routing_fp=routing_fp
         )
