@@ -138,7 +138,7 @@ def test_checked_in_example_configuration_is_structurally_valid(
         profile_root / "art.toml",
     )
     shutil.copyfile(
-        examples / "source_policies" / "visual_arts.example.toml",
+        examples / "source_policies" / "visual_arts.toml",
         policy_root / "visual_arts.toml",
     )
     completed = run_cli(

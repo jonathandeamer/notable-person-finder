@@ -22,7 +22,16 @@ _EXAMPLE_POLICY = (
     Path(__file__).resolve().parents[2]
     / "config"
     / "source_policies"
-    / "visual_arts.example.toml"
+    / "visual_arts.toml"
+)
+
+# Known-good fingerprint computed over the tracked policy's parsed content
+# before config/source_policies/visual_arts.example.toml was renamed (via
+# `git mv`) to config/source_policies/visual_arts.toml. The fingerprint is
+# computed over parsed content, not the filename, so the rename must not
+# change it (task 4, rule 4).
+_FINGERPRINT_BEFORE_RENAME = (
+    "fea3ae16c79b49e0800bfc28df360acab0fd00693bcd276be3a9e8a5a2b5b590"
 )
 
 
@@ -63,6 +72,18 @@ def test_load_example_policy_has_stable_fingerprint() -> None:
     assert policy.fingerprint == fingerprint_source_policy(policy)
     again = load_source_policy(_EXAMPLE_POLICY)
     assert again.fingerprint == policy.fingerprint
+
+
+def test_tracked_policy_fingerprint_unchanged_by_rename() -> None:
+    """The rename of the shipped policy file must not change its fingerprint.
+
+    The fingerprint is computed over parsed content (schema_version, key,
+    label, ordered rules), never the filename or path, so renaming
+    visual_arts.example.toml to visual_arts.toml (task 4) must reproduce the
+    exact fingerprint recorded before the rename.
+    """
+    policy = load_source_policy(_EXAMPLE_POLICY)
+    assert policy.fingerprint == _FINGERPRINT_BEFORE_RENAME
 
 
 def test_fingerprint_stable_across_mapping_reload() -> None:
