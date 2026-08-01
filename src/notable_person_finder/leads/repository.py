@@ -23,14 +23,15 @@ def insert_lead_assessment(
     lead_policy_fingerprint: str,
     ordering_factors_json: str,
     decided_at: str,
+    material_fingerprint: str | None = None,
 ) -> int:
     cursor = connection.execute(
         """
         INSERT INTO lead_assessment (
             person_id, run_id, outcome, qualifying_domain_count,
             incompleteness_reason, ordering_factors_json,
-            lead_policy_fingerprint, decided_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            lead_policy_fingerprint, material_fingerprint, decided_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             person_id,
@@ -40,6 +41,7 @@ def insert_lead_assessment(
             outcome.incompleteness_reason,
             ordering_factors_json,
             lead_policy_fingerprint,
+            material_fingerprint,
             decided_at,
         ),
     )
@@ -68,6 +70,28 @@ def insert_lead_assessment(
         (lead_id, person_id),
     )
     return lead_id
+
+
+def fetch_current_lead_assessment_material_fingerprint(
+    connection: sqlite3.Connection, *, person_id: int
+) -> str | None:
+    """The `material_fingerprint` stored on a person's current (most recent)
+    lead_assessment row, or None if the person has never been aggregated (or
+    a pre-existing row predates this column). Used by
+    `aggregate_person_lead`'s `prepare` for the K6 unchanged-evidence
+    local-refusal check -- a None result never matches a computed
+    fingerprint, so it is never mistaken for "already aggregated."
+    """
+    row = connection.execute(
+        """
+        SELECT la.material_fingerprint
+        FROM person p
+        JOIN lead_assessment la ON la.id = p.current_lead_assessment_id
+        WHERE p.id = ?
+        """,
+        (person_id,),
+    ).fetchone()
+    return row[0] if row is not None else None
 
 
 def fetch_prior_queue_state(

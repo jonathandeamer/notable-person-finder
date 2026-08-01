@@ -32,6 +32,7 @@ from notable_person_finder.leads.aggregation import (
 )
 from notable_person_finder.leads.queue import decide_queue_transition
 from notable_person_finder.leads.repository import (
+    fetch_current_lead_assessment_material_fingerprint,
     fetch_prior_queue_state,
     insert_lead_assessment,
     insert_queue_transition,
@@ -53,6 +54,13 @@ AGGREGATE_PERSON_LEAD_TASK_TYPE = "aggregate_person_lead"
 AGGREGATE_PERSON_LEAD_PRIORITY = 75
 LOCAL_PROVIDER = "local"
 
+# K6 local-refusal prefix, matching wikipedia/service.py's
+# MATCH_PREPARE_REFUSED_PREFIX: build_aggregate_person_lead_handler's
+# `prepare` raises a ValueError with this prefix when the person's evidence
+# fingerprint is unchanged since their last completed aggregation, so the
+# run engine settles the item failed_permanent instead of re-aggregating.
+AGGREGATE_PREPARE_REFUSED_PREFIX = "aggregate_prepare_refused:"
+
 
 @dataclass(frozen=True, slots=True)
 class _AggregatePayload:
@@ -60,6 +68,13 @@ class _AggregatePayload:
     articles: list[ArticleEvidence]
     signals: list[SignalEvidence]
     wikipedia_outcome: str | None
+    material_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecuteResult:
+    lead_outcome: LeadOutcome
+    material_fingerprint: str
 
 
 def _extract_domain(url: str) -> str:
@@ -268,12 +283,33 @@ def build_aggregate_person_lead_handler(
             canonical_domains=canonical_domains,
         )
         signals = _load_signal_evidence(connection, person_id=person_id)
+
+        material_fingerprint = _compute_material_fingerprint(
+            article_assessment_ids=[a.person_article_assessment_id for a in articles],
+            signal_ids=[s.article_assessment_signal_id for s in signals],
+            wikipedia_outcome=wikipedia_outcome,
+            policy=policy,
+            config=config,
+        )
+        stored_fingerprint = fetch_current_lead_assessment_material_fingerprint(
+            connection, person_id=person_id
+        )
+        if (
+            stored_fingerprint is not None
+            and stored_fingerprint == material_fingerprint
+        ):
+            raise ValueError(
+                f"{AGGREGATE_PREPARE_REFUSED_PREFIX}unchanged_fingerprint "
+                f"person {person_id}"
+            )
+
         return TaskPreparation(
             payload=_AggregatePayload(
                 person_id=person_id,
                 articles=articles,
                 signals=signals,
                 wikipedia_outcome=wikipedia_outcome,
+                material_fingerprint=material_fingerprint,
             ),
             reserved_nano_usd=0,
         )
@@ -286,7 +322,14 @@ def build_aggregate_person_lead_handler(
             wikipedia_outcome=prepared.wikipedia_outcome,
             promising_domain_threshold=config.tasks.aggregate_lead.promising_domain_threshold,
         )
-        return TaskOutcome(state=WorkState.SUCCEEDED, reason=None, payload=outcome)
+        return TaskOutcome(
+            state=WorkState.SUCCEEDED,
+            reason=None,
+            payload=_ExecuteResult(
+                lead_outcome=outcome,
+                material_fingerprint=prepared.material_fingerprint,
+            ),
+        )
 
     def persist(work_item: WorkItem, outcome: TaskOutcome) -> None:
         person_id = work_item.subject_id
@@ -294,8 +337,9 @@ def build_aggregate_person_lead_handler(
             raise ValueError(
                 "work_item.subject_id must be provided for aggregate_person_lead"
             )
-        lead_outcome = outcome.payload
-        assert isinstance(lead_outcome, LeadOutcome)
+        result = outcome.payload
+        assert isinstance(result, _ExecuteResult)
+        lead_outcome = result.lead_outcome
 
         run_id = _claimed_run_id(connection, work_item.id)
         now = _observed_at_for_prepare(connection, work_item.id)
@@ -315,6 +359,7 @@ def build_aggregate_person_lead_handler(
             lead_policy_fingerprint=policy.fingerprint,
             ordering_factors_json=ordering_factors,
             decided_at=now,
+            material_fingerprint=result.material_fingerprint,
         )
         prior = fetch_prior_queue_state(connection, person_id=person_id)
         matching_page_found = lead_outcome.wikipedia_outcome == "matching_page_found"
@@ -424,6 +469,14 @@ def reaggregate_person_lead(
         promising_domain_threshold=config.tasks.aggregate_lead.promising_domain_threshold,
     )
 
+    material_fingerprint = _compute_material_fingerprint(
+        article_assessment_ids=[a.person_article_assessment_id for a in articles],
+        signal_ids=[s.article_assessment_signal_id for s in signals],
+        wikipedia_outcome=wikipedia_outcome,
+        policy=policy,
+        config=config,
+    )
+
     ordering_factors = json.dumps(
         {
             "qualifying_domain_count": lead_outcome.qualifying_domain_count,
@@ -439,6 +492,7 @@ def reaggregate_person_lead(
         lead_policy_fingerprint=policy.fingerprint,
         ordering_factors_json=ordering_factors,
         decided_at=now,
+        material_fingerprint=material_fingerprint,
     )
     prior = fetch_prior_queue_state(connection, person_id=person_id)
     matching_page_found = lead_outcome.wikipedia_outcome == "matching_page_found"

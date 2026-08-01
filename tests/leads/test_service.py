@@ -517,3 +517,345 @@ def test_compute_material_fingerprint(empty_policy: SourcePolicy) -> None:
     )
     assert fp1 == fp2
     assert len(fp1) == 64
+
+
+def test_unchanged_fingerprint_does_not_reaggregate(
+    empty_policy: SourcePolicy,
+) -> None:
+    """`_compute_material_fingerprint` is order-independent (sorted before
+    hashing), so two schedule/prepare passes over the same underlying
+    evidence -- regardless of the order rows come back from SQLite -- must
+    agree on "unchanged." (The end-to-end refusal itself is covered by
+    `test_prepare_refuses_when_fingerprint_matches_prior_aggregation` below,
+    which drives the real handler and asserts no second `lead_assessment`
+    row is written.)"""
+    config = _main_config()
+    fp1 = _compute_material_fingerprint(
+        article_assessment_ids=[1, 2],
+        signal_ids=[],
+        wikipedia_outcome="no_matching_page_found",
+        policy=empty_policy,
+        config=config,
+    )
+    fp2 = _compute_material_fingerprint(
+        article_assessment_ids=[2, 1],
+        signal_ids=[],
+        wikipedia_outcome="no_matching_page_found",
+        policy=empty_policy,
+        config=config,
+    )
+    assert fp1 == fp2
+
+
+def test_changed_evidence_changes_fingerprint(empty_policy: SourcePolicy) -> None:
+    config = _main_config()
+    fp1 = _compute_material_fingerprint(
+        article_assessment_ids=[1],
+        signal_ids=[],
+        wikipedia_outcome="no_matching_page_found",
+        policy=empty_policy,
+        config=config,
+    )
+    fp2 = _compute_material_fingerprint(
+        article_assessment_ids=[1, 2],
+        signal_ids=[],
+        wikipedia_outcome="no_matching_page_found",
+        policy=empty_policy,
+        config=config,
+    )
+    assert fp1 != fp2
+
+
+def _add_second_article_assessment(
+    connection: sqlite3.Connection, *, person_id: int, run_id: int
+) -> int:
+    """Add a second, distinct completed person_article_assessment (and a
+    qualifying signal) for an *existing* person, changing that person's
+    evidence set -- and therefore their `_compute_material_fingerprint`
+    input -- without creating a new person. Mirrors
+    `_seed_person_and_articles`'s row shapes but targets `person_id` rather
+    than minting a fresh one."""
+    with immediate(connection):
+        article_id = connection.execute(
+            """
+            INSERT INTO canonical_article (canonical_url, publisher_key, first_seen_at)
+            VALUES ('https://artnews.com/gallery/2', 'artnews.com', ?)
+            """,
+            (NOW,),
+        ).lastrowid
+        assert article_id is not None
+
+        pa_id = connection.execute(
+            """
+            INSERT INTO person_article (person_id, canonical_article_id)
+            VALUES (?, ?)
+            """,
+            (person_id, article_id),
+        ).lastrowid
+        assert pa_id is not None
+
+        work_id = connection.execute(
+            """
+            INSERT INTO work_item (
+                task_type, subject_kind, subject_id, fingerprint, required,
+                priority, eligible_at, state, created_by_run_id, created_at,
+                updated_at
+            ) VALUES (
+                'assess_article', 'person_article', ?, ?, 1, 70, ?, 'succeeded',
+                ?, ?, ?
+            )
+            """,
+            (pa_id, "x" * 64, NOW, run_id, NOW, NOW),
+        ).lastrowid
+        assert work_id is not None
+
+        attempt_id = connection.execute(
+            """
+            INSERT INTO attempt (
+                run_id, work_item_id, provider, operation, ordinal, started_at,
+                finished_at, outcome, request_fingerprint
+            ) VALUES (?, ?, 'openrouter', 'generate', 1, ?, ?, 'succeeded', ?)
+            """,
+            (run_id, work_id, NOW, NOW, "y" * 64),
+        ).lastrowid
+        assert attempt_id is not None
+
+        inspection_id = connection.execute(
+            """
+            INSERT INTO model_inspection (
+                run_id, attempt_id, configured_model_id, resolved_model_id,
+                routing_fingerprint, supported_parameters_json,
+                supports_strict_structured_output, pricing_usable,
+                prompt_unit_price_nano_usd, completion_unit_price_nano_usd,
+                compatibility, inspected_at
+            ) VALUES (
+                ?, ?, 'model', 'model-resolved', ?, '[]', 1, 1, 100, 100,
+                'compatible', ?
+            )
+            """,
+            (run_id, attempt_id, "z" * 64, NOW),
+        ).lastrowid
+        assert inspection_id is not None
+
+        view_id = connection.execute(
+            """
+            INSERT INTO article_view (
+                canonical_article_id, run_id, attempt_id, access_kind,
+                editorial_labels_json, main_text_blocks_json, snippets_json,
+                extractor_version, observed_at
+            ) VALUES (?, ?, ?, 'full', '[]', '[]', '[]', 1, ?)
+            """,
+            (article_id, run_id, attempt_id, NOW),
+        ).lastrowid
+        assert view_id is not None
+
+        paa_id = connection.execute(
+            """
+            INSERT INTO person_article_assessment (
+                person_article_id, person_id, canonical_article_id,
+                article_view_id, run_id, attempt_id, model_inspection_id,
+                disposition, person_relation, coverage_depth, content_types_json,
+                subject_relationship, screening_rule_id, screening_rule_status,
+                source_policy_fingerprint, canonical_supplied_input_json,
+                validated_output_json, prompt_hash, schema_hash, schema_version,
+                task_fingerprint, rationale, observed_at
+            ) VALUES (
+                ?, ?, ?, ?,
+                ?, ?, ?, 'completed',
+                'same_person', 'significant', '["exhibition_review"]',
+                'editorially_independent', 'rule_1', 'curated_eligible', ?,
+                '{}', '{}', ?, ?,
+                1, ?, 'rationale', ?
+            )
+            """,
+            (
+                pa_id,
+                person_id,
+                article_id,
+                view_id,
+                run_id,
+                attempt_id,
+                inspection_id,
+                "a" * 64,
+                "p" * 64,
+                "s" * 64,
+                "tg" * 32,
+                NOW,
+            ),
+        ).lastrowid
+        assert paa_id is not None
+
+        connection.execute(
+            """
+            INSERT INTO article_assessment_signal (
+                assessment_id, signal_kind, category, claim,
+                supporting_passage_ids_json, ordinal
+            ) VALUES (?, 'attention', 'career_milestone', 'claim', '[]', 1)
+            """,
+            (paa_id,),
+        )
+    return paa_id
+
+
+def test_prepare_refuses_when_fingerprint_matches_prior_aggregation(
+    connection: sqlite3.Connection, empty_policy: SourcePolicy
+) -> None:
+    """Integration-level regression for the K6 gap: once a person's evidence
+    has been aggregated once, a *second* aggregate_person_lead work item
+    scheduled against the *same* evidence (schedule_work only dedups
+    pending/running/deferred work, not succeeded -- exactly how
+    seed_lead_aggregation's every-run sweep would otherwise re-run this
+    person forever) must be refused by `prepare` before a second
+    `lead_assessment` row is written."""
+    from notable_person_finder.leads.service import AGGREGATE_PREPARE_REFUSED_PREFIX
+
+    run_id = insert_run(connection)
+    person_id, _paa_id = _seed_person_and_articles(connection, run_id=run_id)
+
+    config = _main_config()
+    handler = build_aggregate_person_lead_handler(
+        connection, config=config, policy=empty_policy
+    )
+
+    def _run_once(fingerprint: str) -> WorkItem:
+        work_id = schedule_aggregate_person_lead(
+            connection,
+            person_id=person_id,
+            material_fingerprint=fingerprint,
+            run_id=run_id,
+            now=NOW,
+        )
+        connection.execute(
+            "UPDATE work_item SET state = 'running', claimed_by_run_id = ? "
+            "WHERE id = ?",
+            (run_id, work_id),
+        )
+        connection.commit()
+        return WorkItem(
+            id=work_id,
+            task_type=AGGREGATE_PERSON_LEAD_TASK_TYPE,
+            subject_kind="person",
+            subject_id=person_id,
+            fingerprint=fingerprint,
+            required=True,
+            priority=AGGREGATE_PERSON_LEAD_PRIORITY,
+            state=WorkState.RUNNING,
+        )
+
+    assert handler.prepare is not None
+    assert handler.persist is not None
+
+    first_work = _run_once("c" * 64)
+    prepared = handler.prepare(first_work)
+    outcome = handler.execute(first_work, 1, prepared.payload)
+    with immediate(connection):
+        handler.persist(first_work, outcome)
+
+    lead_count_after_first = connection.execute(
+        "SELECT COUNT(*) AS n FROM lead_assessment WHERE person_id = ?",
+        (person_id,),
+    ).fetchone()["n"]
+    assert lead_count_after_first == 1
+
+    # A second work item scheduled against the same, unchanged evidence:
+    # schedule_work's dedup only covers pending/running/deferred, so this
+    # succeeds in creating a brand-new work item even though nothing about
+    # the person's evidence has changed since the first aggregation.
+    second_work = _run_once("c" * 64)
+    with pytest.raises(ValueError, match=AGGREGATE_PREPARE_REFUSED_PREFIX):
+        handler.prepare(second_work)
+
+    lead_count_after_refusal = connection.execute(
+        "SELECT COUNT(*) AS n FROM lead_assessment WHERE person_id = ?",
+        (person_id,),
+    ).fetchone()["n"]
+    assert lead_count_after_refusal == 1
+
+
+def test_prepare_proceeds_when_evidence_changed_since_prior_aggregation(
+    connection: sqlite3.Connection, empty_policy: SourcePolicy
+) -> None:
+    """The converse of the refusal test: once the person gains a new
+    qualifying article after their prior aggregation, `prepare` must not
+    refuse, and settling the new work item must produce a fresh
+    `lead_assessment` row."""
+    run_id = insert_run(connection)
+    person_id, _paa_id = _seed_person_and_articles(connection, run_id=run_id)
+
+    config = _main_config()
+    handler = build_aggregate_person_lead_handler(
+        connection, config=config, policy=empty_policy
+    )
+    assert handler.prepare is not None
+    assert handler.persist is not None
+
+    work_id = schedule_aggregate_person_lead(
+        connection,
+        person_id=person_id,
+        material_fingerprint="c" * 64,
+        run_id=run_id,
+        now=NOW,
+    )
+    connection.execute(
+        "UPDATE work_item SET state = 'running', claimed_by_run_id = ? WHERE id = ?",
+        (run_id, work_id),
+    )
+    connection.commit()
+    first_work = WorkItem(
+        id=work_id,
+        task_type=AGGREGATE_PERSON_LEAD_TASK_TYPE,
+        subject_kind="person",
+        subject_id=person_id,
+        fingerprint="c" * 64,
+        required=True,
+        priority=AGGREGATE_PERSON_LEAD_PRIORITY,
+        state=WorkState.RUNNING,
+    )
+    prepared = handler.prepare(first_work)
+    outcome = handler.execute(first_work, 1, prepared.payload)
+    with immediate(connection):
+        handler.persist(first_work, outcome)
+
+    lead_count_after_first = connection.execute(
+        "SELECT COUNT(*) AS n FROM lead_assessment WHERE person_id = ?",
+        (person_id,),
+    ).fetchone()["n"]
+    assert lead_count_after_first == 1
+
+    # Evidence changes: a new qualifying article assessment for this person.
+    _add_second_article_assessment(connection, person_id=person_id, run_id=run_id)
+
+    work_id_2 = schedule_aggregate_person_lead(
+        connection,
+        person_id=person_id,
+        material_fingerprint="d" * 64,
+        run_id=run_id,
+        now=NOW,
+    )
+    connection.execute(
+        "UPDATE work_item SET state = 'running', claimed_by_run_id = ? WHERE id = ?",
+        (run_id, work_id_2),
+    )
+    connection.commit()
+    second_work = WorkItem(
+        id=work_id_2,
+        task_type=AGGREGATE_PERSON_LEAD_TASK_TYPE,
+        subject_kind="person",
+        subject_id=person_id,
+        fingerprint="d" * 64,
+        required=True,
+        priority=AGGREGATE_PERSON_LEAD_PRIORITY,
+        state=WorkState.RUNNING,
+    )
+
+    # Must not raise.
+    prepared_2 = handler.prepare(second_work)
+    outcome_2 = handler.execute(second_work, 1, prepared_2.payload)
+    with immediate(connection):
+        handler.persist(second_work, outcome_2)
+
+    lead_count_after_second = connection.execute(
+        "SELECT COUNT(*) AS n FROM lead_assessment WHERE person_id = ?",
+        (person_id,),
+    ).fetchone()["n"]
+    assert lead_count_after_second == 2

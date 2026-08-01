@@ -7,6 +7,19 @@
 -- for K1-K13 rationale. lead_assessment rows are immutable domain history;
 -- digest_queue is a mutable operational projection with no history of its
 -- own (K3) -- queue_transition is the ledger.
+--
+-- lead_assessment.material_fingerprint (revised into this migration before
+-- cutover, per K6): the same evidence-input fingerprint
+-- leads/service.py's _compute_material_fingerprint computes at schedule
+-- time, persisted here on every real aggregation so aggregate_person_lead's
+-- prepare() can refuse (local-refusal, matching wikipedia/service.py's
+-- match_wikipedia_identity prepare) to re-aggregate a person whose evidence
+-- has not changed since the last completed aggregation. Left nullable
+-- because pre-existing direct-SQL test fixtures across tests/leads seed
+-- lead_assessment rows without it to exercise unrelated behaviour (queue
+-- transitions, merge reconciliation, digest rendering); a NULL stored value
+-- never matches a computed fingerprint, so it is never treated as "already
+-- aggregated."
 
 CREATE TABLE lead_assessment (
     id INTEGER PRIMARY KEY,
@@ -22,6 +35,7 @@ CREATE TABLE lead_assessment (
     ordering_factors_json TEXT NOT NULL,
     lead_policy_fingerprint TEXT NOT NULL
         CHECK (length(lead_policy_fingerprint) = 64),
+    material_fingerprint TEXT,
     decided_at TEXT NOT NULL CHECK (decided_at GLOB '*Z'),
     CHECK (
         (outcome = 'assessment_incomplete' AND incompleteness_reason IS NOT NULL)
