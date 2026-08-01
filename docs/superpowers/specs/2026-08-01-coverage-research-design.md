@@ -44,9 +44,9 @@ The arc is delivered as two milestones, each a vertical slice with observable
 output.
 
 **Milestone 5a — coverage discovery.** Publisher policy, the Brave adapter,
-person search plans, first-class queries, ranked result occurrences, shared
-canonical-article identity, deterministic screening, and deterministic
-selection. A run searches, screens, and selects; the digest and `notable
+person search plans, first-class queries, ranked result occurrences,
+convergence onto the existing canonical-article identity, deterministic
+screening, and deterministic selection. A run searches, screens, and selects; the digest and `notable
 status` report what happened. No article body is fetched and no assessment is
 made.
 
@@ -200,14 +200,21 @@ occurrences may reference one article, but query and rank are never collapsed.
 
 One application-owned `canonicalize_article_url` policy defines article
 identity for feed items, search occurrences, and observed redirect
-destinations alike. This is a change to existing ingestion, which currently
-owns its own URL identity: milestone 5a moves ingestion onto the shared
-function so that feed and search discovery converge on one canonical article
-without a second normalizer. Original and redirected URLs remain as provenance
-aliases.
+destinations alike. It already exists in `ingestion/urls.py`, was written for
+this milestone, and is already the sole normalizer used by feed ingestion.
+Coverage discovery therefore adds no second normalizer: search occurrences and
+redirect destinations call the same function, and search-discovered articles
+converge onto the existing `canonical_article` rows that feed items created.
+Original and redirected URLs remain as provenance aliases.
+
+`publisher_key` in the same module derives the registrable-domain publisher
+identity. Its suffix table is deliberately approximate; if the curated policy
+turns up a publisher it mis-splits, the fix is to grow that table, and the
+milestone plan must include a test for any such publisher in the initial
+policy set.
 
 A canonical article has one conservatively normalized unique URL and a
-canonical publisher key derived under the active source policy. Only identical
+canonical publisher key. Only identical
 canonical URLs deduplicate. The application performs no cross-source
 independence clustering and never claims that a count of results proves
 multiple independent reliable sources.
