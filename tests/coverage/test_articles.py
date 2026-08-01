@@ -7,6 +7,7 @@ exercised. Extraction uses fixture HTML only — never the network (K3).
 
 from __future__ import annotations
 
+import socket
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Literal
@@ -15,6 +16,7 @@ import httpx
 import pytest
 
 from notable_person_finder.config.models import TransportConfig
+from notable_person_finder.providers import articles
 from notable_person_finder.providers.articles import (
     ARTICLE_PROVIDER,
     EXTRACTOR_VERSION,
@@ -549,14 +551,30 @@ def test_extract_partial_fixture_is_partial_quality() -> None:
     assert not hasattr(extracted, "html")
 
 
-def test_extract_is_network_free_even_if_url_like_strings_present() -> None:
-    """Extractor must not open sockets; pure in-process Trafilatura only."""
+def test_extract_is_network_free_even_if_url_like_strings_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Extractor must not open sockets; pure in-process Trafilatura only.
+
+    Asserting only on the returned object proves nothing: it looks identical
+    whether or not the embedded link was fetched. Sockets are therefore made
+    unusable for the duration of the call, so any attempt fails loudly.
+    """
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("the extractor opened a socket")
+
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden)
+
     extractor = TrafilaturaArticleExtractor()
     # Relative asset URLs and external links must not trigger downloads.
     html = (
         b"<!DOCTYPE html><html><head><title>Linked</title></head><body>"
         b"<article><h1>Linked</h1>"
         b'<p>See <a href="https://definitely-not-fetched.invalid/page">here</a>.</p>'
+        b'<img src="/assets/hero.jpg">'
         b"<p>Second paragraph keeps this from collapsing to empty under "
         b"generic extraction while remaining short enough for partial quality.</p>"
         b"</article></body></html>"
@@ -566,13 +584,63 @@ def test_extract_is_network_free_even_if_url_like_strings_present() -> None:
     assert not hasattr(extracted, "html")
 
 
-def test_extract_failure_detail_path_never_embeds_html() -> None:
-    """If extraction internals fail, surface stays typed without HTML leak."""
+def test_socket_guard_in_the_network_free_test_actually_bites(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive control for the guard above: the patch really blocks sockets."""
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("opened a socket")
+
+    monkeypatch.setattr(socket, "socket", forbidden)
+    with pytest.raises(AssertionError, match="opened a socket"):
+        socket.socket()
+
+
+_MARKUP = "<html><body><p>secret markup</p></body></html>"
+
+
+def test_extract_failure_detail_path_never_embeds_html(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If extraction internals fail, surface stays typed without HTML leak.
+
+    The happy-path warnings are hard-coded constants, so asserting `"<html"
+    not in warning` over them can never fail. This drives the real failure
+    branch with an exception whose message *is* the document, which is the
+    only way markup could reach a warning.
+    """
+    raised: list[str] = []
+
+    def exploding(document: str, **kwargs: object) -> object:
+        raised.append(document)
+        raise RuntimeError(document)
+
+    monkeypatch.setattr(articles.trafilatura, "bare_extraction", exploding)
+
     extractor = TrafilaturaArticleExtractor()
-    # Broken markup still must not raise with HTML in an exception detail.
-    extracted = extractor.extract_article(b"<html><body><p>tiny</p>")
+    extracted = extractor.extract_article(_MARKUP.encode("utf-8"))
+
+    # The failure branch was genuinely taken, with markup in the exception.
+    assert raised == [_MARKUP]
+    assert extracted.warnings == ("extract_failed", "empty_body")
+    assert extracted.quality is ExtractionQuality.EMPTY
     assert isinstance(extracted, ExtractedArticle)
     assert not hasattr(extracted, "html")
     for warning in extracted.warnings:
         assert "<html" not in warning
         assert "<body" not in warning
+        assert "secret markup" not in warning
+    assert "secret markup" not in repr(extracted)
+
+
+def test_extract_failure_branch_would_show_a_leak_if_one_existed() -> None:
+    """Positive control: the assertions above can fail.
+
+    Markup fed through the same warning-shaped tuple trips every check, so a
+    green run of the test above is evidence about the extractor, not about
+    unreachable strings.
+    """
+    leaked = (f"extract_failed: {_MARKUP}",)
+    assert any("<html" in warning for warning in leaked)
+    assert any("secret markup" in warning for warning in leaked)
