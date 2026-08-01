@@ -87,5 +87,8 @@ include = [
     "tests/run_engine",
     "tests/ingestion",
     "tests/people",
+    "tests/wikipedia",
+    "tests/coverage",
+    "tests/leads",
 ]
 exclude = ["**/__pycache__", ".venv", ".worktrees"]

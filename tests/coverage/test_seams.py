@@ -33,7 +33,10 @@ from notable_person_finder.coverage.repository import (
     open_plan,
     upsert_person_article,
 )
-from notable_person_finder.coverage.screening import source_policy_from_mapping
+from notable_person_finder.coverage.screening import (
+    SourcePolicy,
+    source_policy_from_mapping,
+)
 from notable_person_finder.coverage.service import BRAVE_WEB_SEARCH_TASK_TYPE
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.db.migrate import apply_migrations
@@ -656,17 +659,38 @@ def test_compose_seed_runs_coverage_research_after_wikipedia_seed(
         real_coverage = cli_main.seed_coverage_research
         real_ensure = cli_main.ensure_model_inspections_for_run
 
-        def spy_wikipedia(*args: object, **kwargs: object) -> object:
+        def spy_wikipedia(
+            connection: sqlite3.Connection,
+            *,
+            run_id: int,
+            config: MainConfig,
+            now: str,
+        ) -> int:
             order.append("wikipedia")
-            return real_wikipedia(*args, **kwargs)
+            return real_wikipedia(connection, run_id=run_id, config=config, now=now)
 
-        def spy_coverage(*args: object, **kwargs: object) -> object:
+        def spy_coverage(
+            connection: sqlite3.Connection,
+            *,
+            run_id: int,
+            config: MainConfig,
+            policy: SourcePolicy,
+            now: str,
+        ) -> int:
             order.append("coverage")
-            return real_coverage(*args, **kwargs)
+            return real_coverage(
+                connection, run_id=run_id, config=config, policy=policy, now=now
+            )
 
-        def spy_ensure(*args: object, **kwargs: object) -> object:
+        def spy_ensure(
+            connection: sqlite3.Connection,
+            *,
+            run_id: int,
+            config: MainConfig,
+            now: str,
+        ) -> int:
             order.append("ensure_model_inspections")
-            return real_ensure(*args, **kwargs)
+            return real_ensure(connection, run_id=run_id, config=config, now=now)
 
         monkeypatch.setattr(cli_main, "seed_wikipedia_identity", spy_wikipedia)
         monkeypatch.setattr(cli_main, "seed_coverage_research", spy_coverage)

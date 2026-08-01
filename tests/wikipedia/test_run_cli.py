@@ -7,7 +7,7 @@ no-match without match-model generations (K4).
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import httpx
@@ -260,13 +260,18 @@ def test_command_run_registers_three_wikipedia_handlers_on_engine_map(
     ``RunEngine.execute`` (not a side-constructed builder). Kills omitting any
     of the three keys from the CLI map.
     """
-    from notable_person_finder.runs.engine import RunEngine
+    from notable_person_finder.runs.engine import RunEngine, RunReport, TaskHandler
     from notable_person_finder.runs.scheduler import WorkerPool as Pool
 
     captured: dict[str, object] = {}
     original_execute = RunEngine.execute
 
-    def spy_execute(self: RunEngine, handlers: object, seed: object = None) -> object:
+    def spy_execute(
+        self: RunEngine,
+        handlers: Mapping[str, TaskHandler],
+        *,
+        seed: Callable[[int], None] | None = None,
+    ) -> RunReport:
         assert isinstance(handlers, dict)
         captured["keys"] = frozenset(handlers.keys())
         captured["handlers"] = handlers

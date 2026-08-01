@@ -36,10 +36,15 @@ from notable_person_finder.people.service import (
     task_types_for_model,
 )
 from notable_person_finder.providers.failures import FailureCategory, ProviderFailure
-from notable_person_finder.providers.mediawiki import MediaWikiPageFactsBatch
+from notable_person_finder.providers.mediawiki import (
+    MediaWikiPageFactsBatch,
+    MediaWikiSearchPage,
+)
 from notable_person_finder.providers.openrouter import (
     GENERATE_OPERATION,
     PROVIDER,
+    ModelInspectionRequest,
+    ModelInspectionResult,
     StructuredGenerationRequest,
     StructuredGenerationResult,
 )
@@ -127,7 +132,7 @@ class ScriptedLlmClient:
             raise result
         return result
 
-    def inspect_model(self, request: object) -> object:
+    def inspect_model(self, request: ModelInspectionRequest) -> ModelInspectionResult:
         raise AssertionError("match handler must not call inspect_model")
 
 
@@ -427,7 +432,7 @@ def _run_match(
     work_id: int,
     run_id: int,
     expect_execute: bool = True,
-) -> tuple[object | None, object | None]:
+) -> tuple[Exception | None, ProviderFailure | None]:
     """Prepare → execute → persist. Returns (prepare_error, execute_error)."""
     work = _work_item(connection, work_id)
     _claim_and_attempt(connection, work_id=work_id, run_id=run_id)
@@ -798,7 +803,9 @@ def test_persist_failure_noop_when_completed_exists(
         (person_id, _HASH),
     ).fetchone()["n"]
     assert count == 1
-    assert load_plan(connection, plan_id=plan_id).status == "completed"
+    plan = load_plan(connection, plan_id=plan_id)
+    assert plan is not None
+    assert plan.status == "completed"
 
 
 def test_budget_reservation_under_hard_cap(
@@ -827,10 +834,12 @@ def test_budget_reservation_under_hard_cap(
     )
 
     class _Dummy:
-        def search_pages(self, *a: object, **k: object) -> object:
+        def search_pages(
+            self, query: str, *, continuation: str | None
+        ) -> MediaWikiSearchPage:
             raise AssertionError
 
-        def get_page_facts(self, *a: object, **k: object) -> object:
+        def get_page_facts(self, page_ids: object) -> MediaWikiPageFactsBatch:
             raise AssertionError
 
     search = build_mediawiki_search_handler(
@@ -1144,7 +1153,9 @@ def test_permanent_match_preflight_failed_obs_plan_failed_pointer_unchanged(
     assert obs.attempt_id == inspection_attempt
     assert obs.failure_category == "permanent_preflight"
     assert _person_pointer(connection, person_id) == prior  # K25 unchanged
-    assert load_plan(connection, plan_id=plan_id).status == "failed"
+    plan = load_plan(connection, plan_id=plan_id)
+    assert plan is not None
+    assert plan.status == "failed"
     # No generate_structured attempts invented.
     assert (
         connection.execute(

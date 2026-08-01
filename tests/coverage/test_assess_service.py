@@ -64,6 +64,8 @@ from notable_person_finder.providers.failures import FailureCategory, ProviderFa
 from notable_person_finder.providers.openrouter import (
     GENERATE_OPERATION,
     PROVIDER,
+    ModelInspectionRequest,
+    ModelInspectionResult,
     StructuredGenerationRequest,
     StructuredGenerationResult,
 )
@@ -138,7 +140,7 @@ class ScriptedLlmClient:
             raise result
         return result
 
-    def inspect_model(self, request: object) -> object:
+    def inspect_model(self, request: ModelInspectionRequest) -> ModelInspectionResult:
         raise AssertionError("assess handler must not call inspect_model")
 
 

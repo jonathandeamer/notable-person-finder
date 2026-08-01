@@ -24,7 +24,10 @@ from notable_person_finder.coverage.repository import (
     load_coverage_article_target,
     load_person_article_by_pair,
 )
-from notable_person_finder.coverage.screening import source_policy_from_mapping
+from notable_person_finder.coverage.screening import (
+    SourcePolicy,
+    source_policy_from_mapping,
+)
 from notable_person_finder.coverage.service import (
     ASSESS_ARTICLE_TASK_TYPE,
     FETCH_ARTICLE_TASK_TYPE,
@@ -50,6 +53,7 @@ from notable_person_finder.providers.brave import (
     PROVIDER as BRAVE_PROVIDER,
 )
 from notable_person_finder.providers.failures import FailureCategory, ProviderFailure
+from notable_person_finder.runs.engine import TaskOutcome
 from notable_person_finder.runs.models import WorkItem, WorkState
 from tests.coverage.fakes_articles import (
     FakeArticleExtractor,
@@ -347,11 +351,11 @@ def _run_fetch(
     fetcher: FakeArticleFetcher,
     extractor: FakeArticleExtractor,
     config: MainConfig,
-    policy,
+    policy: SourcePolicy,
     target_id: int,
     material_fingerprint: str,
     run_id: int,
-) -> tuple[WorkItem, object]:
+) -> tuple[WorkItem, TaskOutcome]:
     with immediate(connection) as conn:
         work_id = schedule_fetch_article(
             conn,
@@ -392,8 +396,8 @@ def _plan_with_search_hits(
     titles: tuple[str, ...] | None = None,
     snippets: tuple[str, ...] | None = None,
     config: MainConfig | None = None,
-    policy=None,
-) -> tuple[int, int, int, MainConfig, object]:
+    policy: SourcePolicy | None = None,
+) -> tuple[int, int, int, MainConfig, SourcePolicy]:
     """Open plan, complete one Brave form with the given result URLs."""
     policy = policy if policy is not None else _policy()
     config = config if config is not None else _main_config()

@@ -11,6 +11,7 @@ Verifies that:
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -61,7 +62,7 @@ _VISUAL_ARTS_POLICY = _REPO_ROOT / "config" / "source_policies" / "visual_arts.t
 
 
 @pytest.fixture
-def connection(tmp_path: Path) -> sqlite3.Connection:
+def connection(tmp_path: Path) -> Generator[sqlite3.Connection]:
     db_path = tmp_path / "test.db"
     conn = connect_database(db_path)
     apply_migrations(conn, db_path, tmp_path / "backups")

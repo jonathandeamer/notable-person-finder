@@ -12,7 +12,7 @@ eligibility, or the Wikipedia-match stop/supersede path (K5).
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import httpx
@@ -21,6 +21,7 @@ import pytest
 from notable_person_finder.cli import main as cli_main
 from notable_person_finder.config.models import TransportConfig
 from notable_person_finder.coverage.repository import insert_query_forms, open_plan
+from notable_person_finder.coverage.screening import SourcePolicy
 from notable_person_finder.coverage.service import (
     ASSESS_ARTICLE_TASK_TYPE,
     BRAVE_WEB_SEARCH_TASK_TYPE,
@@ -315,12 +316,17 @@ def test_command_run_registers_three_coverage_handlers_on_engine_map(
     Wikipedia equivalent. Kills omitting any of the three keys from the CLI
     map.
     """
-    from notable_person_finder.runs.engine import RunEngine
+    from notable_person_finder.runs.engine import RunEngine, RunReport, TaskHandler
 
     captured: dict[str, object] = {}
     original_execute = RunEngine.execute
 
-    def spy_execute(self: RunEngine, handlers: object, seed: object = None) -> object:
+    def spy_execute(
+        self: RunEngine,
+        handlers: Mapping[str, TaskHandler],
+        *,
+        seed: Callable[[int], None] | None = None,
+    ) -> RunReport:
         assert isinstance(handlers, dict)
         captured["keys"] = frozenset(handlers.keys())
         return original_execute(self, handlers, seed=seed)
@@ -352,22 +358,39 @@ def test_seed_runs_coverage_research_between_wikipedia_and_model_inspection(
     config = write_people_graph(tmp_path, feeds=_single_feed())
     _wire(monkeypatch, rss=RESEARCH_FEED.encode())
 
+    import sqlite3
+
+    from notable_person_finder.config.models import MainConfig
+
     order: list[str] = []
     real_wikipedia = cli_main.seed_wikipedia_identity
     real_coverage = cli_main.seed_coverage_research
     real_ensure = cli_main.ensure_model_inspections_for_run
 
-    def spy_wikipedia(*args: object, **kwargs: object) -> object:
+    def spy_wikipedia(
+        connection: sqlite3.Connection, *, run_id: int, config: MainConfig, now: str
+    ) -> int:
         order.append("wikipedia")
-        return real_wikipedia(*args, **kwargs)
+        return real_wikipedia(connection, run_id=run_id, config=config, now=now)
 
-    def spy_coverage(*args: object, **kwargs: object) -> object:
+    def spy_coverage(
+        connection: sqlite3.Connection,
+        *,
+        run_id: int,
+        config: MainConfig,
+        policy: SourcePolicy,
+        now: str,
+    ) -> int:
         order.append("coverage")
-        return real_coverage(*args, **kwargs)
+        return real_coverage(
+            connection, run_id=run_id, config=config, policy=policy, now=now
+        )
 
-    def spy_ensure(*args: object, **kwargs: object) -> object:
+    def spy_ensure(
+        connection: sqlite3.Connection, *, run_id: int, config: MainConfig, now: str
+    ) -> int:
         order.append("ensure_model_inspections")
-        return real_ensure(*args, **kwargs)
+        return real_ensure(connection, run_id=run_id, config=config, now=now)
 
     monkeypatch.setattr(cli_main, "seed_wikipedia_identity", spy_wikipedia)
     monkeypatch.setattr(cli_main, "seed_coverage_research", spy_coverage)

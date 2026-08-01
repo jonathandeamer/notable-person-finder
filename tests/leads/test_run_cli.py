@@ -9,6 +9,7 @@ Kills omitting ``AGGREGATE_PERSON_LEAD_TASK_TYPE`` from the CLI map.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import pytest
@@ -22,12 +23,17 @@ from tests.people.test_run_cli import RESEARCH_FEED, _single_feed, write_people_
 def test_command_run_registers_aggregate_person_lead_handler_on_engine_map(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from notable_person_finder.runs.engine import RunEngine
+    from notable_person_finder.runs.engine import RunEngine, RunReport, TaskHandler
 
     captured: dict[str, object] = {}
     original_execute = RunEngine.execute
 
-    def spy_execute(self: RunEngine, handlers: object, seed: object = None) -> object:
+    def spy_execute(
+        self: RunEngine,
+        handlers: Mapping[str, TaskHandler],
+        *,
+        seed: Callable[[int], None] | None = None,
+    ) -> RunReport:
         assert isinstance(handlers, dict)
         captured["keys"] = frozenset(handlers.keys())
         return original_execute(self, handlers, seed=seed)
