@@ -7,6 +7,8 @@ import sqlite3
 import pytest
 
 from notable_person_finder.coverage.repository import (
+    coverage_corpus_counts,
+    coverage_run_counts,
     insert_article_view,
     insert_assessment_signals,
     insert_coverage_article_target,
@@ -20,6 +22,7 @@ from notable_person_finder.coverage.repository import (
     open_plan,
     point_person_article_current_assessment,
     supersede_plan,
+    update_plan_status,
     upsert_person_article,
 )
 from tests.ingestion.helpers import immediate, insert_run, moment
@@ -30,7 +33,9 @@ _PROMPT_HASH = "d" * 64
 _SCHEMA_HASH = "e" * 64
 
 
-def _work_item(connection: sqlite3.Connection, *, run_id: int) -> int:
+def _work_item(
+    connection: sqlite3.Connection, *, run_id: int, fingerprint: str = _HASH
+) -> int:
     cursor = connection.execute(
         """
         INSERT INTO work_item (
@@ -42,7 +47,7 @@ def _work_item(connection: sqlite3.Connection, *, run_id: int) -> int:
             'running', ?, ?, ?
         )
         """,
-        (_HASH, moment(), run_id, moment(), moment()),
+        (fingerprint, moment(), run_id, moment(), moment()),
     )
     assert cursor.lastrowid is not None
     return cursor.lastrowid
@@ -56,7 +61,7 @@ def _attempt(
     operation: str = "search_web",
     fingerprint: str = _HASH,
 ) -> int:
-    work_item_id = _work_item(connection, run_id=run_id)
+    work_item_id = _work_item(connection, run_id=run_id, fingerprint=fingerprint)
     cursor = connection.execute(
         """
         INSERT INTO attempt (
@@ -492,3 +497,168 @@ def test_unusable_screening_without_discovery_row(
             (plan_id,),
         ).fetchone()[0]
         assert discovery_count == 0
+
+
+def _completed_assessment(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    run_id: int,
+    url: str,
+    fingerprint: str = _HASH,
+    inspection_id: int | None = None,
+) -> tuple[int, int]:
+    article_id = _canonical_article(connection, url=url)
+    attempt_id = _attempt(connection, run_id=run_id, fingerprint=fingerprint)
+    if inspection_id is None:
+        inspection_id = _inspection(connection, run_id=run_id, attempt_id=attempt_id)
+    if connection.in_transaction:
+        connection.commit()
+    reused_inspection = inspection_id
+    with immediate(connection) as conn:
+        person_article_id = upsert_person_article(
+            conn,
+            person_id=person_id,
+            canonical_article_id=article_id,
+            first_plan_id=None,
+        )
+        view_id = insert_article_view(
+            conn,
+            canonical_article_id=article_id,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            access_kind="full",
+            requested_url=url,
+            final_url=url,
+            title="Title",
+            dek=None,
+            byline=None,
+            published_at=None,
+            editorial_labels_json="[]",
+            main_text_blocks_json='[{"id":"b1","text":"Body"}]',
+            snippets_json="[]",
+            extraction_quality="full",
+            extractor_version=1,
+            observed_at=moment(),
+        )
+        assessment_id = insert_person_article_assessment(
+            conn,
+            person_article_id=person_article_id,
+            person_id=person_id,
+            canonical_article_id=article_id,
+            plan_id=None,
+            article_view_id=view_id,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            model_inspection_id=inspection_id,
+            disposition="completed",
+            person_relation="same_person",
+            coverage_depth="significant",
+            content_types_json='["reporting"]',
+            subject_relationship="editorially_independent",
+            screening_rule_id="eligible.example.com",
+            screening_rule_status="curated_eligible",
+            source_policy_fingerprint=_OTHER_HASH,
+            canonical_supplied_input_json="{}",
+            validated_output_json="{}",
+            prompt_hash=_PROMPT_HASH,
+            schema_hash=_SCHEMA_HASH,
+            schema_version=1,
+            task_fingerprint=_HASH,
+            rationale="ok",
+            failure_category=None,
+            observed_at=moment(),
+        )
+    return assessment_id, reused_inspection
+
+
+def test_people_with_completed_assessment_excludes_merged_away_people(
+    connection: sqlite3.Connection,
+) -> None:
+    """I7: K18 keeps the observation-time person_id on the assessment row.
+
+    A bare `COUNT(DISTINCT person_id)` therefore counts both halves of a
+    merged pair, overcounting the digest and `notable status` after any merge.
+    """
+    run_id = insert_run(connection)
+    survivor = _person(connection, run_id=run_id)
+    loser_cursor = connection.execute(
+        """
+        INSERT INTO person (
+            created_at, created_by_run_id, display_name, identity_fingerprint
+        ) VALUES (?, ?, 'Alex Smyth', ?)
+        """,
+        (moment(), run_id, _OTHER_HASH),
+    )
+    assert loser_cursor.lastrowid is not None
+    loser = int(loser_cursor.lastrowid)
+    connection.commit()
+
+    _, inspection_id = _completed_assessment(
+        connection, person_id=survivor, run_id=run_id, url="https://example.com/1"
+    )
+    _completed_assessment(
+        connection,
+        person_id=loser,
+        run_id=run_id,
+        url="https://example.com/2",
+        fingerprint=_OTHER_HASH,
+        inspection_id=inspection_id,
+    )
+    # Positive control: two canonical people are two people.
+    assert coverage_corpus_counts(connection).people_with_completed_assessment == 2
+
+    connection.execute(
+        "UPDATE person SET merged_into_person_id = ? WHERE id = ?",
+        (survivor, loser),
+    )
+    connection.commit()
+
+    counts = coverage_corpus_counts(connection)
+    assert counts.people_with_completed_assessment == 1
+    # The assessment rows themselves are untouched.
+    assert counts.assessments_completed == 2
+
+
+def test_plan_counters_credit_the_settling_run_not_the_opening_run(
+    connection: sqlite3.Connection,
+) -> None:
+    """I5: plans open in run N and terminalize in N+1.
+
+    Counting on `person_coverage_plan.run_id` -- the opening run -- puts every
+    plan in a digest that cannot yet report its outcome, and in no later one.
+    """
+    opening_run = insert_run(connection)
+    person_id = _person(connection, run_id=opening_run)
+    with immediate(connection) as conn:
+        plan_id = open_plan(
+            conn,
+            person_id=person_id,
+            run_id=opening_run,
+            material_fingerprint=_HASH,
+            source_policy_fingerprint=_OTHER_HASH,
+            retrieval_target=5,
+            created_at=moment(),
+        )
+
+    settling_run = insert_run(connection)
+    connection.execute(
+        "UPDATE run SET started_at = ? WHERE id = ?",
+        (moment(60), settling_run),
+    )
+    connection.commit()
+
+    # Still open: neither run may claim it.
+    assert coverage_run_counts(connection, run_id=opening_run).plans_completed == 0
+    assert coverage_run_counts(connection, run_id=settling_run).plans_completed == 0
+
+    with immediate(connection) as conn:
+        update_plan_status(
+            conn,
+            plan_id=plan_id,
+            status="completed",
+            completed_at=moment(120),
+        )
+
+    assert coverage_run_counts(connection, run_id=settling_run).plans_completed == 1
+    assert coverage_run_counts(connection, run_id=opening_run).plans_completed == 0

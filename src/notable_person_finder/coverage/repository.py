@@ -1301,10 +1301,18 @@ def coverage_corpus_counts(connection: sqlite3.Connection) -> CoverageCorpusCoun
             "WHERE disposition = 'completed'"
         ).fetchone()["n"]
     )
+    # K18 keeps the observation-time `person_id` on the assessment row, so a
+    # bare DISTINCT over it double-counts a merged pair. Resolve each row to
+    # its canonical survivor and drop the merged-away ones.
     people = int(
         connection.execute(
-            "SELECT COUNT(DISTINCT person_id) AS n FROM person_article_assessment "
-            "WHERE disposition = 'completed'"
+            """
+        SELECT COUNT(DISTINCT p.id) AS n
+        FROM person_article_assessment AS a
+        JOIN person AS p ON p.id = a.person_id
+        WHERE a.disposition = 'completed'
+          AND p.merged_into_person_id IS NULL
+        """
         ).fetchone()["n"]
     )
 
@@ -1330,29 +1338,51 @@ def coverage_corpus_counts(connection: sqlite3.Connection) -> CoverageCorpusCoun
     )
 
 
+# "Settled by this run" = the plan reached a terminal status at or after this
+# run started, and no *later* run had started by then. Runs are serialised by
+# the mutation lock, so that pair identifies exactly one run per settlement.
+_PLANS_SETTLED_THIS_RUN_SQL = """
+    SELECT COUNT(*) AS n
+    FROM person_coverage_plan AS p
+    JOIN run AS r ON r.id = ?
+    WHERE p.status = ?
+      AND p.completed_at IS NOT NULL
+      AND p.completed_at >= r.started_at
+      AND NOT EXISTS (
+          SELECT 1
+          FROM run AS later
+          WHERE later.started_at > r.started_at
+            AND later.started_at <= p.completed_at
+      )
+"""
+
+
 def coverage_run_counts(
     connection: sqlite3.Connection, *, run_id: int
 ) -> CoverageRunCounts:
     # plans completed / incomplete / failed
+    # `person_coverage_plan.run_id` is the run that *opened* the plan. Plans
+    # normally open in run N and terminalize in N+1, so counting on it puts
+    # every plan in a digest that cannot yet report its outcome -- and in no
+    # later one. Count the settling run instead. Runs are serialised by the
+    # mutation lock, so a plan whose `completed_at` is at or after this run's
+    # start was terminalized by this run.
     plans_completed = int(
         connection.execute(
-            "SELECT COUNT(*) AS n FROM person_coverage_plan "
-            "WHERE run_id = ? AND status = 'completed'",
-            (run_id,),
+            _PLANS_SETTLED_THIS_RUN_SQL,
+            (run_id, "completed"),
         ).fetchone()["n"]
     )
     plans_incomplete = int(
         connection.execute(
-            "SELECT COUNT(*) AS n FROM person_coverage_plan "
-            "WHERE run_id = ? AND status = 'incomplete'",
-            (run_id,),
+            _PLANS_SETTLED_THIS_RUN_SQL,
+            (run_id, "incomplete"),
         ).fetchone()["n"]
     )
     plans_failed = int(
         connection.execute(
-            "SELECT COUNT(*) AS n FROM person_coverage_plan "
-            "WHERE run_id = ? AND status = 'failed'",
-            (run_id,),
+            _PLANS_SETTLED_THIS_RUN_SQL,
+            (run_id, "failed"),
         ).fetchone()["n"]
     )
 
