@@ -457,6 +457,13 @@ class AssessArticleConfig(_StrictConfigurationModel):
         return self
 
 
+class AggregateLeadConfig(_StrictConfigurationModel):
+    promising_domain_threshold: int = Field(default=2, strict=True, ge=1, le=10)
+    digest_limit: int = Field(default=10, strict=True, ge=1, le=1000)
+    starvation_days: int = Field(default=14, strict=True, ge=1, le=365)
+    reminder_interval_days: int = Field(default=0, strict=True, ge=0, le=365)
+
+
 class TasksConfig(_StrictConfigurationModel):
     detect_people: DetectPeopleConfig = DetectPeopleConfig()
     resolve_person_entity: ResolvePersonEntityConfig = ResolvePersonEntityConfig()
@@ -464,6 +471,7 @@ class TasksConfig(_StrictConfigurationModel):
         MatchWikipediaIdentityConfig()
     )
     assess_article: AssessArticleConfig = AssessArticleConfig()
+    aggregate_lead: AggregateLeadConfig = AggregateLeadConfig()
 
 
 class DigestConfig(StrictModel):

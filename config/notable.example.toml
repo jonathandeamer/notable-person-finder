@@ -152,6 +152,12 @@ temperature = 0.0
 top_p = 1.0
 reasoning_effort = "low"
 
+[tasks.aggregate_lead]
+promising_domain_threshold = 2
+digest_limit = 10
+starvation_days = 14
+reminder_interval_days = 0
+
 [digest]
 write_latest_copy = true
 
