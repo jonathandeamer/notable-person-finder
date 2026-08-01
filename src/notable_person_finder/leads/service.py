@@ -554,3 +554,33 @@ def _schedule_lead_aggregation_after_settled(
         run_id=run_id,
         now=now,
     )
+
+
+def seed_lead_aggregation(
+    connection: sqlite3.Connection, *, run_id: int, config: MainConfig, now: str
+) -> None:
+    """Top-of-run sweep for any person whose settlement hook was missed by a
+    crash window (same at-least-once posture as every other milestone; see
+    docs/architecture/at-least-once-execution.md).
+
+    Reuses `_schedule_lead_aggregation_after_settled` for every person with
+    completed coverage evidence, so scheduling stays fingerprint-deduplicated
+    against any work item a hook already enqueued this run or a prior one --
+    matching `seed_coverage_research`'s iterate-all-then-let-dedup-handle-it
+    shape rather than trying to detect "missed" people directly.
+    """
+    rows = connection.execute(
+        """
+        SELECT DISTINCT person_id
+        FROM person_article_assessment
+        WHERE disposition = 'completed'
+        """
+    ).fetchall()
+    for row in rows:
+        _schedule_lead_aggregation_after_settled(
+            connection,
+            person_id=row["person_id"],
+            run_id=run_id,
+            config=config,
+            now=now,
+        )

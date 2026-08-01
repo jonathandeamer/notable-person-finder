@@ -43,6 +43,7 @@ from notable_person_finder.ingestion.service import (
 from notable_person_finder.leads.service import (
     AGGREGATE_PERSON_LEAD_TASK_TYPE,
     build_aggregate_person_lead_handler,
+    seed_lead_aggregation,
 )
 from notable_person_finder.obs.logging import configure_logging, log_event
 from notable_person_finder.people.repository import (
@@ -244,6 +245,12 @@ def _compose_seed(
             run_id=run_id,
             config=config,
             policy=policy,
+            now=now,
+        )
+        seed_lead_aggregation(
+            connection,
+            run_id=run_id,
+            config=config,
             now=now,
         )
         ensure_model_inspections_for_run(

@@ -4,6 +4,8 @@ Verifies that:
 1. Coverage plan completion schedules an aggregate_person_lead work item.
 2. Wikipedia matching_page_found observation schedules an
    aggregate_person_lead work item.
+3. The top-of-run seed sweep catches a person whose settlement hook was
+   missed by a crash window.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from notable_person_finder.coverage.repository import (
 from notable_person_finder.coverage.service import advance_coverage_plan_after_assess
 from notable_person_finder.db.connection import connect_database
 from notable_person_finder.db.migrate import apply_migrations
+from notable_person_finder.leads.service import seed_lead_aggregation
 from notable_person_finder.people.identity import match_key
 from notable_person_finder.people.repository import mechanical_search_name
 from notable_person_finder.wikipedia.repository import (
@@ -47,6 +50,7 @@ from notable_person_finder.wikipedia.service import (
     _schedule_coverage_after_wikipedia_settled,
 )
 from tests.ingestion.helpers import immediate, insert_run, moment
+from tests.leads.test_service import _seed_person_and_articles
 
 NOW = moment()
 _PROMPT = "p" * 64
@@ -174,6 +178,46 @@ def test_coverage_plan_completion_schedules_aggregate_person_lead(
     assert len(work_items) == 1
     assert work_items[0]["subject_kind"] == "person"
     assert work_items[0]["subject_id"] == person_id
+
+
+def test_seed_lead_aggregation_catches_missed_settlement_hook(
+    connection: sqlite3.Connection,
+) -> None:
+    """A person with completed coverage evidence but no scheduling hook call
+    (simulating a crash between settlement and hook-firing) must be swept at
+    the top of the next run, same at-least-once posture as every other
+    milestone."""
+    config = _config()
+    run_id = insert_run(connection)
+    person_id, _paa_id = _seed_person_and_articles(connection, run_id=run_id)
+
+    seed_lead_aggregation(connection, run_id=run_id, config=config, now=NOW)
+
+    work_items = connection.execute(
+        "SELECT task_type, subject_kind, subject_id FROM work_item "
+        "WHERE task_type = 'aggregate_person_lead'"
+    ).fetchall()
+    assert len(work_items) == 1
+    assert work_items[0]["subject_kind"] == "person"
+    assert work_items[0]["subject_id"] == person_id
+
+
+def test_seed_lead_aggregation_is_idempotent_via_fingerprint_dedup(
+    connection: sqlite3.Connection,
+) -> None:
+    """Sweeping twice in a row (e.g. two runs before the item is claimed)
+    must not create a second active work item for the same evidence."""
+    config = _config()
+    run_id = insert_run(connection)
+    _person_id, _paa_id = _seed_person_and_articles(connection, run_id=run_id)
+
+    seed_lead_aggregation(connection, run_id=run_id, config=config, now=NOW)
+    seed_lead_aggregation(connection, run_id=run_id, config=config, now=NOW)
+
+    work_items = connection.execute(
+        "SELECT id FROM work_item WHERE task_type = 'aggregate_person_lead'"
+    ).fetchall()
+    assert len(work_items) == 1
 
 
 def _complete_wikipedia(
