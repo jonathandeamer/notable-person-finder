@@ -143,6 +143,41 @@ class CoverageSummary:
     model_failed: int
 
 
+@dataclass(frozen=True, slots=True)
+class ShortlistEntry:
+    """One ranked digest-queue person, rendered in the Shortlist section."""
+
+    person_id: int
+    display_name: str
+    outcome: str
+    eligibility_reason: str
+    wikipedia_outcome: str | None
+    qualifying_domain_count: int
+    qualifying_sources: tuple[tuple[str, str, str, str, str, str], ...]
+    attention_signals: tuple[str, ...]
+    caution_signals: tuple[str, ...]
+    unresolved_issues: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class QueueFlowSummary:
+    """Digest-queue arrival/emission flow, rendered in the ``### Digest
+    queue`` run-summary block. Rate and clear-time fields are ``None`` when
+    there is not enough ``queue_transition`` history to compute them --
+    never fabricated from zero days of history."""
+
+    newly_queued: int
+    emitted: int
+    removed_matching_wikipedia: int
+    ending_backlog_promising: int
+    ending_backlog_possible: int
+    arrival_rate_7d: float | None
+    emission_rate_7d: float | None
+    net_queue_growth: int
+    oldest_pending_days: int | None
+    estimated_clear_days: int | None
+
+
 def render_digest(
     report: RunReport,
     *,
@@ -152,6 +187,8 @@ def render_digest(
     identity: IdentityRunSummary | None = None,
     wikipedia: WikipediaRunSummary | None = None,
     coverage: CoverageSummary | None = None,
+    shortlist_entries: list[ShortlistEntry] | None = None,
+    queue_flow: QueueFlowSummary | None = None,
 ) -> str:
     lines = [f"# Notable Person Finder — {local_date}", ""]
 
@@ -174,8 +211,33 @@ def render_digest(
         "",
     ]
 
-    # Milestone 6 replaces this section with ranked entries and synthesis.
-    lines += ["No candidates met the shortlist criteria in this window.", ""]
+    if shortlist_entries:
+        for entry in shortlist_entries:
+            lines.append(f"### {entry.display_name} — {entry.outcome}")
+            lines.append(f"- Why shown: {entry.eligibility_reason}")
+            lines.append(f"- Wikipedia: {entry.wikipedia_outcome or 'not researched'}")
+            lines.append(f"- Qualifying domains: {entry.qualifying_domain_count}")
+            for (
+                domain,
+                title,
+                date,
+                content_type,
+                depth,
+                visibility,
+            ) in entry.qualifying_sources:
+                lines.append(
+                    f'  - {domain} — "{title}" ({date}, {content_type}, '
+                    f"{depth}, {visibility})"
+                )
+            for signal in entry.attention_signals:
+                lines.append(f"- Attention: {signal}")
+            for signal in entry.caution_signals:
+                lines.append(f"- Caution: {signal}")
+            for issue in entry.unresolved_issues:
+                lines.append(f"- Unresolved: {issue}")
+            lines.append("")
+    else:
+        lines += ["No candidates met the shortlist criteria in this window.", ""]
 
     counters = report.counters
     lines += [
@@ -361,6 +423,45 @@ def render_digest(
             f"- Assess model permanently failed: {coverage.model_failed}",
         ]
 
+    if queue_flow is not None:
+        lines.append("")
+        lines.append("### Digest queue")
+        lines.append(f"- Newly queued: {queue_flow.newly_queued}")
+        lines.append(f"- Emitted: {queue_flow.emitted}")
+        lines.append(
+            f"- Removed (matched Wikipedia): {queue_flow.removed_matching_wikipedia}"
+        )
+        lines.append(
+            "- Ending backlog: "
+            f"{queue_flow.ending_backlog_promising} promising, "
+            f"{queue_flow.ending_backlog_possible} possible"
+        )
+        arrival = (
+            f"{queue_flow.arrival_rate_7d:.1f}/day"
+            if queue_flow.arrival_rate_7d is not None
+            else "insufficient history"
+        )
+        emission = (
+            f"{queue_flow.emission_rate_7d:.1f}/day"
+            if queue_flow.emission_rate_7d is not None
+            else "insufficient history"
+        )
+        lines.append(f"- 7-day arrival rate: {arrival}")
+        lines.append(f"- 7-day emission rate: {emission}")
+        lines.append(f"- Net queue growth: {queue_flow.net_queue_growth}")
+        oldest = (
+            f"{queue_flow.oldest_pending_days} days"
+            if queue_flow.oldest_pending_days is not None
+            else "no pending entries"
+        )
+        lines.append(f"- Oldest pending: {oldest}")
+        clear = (
+            f"{queue_flow.estimated_clear_days} days"
+            if queue_flow.estimated_clear_days is not None
+            else "not clearing"
+        )
+        lines.append(f"- Estimated clear time: {clear}")
+
     return "\n".join(lines) + "\n"
 
 
@@ -470,6 +571,8 @@ def write_digest(
     identity: IdentityRunSummary | None = None,
     wikipedia: WikipediaRunSummary | None = None,
     coverage: CoverageSummary | None = None,
+    shortlist_entries: list[ShortlistEntry] | None = None,
+    queue_flow: QueueFlowSummary | None = None,
 ) -> DigestRecord:
     """Atomically persist the immutable dated digest and the latest copy.
 
@@ -488,6 +591,8 @@ def write_digest(
         identity=identity,
         wikipedia=wikipedia,
         coverage=coverage,
+        shortlist_entries=shortlist_entries,
+        queue_flow=queue_flow,
     )
     try:
         digests_dir.mkdir(parents=True, exist_ok=True)

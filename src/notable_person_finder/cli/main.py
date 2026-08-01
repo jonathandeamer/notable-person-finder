@@ -40,6 +40,17 @@ from notable_person_finder.ingestion.service import (
     build_fetch_handler,
     build_seed_hook,
 )
+from notable_person_finder.leads.aggregation import LeadOutcome
+from notable_person_finder.leads.ranking import QueueEntry, rank_key
+from notable_person_finder.leads.repository import (
+    ShortlistCandidate,
+    count_attention_signals_for_lead,
+    fetch_pending_shortlist_candidates,
+    fetch_qualifying_sources_for_lead,
+    fetch_queue_flow_counts,
+    fetch_signal_claims_for_person,
+    shift_utc_days,
+)
 from notable_person_finder.leads.service import (
     AGGREGATE_PERSON_LEAD_TASK_TYPE,
     build_aggregate_person_lead_handler,
@@ -85,6 +96,8 @@ from notable_person_finder.reporting.digest import (
     IdentityRunSummary,
     IngestionSummary,
     PeopleRunSummary,
+    QueueFlowSummary,
+    ShortlistEntry,
     WikipediaRunSummary,
     write_digest,
 )
@@ -355,6 +368,24 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                     if _coverage_schema_present(connection)
                     else None
                 )
+                leads = (
+                    _leads_summary(
+                        connection,
+                        report,
+                        config=loaded.main,
+                        now=utc_timestamp(clock.now()),
+                    )
+                    if _leads_schema_present(connection)
+                    else None
+                )
+                shortlist_entries, queue_flow = (
+                    leads
+                    if leads is not None
+                    else (
+                        None,
+                        None,
+                    )
+                )
                 try:
                     written = write_digest(
                         loaded.paths.digests,
@@ -366,6 +397,8 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                         identity=identity,
                         wikipedia=wikipedia,
                         coverage=coverage,
+                        shortlist_entries=shortlist_entries,
+                        queue_flow=queue_flow,
                     )
                 except DigestWriteError:
                     # `cli.` prefix, not `run.`: the engine already emits
@@ -633,6 +666,139 @@ def _coverage_schema_present(connection: sqlite3.Connection) -> bool:
         ).fetchone()
         is not None
     )
+
+
+def _leads_schema_present(connection: sqlite3.Connection) -> bool:
+    return (
+        connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'digest_queue'"
+        ).fetchone()
+        is not None
+    )
+
+
+def _leads_summary(
+    connection: sqlite3.Connection,
+    report: RunReport,
+    *,
+    config: MainConfig,
+    now: str,
+) -> tuple[list[ShortlistEntry], QueueFlowSummary] | None:
+    """Ranked shortlist entries and queue-flow counters, or None pre-0008."""
+    if not _leads_schema_present(connection):
+        return None
+
+    lead_cfg = config.tasks.aggregate_lead
+    starvation_cutoff = shift_utc_days(now, -lead_cfg.starvation_days)
+
+    candidates = fetch_pending_shortlist_candidates(connection)
+    ranked: list[
+        tuple[
+            tuple[object, ...],
+            ShortlistCandidate,
+            list[tuple[str, str, str, str, str, str]],
+        ]
+    ] = []
+    for candidate in candidates:
+        sources = fetch_qualifying_sources_for_lead(
+            connection, lead_assessment_id=candidate.lead_assessment_id
+        )
+        positive_signal_count = count_attention_signals_for_lead(
+            connection, lead_assessment_id=candidate.lead_assessment_id
+        )
+        # Best (lowest-rank) access_kind among this lead's qualifying
+        # sources; "snippets" (the plural CHECK value) falls through to
+        # rank_key's unrecognized-visibility default, same as any other
+        # value ranking.py's _EVIDENCE_VISIBILITY_RANK does not name.
+        visibilities = [source[5] for source in sources]
+        best_visibility = min(
+            visibilities,
+            key=lambda v: {"full": 0, "partial": 1, "snippet": 2}.get(v, 3),
+            default="",
+        )
+        freshest_at = max((source[2] for source in sources), default=None)
+        if freshest_at == "-":
+            freshest_at = None
+        entry_key = QueueEntry(
+            person_id=candidate.person_id,
+            eligibility_reason=candidate.eligibility_reason,
+            first_pending_at=candidate.first_pending_at,
+        )
+        lead_outcome = LeadOutcome(
+            outcome=candidate.outcome,
+            qualifying_domain_count=candidate.qualifying_domain_count,
+            qualifying_articles=(),
+            contributing_signals=(),
+            wikipedia_outcome=candidate.wikipedia_outcome,
+        )
+        key = rank_key(
+            entry_key,
+            lead_outcome,
+            positive_signal_count=positive_signal_count,
+            best_evidence_visibility=best_visibility,
+            freshest_qualifying_article_at=freshest_at,
+            starvation_cutoff=starvation_cutoff,
+        )
+        ranked.append((key, candidate, sources))
+
+    ranked.sort(key=lambda item: item[0])
+    limited = ranked[: lead_cfg.digest_limit]
+
+    shortlist_entries: list[ShortlistEntry] = []
+    for _key, candidate, sources in limited:
+        attention = fetch_signal_claims_for_person(
+            connection, person_id=candidate.person_id, signal_kind="attention"
+        )
+        caution = fetch_signal_claims_for_person(
+            connection, person_id=candidate.person_id, signal_kind="caution"
+        )
+        shortlist_entries.append(
+            ShortlistEntry(
+                person_id=candidate.person_id,
+                display_name=candidate.display_name,
+                outcome=candidate.outcome,
+                eligibility_reason=candidate.eligibility_reason,
+                wikipedia_outcome=candidate.wikipedia_outcome,
+                qualifying_domain_count=candidate.qualifying_domain_count,
+                qualifying_sources=tuple(sources),
+                attention_signals=tuple(attention),
+                caution_signals=tuple(caution),
+                unresolved_issues=(),
+            )
+        )
+
+    counts = fetch_queue_flow_counts(connection, run_id=report.run_id, now=now)
+    net_queue_growth = (
+        counts.newly_queued - counts.emitted - counts.removed_matching_wikipedia
+    )
+    # Conservative by design (Global Constraint, K-series lead spec): only
+    # project a clear time when there is a nonzero trailing emission rate and
+    # an actual backlog to clear against it. Any other case -- no rate
+    # history, a zero rate, or an empty backlog -- reports "not clearing"
+    # rather than fabricating a number.
+    backlog_total = counts.ending_backlog_promising + counts.ending_backlog_possible
+    estimated_clear_days: int | None = None
+    if (
+        counts.emission_rate_7d is not None
+        and counts.emission_rate_7d > 0
+        and backlog_total > 0
+    ):
+        estimated_clear_days = round(backlog_total / counts.emission_rate_7d)
+
+    queue_flow = QueueFlowSummary(
+        newly_queued=counts.newly_queued,
+        emitted=counts.emitted,
+        removed_matching_wikipedia=counts.removed_matching_wikipedia,
+        ending_backlog_promising=counts.ending_backlog_promising,
+        ending_backlog_possible=counts.ending_backlog_possible,
+        arrival_rate_7d=counts.arrival_rate_7d,
+        emission_rate_7d=counts.emission_rate_7d,
+        net_queue_growth=net_queue_growth,
+        oldest_pending_days=counts.oldest_pending_days,
+        estimated_clear_days=estimated_clear_days,
+    )
+    return shortlist_entries, queue_flow
 
 
 def _model_work_counts(
