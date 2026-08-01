@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -511,6 +512,126 @@ def _parse_utc(value: str) -> datetime:
 def shift_utc_days(value: str, days: int) -> str:
     shifted = _parse_utc(value) + timedelta(days=days)
     return shifted.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def mark_digest_queue_emitted(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    last_material_change_at: str,
+) -> None:
+    """Transition one digest_queue row's status to 'emitted'. Mirrors
+    `remove_digest_queue`'s style for the 'removed' transition; called only
+    for a person actually selected into this run's rendered shortlist."""
+    connection.execute(
+        """
+        UPDATE digest_queue
+        SET status = 'emitted', last_material_change_at = ?
+        WHERE person_id = ?
+        """,
+        (last_material_change_at, person_id),
+    )
+
+
+def emit_shortlist_entries(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    occurred_at: str,
+    candidates: Sequence[ShortlistCandidate],
+) -> list[tuple[ShortlistCandidate, int]]:
+    """Transition every rendered shortlist candidate `pending -> emitted`:
+    one `queue_transition` row and a `digest_queue` status update each, in a
+    single transaction covering the whole shortlist. Entries beyond
+    `digest_limit` are never passed in here and so stay `pending` untouched.
+
+    Runs in its own top-level transaction (`BEGIN IMMEDIATE` / commit) rather
+    than the caller's, because it is invoked from the CLI's digest-reporting
+    step, outside the run engine's per-work-item transaction scope -- the
+    same reason `runs.repository.create_run`/`finish_run` manage their own
+    transaction boundaries.
+
+    Returns the candidates paired with their new `queue_transition` id, in
+    the same order, so the caller can later attach `digest_entry` rows once
+    the digest's real `file_path`/`content_hash` are known.
+    """
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        emitted: list[tuple[ShortlistCandidate, int]] = []
+        for candidate in candidates:
+            transition_id = insert_queue_transition(
+                connection,
+                person_id=candidate.person_id,
+                run_id=run_id,
+                lead_assessment_id=candidate.lead_assessment_id,
+                tier=candidate.tier,
+                from_status="pending",
+                to_status="emitted",
+                reason="digest_rendered",
+                occurred_at=occurred_at,
+            )
+            mark_digest_queue_emitted(
+                connection,
+                person_id=candidate.person_id,
+                last_material_change_at=occurred_at,
+            )
+            emitted.append((candidate, transition_id))
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+    return emitted
+
+
+def record_digest_with_entries(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    file_path: str,
+    timezone: str,
+    window_start: str,
+    window_end: str,
+    run_state: str,
+    content_hash: str,
+    created_at: str,
+    emitted: Sequence[tuple[ShortlistCandidate, int]],
+) -> int:
+    """Insert the `digest` row for a written digest file and one
+    `digest_entry` per already-emitted shortlist candidate, in a single
+    transaction. Called after `reporting.digest.write_digest` returns, since
+    only then are the real `file_path`/`content_hash` known -- see
+    `emit_shortlist_entries` for why this manages its own transaction rather
+    than the caller's.
+    """
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        digest_id = insert_digest(
+            connection,
+            run_id=run_id,
+            file_path=file_path,
+            timezone=timezone,
+            window_start=window_start,
+            window_end=window_end,
+            run_state=run_state,
+            content_hash=content_hash,
+            created_at=created_at,
+        )
+        for ordinal, (candidate, transition_id) in enumerate(emitted, start=1):
+            insert_digest_entry(
+                connection,
+                digest_id=digest_id,
+                person_id=candidate.person_id,
+                lead_assessment_id=candidate.lead_assessment_id,
+                queue_transition_id=transition_id,
+                ordinal=ordinal,
+            )
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+    return digest_id
 
 
 def _days_between(earlier: str, later: str) -> int:

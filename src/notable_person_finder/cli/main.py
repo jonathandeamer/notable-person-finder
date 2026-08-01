@@ -45,10 +45,12 @@ from notable_person_finder.leads.ranking import QueueEntry, rank_key
 from notable_person_finder.leads.repository import (
     ShortlistCandidate,
     count_attention_signals_for_lead,
+    emit_shortlist_entries,
     fetch_pending_shortlist_candidates,
     fetch_qualifying_sources_for_lead,
     fetch_queue_flow_counts,
     fetch_signal_claims_for_person,
+    record_digest_with_entries,
     shift_utc_days,
 )
 from notable_person_finder.leads.service import (
@@ -368,20 +370,22 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                     if _coverage_schema_present(connection)
                     else None
                 )
+                leads_now = utc_timestamp(clock.now())
                 leads = (
                     _leads_summary(
                         connection,
                         report,
                         config=loaded.main,
-                        now=utc_timestamp(clock.now()),
+                        now=leads_now,
                     )
                     if _leads_schema_present(connection)
                     else None
                 )
-                shortlist_entries, queue_flow = (
+                shortlist_entries, queue_flow, emitted = (
                     leads
                     if leads is not None
                     else (
+                        None,
                         None,
                         None,
                     )
@@ -411,6 +415,25 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                     # own `cli.` namespace instead.
                     log_event(logger, "cli.run_reporting_failed", run_id=report.run_id)
                     raise
+                if emitted:
+                    # The digest_queue pending -> emitted transition already
+                    # happened inside _leads_summary (so this run's own
+                    # "Emitted" queue-flow counter is correct); this is only
+                    # the digest/digest_entry rows, which need the real
+                    # file_path/content_hash that only exist once
+                    # write_digest has returned.
+                    record_digest_with_entries(
+                        connection,
+                        run_id=report.run_id,
+                        file_path=str(written.path),
+                        timezone=loaded.main.timezone,
+                        window_start=report.window_start,
+                        window_end=report.window_end,
+                        run_state=str(report.state),
+                        content_hash=written.sha256,
+                        created_at=leads_now,
+                        emitted=emitted,
+                    )
                 return ReportArtifact(
                     path=str(written.path),
                     sha256=written.sha256,
@@ -684,8 +707,21 @@ def _leads_summary(
     *,
     config: MainConfig,
     now: str,
-) -> tuple[list[ShortlistEntry], QueueFlowSummary] | None:
-    """Ranked shortlist entries and queue-flow counters, or None pre-0008."""
+) -> (
+    tuple[list[ShortlistEntry], QueueFlowSummary, list[tuple[ShortlistCandidate, int]]]
+    | None
+):
+    """Ranked shortlist entries, queue-flow counters, and the emitted
+    (candidate, queue_transition_id) pairs for the rendered shortlist, or
+    None pre-0008.
+
+    The `pending -> emitted` transition happens here, before `queue_flow` is
+    computed, so this run's own emission shows up in its own "Emitted"
+    counter rather than lagging a digest behind. `digest`/`digest_entry`
+    rows are deferred to the caller (`command_run`'s `report_run`), which
+    calls `leads.repository.record_digest_with_entries` once
+    `write_digest`'s real `file_path`/`content_hash` are known.
+    """
     if not _leads_schema_present(connection):
         return None
 
@@ -745,6 +781,20 @@ def _leads_summary(
     ranked.sort(key=lambda item: item[0])
     limited = ranked[: lead_cfg.digest_limit]
 
+    # Transition exactly the entries selected into this digest from
+    # 'pending' to 'emitted' -- one queue_transition row and a digest_queue
+    # status update each -- so they do not reappear in every future digest
+    # forever (the finding this fix addresses). Entries ranked beyond
+    # digest_limit are never in `limited` and so keep their 'pending' status
+    # untouched, preserving the existing digest-limit-omission-retains-
+    # eligibility rule.
+    emitted = emit_shortlist_entries(
+        connection,
+        run_id=report.run_id,
+        occurred_at=now,
+        candidates=[candidate for _key, candidate, _sources in limited],
+    )
+
     shortlist_entries: list[ShortlistEntry] = []
     for _key, candidate, sources in limited:
         attention = fetch_signal_claims_for_person(
@@ -798,7 +848,7 @@ def _leads_summary(
         oldest_pending_days=counts.oldest_pending_days,
         estimated_clear_days=estimated_clear_days,
     )
-    return shortlist_entries, queue_flow
+    return shortlist_entries, queue_flow, emitted
 
 
 def _model_work_counts(
