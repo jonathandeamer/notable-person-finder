@@ -19,7 +19,6 @@ from notable_person_finder.people.identity import (
 from notable_person_finder.people.merge import (
     MERGED_AWAY_REASON,
     confirm_person_merge,
-    reconcile_digest_queue_on_merge,
 )
 from notable_person_finder.people.repository import (
     RECONSIDER_PERSON_ENTITY_TASK_TYPE,
@@ -742,42 +741,6 @@ def test_flatten_redirects_when_prior_loser_points_at_new_loser(
         == person_a
     )
     assert canonical_person_id(connection, nested) == person_a
-
-
-def test_digest_queue_hook_is_noop(connection: sqlite3.Connection) -> None:
-    """K13: named hook does not create tables or rows."""
-    run_id, _a, _i, person_a, person_b, _er = _two_people(connection)
-    tables_before = {
-        row[0]
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        )
-    }
-    with immediate(connection):
-        reconcile_digest_queue_on_merge(
-            connection,
-            survivor_id=person_a,
-            loser_id=person_b,
-            now=NOW,
-        )
-    tables_after = {
-        row[0]
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        )
-    }
-    assert tables_after == tables_before
-    assert "digest_queue" not in tables_after
-    # Calling it during a real merge must not fail either.
-    with immediate(connection):
-        confirm_person_merge(
-            connection,
-            loser_id=person_b,
-            survivor_id=person_a,
-            run_id=run_id,
-            observation_id=None,
-            now=NOW,
-        )
 
 
 def test_missing_person_raises(connection: sqlite3.Connection) -> None:

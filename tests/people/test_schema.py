@@ -86,6 +86,7 @@ _EXPECTED_COLUMNS = {
         "identity_fingerprint",
         "merged_into_person_id",
         "current_wikipedia_identity_observation_id",
+        "current_lead_assessment_id",
     },
     "sourced_name": {
         "id",
@@ -339,7 +340,7 @@ def test_migration_0005_applies_to_a_fresh_database(
             "SELECT version FROM schema_migration ORDER BY version"
         )
     )
-    assert versions == (1, 2, 3, 4, 5, 6, 7)
+    assert versions == (1, 2, 3, 4, 5, 6, 7, 8)
 
 
 @pytest.mark.parametrize("retained_version", [0, 1, 2, 3, 4])
@@ -358,7 +359,7 @@ def test_migration_0005_upgrades_every_retained_schema_version(
         if retained:
             apply_migrations(connection, database, backups, retained)
         result = apply_migrations(connection, database, backups)
-        assert result.applied_versions == tuple(range(retained_version + 1, 8))
+        assert result.applied_versions == tuple(range(retained_version + 1, 9))
         assert result.backup_path is not None and result.backup_path.exists()
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
@@ -391,7 +392,7 @@ def test_migration_0005_preserves_existing_source_items_and_mentions_from_0004(
 
         result = apply_migrations(connection, database, backups)
 
-        assert result.applied_versions == (5, 6, 7)
+        assert result.applied_versions == (5, 6, 7, 8)
         row = connection.execute(
             """
             SELECT title_text, current_triage_observation_id

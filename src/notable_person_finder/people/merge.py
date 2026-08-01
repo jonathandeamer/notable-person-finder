@@ -31,15 +31,47 @@ _SUBJECT_KIND_PERSON_MENTION = "person_mention"
 _SUBJECT_KIND_PERSON_RELATION = "person_relation"
 
 
-def reconcile_digest_queue_on_merge(
+def _reconcile_lead_aggregation_on_merge(
     connection: sqlite3.Connection,
     *,
     survivor_id: int,
     loser_id: int,
+    run_id: int,
+    config: MainConfig,
     now: str,
+    coverage_policy: object | None,
 ) -> None:
-    """No-op until milestone 6 creates ``digest_queue`` (K13)."""
-    del connection, survivor_id, loser_id, now
+    """Run lead aggregation reconcile when a source policy is available."""
+    from notable_person_finder.coverage.screening import (
+        SourcePolicy,
+        SourcePolicyError,
+        load_source_policy,
+    )
+
+    policy: SourcePolicy | None
+    if isinstance(coverage_policy, SourcePolicy):
+        policy = coverage_policy
+    else:
+        try:
+            policy = load_source_policy(config.source_policy_file)
+        except (SourcePolicyError, OSError):
+            policy = None
+    if policy is None:
+        return
+
+    from notable_person_finder.leads.merge_hooks import (
+        reconcile_on_merge as reconcile_lead_aggregation_on_merge,
+    )
+
+    reconcile_lead_aggregation_on_merge(
+        connection,
+        survivor_id=survivor_id,
+        loser_id=loser_id,
+        run_id=run_id,
+        config=config,
+        policy=policy,
+        now=now,
+    )
 
 
 def _reconcile_coverage_on_merge(
@@ -239,12 +271,6 @@ def confirm_person_merge(
         run_id=run_id,
         now=now,
     )
-    reconcile_digest_queue_on_merge(
-        connection,
-        survivor_id=actual_survivor,
-        loser_id=actual_loser,
-        now=now,
-    )
     if config is not None:
         # Lazy import keeps people.merge free of wikipedia/coverage cycles at
         # module load; production reconsider path always supplies config (K16).
@@ -264,6 +290,15 @@ def confirm_person_merge(
         # identity fingerprint; optional policy when caller supplies it or the
         # main config path is loadable.
         _reconcile_coverage_on_merge(
+            connection,
+            survivor_id=actual_survivor,
+            loser_id=actual_loser,
+            run_id=run_id,
+            config=config,
+            now=now,
+            coverage_policy=coverage_policy,
+        )
+        _reconcile_lead_aggregation_on_merge(
             connection,
             survivor_id=actual_survivor,
             loser_id=actual_loser,

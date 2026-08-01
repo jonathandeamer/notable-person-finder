@@ -385,6 +385,116 @@ def build_aggregate_person_lead_handler(
     )
 
 
+def reaggregate_person_lead(
+    connection: sqlite3.Connection,
+    *,
+    person_id: int,
+    run_id: int,
+    config: MainConfig,
+    policy: SourcePolicy,
+    now: str,
+) -> None:
+    canonical_domains = _canonical_domain_map(policy)
+    row = connection.execute(
+        "SELECT current_wikipedia_identity_observation_id FROM person WHERE id = ?",
+        (person_id,),
+    ).fetchone()
+    wikipedia_outcome = None
+    if row and row["current_wikipedia_identity_observation_id"] is not None:
+        outcome_row = connection.execute(
+            """
+            SELECT semantic_outcome FROM wikipedia_identity_observation
+             WHERE id = ?
+            """,
+            (row["current_wikipedia_identity_observation_id"],),
+        ).fetchone()
+        if outcome_row:
+            wikipedia_outcome = outcome_row["semantic_outcome"]
+    articles = _load_article_evidence(
+        connection,
+        person_id=person_id,
+        canonical_domains=canonical_domains,
+    )
+    signals = _load_signal_evidence(connection, person_id=person_id)
+
+    lead_outcome = aggregate_lead(
+        articles=articles,
+        signals=signals,
+        wikipedia_outcome=wikipedia_outcome,
+        promising_domain_threshold=config.tasks.aggregate_lead.promising_domain_threshold,
+    )
+
+    ordering_factors = json.dumps(
+        {
+            "qualifying_domain_count": lead_outcome.qualifying_domain_count,
+            "wikipedia_outcome": lead_outcome.wikipedia_outcome,
+        },
+        sort_keys=True,
+    )
+    lead_id = insert_lead_assessment(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        outcome=lead_outcome,
+        lead_policy_fingerprint=policy.fingerprint,
+        ordering_factors_json=ordering_factors,
+        decided_at=now,
+    )
+    prior = fetch_prior_queue_state(connection, person_id=person_id)
+    matching_page_found = lead_outcome.wikipedia_outcome == "matching_page_found"
+    decision = decide_queue_transition(
+        prior=prior,
+        outcome=lead_outcome,
+        matching_page_found=matching_page_found,
+        now=now,
+    )
+    tier = (
+        lead_outcome.outcome
+        if lead_outcome.outcome in ("promising_lead", "possible_lead")
+        else (prior.tier if prior else "possible_lead")
+    )
+    if decision.should_upsert:
+        upsert_digest_queue(
+            connection,
+            person_id=person_id,
+            status=decision.to_status or "pending",
+            tier=tier,
+            eligibility_reason=decision.eligibility_reason or "new",
+            lead_assessment_id=lead_id,
+            first_pending_at=decision.first_pending_at or now,
+            last_material_change_at=now,
+        )
+        insert_queue_transition(
+            connection,
+            person_id=person_id,
+            run_id=run_id,
+            lead_assessment_id=lead_id,
+            tier=tier,
+            from_status=prior.status if prior else None,
+            to_status=decision.to_status or "pending",
+            reason=decision.eligibility_reason or "new",
+            occurred_at=now,
+        )
+    elif decision.should_remove:
+        remove_digest_queue(
+            connection,
+            person_id=person_id,
+            removed_reason=decision.removed_reason or "matching_page_found",
+            last_material_change_at=now,
+        )
+        insert_queue_transition(
+            connection,
+            person_id=person_id,
+            run_id=run_id,
+            lead_assessment_id=lead_id,
+            tier=prior.tier if prior else tier,
+            from_status=prior.status if prior else None,
+            to_status="removed",
+            reason=decision.removed_reason or "matching_page_found",
+            occurred_at=now,
+        )
+
+
 def _schedule_lead_aggregation_after_settled(
     connection: sqlite3.Connection,
     *,
