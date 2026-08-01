@@ -49,6 +49,7 @@ RESOLVER = StaticHostResolver(
     {
         "example.com": ("93.184.216.34",),
         "en.wikipedia.org": ("208.80.154.224",),
+        "api.search.brave.com": ("104.18.0.1",),
     }
 )
 

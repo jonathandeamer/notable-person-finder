@@ -46,6 +46,7 @@ RESOLVER = StaticHostResolver(
     {
         "example.com": ("93.184.216.34",),
         "en.wikipedia.org": ("208.80.154.224",),
+        "api.search.brave.com": ("104.18.0.1",),
     }
 )
 EMPTY_MEDIAWIKI_SEARCH = (
@@ -852,7 +853,13 @@ def test_second_run_reuses_completed_triage(
     monkeypatch.setattr(cli_main, "OpenRouterClient", second.factory)
     assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
     assert len(first_client.generate_calls) == 1
-    assert second.instances[-1].generate_calls == []
+    # Triage/detect_people must not repeat on the second run: the person was
+    # already triaged. Coverage's assess_article is a distinct, legitimate
+    # generation once Wikipedia/Brave/fetch land a passage-ready view; it is
+    # not "reused triage" and must not be conflated with a repeat detection
+    # call.
+    second_calls = second.instances[-1].generate_calls
+    assert [call.schema_name for call in second_calls] == ["assess_article"]
 
     connection = _open_db(config)
     try:
