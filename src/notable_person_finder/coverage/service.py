@@ -819,6 +819,7 @@ def sweep_stalled_coverage_plans(
                     connection,
                     plan_id=plan_id,
                     now=now,
+                    config=config,
                 )
             else:
                 maybe_advance_coverage_plan(
@@ -3990,8 +3991,6 @@ def _persist_assess_for(
     *,
     config: MainConfig,
 ) -> Callable[[WorkItem, TaskOutcome], None]:
-    del config  # reserved: full maybe_advance with SourcePolicy if needed later
-
     def persist(work_item: WorkItem, outcome: TaskOutcome) -> None:
         payload = outcome.payload
         if not isinstance(payload, _AssessPersist):
@@ -4016,6 +4015,7 @@ def _persist_assess_for(
                         connection,
                         plan_id=payload.plan_id,
                         now=observed_at,
+                        config=config,
                     )
             return
 
@@ -4081,6 +4081,7 @@ def _persist_assess_for(
                 connection,
                 plan_id=payload.plan_id,
                 now=observed_at,
+                config=config,
             )
 
     return persist
@@ -4171,6 +4172,7 @@ def _persist_assess_failure_for(
                 connection,
                 plan_id=context.plan_id,
                 now=observed_at,
+                config=config,
             )
 
     return persist_failure
@@ -4181,6 +4183,7 @@ def advance_coverage_plan_after_assess(
     *,
     plan_id: int,
     now: str,
+    config: MainConfig | None = None,
 ) -> None:
     """Terminalize a coverage plan when selected assess paths are settled.
 
@@ -4215,6 +4218,24 @@ def advance_coverage_plan_after_assess(
         targets=targets,
         now=now,
     )
+    if config is not None:
+        after = load_plan(connection, plan_id=plan_id)
+        if (
+            after is not None
+            and after.status in _TERMINAL_PLAN_STATUSES
+            and after.status != "superseded"
+        ):
+            from notable_person_finder.leads.service import (
+                _schedule_lead_aggregation_after_settled,
+            )
+
+            _schedule_lead_aggregation_after_settled(
+                connection,
+                person_id=after.person_id,
+                run_id=after.run_id,
+                config=config,
+                now=now,
+            )
 
 
 def _build_and_render_assess(

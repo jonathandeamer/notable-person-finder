@@ -40,6 +40,10 @@ from notable_person_finder.ingestion.service import (
     build_fetch_handler,
     build_seed_hook,
 )
+from notable_person_finder.leads.service import (
+    AGGREGATE_PERSON_LEAD_TASK_TYPE,
+    build_aggregate_person_lead_handler,
+)
 from notable_person_finder.obs.logging import configure_logging, log_event
 from notable_person_finder.people.repository import (
     RECONSIDER_PERSON_ENTITY_TASK_TYPE,
@@ -502,6 +506,13 @@ def command_run(config_file: Path | None, *, verbose: bool) -> int:
                         connection,
                         client=llm_client,
                         config=loaded.main,
+                    ),
+                    AGGREGATE_PERSON_LEAD_TASK_TYPE: (
+                        build_aggregate_person_lead_handler(
+                            connection,
+                            config=loaded.main,
+                            policy=loaded.source_policy,
+                        )
                     ),
                 }
                 seed = _compose_seed(

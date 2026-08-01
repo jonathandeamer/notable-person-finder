@@ -2619,6 +2619,18 @@ def _persist_match_for(
                     config=config,
                     now=observed_at,
                 )
+                if existing.semantic_outcome == "matching_page_found":
+                    from notable_person_finder.leads.service import (
+                        _schedule_lead_aggregation_after_settled,
+                    )
+
+                    _schedule_lead_aggregation_after_settled(
+                        connection,
+                        person_id=payload.person_id,
+                        run_id=run_id,
+                        config=config,
+                        now=observed_at,
+                    )
             return
 
         plan = load_plan(connection, plan_id=payload.plan_id)
@@ -2687,6 +2699,18 @@ def _persist_match_for(
             config=config,
             now=observed_at,
         )
+        if semantic == "matching_page_found":
+            from notable_person_finder.leads.service import (
+                _schedule_lead_aggregation_after_settled,
+            )
+
+            _schedule_lead_aggregation_after_settled(
+                connection,
+                person_id=payload.person_id,
+                run_id=run_id,
+                config=config,
+                now=observed_at,
+            )
 
     return persist
 
@@ -2726,6 +2750,30 @@ def _schedule_coverage_after_wikipedia_settled(
         policy=policy,
         now=now,
     )
+    person_row = connection.execute(
+        "SELECT current_wikipedia_identity_observation_id FROM person WHERE id = ?",
+        (person_id,),
+    ).fetchone()
+    if (
+        person_row
+        and person_row["current_wikipedia_identity_observation_id"] is not None
+    ):
+        obs = connection.execute(
+            "SELECT semantic_outcome FROM wikipedia_identity_observation WHERE id = ?",
+            (person_row["current_wikipedia_identity_observation_id"],),
+        ).fetchone()
+        if obs and obs["semantic_outcome"] == "matching_page_found":
+            from notable_person_finder.leads.service import (
+                _schedule_lead_aggregation_after_settled,
+            )
+
+            _schedule_lead_aggregation_after_settled(
+                connection,
+                person_id=person_id,
+                run_id=run_id,
+                config=config,
+                now=now,
+            )
 
 
 def _persist_match_failure_for(

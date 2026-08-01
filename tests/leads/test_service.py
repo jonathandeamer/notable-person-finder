@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -36,7 +37,7 @@ def _main_config(*, policy_file: Path | None = None) -> MainConfig:
 
 
 @pytest.fixture
-def connection(tmp_path: Path) -> sqlite3.Connection:
+def connection(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     db_path = tmp_path / "test.db"
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row

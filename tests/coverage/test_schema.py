@@ -465,7 +465,7 @@ def test_migration_0007_applies_to_a_fresh_database(
             "SELECT version FROM schema_migration ORDER BY version"
         )
     )
-    assert versions == (1, 2, 3, 4, 5, 6, 7)
+    assert versions == (1, 2, 3, 4, 5, 6, 7, 8)
 
 
 @pytest.mark.parametrize("retained_version", [0, 1, 2, 3, 4, 5, 6])
@@ -484,7 +484,7 @@ def test_migration_0007_upgrades_every_retained_schema_version(
         if retained:
             apply_migrations(connection, database, backups, retained)
         result = apply_migrations(connection, database, backups)
-        assert result.applied_versions == tuple(range(retained_version + 1, 8))
+        assert result.applied_versions == tuple(range(retained_version + 1, 9))
         assert result.backup_path is not None and result.backup_path.exists()
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
@@ -529,7 +529,7 @@ def test_migration_0007_preserves_existing_aliases_and_adds_search_result(
         connection.commit()
 
         result = apply_migrations(connection, database, backups)
-        assert result.applied_versions == (7,)
+        assert result.applied_versions == (7, 8)
 
         kinds = {
             row["kind"]

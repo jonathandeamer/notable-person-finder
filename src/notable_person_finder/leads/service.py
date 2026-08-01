@@ -57,6 +57,8 @@ LOCAL_PROVIDER = "local"
 @dataclass(frozen=True, slots=True)
 class _AggregatePayload:
     person_id: int
+    articles: list[ArticleEvidence]
+    signals: list[SignalEvidence]
     wikipedia_outcome: str | None
 
 
@@ -260,24 +262,27 @@ def build_aggregate_person_lead_handler(
             ).fetchone()
             if outcome_row:
                 wikipedia_outcome = outcome_row["semantic_outcome"]
+        articles = _load_article_evidence(
+            connection,
+            person_id=person_id,
+            canonical_domains=canonical_domains,
+        )
+        signals = _load_signal_evidence(connection, person_id=person_id)
         return TaskPreparation(
             payload=_AggregatePayload(
-                person_id=person_id, wikipedia_outcome=wikipedia_outcome
+                person_id=person_id,
+                articles=articles,
+                signals=signals,
+                wikipedia_outcome=wikipedia_outcome,
             ),
             reserved_nano_usd=0,
         )
 
     def execute(work_item: WorkItem, ordinal: int, prepared: object) -> TaskOutcome:
         assert isinstance(prepared, _AggregatePayload)
-        articles = _load_article_evidence(
-            connection,
-            person_id=prepared.person_id,
-            canonical_domains=canonical_domains,
-        )
-        signals = _load_signal_evidence(connection, person_id=prepared.person_id)
         outcome = aggregate_lead(
-            articles=articles,
-            signals=signals,
+            articles=prepared.articles,
+            signals=prepared.signals,
             wikipedia_outcome=prepared.wikipedia_outcome,
             promising_domain_threshold=config.tasks.aggregate_lead.promising_domain_threshold,
         )
