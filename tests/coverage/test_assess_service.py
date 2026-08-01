@@ -30,14 +30,17 @@ from notable_person_finder.coverage.repository import (
     load_plan,
     open_plan,
     point_person_article_current_assessment,
+    update_plan_status,
     upsert_person_article,
 )
+from notable_person_finder.coverage.screening import source_policy_from_mapping
 from notable_person_finder.coverage.service import (
     ASSESS_ARTICLE_PRIORITY,
     ASSESS_ARTICLE_TASK_TYPE,
     assess_model_needed,
     build_assess_article_handler,
     schedule_assess_article,
+    sweep_stalled_coverage_plans,
 )
 from notable_person_finder.people.identity import insert_person, upsert_sourced_name
 from notable_person_finder.people.repository import (
@@ -1184,6 +1187,81 @@ def test_assess_input_overflow_records_local_refuse_and_advances_plan(
     # K25: a failed assessment never becomes the current pointer.
     assert _person_article_pointer(connection, person_article_id) is None
 
+    plan = load_plan(connection, plan_id=plan_id)
+    assert plan is not None
+    assert plan.status in {"completed", "incomplete", "failed"}
+    assert plan.completed_at is not None
+
+
+def test_sweep_terminalizes_a_plan_whose_assess_work_died_without_a_row(
+    connection: sqlite3.Connection,
+) -> None:
+    """C2: a `fetched` path whose assess work is permanently dead is terminal.
+
+    `prepare` exits such as `unresolved_context` and `missing_view` raise
+    before any domain write, so the target keeps `fetched` and no assessment
+    row exists. Without treating the dead work item as terminal the plan can
+    never leave `assessing`.
+    """
+    run_id = insert_run(connection)
+    person_id = _person_with_name(connection, run_id=run_id)
+    plan_id, person_article_id, view_id, _article = _seed_assessable(
+        connection, person_id=person_id, run_id=run_id
+    )
+    work_id = _schedule_assess(
+        connection,
+        person_article_id=person_article_id,
+        article_view_id=view_id,
+        run_id=run_id,
+    )
+    with immediate(connection) as conn:
+        update_plan_status(conn, plan_id=plan_id, status="assessing")
+        conn.execute(
+            """
+            UPDATE work_item
+               SET state = 'failed_permanent', reason = 'prepare raised ValueError',
+                   completed_by_run_id = ?, updated_at = ?
+             WHERE id = ?
+            """,
+            (run_id, NOW, work_id),
+        )
+    assert (
+        load_person_article_assessment_by_fingerprint(
+            connection,
+            person_article_id=person_article_id,
+            task_fingerprint=_work_item(connection, work_id).fingerprint,
+        )
+        is None
+    )
+    plan = load_plan(connection, plan_id=plan_id)
+    assert plan is not None
+    assert plan.status == "assessing"
+
+    swept = sweep_stalled_coverage_plans(
+        connection,
+        run_id=run_id,
+        config=_main_config(),
+        policy=source_policy_from_mapping(
+            {
+                "schema_version": 1,
+                "key": "test-sources",
+                "label": "Test policy",
+                "rules": [],
+            }
+        ),
+        now=moment(2),
+    )
+    assert swept == 1
+    recovered = load_person_article_assessment_by_fingerprint(
+        connection,
+        person_article_id=person_article_id,
+        task_fingerprint=_work_item(connection, work_id).fingerprint,
+    )
+    assert recovered is not None
+    assert recovered.disposition == "failed"
+    assert recovered.failure_category == "local_refuse"
+    assert recovered.attempt_id is None
+    assert _person_article_pointer(connection, person_article_id) is None
     plan = load_plan(connection, plan_id=plan_id)
     assert plan is not None
     assert plan.status in {"completed", "incomplete", "failed"}

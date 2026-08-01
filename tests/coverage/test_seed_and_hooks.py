@@ -758,3 +758,133 @@ def test_failed_terminal_does_not_time_refresh(
         )
         == "ineligible"
     )
+
+
+def _plan_status(connection: sqlite3.Connection, *, plan_id: int) -> str:
+    row = connection.execute(
+        "SELECT status FROM person_coverage_plan WHERE id = ?", (plan_id,)
+    ).fetchone()
+    assert row is not None
+    return str(row["status"])
+
+
+def test_seed_recovers_a_plan_wedged_by_a_settlement_that_skipped_persist(
+    connection: sqlite3.Connection,
+) -> None:
+    """C2: `maybe_advance_coverage_plan` only runs from the persist paths.
+
+    A raising `prepare` settles the work item `failed_permanent` with no
+    failure, so `persist_failure` never runs and the form keeps its `pending`
+    status. Nothing then advances the plan: it stays active forever,
+    `ensure_coverage_research` answers `reused`, and the person vanishes from
+    "coverage eligible remaining". The next run must sweep it.
+    """
+    run_id = insert_run(connection)
+    person_id = _person(connection, run_id=run_id)
+    _complete_wikipedia(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        semantic_outcome="no_matching_page_found",
+    )
+    config = _config()
+    policy = _policy()
+    material_fp = coverage_material_fingerprint(
+        CoveragePersonMaterialView(person_id=person_id, identity_fingerprint=_HASH),
+        config.tasks.assess_article,
+        source_policy_fingerprint=policy.fingerprint,
+        refresh_of_plan_id=None,
+    )
+    plan_id, form_id, work_id = _open_active_coverage_with_brave_work(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        material_fingerprint=material_fp,
+        policy_fp=policy.fingerprint,
+    )
+    # Exactly what the engine leaves behind for a raising `prepare`.
+    with immediate(connection) as conn:
+        conn.execute(
+            """
+            UPDATE work_item
+               SET state = 'failed_permanent', reason = 'prepare raised ValueError',
+                   completed_by_run_id = ?, updated_at = ?
+             WHERE id = ?
+            """,
+            (run_id, NOW, work_id),
+        )
+    assert _plan_status(connection, plan_id=plan_id) == "retrieving"
+    form_before = connection.execute(
+        "SELECT status FROM coverage_query_form WHERE id = ?", (form_id,)
+    ).fetchone()
+    assert form_before is not None
+    assert form_before["status"] == "pending"
+
+    next_run_id = insert_run(connection)
+    later = _hours_after(NOW, 1)
+    seed_coverage_research(
+        connection,
+        run_id=next_run_id,
+        config=config,
+        policy=policy,
+        now=later,
+    )
+
+    assert _plan_status(connection, plan_id=plan_id) in {
+        "completed",
+        "incomplete",
+        "failed",
+    }
+    assert _active_plan_count(connection, person_id=person_id) == 0
+    form_after = connection.execute(
+        "SELECT status, failure_category FROM coverage_query_form WHERE id = ?",
+        (form_id,),
+    ).fetchone()
+    assert form_after is not None
+    assert form_after["status"] == "failed"
+    assert form_after["failure_category"] == "work_item_failed_permanent"
+
+
+def test_sweep_leaves_a_plan_alone_while_its_work_can_still_run(
+    connection: sqlite3.Connection,
+) -> None:
+    """Positive control for the sweep: a live work item is not swept."""
+    run_id = insert_run(connection)
+    person_id = _person(connection, run_id=run_id)
+    _complete_wikipedia(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        semantic_outcome="no_matching_page_found",
+    )
+    config = _config()
+    policy = _policy()
+    material_fp = coverage_material_fingerprint(
+        CoveragePersonMaterialView(person_id=person_id, identity_fingerprint=_HASH),
+        config.tasks.assess_article,
+        source_policy_fingerprint=policy.fingerprint,
+        refresh_of_plan_id=None,
+    )
+    plan_id, form_id, _work_id = _open_active_coverage_with_brave_work(
+        connection,
+        person_id=person_id,
+        run_id=run_id,
+        material_fingerprint=material_fp,
+        policy_fp=policy.fingerprint,
+    )
+
+    next_run_id = insert_run(connection)
+    seed_coverage_research(
+        connection,
+        run_id=next_run_id,
+        config=config,
+        policy=policy,
+        now=_hours_after(NOW, 1),
+    )
+
+    assert _plan_status(connection, plan_id=plan_id) == "retrieving"
+    row = connection.execute(
+        "SELECT status FROM coverage_query_form WHERE id = ?", (form_id,)
+    ).fetchone()
+    assert row is not None
+    assert row["status"] == "pending"

@@ -215,6 +215,7 @@ MISSING_PERSON_ARTICLE_DETAIL = "person_article is missing"
 ASSESS_PREPARE_REFUSED_PREFIX = "assess_prepare_refused:"
 ASSESS_FAILED_SUPPLIED_INPUT_JSON = "{}"
 _ASSESS_INPUT_TOO_LARGE_RATIONALE = "assess input exceeds max_input_tokens"
+_ASSESS_WORK_DIED_RATIONALE = "assess work failed permanently without a result"
 _ACTIVE_COVERAGE_PLAN_STATUSES = frozenset({"retrieving", "selecting", "assessing"})
 
 
@@ -721,6 +722,15 @@ def seed_coverage_research(
     ineligible result (``scheduled``, ``reused``, or ``stopped_matching``),
     plus people whose matching path superseded active coverage.
     """
+    # Recover plans wedged by a settlement that bypassed `persist` before
+    # deciding what is eligible: a stuck plan makes its person look ineligible.
+    sweep_stalled_coverage_plans(
+        connection,
+        run_id=run_id,
+        config=config,
+        policy=policy,
+        now=now,
+    )
     rows = connection.execute(
         """
         SELECT id
@@ -756,6 +766,262 @@ def seed_coverage_research(
         if result != "ineligible":
             acted += 1
     return acted
+
+
+def sweep_stalled_coverage_plans(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    config: MainConfig,
+    policy: SourcePolicy,
+    now: str,
+) -> int:
+    """Advance every active plan that has no coverage work left to run.
+
+    `maybe_advance_coverage_plan` is only ever called from the six persist
+    paths, and several settlements never reach one: a raising `prepare`, a
+    refused reservation, a `persist` that itself failed. The work item goes
+    `failed_permanent` and is never re-claimed, but the form or target row it
+    named keeps its pre-settlement status, so the plan can never terminalize.
+    `seed_coverage_research` then reports `reused` forever and the person
+    silently disappears from "coverage eligible remaining".
+
+    Returns the number of plans this swept.
+    """
+    plan_rows = connection.execute(
+        """
+        SELECT id, status
+          FROM person_coverage_plan
+         WHERE status IN ('retrieving', 'selecting', 'assessing')
+         ORDER BY id
+        """
+    ).fetchall()
+    swept = 0
+    for row in plan_rows:
+        plan_id = int(row["id"])
+        status = str(row["status"])
+        if _plan_has_live_coverage_work(connection, plan_id=plan_id):
+            continue
+        owns = not connection.in_transaction
+        if owns:
+            connection.execute("BEGIN IMMEDIATE")
+        try:
+            _fail_subject_rows_for_dead_work(
+                connection, plan_id=plan_id, run_id=run_id, now=now
+            )
+            if status == "assessing":
+                # The narrower join point: search is over, and the wider one
+                # would re-open alias or context forms on a plan past retrieval.
+                advance_coverage_plan_after_assess(
+                    connection,
+                    plan_id=plan_id,
+                    now=now,
+                )
+            else:
+                maybe_advance_coverage_plan(
+                    connection,
+                    plan_id=plan_id,
+                    run_id=run_id,
+                    config=config,
+                    policy=policy,
+                    now=now,
+                )
+        except BaseException:
+            if owns:
+                connection.rollback()
+            raise
+        else:
+            if owns:
+                connection.commit()
+        swept += 1
+    return swept
+
+
+def _plan_has_live_coverage_work(
+    connection: sqlite3.Connection, *, plan_id: int
+) -> bool:
+    """True when any of this plan's three work kinds can still run."""
+    row = connection.execute(
+        """
+        SELECT 1 AS present
+          FROM work_item AS w
+          JOIN coverage_query_form AS f ON f.id = w.subject_id
+         WHERE w.task_type = ?
+           AND w.subject_kind = ?
+           AND f.plan_id = ?
+           AND w.state IN ('pending', 'deferred', 'running')
+         LIMIT 1
+        """,
+        (BRAVE_WEB_SEARCH_TASK_TYPE, SUBJECT_KIND_COVERAGE_QUERY_FORM, plan_id),
+    ).fetchone()
+    if row is not None:
+        return True
+    row = connection.execute(
+        """
+        SELECT 1 AS present
+          FROM work_item AS w
+          JOIN coverage_article_target AS t ON t.id = w.subject_id
+         WHERE w.task_type = ?
+           AND w.subject_kind = ?
+           AND t.plan_id = ?
+           AND w.state IN ('pending', 'deferred', 'running')
+         LIMIT 1
+        """,
+        (FETCH_ARTICLE_TASK_TYPE, SUBJECT_KIND_COVERAGE_ARTICLE_TARGET, plan_id),
+    ).fetchone()
+    if row is not None:
+        return True
+    row = connection.execute(
+        """
+        SELECT 1 AS present
+          FROM work_item AS w
+          JOIN person_article AS pa ON pa.id = w.subject_id
+          JOIN coverage_article_target AS t
+            ON t.canonical_article_id = pa.canonical_article_id
+           AND t.plan_id = ?
+         WHERE w.task_type = ?
+           AND w.subject_kind = ?
+           AND w.state IN ('pending', 'deferred', 'running')
+         LIMIT 1
+        """,
+        (plan_id, ASSESS_ARTICLE_TASK_TYPE, SUBJECT_KIND_PERSON_ARTICLE),
+    ).fetchone()
+    return row is not None
+
+
+def _fail_subject_rows_for_dead_work(
+    connection: sqlite3.Connection, *, plan_id: int, run_id: int, now: str
+) -> None:
+    """Mark rows terminal when the work item that owned them is dead.
+
+    Only reached with no live work on the plan, so a still-``pending`` form or
+    target whose only work item is ``failed_permanent`` has nothing that will
+    ever settle it. ``failed_permanent`` is terminal for the subject row.
+    """
+    form_ids = [
+        int(row["id"])
+        for row in connection.execute(
+            """
+            SELECT DISTINCT f.id AS id
+              FROM coverage_query_form AS f
+              JOIN work_item AS w
+                ON w.subject_id = f.id
+               AND w.task_type = ?
+               AND w.subject_kind = ?
+             WHERE f.plan_id = ?
+               AND f.status = 'pending'
+               AND w.state = 'failed_permanent'
+             ORDER BY f.id
+            """,
+            (BRAVE_WEB_SEARCH_TASK_TYPE, SUBJECT_KIND_COVERAGE_QUERY_FORM, plan_id),
+        )
+    ]
+    for form_id in form_ids:
+        mark_query_form_failed(
+            connection,
+            form_id=form_id,
+            failure_category=_WORK_FAILED_PERMANENT_CATEGORY,
+        )
+
+    target_ids = [
+        int(row["id"])
+        for row in connection.execute(
+            """
+            SELECT DISTINCT t.id AS id
+              FROM coverage_article_target AS t
+              JOIN work_item AS w
+                ON w.subject_id = t.id
+               AND w.task_type = ?
+               AND w.subject_kind = ?
+             WHERE t.plan_id = ?
+               AND t.status = 'pending'
+               AND w.state = 'failed_permanent'
+             ORDER BY t.id
+            """,
+            (
+                FETCH_ARTICLE_TASK_TYPE,
+                SUBJECT_KIND_COVERAGE_ARTICLE_TARGET,
+                plan_id,
+            ),
+        )
+    ]
+    for target_id in target_ids:
+        update_coverage_article_target(
+            connection,
+            target_id=target_id,
+            status="failed",
+            failure_category=_WORK_FAILED_PERMANENT_CATEGORY,
+        )
+
+    _record_missing_assessments_for_dead_work(
+        connection, plan_id=plan_id, run_id=run_id, observed_at=now
+    )
+
+
+def _record_missing_assessments_for_dead_work(
+    connection: sqlite3.Connection,
+    *,
+    plan_id: int,
+    run_id: int,
+    observed_at: str,
+) -> None:
+    """Write the `local_refuse` row a dead assess item never got to write.
+
+    A `fetched` target needs a terminal assessment before its plan may
+    terminalize. A settlement that bypassed `persist` left none, so the row is
+    reconstructed here from the work item's own subject and fingerprint --
+    the same shape `prepare` writes when it refuses locally.
+    """
+    rows = connection.execute(
+        """
+        SELECT DISTINCT w.subject_id AS person_article_id,
+               w.fingerprint AS fingerprint
+          FROM work_item AS w
+          JOIN person_article AS pa ON pa.id = w.subject_id
+          JOIN coverage_article_target AS t
+            ON t.canonical_article_id = pa.canonical_article_id
+           AND t.plan_id = ?
+         WHERE w.task_type = ?
+           AND w.subject_kind = ?
+           AND w.state = 'failed_permanent'
+         ORDER BY w.subject_id
+        """,
+        (plan_id, ASSESS_ARTICLE_TASK_TYPE, SUBJECT_KIND_PERSON_ARTICLE),
+    ).fetchall()
+    for row in rows:
+        person_article_id = int(row["person_article_id"])
+        task_fingerprint = str(row["fingerprint"])
+        existing = load_person_article_assessment_by_fingerprint(
+            connection,
+            person_article_id=person_article_id,
+            task_fingerprint=task_fingerprint,
+        )
+        if existing is not None:
+            continue
+        person_article = load_person_article(
+            connection, person_article_id=person_article_id
+        )
+        if person_article is None:
+            continue
+        context = resolve_assess_work_context(
+            connection,
+            person_article_id=person_article_id,
+            task_fingerprint=task_fingerprint,
+        )
+        if context is None:
+            continue
+        _insert_local_refuse_assessment(
+            connection,
+            person_article=person_article,
+            person_article_id=person_article_id,
+            context=context,
+            run_id=run_id,
+            model_inspection_id=None,
+            task_fingerprint=task_fingerprint,
+            failure_category=_LOCAL_REFUSE_CATEGORY,
+            rationale=_ASSESS_WORK_DIED_RATIONALE,
+            observed_at=observed_at,
+        )
 
 
 def supersede_coverage_work_for_person(
@@ -3297,6 +3563,10 @@ def _selected_paths_ready_to_terminalize(
     - ``failed`` / ``snippets_only``: interim permanent fetch death without assess
       (allowed so T10 salvage can close before Task 7 wires snippets→assess).
     - other non-pending: require terminal assessment.
+
+    A path whose assess work died without writing a row is not handled here:
+    `sweep_stalled_coverage_plans` records the missing `local_refuse`
+    assessment first, so by the time this runs every dead path has one.
     """
     if not targets:
         return True
@@ -3306,16 +3576,6 @@ def _selected_paths_ready_to_terminalize(
             return False
         if status in {"failed", "snippets_only", "superseded"}:
             continue
-        if status == "fetched":
-            if not _target_has_terminal_assessment(
-                connection,
-                plan_id=plan_id,
-                person_id=person_id,
-                canonical_article_id=int(target.canonical_article_id),
-            ):
-                return False
-            continue
-        # Unknown / future statuses: require assessment.
         if not _target_has_terminal_assessment(
             connection,
             plan_id=plan_id,
@@ -4016,32 +4276,16 @@ def _record_local_refuse_assessment(
     if owns:
         connection.execute("BEGIN IMMEDIATE")
     try:
-        insert_person_article_assessment(
+        _insert_local_refuse_assessment(
             connection,
+            person_article=person_article,
             person_article_id=person_article_id,
-            person_id=person_article.person_id,
-            canonical_article_id=person_article.canonical_article_id,
-            plan_id=context.plan_id,
-            article_view_id=context.article_view_id,
+            context=context,
             run_id=run_id,
-            attempt_id=None,
             model_inspection_id=model_inspection_id,
-            disposition="failed",
-            person_relation=None,
-            coverage_depth=None,
-            content_types_json=None,
-            subject_relationship=None,
-            screening_rule_id=context.screening_rule_id,
-            screening_rule_status=context.screening_rule_status,
-            source_policy_fingerprint=context.source_policy_fingerprint,
-            canonical_supplied_input_json=ASSESS_FAILED_SUPPLIED_INPUT_JSON,
-            validated_output_json=None,
-            prompt_hash=None,
-            schema_hash=None,
-            schema_version=None,
             task_fingerprint=task_fingerprint,
-            rationale=rationale,
             failure_category=failure_category,
+            rationale=rationale,
             observed_at=observed_at,
         )
         # K25: do not move the current pointer on a failed assessment.
@@ -4058,6 +4302,50 @@ def _record_local_refuse_assessment(
     else:
         if owns:
             connection.commit()
+
+
+def _insert_local_refuse_assessment(
+    connection: sqlite3.Connection,
+    *,
+    person_article: Any,
+    person_article_id: int,
+    context: AssessWorkContext,
+    run_id: int,
+    model_inspection_id: int | None,
+    task_fingerprint: str,
+    failure_category: str,
+    rationale: str,
+    observed_at: str,
+) -> None:
+    """Insert one `failed` assessment with no attempt row. Caller owns the txn."""
+    insert_person_article_assessment(
+        connection,
+        person_article_id=person_article_id,
+        person_id=person_article.person_id,
+        canonical_article_id=person_article.canonical_article_id,
+        plan_id=context.plan_id,
+        article_view_id=context.article_view_id,
+        run_id=run_id,
+        attempt_id=None,
+        model_inspection_id=model_inspection_id,
+        disposition="failed",
+        person_relation=None,
+        coverage_depth=None,
+        content_types_json=None,
+        subject_relationship=None,
+        screening_rule_id=context.screening_rule_id,
+        screening_rule_status=context.screening_rule_status,
+        source_policy_fingerprint=context.source_policy_fingerprint,
+        canonical_supplied_input_json=ASSESS_FAILED_SUPPLIED_INPUT_JSON,
+        validated_output_json=None,
+        prompt_hash=None,
+        schema_hash=None,
+        schema_version=None,
+        task_fingerprint=task_fingerprint,
+        rationale=rationale,
+        failure_category=failure_category,
+        observed_at=observed_at,
+    )
 
 
 def _run_started_at(connection: sqlite3.Connection, *, run_id: int) -> str:
