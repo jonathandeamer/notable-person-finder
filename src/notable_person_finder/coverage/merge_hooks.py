@@ -7,9 +7,13 @@ import sqlite3
 from notable_person_finder.config.models import MainConfig
 from notable_person_finder.coverage.screening import SourcePolicy
 from notable_person_finder.coverage.service import (
+    ASSESS_ARTICLE_TASK_TYPE,
+    SUBJECT_KIND_PERSON_ARTICLE,
     ensure_coverage_research,
     supersede_coverage_work_for_person,
 )
+
+_RETIRED_RELATION_REASON = "person_article retired by confirmed merge"
 
 
 def reconcile_on_merge(
@@ -35,10 +39,22 @@ def reconcile_on_merge(
         run_id=run_id,
         now=now,
     )
+    # The survivor's `identity_fingerprint` changes on a merge, so
+    # `ensure_coverage_research` below opens a *new* plan. Without this the old
+    # plan's Brave, fetch, and assess work keeps running alongside it: two
+    # plans, duplicate paid calls, for one person.
+    supersede_coverage_work_for_person(
+        connection,
+        person_id=survivor_id,
+        run_id=run_id,
+        now=now,
+    )
     _reassign_person_articles(
         connection,
         survivor_id=survivor_id,
         loser_id=loser_id,
+        run_id=run_id,
+        now=now,
     )
     ensure_coverage_research(
         connection,
@@ -55,6 +71,8 @@ def _reassign_person_articles(
     *,
     survivor_id: int,
     loser_id: int,
+    run_id: int,
+    now: str,
 ) -> None:
     rows = connection.execute(
         """
@@ -124,6 +142,8 @@ def _reassign_person_articles(
             retiree_current=retiree_current,
             survivor_id=survivor_id,
             reassign_keeper_person=reassign_keeper_person,
+            run_id=run_id,
+            now=now,
         )
 
 
@@ -136,6 +156,8 @@ def _merge_person_article_conflict(
     retiree_current: int | None,
     survivor_id: int,
     reassign_keeper_person: bool,
+    run_id: int,
+    now: str,
 ) -> None:
     """Resolve two person_article rows for the same (person, article).
 
@@ -171,6 +193,30 @@ def _merge_person_article_conflict(
          WHERE person_article_id = ?
         """,
         (keeper_id, retiree_id),
+    )
+
+    # Whichever row retires may be the *survivor's*: the keeper is the lower
+    # person_article.id, not the survivor's. Assess work naming the retiree
+    # would be left with a dangling subject_id, and its `prepare` would then
+    # raise into a settlement that writes nothing.
+    connection.execute(
+        """
+        UPDATE work_item
+           SET state = 'superseded', reason = ?, completed_by_run_id = ?,
+               updated_at = ?
+         WHERE task_type = ?
+           AND subject_kind = ?
+           AND subject_id = ?
+           AND state IN ('pending', 'deferred')
+        """,
+        (
+            _RETIRED_RELATION_REASON,
+            run_id,
+            now,
+            ASSESS_ARTICLE_TASK_TYPE,
+            SUBJECT_KIND_PERSON_ARTICLE,
+            retiree_id,
+        ),
     )
 
     # Delete retiree before reassigning keeper person_id so UNIQUE

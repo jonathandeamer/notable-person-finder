@@ -22,7 +22,11 @@ from notable_person_finder.coverage.repository import (
     upsert_person_article,
 )
 from notable_person_finder.coverage.screening import source_policy_from_mapping
-from notable_person_finder.coverage.service import BRAVE_WEB_SEARCH_TASK_TYPE
+from notable_person_finder.coverage.service import (
+    ASSESS_ARTICLE_TASK_TYPE,
+    BRAVE_WEB_SEARCH_TASK_TYPE,
+    SUBJECT_KIND_PERSON_ARTICLE,
+)
 from notable_person_finder.ingestion.repository import upsert_article
 from notable_person_finder.people.identity import match_key
 from notable_person_finder.people.merge import confirm_person_merge
@@ -600,3 +604,187 @@ def test_merge_does_not_blind_copy_coverage_pointers(
     ).fetchone()
     assert assessment is not None
     assert int(assessment["person_id"]) == loser
+
+
+def _assess_work(
+    connection: sqlite3.Connection,
+    *,
+    person_article_id: int,
+    run_id: int,
+    fingerprint: str,
+) -> int:
+    with immediate(connection) as conn:
+        work_id = conn.execute(
+            """
+            INSERT INTO work_item (
+                task_type, subject_kind, subject_id, fingerprint, required,
+                priority, eligible_at, state, created_by_run_id, created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, 1, 70, ?, 'pending', ?, ?, ?)
+            """,
+            (
+                ASSESS_ARTICLE_TASK_TYPE,
+                SUBJECT_KIND_PERSON_ARTICLE,
+                person_article_id,
+                fingerprint,
+                NOW,
+                run_id,
+                NOW,
+                NOW,
+            ),
+        ).lastrowid
+        assert work_id is not None
+    return int(work_id)
+
+
+def _work_state(connection: sqlite3.Connection, work_id: int) -> str:
+    row = connection.execute(
+        "SELECT state FROM work_item WHERE id = ?", (work_id,)
+    ).fetchone()
+    assert row is not None
+    return str(row["state"])
+
+
+def test_merge_supersedes_assess_work_naming_the_retired_relation(
+    connection: sqlite3.Connection,
+) -> None:
+    """I3: the retiree may be the *survivor's* person_article row.
+
+    The keeper is the lower `person_article.id`, not the survivor's. When
+    `survivor_pa_id > loser_pa_id` the survivor's row is deleted, and pending
+    assess work naming it is left with a dangling `subject_id` -- which
+    `prepare` then raises on, into a settlement that writes nothing.
+    """
+    config = _config()
+    policy = _policy()
+    run_id = insert_run(connection)
+    # The loser is created first, so its person_article id is the lower one and
+    # the survivor's is the row that retires.
+    loser = _person(connection, run_id=run_id, name="Fay G", fingerprint="2" * 64)
+    survivor = _person(connection, run_id=run_id, name="Fay", fingerprint="1" * 64)
+    article_id = _article(connection, url="https://example.com/fay")
+    with immediate(connection) as conn:
+        loser_pa_id = upsert_person_article(
+            conn,
+            person_id=loser,
+            canonical_article_id=article_id,
+            first_plan_id=None,
+        )
+        survivor_pa_id = upsert_person_article(
+            conn,
+            person_id=survivor,
+            canonical_article_id=article_id,
+            first_plan_id=None,
+        )
+    assert survivor_pa_id > loser_pa_id
+
+    survivor_work = _assess_work(
+        connection,
+        person_article_id=survivor_pa_id,
+        run_id=run_id,
+        fingerprint="9" * 64,
+    )
+    loser_work = _assess_work(
+        connection,
+        person_article_id=loser_pa_id,
+        run_id=run_id,
+        fingerprint="8" * 64,
+    )
+    _complete_wikipedia_no_match(
+        connection,
+        person_id=survivor,
+        run_id=run_id,
+        material_fingerprint="7" * 64,
+    )
+
+    with immediate(connection):
+        reconcile_on_merge(
+            connection,
+            survivor_id=survivor,
+            loser_id=loser,
+            run_id=run_id,
+            config=config,
+            policy=policy,
+            now=NOW,
+        )
+
+    assert (
+        connection.execute(
+            "SELECT id FROM person_article WHERE id = ?", (survivor_pa_id,)
+        ).fetchone()
+        is None
+    )
+    # No work item may still name a person_article that no longer exists.
+    dangling = connection.execute(
+        """
+        SELECT w.id
+          FROM work_item AS w
+          LEFT JOIN person_article AS pa ON pa.id = w.subject_id
+         WHERE w.task_type = ?
+           AND w.subject_kind = ?
+           AND w.state IN ('pending', 'deferred')
+           AND pa.id IS NULL
+        """,
+        (ASSESS_ARTICLE_TASK_TYPE, SUBJECT_KIND_PERSON_ARTICLE),
+    ).fetchall()
+    assert dangling == []
+    assert _work_state(connection, survivor_work) == "superseded"
+    assert _work_state(connection, loser_work) == "superseded"
+
+
+def test_merge_supersedes_the_survivors_own_stale_plan_before_opening_a_new_one(
+    connection: sqlite3.Connection,
+) -> None:
+    """I4: the survivor's fingerprint changes, so a second plan would open.
+
+    Leaving the old plan active means its Brave, fetch, and assess work keeps
+    running alongside the new plan's -- duplicate paid calls for one person.
+    """
+    config = _config()
+    policy = _policy()
+    run_id = insert_run(connection)
+    survivor = _person(connection, run_id=run_id, name="Hal", fingerprint="1" * 64)
+    loser = _person(connection, run_id=run_id, name="Hal I", fingerprint="2" * 64)
+    _complete_wikipedia_no_match(
+        connection,
+        person_id=survivor,
+        run_id=run_id,
+        material_fingerprint="5" * 64,
+    )
+    stale_plan_id, stale_work_id = _active_coverage_with_work(
+        connection,
+        person_id=survivor,
+        run_id=run_id,
+        material_fingerprint="3" * 64,
+        policy_fp=policy.fingerprint,
+    )
+
+    with immediate(connection):
+        reconcile_on_merge(
+            connection,
+            survivor_id=survivor,
+            loser_id=loser,
+            run_id=run_id,
+            config=config,
+            policy=policy,
+            now=NOW,
+        )
+
+    stale = connection.execute(
+        "SELECT status FROM person_coverage_plan WHERE id = ?", (stale_plan_id,)
+    ).fetchone()
+    assert stale is not None
+    assert stale["status"] == "superseded"
+    assert _work_state(connection, stale_work_id) == "superseded"
+    active = connection.execute(
+        """
+        SELECT COUNT(*) AS n
+          FROM person_coverage_plan
+         WHERE person_id = ?
+           AND status IN ('retrieving', 'selecting', 'assessing')
+        """,
+        (survivor,),
+    ).fetchone()
+    assert active is not None
+    # At most one plan may be active for the survivor after the merge.
+    assert int(active["n"]) <= 1
