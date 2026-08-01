@@ -456,6 +456,8 @@ class OpenRouterClient:
             ],
             "model": request.model_id,
             "max_completion_tokens": request.max_completion_tokens,
+            "temperature": request.temperature,
+            "top_p": request.top_p,
             "stream": False,
             "response_format": {
                 "type": "json_schema",
@@ -470,10 +472,6 @@ class OpenRouterClient:
             "retries": self._retry,
             "timeout_ms": self._timeout_ms,
         }
-        if request.temperature is not None:
-            kwargs["temperature"] = request.temperature
-        if request.top_p is not None:
-            kwargs["top_p"] = request.top_p
         if request.reasoning_effort is not None:
             kwargs["reasoning_effort"] = request.reasoning_effort
         try:
