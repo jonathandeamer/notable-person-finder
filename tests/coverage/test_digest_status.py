@@ -12,7 +12,7 @@ def test_coverage_summary_counts_integration(connection: sqlite3.Connection):
     assert corpus.assessments_completed == 0
     assert corpus.people_with_completed_assessment == 0
     assert corpus.stopped_matching_wikipedia == 0
-    
+
     run = coverage_run_counts(connection, run_id=1)
     assert run.plans_completed == 0
     assert run.plans_incomplete == 0

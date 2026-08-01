@@ -507,7 +507,7 @@ def _is_mediawiki_request(request: httpx.Request) -> bool:
 
 def _is_brave_request(request: httpx.Request) -> bool:
     host = request.url.host or ""
-    print("HOST:", host); return "api.search.brave.com" in host
+    return "api.search.brave.com" in host
 
 
 def _rss_handler(payload: bytes) -> Callable[[httpx.Request], httpx.Response]:
@@ -523,7 +523,9 @@ def _rss_handler(payload: bytes) -> Callable[[httpx.Request], httpx.Response]:
         if _is_brave_request(request):
             return httpx.Response(
                 200,
-                content=streaming_body(b'{"query": {"original": ""}, "web": {"results": []}}'),
+                content=streaming_body(
+                    b'{"query": {"original": ""}, "web": {"results": []}}'
+                ),
                 headers={"content-type": "application/json"},
             )
         return httpx.Response(200, content=streaming_body(payload))
@@ -544,7 +546,9 @@ def _not_modified_or_empty_mediawiki(
     if _is_brave_request(request):
         return httpx.Response(
             200,
-            content=streaming_body(b'{"query": {"original": ""}, "web": {"results": []}}'),
+            content=streaming_body(
+                b'{"query": {"original": ""}, "web": {"results": []}}'
+            ),
             headers={"content-type": "application/json"},
         )
     return httpx.Response(304, content=streaming_body(b""))
@@ -591,11 +595,7 @@ def test_fresh_run_triages_ingested_items(
         llm=ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,)),
     )
 
-    if cli_main.command_run(config, verbose=False) != cli_main.EXIT_OK:
-        import sqlite3; db = sqlite3.connect(tmp_path / "portable/data/notable.sqlite3")
-        db.row_factory = sqlite3.Row
-        for row in db.execute("SELECT * FROM work_item WHERE state = \"permanently_failed\""): print("FAIL:", dict(row))
-        assert False
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
     digest = _latest_digest(config)
     assert "### Person detection" in digest
     assert "Source items triaged: 1" in digest
@@ -631,11 +631,7 @@ def test_existing_backlog_is_seeded_without_new_feed_items(
             content_by_substring={"assess_article": ASSESS_JSON},
         ),
     )
-    if cli_main.command_run(config, verbose=False) != cli_main.EXIT_OK:
-        import sqlite3; db = sqlite3.connect(tmp_path / "portable/data/notable.sqlite3")
-        db.row_factory = sqlite3.Row
-        for row in db.execute("SELECT * FROM work_item WHERE state = \"permanently_failed\""): print("FAIL:", dict(row))
-        assert False
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
     first_generations = len(client.instances[-1].generate_calls)
 
     # Second run: 304, no new items; backlog already triaged so no generation.
@@ -649,11 +645,7 @@ def test_existing_backlog_is_seeded_without_new_feed_items(
         content_by_substring={"assess_article": ASSESS_JSON},
     )
     monkeypatch.setattr(cli_main, "OpenRouterClient", second.factory)
-    if cli_main.command_run(config, verbose=False) != cli_main.EXIT_OK:
-        import sqlite3; db = sqlite3.connect(tmp_path / "portable/data/notable.sqlite3")
-        db.row_factory = sqlite3.Row
-        for row in db.execute("SELECT * FROM work_item WHERE state = \"permanently_failed\""): print("FAIL:", dict(row))
-        assert False
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
     assert first_generations >= 1
     # We might have generated ASSESS_JSON in the second run for coverage.
     assert "Source items triaged: 0" in _latest_digest(config)
@@ -674,11 +666,7 @@ def test_zero_mentions_and_multiple_mentions(
             }
         ),
     )
-    if cli_main.command_run(config, verbose=False) != cli_main.EXIT_OK:
-        import sqlite3; db = sqlite3.connect(tmp_path / "portable/data/notable.sqlite3")
-        db.row_factory = sqlite3.Row
-        for row in db.execute("SELECT * FROM work_item WHERE state = \"permanently_failed\""): print("FAIL:", dict(row))
-        assert False
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
     digest = _latest_digest(config)
     assert "Source items triaged: 2" in digest
     assert "Research: 1" in digest
@@ -695,11 +683,7 @@ def test_empty_input_is_insufficient_without_model_call(
         payload=EMPTY_TITLE_SUMMARY_FEED.encode(),
         llm=ScriptedOpenRouterClient(),
     )
-    if cli_main.command_run(config, verbose=False) != cli_main.EXIT_OK:
-        import sqlite3; db = sqlite3.connect(tmp_path / "portable/data/notable.sqlite3")
-        db.row_factory = sqlite3.Row
-        for row in db.execute("SELECT * FROM work_item WHERE state = \"permanently_failed\""): print("FAIL:", dict(row))
-        assert False
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
     assert client.instances[-1].inspect_calls == []
     assert client.instances[-1].generate_calls == []
     digest = _latest_digest(config)
@@ -801,11 +785,7 @@ def test_seed_untriaged_backfills_corpus_without_new_ingestion(
         payload=RESEARCH_FEED.encode(),
         llm=ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,)),
     )
-    if cli_main.command_run(config, verbose=False) != cli_main.EXIT_OK:
-        import sqlite3; db = sqlite3.connect(tmp_path / "portable/data/notable.sqlite3")
-        db.row_factory = sqlite3.Row
-        for row in db.execute("SELECT * FROM work_item WHERE state = \"permanently_failed\""): print("FAIL:", dict(row))
-        assert False
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
 
     connection = _open_db(config)
     try:
@@ -838,11 +818,7 @@ def test_seed_untriaged_backfills_corpus_without_new_ingestion(
     )
     monkeypatch.setattr(cli_main, "OpenRouterClient", second.factory)
 
-    if cli_main.command_run(config, verbose=False) != cli_main.EXIT_OK:
-        import sqlite3; db = sqlite3.connect(tmp_path / "portable/data/notable.sqlite3")
-        db.row_factory = sqlite3.Row
-        for row in db.execute("SELECT * FROM work_item WHERE state = \"permanently_failed\""): print("FAIL:", dict(row))
-        assert False
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
     assert len(second.instances[-1].generate_calls) == 1
     digest = _latest_digest(config)
     assert "Source items triaged: 1" in digest
@@ -862,11 +838,7 @@ def test_second_run_reuses_completed_triage(
             content_by_substring={"assess_article": ASSESS_JSON},
         ),
     )
-    if cli_main.command_run(config, verbose=False) != cli_main.EXIT_OK:
-        import sqlite3; db = sqlite3.connect(tmp_path / "portable/data/notable.sqlite3")
-        db.row_factory = sqlite3.Row
-        for row in db.execute("SELECT * FROM work_item WHERE state = \"permanently_failed\""): print("FAIL:", dict(row))
-        assert False
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
     first_client = client.instances[-1]
 
     monkeypatch.setattr(
@@ -879,11 +851,7 @@ def test_second_run_reuses_completed_triage(
         content_by_substring={"assess_article": ASSESS_JSON},
     )
     monkeypatch.setattr(cli_main, "OpenRouterClient", second.factory)
-    if cli_main.command_run(config, verbose=False) != cli_main.EXIT_OK:
-        import sqlite3; db = sqlite3.connect(tmp_path / "portable/data/notable.sqlite3")
-        db.row_factory = sqlite3.Row
-        for row in db.execute("SELECT * FROM work_item WHERE state = \"permanently_failed\""): print("FAIL:", dict(row))
-        assert False
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
     assert len(first_client.generate_calls) == 1
     assert second.instances[-1].generate_calls == []
 
@@ -917,11 +885,7 @@ def test_status_reports_durable_triage_counts(
             }
         ),
     )
-    if cli_main.command_run(config, verbose=False) != cli_main.EXIT_OK:
-        import sqlite3; db = sqlite3.connect(tmp_path / "portable/data/notable.sqlite3")
-        db.row_factory = sqlite3.Row
-        for row in db.execute("SELECT * FROM work_item WHERE state = \"permanently_failed\""): print("FAIL:", dict(row))
-        assert False
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
     capsys.readouterr()
 
     assert cli_main.command_status(config) == cli_main.EXIT_OK
@@ -988,11 +952,7 @@ def test_pools_drain_before_clients_close_on_success(
 
     monkeypatch.setattr(BoundedScheduler, "close", close_and_signal)
 
-    if cli_main.command_run(config, verbose=False) != cli_main.EXIT_OK:
-        import sqlite3; db = sqlite3.connect(tmp_path / "portable/data/notable.sqlite3")
-        db.row_factory = sqlite3.Row
-        for row in db.execute("SELECT * FROM work_item WHERE state = \"permanently_failed\""): print("FAIL:", dict(row))
-        assert False
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
     instance = llm.instances[-1]
     assert instance.entered is True
     assert instance.exited is True
@@ -1109,10 +1069,6 @@ def test_both_scheduler_pools_are_closed(
     )
     monkeypatch.setattr(cli_main, "BoundedScheduler", _SpyScheduler)
 
-    if cli_main.command_run(config, verbose=False) != cli_main.EXIT_OK:
-        import sqlite3; db = sqlite3.connect(tmp_path / "portable/data/notable.sqlite3")
-        db.row_factory = sqlite3.Row
-        for row in db.execute("SELECT * FROM work_item WHERE state = \"permanently_failed\""): print("FAIL:", dict(row))
-        assert False
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
     assert len(_SpyScheduler.instances) == 2
     assert all(instance.closed for instance in _SpyScheduler.instances)
