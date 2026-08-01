@@ -138,6 +138,16 @@ def test_loser_only_queue_row_moves_to_survivor(connection, empty_policy):
 def test_lead_assessment_history_is_not_rewritten_onto_survivor(
     connection, empty_policy
 ):
+    """Regression for Task 16's mutation-testing finding: this test must
+    actually drive `_dedup_queue_rows` into `_move_queue_row_to_survivor` --
+    the function where the forbidden `UPDATE lead_assessment SET person_id`
+    rewrite would live if it existed -- not merely hit `_dedup_queue_rows`'s
+    early `survivor_prior is None or loser_prior is None: return`
+    short-circuit. That requires a `digest_queue` row for the loser (and
+    none for the survivor), matching
+    `test_loser_only_queue_row_moves_to_survivor`'s fixture shape above, so
+    `survivor_prior is None and loser_prior is not None` is true and
+    `_move_queue_row_to_survivor` actually runs."""
     outcome = LeadOutcome(
         outcome="possible_lead",
         qualifying_domain_count=1,
@@ -153,6 +163,16 @@ def test_lead_assessment_history_is_not_rewritten_onto_survivor(
         lead_policy_fingerprint="a" * 64,
         ordering_factors_json="{}",
         decided_at="2026-08-01T00:00:00Z",
+    )
+    upsert_digest_queue(
+        connection,
+        person_id=2,
+        status="pending",
+        tier="possible_lead",
+        eligibility_reason="new",
+        lead_assessment_id=lead_id,
+        first_pending_at="2026-08-01T00:00:00Z",
+        last_material_change_at="2026-08-01T00:00:00Z",
     )
     connection.commit()
 

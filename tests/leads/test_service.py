@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from notable_person_finder.config.models import MainConfig
-from notable_person_finder.coverage.screening import SourcePolicy
+from notable_person_finder.coverage.screening import PolicyRule, SourcePolicy
 from notable_person_finder.db.migrate import apply_migrations
 from notable_person_finder.leads.service import (
     AGGREGATE_PERSON_LEAD_PRIORITY,
     AGGREGATE_PERSON_LEAD_TASK_TYPE,
     LOCAL_PROVIDER,
+    _canonical_domain_map,
     _compute_material_fingerprint,
     _schedule_lead_aggregation_after_settled,
     build_aggregate_person_lead_handler,
@@ -886,3 +889,51 @@ def test_prepare_proceeds_when_evidence_changed_since_prior_aggregation(
         (person_id,),
     ).fetchone()["n"]
     assert lead_count_after_second == 2
+
+
+def test_canonical_domain_map_applies_policy_canonical_domain_override() -> None:
+    """K1: a source-policy rule's own host aliases to an explicit
+    ``canonical_domain`` override when the rule carries one, and otherwise
+    maps to its own host as-is.
+
+    ``PolicyRule`` (``coverage/screening.py``) does not currently declare a
+    ``canonical_domain`` field, so this override is unreachable through any
+    policy built from a real TOML file via ``source_policy_from_mapping``/
+    ``load_source_policy`` -- adding that field is out of scope here because
+    ``fingerprint_source_policy_document`` hashes the full validated model
+    dump, so a new field would change every existing tracked policy's
+    content fingerprint (a much larger, non-remediation change; see the
+    Task 16 fix report). This test instead exercises
+    ``_canonical_domain_map``'s own aliasing logic directly, through a
+    minimal duck-typed stand-in carrying only the attributes it actually
+    reads (``host_exact``, ``canonical_domain``), ``cast`` to ``PolicyRule``
+    for the type checker.
+    """
+
+    @dataclass(frozen=True, slots=True)
+    class _FakeRule:
+        host_exact: str | None = None
+        host_suffix: str | None = None
+        canonical_domain: str | None = None
+
+    override_rule = cast(
+        PolicyRule,
+        _FakeRule(host_exact="www.example.com", canonical_domain="example.com"),
+    )
+    plain_rule = cast(
+        PolicyRule,
+        _FakeRule(host_exact="standalone.example"),
+    )
+
+    policy = SourcePolicy(
+        schema_version=1,
+        key="test_policy",
+        label="Test Policy",
+        rules=(override_rule, plain_rule),
+        fingerprint="a" * 64,
+    )
+
+    mapping = _canonical_domain_map(policy)
+
+    assert mapping["www.example.com"] == "example.com"
+    assert mapping["standalone.example"] == "standalone.example"

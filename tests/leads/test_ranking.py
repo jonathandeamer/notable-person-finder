@@ -55,9 +55,16 @@ def test_promising_ranks_before_possible():
 
 
 def test_starved_entry_ranks_ahead_of_fresher_same_tier_entry():
+    # person_id deliberately reversed relative to staleness (starved=99 >
+    # fresh=1): person_id is rank_key's final tie-breaker, so if the
+    # starvation key were dropped from the tuple, the tie-breaker alone
+    # would sort the fresh entry first (1 < 99) -- disagreeing with the
+    # assertion below. Only the (correct) starvation logic makes the
+    # starved entry sort ahead here; with matching low-to-high person_ids
+    # this test would pass for the wrong reason with or without it.
     lead, *_ = _lead(outcome="possible_lead")
-    starved = _entry(person_id=1, first_pending_at="2025-01-01T00:00:00Z")
-    fresh = _entry(person_id=2, first_pending_at="2026-08-01T00:00:00Z")
+    starved = _entry(person_id=99, first_pending_at="2025-01-01T00:00:00Z")
+    fresh = _entry(person_id=1, first_pending_at="2026-08-01T00:00:00Z")
     starved_key = rank_key(
         starved,
         lead,
