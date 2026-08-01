@@ -181,8 +181,8 @@ def test_live_assess_article_with_shipped_default_config() -> None:
                 schema_name="assess_article",
                 json_schema=rendered.schema,
                 max_completion_tokens=config.max_completion_tokens,
-                temperature=config.parameters.temperature,
-                top_p=config.parameters.top_p,
+                temperature=None,
+                top_p=None,
                 reasoning_effort=config.parameters.reasoning_effort,
             )
         )
