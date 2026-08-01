@@ -194,6 +194,27 @@ for regressions:
   `source_policy_file` already absolute
   (`tests/foundation/test_review_findings.py::
   test_source_policy_file_is_resolved_absolute_on_the_main_config`).
+- **K1's canonical-domain-aliasing schema field was never wired in.**
+  `docs/superpowers/specs/2026-08-01-lead-aggregation-and-digest-queue-design.md`
+  locks K1: "`config/source_policies/*.toml` rules gain an optional
+  `canonical_domain` key." `leads/service.py`'s `_canonical_domain_map`
+  reads `getattr(rule, "canonical_domain", None)`, but `PolicyRule` in
+  `coverage/screening.py` has no such field — its only fields are `id`,
+  `status`, `match`, `rationale`, `review_date`, `provenance_url`. The
+  override is therefore unreachable from any policy loaded via
+  `source_policy_from_mapping`/`load_source_policy`; two source-policy rules
+  sharing a publisher today never count as one domain for the promising-lead
+  threshold. `tests/leads/test_service.py::
+  test_canonical_domain_map_applies_policy_canonical_domain_override` covers
+  `_canonical_domain_map`'s aliasing logic directly against a duck-typed
+  stand-in, not through the real schema, so it does not paper over this gap.
+  Adding the field is deliberately deferred, not done inline: every
+  `PolicyRule` change alters `fingerprint_source_policy_document`'s hash
+  (full pydantic `model_dump`), which would move
+  `config/source_policies/visual_arts.toml`'s tracked fingerprint and every
+  fingerprint-pinned test, coverage plan fingerprint, and merge
+  reconciliation path that depends on it — real schema/feature surface, not
+  a remediation-scoped fix.
 
 ## Rewrite Structure
 
