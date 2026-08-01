@@ -450,7 +450,6 @@ class ScriptedOpenRouterClient:
         )
 
     def _select_content(self, user_content: str, index: int) -> str:
-        print(f"DEBUG: selecting content for: {user_content[:100]}...")
         for needle, body in self.content_by_substring.items():
             if needle in user_content:
                 return body
