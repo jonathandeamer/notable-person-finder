@@ -4,8 +4,14 @@
 
 **Goal:** Bring the interrupted `feat/coverage-evidence` branch to a green,
 reviewed, mergeable state implementing workflow steps J→L (Brave search,
-article fetch and extraction, `assess_article`), and align it with the
-2026-08-01 coverage research design.
+article fetch and extraction, `assess_article`) as specified by its own
+authority, `docs/superpowers/specs/2026-07-30-coverage-evidence-design.md`.
+
+**Design authority:** the 2026-07-30 coverage evidence design and its locked
+decisions K1–K34. The branch's plan (Tasks 1–8) is recorded complete and
+reviewed in `.superpowers/sdd/2026-07-30-coverage-evidence/progress.md`. What
+remained when the session was interrupted was cross-suite integration fallout,
+not milestone work.
 
 **Status of the work:** This plan does **not** write the coverage milestone from
 scratch. Roughly 8,200 lines of coverage source and 20+ test files already
@@ -301,32 +307,48 @@ git commit -m "feat(coverage): ship the source policy as a tracked artifact"
 - Modify: `docs/superpowers/plans/2026-08-01-coverage-discovery.md` (mark
   superseded)
 
-**Context:** The design was written without knowledge of the existing branch and
-describes some things differently from what shipped. The shipped code and its
-tests govern (per `CLAUDE.md`, "Plans and Specifications"). Amend the spec to
-describe reality, and be explicit about what remains unbuilt.
+**Context:** The authoritative design for this milestone is
+`docs/superpowers/specs/2026-07-30-coverage-evidence-design.md` (2,005 lines,
+locked decisions K1–K34) with plan
+`docs/superpowers/plans/2026-07-30-coverage-evidence.md` (Tasks 1–8, all
+recorded complete and reviewed in the branch's own ledger at
+`.superpowers/sdd/2026-07-30-coverage-evidence/progress.md`).
+
+`docs/superpowers/specs/2026-08-01-coverage-research-design.md` and
+`docs/superpowers/plans/2026-08-01-coverage-discovery.md` were written on
+2026-08-01 without knowledge of that branch. They are redundant, and in places
+contradict locked decisions — they describe `eligible`/`ineligible` with
+longest-path-prefix matching where K8/K33 shipped `curated_eligible` /
+`curated_ineligible` with `host_suffix` first-match-wins, and they propose an
+`assess_person_lead` work kind where K2 locks three kinds and K12 forbids
+inventing lead outcomes in this milestone.
+
+**Retire the 2026-08-01 documents rather than amending the 2026-07-30 ones to
+match them.** The earlier design is the reviewed authority and the shipped code
+implements it.
 
 **Rules:**
 
-1. The spec's publisher-policy section describes the shipped vocabulary
-   (`curated_eligible`, `curated_ineligible`, unclassified), `host_suffix`
-   matching, and first-match-wins ordering — not the `eligible`/`ineligible`
-   plus longest-path-prefix scheme it currently describes.
-2. The spec's milestone split reflects reality: J→L shipped together; M is a
-   separate later milestone.
-3. The spec's work-kind table names the shipped kinds: `brave_web_search`,
-   `fetch_article`, `assess_article`. `assess_person_lead` is marked as
-   belonging to the deferred lead-aggregation milestone.
+1. `2026-08-01-coverage-research-design.md` carries a prominent header marking
+   it superseded by `2026-07-30-coverage-evidence-design.md`, never
+   implemented, and retained only as a record. Do not delete it.
+2. Any genuinely new decision it contains that is *not* covered by K1–K34 — the
+   tracked-artifact source policy from Task 4 — is folded into the 2026-07-30
+   design as an explicit amendment note with today's date.
+3. Nothing in the 2026-07-30 design is rewritten to match the 2026-08-01 one.
 4. `CLAUDE.md` moves Brave web search, article fetch, and article extraction
    out of "Not built at all"; records coverage research through per-article
    assessment as delivered; and states plainly that lead aggregation, ranking,
    and the digest queue remain unbuilt.
-5. `CLAUDE.md` adds `tests/coverage` to the verification section and to the
+6. `CLAUDE.md` adds `tests/coverage` to the verification section and to the
    combined gate command, and adds `coverage/` to the Rewrite Structure list.
-6. The digest's "Coverage evidence" section is described accurately, including
+7. The digest's "Coverage evidence" section is described accurately, including
    that the shortlist remains a placeholder.
-7. `2026-08-01-coverage-discovery.md` carries a header line marking it
-   superseded by this plan and never executed.
+8. `2026-08-01-coverage-discovery.md` carries a header line marking it
+   superseded and never executed.
+9. The branch's own ledger at
+   `.superpowers/sdd/2026-07-30-coverage-evidence/progress.md` is left in
+   place — it is the record of Tasks 1-8.
 
 - [ ] **Step 1: Read the shipped code, not the spec, for each claim**
 
@@ -334,7 +356,7 @@ describe reality, and be explicit about what remains unbuilt.
 
 - [ ] **Step 3: Amend CLAUDE.md**
 
-- [ ] **Step 4: Mark the superseded plan**
+- [ ] **Step 4: Mark both superseded 2026-08-01 documents**
 
 - [ ] **Step 5: Run the full completion gate**
 
