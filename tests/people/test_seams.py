@@ -72,6 +72,7 @@ from tests.people.test_detection_service import (
 )
 from tests.people.test_openrouter import MODEL_ID, _client, _generation_request
 from tests.people.test_run_cli import (
+    ASSESS_JSON,
     RESEARCH_FEED,
     RESEARCH_JSON,
     ScriptedOpenRouterClient,
@@ -256,7 +257,10 @@ max_people = 3
     _wire(
         monkeypatch,
         payload=RESEARCH_FEED.encode(),
-        llm=ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,)),
+        llm=ScriptedOpenRouterClient(
+            generate_contents=(RESEARCH_JSON,),
+            content_by_substring={"assess_article": ASSESS_JSON},
+        ),
     )
     monkeypatch.setattr(cli_main, "BoundedScheduler", _RecordingScheduler)
 
@@ -513,7 +517,10 @@ def test_ingestion_downstream_callback_schedules_detection(
     _wire(
         monkeypatch,
         payload=RESEARCH_FEED.encode(),
-        llm=ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,)),
+        llm=ScriptedOpenRouterClient(
+            generate_contents=(RESEARCH_JSON,),
+            content_by_substring={"assess_article": ASSESS_JSON},
+        ),
     )
     assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
     digest = _latest_digest(config)
@@ -549,7 +556,10 @@ def test_provider_clients_close_only_after_pools_drain(
 ) -> None:
     """Kills closing either provider client while its pool still has a worker."""
     config = write_people_graph(tmp_path, feeds=_single_feed())
-    llm = ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,))
+    llm = ScriptedOpenRouterClient(
+        generate_contents=(RESEARCH_JSON,),
+        content_by_substring={"assess_article": ASSESS_JSON},
+    )
     _wire(monkeypatch, payload=RESEARCH_FEED.encode(), llm=llm)
     pool_closed = threading.Event()
     llm._pool_closed = pool_closed

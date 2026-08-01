@@ -97,6 +97,22 @@ def test_non_utf8_configuration_reports_actionable_error(tmp_path: Path) -> None
     assert any("not valid UTF-8" in error for error in caught.value.errors)
 
 
+def test_source_policy_file_is_resolved_absolute_on_the_main_config(
+    tmp_path: Path,
+) -> None:
+    config_file = write_graph(tmp_path)
+
+    loaded = load_config(
+        config_file,
+        environ={"TEST_OPENROUTER": "openrouter-key", "TEST_BRAVE": "brave-key"},
+        require_secrets=True,
+    )
+
+    expected = (tmp_path / "source_policies" / "visual_arts.toml").resolve()
+    assert loaded.main.source_policy_file == expected
+    assert loaded.main.source_policy_file.is_absolute()
+
+
 def test_configuration_path_through_a_file_reports_actionable_error(
     tmp_path: Path,
 ) -> None:

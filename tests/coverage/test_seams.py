@@ -60,14 +60,14 @@ _SCHEMA = "s" * 64
 
 # The real tracked policy file, referenced by an absolute path. The seam under
 # test (`_schedule_coverage_after_wikipedia_settled`) loads the source policy
-# itself via `config.source_policy_file` with no override hook, and that path
-# is a known, disclosed production defect: `config/loader.py` resolves
-# `source_policy_file` only into the snapshot dict, not into the `MainConfig`
-# object, so the real hook re-resolves the relative path against the process
-# CWD and silently no-ops outside the config directory (bare
-# `except (SourcePolicyError, OSError): return`). Using an absolute path here
-# keeps rules 1-2 about the seam's *own* wiring, not about that separately
-# disclosed loader defect.
+# itself via `config.source_policy_file` with no override hook.
+# `config/loader.py`'s `load_config` resolves `source_policy_file` to an
+# absolute path on the `MainConfig` object it returns (see
+# `tests/foundation/test_review_findings.py::
+# test_source_policy_file_is_resolved_absolute_on_the_main_config`), but this
+# module builds `MainConfig` directly rather than through `load_config`, so an
+# absolute path is supplied here to keep rules 1-2 about the seam's *own*
+# wiring, independent of loader resolution.
 _REPO_ROOT = Path(notable_person_finder.__file__).resolve().parents[2]
 _VISUAL_ARTS_POLICY = _REPO_ROOT / "config" / "source_policies" / "visual_arts.toml"
 
@@ -287,8 +287,8 @@ def test_wikipedia_settle_seam_schedules_coverage_when_eligible(
     every completed Wikipedia identity observation in real match settlement --
     rather than the already-covered `schedule_coverage_after_wikipedia_ready`
     it delegates to (see `tests/coverage/test_seed_and_hooks.py`). This is the
-    actual handoff point, and it is the one that carries the CWD-relative
-    `load_source_policy` call the loader defect above is about.
+    actual handoff point, and it is the one that carries the
+    `load_source_policy` call described in the module comment above.
     """
     run_id = insert_run(connection)
     person_id = _person(

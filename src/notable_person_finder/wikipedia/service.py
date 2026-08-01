@@ -2703,7 +2703,8 @@ def _schedule_coverage_after_wikipedia_settled(
 
     Loads the configured source policy when present. Missing policy is a no-op
     so Wikipedia settlement remains robust in unit tests without policy files;
-    production ``notable run`` always has a resolved policy path.
+    ``config.source_policy_file`` is expected to already be resolved to an
+    absolute path by ``load_config``.
     """
     from notable_person_finder.coverage.screening import (
         SourcePolicyError,

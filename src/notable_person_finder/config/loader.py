@@ -70,6 +70,7 @@ def load_config(
     feeds_path = _source_path(main_path.parent, main.feeds_file)
     domain_profile_path = _source_path(main_path.parent, main.domain_profile_file)
     source_policy_path = _source_path(main_path.parent, main.source_policy_file)
+    main = main.model_copy(update={"source_policy_file": source_policy_path})
     feeds_data = _read_toml(feeds_path, errors)
     domain_profile_data = _read_toml(domain_profile_path, errors)
 

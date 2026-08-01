@@ -38,6 +38,7 @@ from notable_person_finder.wikipedia.repository import (
 )
 from tests.ingestion.helpers import immediate, moment
 from tests.people.test_run_cli import (
+    ASSESS_JSON,
     RESEARCH_FEED,
     RESEARCH_JSON,
     ScriptedOpenRouterClient,
@@ -141,7 +142,10 @@ def _wire(
         "build_transport",
         _transport_patch(_handler(rss=rss, brave_calls=brave_calls)),
     )
-    client = llm or ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,))
+    client = llm or ScriptedOpenRouterClient(
+        generate_contents=(RESEARCH_JSON,),
+        content_by_substring={"assess_article": ASSESS_JSON},
+    )
     monkeypatch.setattr(cli_main, "OpenRouterClient", client.factory)
     return client
 
@@ -476,8 +480,13 @@ def test_matching_wikipedia_page_opens_no_plan_and_supersedes_existing(
         connection.close()
 
     # Positive control: the plan and its Brave work are active/pending before
-    # the run that is meant to supersede them.
-    assert _plan_rows(config, person_id=person_id) == [(plan_id, "retrieving")]
+    # the run that is meant to supersede them. The first run's own
+    # no-match-then-coverage plan is also present now (K5 fires in-run), and
+    # already terminalized to "completed"; only the freshly inserted plan is
+    # still active.
+    before = _plan_rows(config, person_id=person_id)
+    assert before[-1] == (plan_id, "retrieving")
+    assert all(status == "completed" for _, status in before[:-1])
     connection = connect_database(database, readonly=True)
     try:
         row = connection.execute(
@@ -495,7 +504,10 @@ def test_matching_wikipedia_page_opens_no_plan_and_supersedes_existing(
     assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
 
     after = _plan_rows(config, person_id=person_id)
-    assert after == [(plan_id, "superseded")]  # no new plan, same row superseded
+    # The run's own earlier plan stays "completed" (already terminal); only
+    # the manually inserted active plan is superseded — no new plan opens.
+    assert after[-1] == (plan_id, "superseded")
+    assert after[:-1] == before[:-1]
     connection = connect_database(database, readonly=True)
     try:
         row = connection.execute(
@@ -511,23 +523,16 @@ def test_matching_wikipedia_page_opens_no_plan_and_supersedes_existing(
 def test_second_run_unchanged_material_opens_no_second_plan_or_brave_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A second run over unchanged material must not duplicate plan or call."""
+    """A later run over unchanged material must not duplicate plan or call."""
     config = write_people_graph(tmp_path, feeds=_single_feed())
-    _wire(monkeypatch, rss=RESEARCH_FEED.encode())
+    # With the K5 same-run hook now actually firing, this very first run's
+    # top-of-run seed batch is the one that opens and drives the plan to a
+    # terminal state: the person's Wikipedia no-match settles this run, which
+    # makes it coverage-eligible in the same run.
+    brave_calls_open: list[httpx.Request] = []
+    _wire(monkeypatch, rss=RESEARCH_FEED.encode(), brave_calls=brave_calls_open)
     assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
     person_id = _sole_person_id(config)
-
-    # This run is the one whose top-of-run seed batch actually opens and
-    # drives the plan to a terminal state (see the finding on the same-run
-    # inline hook): it is the "first" run from the rule's point of view.
-    brave_calls_open: list[httpx.Request] = []
-    _wire(
-        monkeypatch,
-        rss=None,
-        brave_calls=brave_calls_open,
-        llm=ScriptedOpenRouterClient(),
-    )
-    cli_main.command_run(config, verbose=False)
     first_plans = _plan_rows(config, person_id=person_id)
     assert len(first_plans) == 1
     # Positive control: opening the plan really did call Brave at least once,
@@ -605,14 +610,18 @@ def test_brave_secret_never_reaches_digest_or_output_but_is_in_the_request(
         "build_transport",
         _transport_patch(make_handler(rss=RESEARCH_FEED.encode())),
     )
-    client = ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,))
+    client = ScriptedOpenRouterClient(
+        generate_contents=(RESEARCH_JSON,),
+        content_by_substring={"assess_article": ASSESS_JSON},
+    )
     monkeypatch.setattr(cli_main, "OpenRouterClient", client.factory)
     assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
 
-    # The Wikipedia-match-then-coverage-seed sequencing means Brave is only
-    # called starting from a following run (see the reported finding on the
-    # same-run inline hook), so a second run is needed to exercise the
-    # request path the secret travels through.
+    # With the K5 same-run hook now actually firing, the person's Wikipedia
+    # no-match this run already makes coverage eligible and opens/advances a
+    # plan in the same run, so Brave is already called during this first run.
+    # A second run over unchanged material is still taken to prove no repeat
+    # Brave call happens once the plan has terminalized.
     monkeypatch.setattr(
         cli_main, "build_transport", _transport_patch(make_handler(rss=None))
     )

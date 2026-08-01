@@ -592,7 +592,10 @@ def test_fresh_run_triages_ingested_items(
     _wire(
         monkeypatch,
         payload=RESEARCH_FEED.encode(),
-        llm=ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,)),
+        llm=ScriptedOpenRouterClient(
+            generate_contents=(RESEARCH_JSON,),
+            content_by_substring={"assess_article": ASSESS_JSON},
+        ),
     )
 
     assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
@@ -661,6 +664,7 @@ def test_zero_mentions_and_multiple_mentions(
         payload=SIBLING_FEED.encode(),
         llm=ScriptedOpenRouterClient(
             content_by_substring={
+                "assess_article": ASSESS_JSON,
                 "Élodie N'Diaye": MULTI_JSON,
                 "second piece": ZERO_MENTIONS_JSON,
             }
@@ -819,7 +823,13 @@ def test_seed_untriaged_backfills_corpus_without_new_ingestion(
     monkeypatch.setattr(cli_main, "OpenRouterClient", second.factory)
 
     assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
-    assert len(second.instances[-1].generate_calls) == 1
+    # One detect_people call for the backfilled item plus one assess_article
+    # call: the person it resolves to gets a Wikipedia no-match this same run,
+    # which now (K5 fix) opens and advances coverage synchronously instead of
+    # deferring to a third run.
+    assert len(second.instances[-1].generate_calls) == 2
+    schema_names = {call.schema_name for call in second.instances[-1].generate_calls}
+    assert schema_names == {"detect_people", "assess_article"}
     digest = _latest_digest(config)
     assert "Source items triaged: 1" in digest
     assert "Research: 1" in digest
@@ -852,14 +862,18 @@ def test_second_run_reuses_completed_triage(
     )
     monkeypatch.setattr(cli_main, "OpenRouterClient", second.factory)
     assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
-    assert len(first_client.generate_calls) == 1
+    # The first run now does detect_people, resolves the person, matches
+    # Wikipedia no-match, and opens/completes coverage research all in the
+    # same run (K5 fix): one detect_people call plus one assess_article call.
+    first_schema_names = {call.schema_name for call in first_client.generate_calls}
+    assert first_schema_names == {"detect_people", "assess_article"}
+    assert len(first_client.generate_calls) == 2
     # Triage/detect_people must not repeat on the second run: the person was
-    # already triaged. Coverage's assess_article is a distinct, legitimate
-    # generation once Wikipedia/Brave/fetch land a passage-ready view; it is
-    # not "reused triage" and must not be conflated with a repeat detection
-    # call.
+    # already triaged, and coverage's plan already completed in the first run
+    # (its material has not changed and the refresh interval has not
+    # elapsed), so the second run performs no generation at all.
     second_calls = second.instances[-1].generate_calls
-    assert [call.schema_name for call in second_calls] == ["assess_article"]
+    assert second_calls == []
 
     connection = _open_db(config)
     try:
@@ -886,6 +900,7 @@ def test_status_reports_durable_triage_counts(
         payload=SIBLING_FEED.encode(),
         llm=ScriptedOpenRouterClient(
             content_by_substring={
+                "assess_article": ASSESS_JSON,
                 "Élodie N'Diaye": MULTI_JSON,
                 "second piece": ZERO_MENTIONS_JSON,
             }
@@ -945,7 +960,10 @@ def test_pools_drain_before_clients_close_on_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = write_people_graph(tmp_path, feeds=_single_feed())
-    llm = ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,))
+    llm = ScriptedOpenRouterClient(
+        generate_contents=(RESEARCH_JSON,),
+        content_by_substring={"assess_article": ASSESS_JSON},
+    )
     _wire(monkeypatch, payload=RESEARCH_FEED.encode(), llm=llm)
 
     pool_closed = threading.Event()

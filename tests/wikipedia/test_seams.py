@@ -13,6 +13,7 @@ from notable_person_finder.wikipedia.service import (
     seed_wikipedia_identity,
 )
 from tests.people.test_run_cli import (
+    ASSESS_JSON,
     RESEARCH_FEED,
     RESEARCH_JSON,
     ScriptedOpenRouterClient,
@@ -71,7 +72,10 @@ def test_seed_order_includes_wikipedia_before_inspections(
     # Feed has no research people; only seed can open Wikipedia for pre-existing.
     _wire(
         monkeypatch,
-        llm=ScriptedOpenRouterClient(generate_contents=(ZERO_MENTIONS_JSON,)),
+        llm=ScriptedOpenRouterClient(
+            generate_contents=(ZERO_MENTIONS_JSON,),
+            content_by_substring={"assess_article": ASSESS_JSON},
+        ),
     )
     assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
 
@@ -104,7 +108,10 @@ def test_digest_reports_wikipedia_after_person_create(
     _wire(
         monkeypatch,
         payload=RESEARCH_FEED.encode(),
-        llm=ScriptedOpenRouterClient(generate_contents=(RESEARCH_JSON,)),
+        llm=ScriptedOpenRouterClient(
+            generate_contents=(RESEARCH_JSON,),
+            content_by_substring={"assess_article": ASSESS_JSON},
+        ),
     )
     assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
     digest = _latest_digest(config)

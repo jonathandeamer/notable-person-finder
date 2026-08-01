@@ -184,20 +184,16 @@ for regressions:
   cutover. `test_live_article_fetch.py` is the exception: it is keyless, it
   makes one real GET to `en.wikipedia.org`, and it currently passes — the
   only one of the three genuinely verified so far.
-- **`config/loader.py` resolves `source_policy_file` to an absolute path only
-  into a local variable and the configuration snapshot dict — never into the
-  `MainConfig` object itself** (`main_settings["source_policy_file"]` at
-  `config/loader.py:255`, versus the unresolved value `MainConfig` keeps).
-  `wikipedia/service.py`'s `_schedule_coverage_after_wikipedia_settled` then
-  calls `load_source_policy(config.source_policy_file)` on the unresolved
-  relative path; outside the config directory this raises `FileNotFoundError`
-  → `SourcePolicyError`, silently swallowed by `except (SourcePolicyError,
-  OSError): return` at `wikipedia/service.py:2718`. The same-run K5 hook
-  therefore no-ops in a real deployment; the next run's top-of-run seed
-  batch picks up the eligible person instead, so coverage research is
-  delayed by one run rather than lost. The function's own docstring falsely
-  asserts "production `notable run` always has a resolved policy path" — do
-  not trust that line. Not fixed here; reported as a defect.
+- **Fixed:** `config/loader.py`'s `load_config` previously resolved
+  `source_policy_file` to an absolute path only into a local variable and the
+  configuration snapshot dict, never into the `MainConfig` object itself, so
+  `wikipedia/service.py`'s `_schedule_coverage_after_wikipedia_settled` (and
+  `people/merge.py`'s `_reconcile_coverage_on_merge`) re-resolved the
+  unresolved relative path against the process CWD and silently no-op'd
+  outside the config directory. `load_config` now returns `MainConfig` with
+  `source_policy_file` already absolute
+  (`tests/foundation/test_review_findings.py::
+  test_source_policy_file_is_resolved_absolute_on_the_main_config`).
 
 ## Rewrite Structure
 
