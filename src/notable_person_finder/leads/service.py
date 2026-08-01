@@ -210,7 +210,21 @@ def schedule_aggregate_person_lead(
         subject_kind="person",
         subject_id=person_id,
         fingerprint=material_fingerprint,
-        required=True,
+        # Not required: K6's unchanged-fingerprint refusal in prepare() is
+        # the expected steady-state outcome for a person whose evidence
+        # hasn't changed since their last aggregation, not a failure. This
+        # item is still scheduled and attempted every run (seed_lead_
+        # aggregation sweeps every person with completed coverage evidence
+        # unconditionally); only its failed_permanent settlement stops
+        # counting toward RunState/exit-code computation. required=True
+        # previously forced RunState.PARTIAL on every run following a
+        # person's first aggregation, since a raising prepare() always
+        # settles failed_permanent (runs/engine.py) and
+        # required_failed_permanent > 0 forces PARTIAL whenever the run
+        # also produced meaningful results (runs/engine.py's
+        # derive_run_state) -- i.e. forever, once any person had been
+        # aggregated once.
+        required=False,
         priority=AGGREGATE_PERSON_LEAD_PRIORITY,
         eligible_at=now,
         run_id=run_id,

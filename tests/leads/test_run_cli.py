@@ -86,3 +86,59 @@ def test_aggregation_fires_in_same_run_coverage_settles(
         assert lead_row["run_id"] == coverage_completion_run_id
     finally:
         connection.close()
+
+
+def test_second_run_with_unchanged_evidence_still_reports_exit_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Direct regression test for the required=True steady-state bug found
+    in Task 16's verification pass: ``aggregate_person_lead``'s K6 prepare()
+    refuses (raises) when a person's material fingerprint is unchanged since
+    their last aggregation, and the run engine settles any raising prepare()
+    as ``failed_permanent``. When the work item was registered
+    ``required=True``, that made every steady-state second run (one where at
+    least one person's evidence has not changed) report ``EXIT_PARTIAL``
+    forever, because ``seed_lead_aggregation`` unconditionally reschedules
+    the item every run and the refusal is expected, not a failure.
+    ``aggregate_person_lead`` must be scheduled ``required=False`` so this
+    expected local refusal does not gate ``RunState``/exit code. The first
+    run aggregates fresh evidence for the person; the second run's
+    fingerprint is unchanged (no new coverage evidence arrived), so its
+    prepare() refuses -- but the run as a whole must still report
+    ``EXIT_OK``.
+    """
+    config = write_people_graph(tmp_path, feeds=_single_feed())
+    _wire(monkeypatch, rss=RESEARCH_FEED.encode())
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
+
+    person_id = _sole_person_id(config)
+
+    database = config.parent / "portable" / "data" / "notable.sqlite3"
+    connection = connect_database(database, readonly=True)
+    try:
+        first_lead_row = connection.execute(
+            "SELECT id FROM lead_assessment WHERE person_id = ?",
+            (person_id,),
+        ).fetchone()
+        assert first_lead_row is not None
+    finally:
+        connection.close()
+
+    # Second run: no new feed content, no new coverage evidence -- the
+    # person's material fingerprint is unchanged, so aggregate_person_lead's
+    # prepare() will refuse (K6). The run overall must still be EXIT_OK.
+    _wire(monkeypatch, rss=RESEARCH_FEED.encode())
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
+
+    connection = connect_database(database, readonly=True)
+    try:
+        lead_count = connection.execute(
+            "SELECT COUNT(*) FROM lead_assessment WHERE person_id = ?",
+            (person_id,),
+        ).fetchone()[0]
+        assert lead_count == 1, (
+            "expected no additional lead_assessment row from the refused "
+            "second-run aggregation attempt"
+        )
+    finally:
+        connection.close()
