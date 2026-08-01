@@ -22,6 +22,14 @@ _VARIANT_CONTEXT = "context"
 
 _OBITUARY_SUFFIX = "obituary"
 
+# A merged person accumulates one context fact per mention across the whole
+# merge closure. Joining every one of them produces a multi-hundred-character
+# query Brave will reject -- a wasted paid call. These caps are deliberately
+# small: a context form is a last-resort broadening, not an exhaustive one.
+MAX_CONTEXT_TERMS = 3
+MAX_CONTEXT_TERM_CHARACTERS = 40
+MAX_CONTEXT_QUERY_CHARACTERS = 200
+
 
 @dataclass(frozen=True, slots=True)
 class QueryFormSpec:
@@ -138,15 +146,24 @@ def generate_context_form(
     if not exact:
         return None
 
+    quoted = _quote_phrase(exact)
     cleaned_terms: list[str] = []
+    seen: set[str] = set()
+    budget = MAX_CONTEXT_QUERY_CHARACTERS - len(quoted)
     for term in context_terms:
-        collapsed = collapse_whitespace(term)
-        if collapsed:
-            cleaned_terms.append(collapsed)
+        if len(cleaned_terms) >= MAX_CONTEXT_TERMS:
+            break
+        collapsed = collapse_whitespace(term)[:MAX_CONTEXT_TERM_CHARACTERS].strip()
+        if not collapsed or collapsed in seen:
+            continue
+        if len(collapsed) + 1 > budget:
+            continue
+        seen.add(collapsed)
+        cleaned_terms.append(collapsed)
+        budget -= len(collapsed) + 1
     if not cleaned_terms:
         return None
 
-    quoted = _quote_phrase(exact)
     composed = f"{quoted} {' '.join(cleaned_terms)}"
     if composed in existing_query_texts:
         return None

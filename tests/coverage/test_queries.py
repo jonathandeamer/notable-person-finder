@@ -6,6 +6,9 @@ import pytest
 
 from notable_person_finder.coverage.queries import (
     COVERAGE_QUERY_PLAN_VERSION,
+    MAX_CONTEXT_QUERY_CHARACTERS,
+    MAX_CONTEXT_TERM_CHARACTERS,
+    MAX_CONTEXT_TERMS,
     generate_alias_forms,
     generate_context_form,
     generate_exact_forms,
@@ -132,3 +135,33 @@ def test_context_form_none_without_terms_or_when_duplicate() -> None:
 def test_max_exact_forms_must_be_positive() -> None:
     with pytest.raises(ValueError, match="max_exact_forms"):
         generate_exact_forms(("A",), max_exact_forms=0)
+
+
+def test_context_form_caps_term_count_and_query_length() -> None:
+    """I6: a merged person yields every distinct fact across the closure.
+
+    Joining them all produces a multi-hundred-character query Brave will
+    reject -- one wasted paid call per merged person.
+    """
+    terms = tuple(f"long context term number {index} " * 4 for index in range(40))
+    spec = generate_context_form("Alex Smith", terms, existing_query_texts=set())
+    assert spec is not None
+    assert len(spec.query_text) <= MAX_CONTEXT_QUERY_CHARACTERS
+    # Positive control: the terms really are long enough to blow the budget.
+    assert sum(len(term) for term in terms) > MAX_CONTEXT_QUERY_CHARACTERS * 10
+    assert spec.query_text.startswith('"Alex Smith" ')
+    tail = spec.query_text[len('"Alex Smith" ') :]
+    assert tail
+    # At most MAX_CONTEXT_TERMS terms survive, each clipped to its own cap.
+    assert len(tail) <= MAX_CONTEXT_TERMS * (MAX_CONTEXT_TERM_CHARACTERS + 1)
+
+
+def test_context_form_keeps_a_short_realistic_term_list_intact() -> None:
+    """Positive control: ordinary facts are not truncated by the caps."""
+    spec = generate_context_form(
+        "Alex Smith",
+        ("sculptor", "Paris"),
+        existing_query_texts=set(),
+    )
+    assert spec is not None
+    assert spec.query_text == '"Alex Smith" sculptor Paris'

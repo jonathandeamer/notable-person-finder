@@ -55,8 +55,12 @@ endpoint = "https://en.wikipedia.org/w/api.php"
 maxlag_seconds = 5
 
 [brave]
-# BraveConfig: endpoint only (like MediaWikiConfig). Auth is env BRAVE_API_KEY.
+# BraveConfig: endpoint and one plan flag. Auth is env BRAVE_API_KEY.
 endpoint = "https://api.search.brave.com/res/v1/web/search"
+# `extra_snippets` is a paid-plan parameter: Brave rejects it on the free and
+# base tiers, and that rejection is permanent, so leave it false unless your
+# subscription includes it.
+extra_snippets = false
 
 [tasks.detect_people]
 model = "openai/gpt-5.4-mini"

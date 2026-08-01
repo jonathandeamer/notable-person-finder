@@ -59,6 +59,7 @@ def test_model_settings_are_complete_in_the_redacted_snapshot(tmp_path: Path) ->
     assert "api_key" not in snapshot["main"]["mediawiki"]
     assert snapshot["main"]["brave"] == {
         "endpoint": "https://api.search.brave.com/res/v1/web/search",
+        "extra_snippets": False,
     }
     assert "api_key" not in snapshot["main"]["brave"]
     assert snapshot["main"]["tasks"]["detect_people"] == {

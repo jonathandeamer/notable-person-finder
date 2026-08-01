@@ -221,6 +221,11 @@ class BraveConfig(_StrictConfigurationModel):
     """Brave Web Search API endpoint only; auth is ``BRAVE_API_KEY`` from the env."""
 
     endpoint: str = "https://api.search.brave.com/res/v1/web/search"
+    # Brave rejects `extra_snippets` on the free and base tiers, and the 4xx
+    # classifies as CONFIGURATION -- permanent -- so every `brave_web_search`
+    # would fail on the first live run. Off by default so a free-tier key works
+    # out of the box; paid-plan operators may turn it on.
+    extra_snippets: bool = False
 
     @field_validator("endpoint")
     @classmethod

@@ -216,7 +216,8 @@ def test_search_web_returns_ordered_results_with_ranks_and_snippets() -> None:
     assert params["spellcheck"] == "false"
     assert params["country"] == "ALL"
     assert params["result_filter"] == "web"
-    assert params["extra_snippets"] == "true"
+    # I9: paid-plan only, so the default must not send it at all.
+    assert "extra_snippets" not in params
     assert request.headers.get("X-Subscription-Token") == API_KEY
 
 
@@ -449,3 +450,28 @@ def test_auth_header_uses_api_key_and_never_puts_key_in_failure_detail() -> None
     assert headers["X-Subscription-Token"] == secret
     assert secret not in str(caught.value)
     assert secret not in (caught.value.detail or "")
+
+
+def test_extra_snippets_is_opt_in_and_off_by_default() -> None:
+    """I9: Brave rejects `extra_snippets` on the free and base tiers.
+
+    The 4xx classifies as CONFIGURATION -- permanent -- so sending it
+    unconditionally makes every `brave_web_search` fail on a first live run
+    with a free-tier key.
+    """
+    assert BraveConfig().extra_snippets is False
+
+    off_seen: list[httpx.Request] = []
+    client_for(fixture_bytes("brave_search_page.json"), seen=off_seen).search_web(
+        "Ada Lovelace", count=10, offset=0
+    )
+    assert "extra_snippets" not in dict(off_seen[0].url.params)
+
+    # Positive control: the parameter is reachable when an operator opts in.
+    on_seen: list[httpx.Request] = []
+    client_for(
+        fixture_bytes("brave_search_page.json"),
+        seen=on_seen,
+        brave=BraveConfig(extra_snippets=True),
+    ).search_web("Ada Lovelace", count=10, offset=0)
+    assert dict(on_seen[0].url.params)["extra_snippets"] == "true"

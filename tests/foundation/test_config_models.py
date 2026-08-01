@@ -282,7 +282,9 @@ def test_mediawiki_config_has_no_secret_fields() -> None:
 
 def test_brave_config_has_no_secret_fields() -> None:
     fields = set(BraveConfig.model_fields)
-    assert fields == {"endpoint"}
+    # `extra_snippets` is a plan flag, not a credential.
+    assert fields == {"endpoint", "extra_snippets"}
+    assert BraveConfig().extra_snippets is False
     for name in fields:
         assert "key" not in name
         assert "secret" not in name

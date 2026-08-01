@@ -217,6 +217,9 @@ ASSESS_FAILED_SUPPLIED_INPUT_JSON = "{}"
 _ASSESS_INPUT_TOO_LARGE_RATIONALE = "assess input exceeds max_input_tokens"
 _ASSESS_WORK_DIED_RATIONALE = "assess work failed permanently without a result"
 _ACTIVE_COVERAGE_PLAN_STATUSES = frozenset({"retrieving", "selecting", "assessing"})
+# A merged person can hold thousands of mention facts; `generate_context_form`
+# uses at most `MAX_CONTEXT_TERMS` of them, so reading more is pure waste.
+_CONTEXT_FACT_ROW_LIMIT = 200
 
 
 @dataclass(frozen=True, slots=True)
@@ -3441,8 +3444,9 @@ def _operational_context_terms(
          WHERE m.person_id IN ({placeholders})
            AND f.kind IN ({",".join("?" for _ in _CONTEXT_FACT_KINDS)})
          ORDER BY m.id, f.id
+         LIMIT ?
         """,
-        (*closure, *_CONTEXT_FACT_KINDS),
+        (*closure, *_CONTEXT_FACT_KINDS, _CONTEXT_FACT_ROW_LIMIT),
     ).fetchall()
     terms: list[str] = []
     seen: set[str] = set()

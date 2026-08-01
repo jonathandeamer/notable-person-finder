@@ -100,8 +100,10 @@ class HttpxBraveWebSearchClient:
             "safesearch": _SAFESEARCH,
             "spellcheck": "false",
             "result_filter": _RESULT_FILTER,
-            "extra_snippets": "true",
         }
+        if self._config.extra_snippets:
+            # Paid-plan only; see BraveConfig.
+            params["extra_snippets"] = "true"
         headers = {_AUTH_HEADER: self._api_key}
 
         try:
