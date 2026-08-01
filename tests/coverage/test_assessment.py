@@ -8,7 +8,11 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from notable_person_finder.config.models import AssessArticleConfig
+from notable_person_finder.config.models import (
+    ASSESS_FIXED_REQUEST_TOKEN_FLOOR,
+    AssessArticleConfig,
+    assess_minimum_input_tokens,
+)
 from notable_person_finder.coverage.assessment import (
     ASSESS_SCHEMA_VERSION,
     CONTENT_TYPES,
@@ -16,9 +20,11 @@ from notable_person_finder.coverage.assessment import (
     AssessArticleInput,
     AssessArticleOutput,
     AssessFact,
+    AssessInputTooLarge,
     AssessName,
     AssessValidationError,
     CoveragePersonMaterialView,
+    assess_fixed_request_tokens,
     assess_prompt_and_schema_hashes,
     assess_schema,
     assess_task_fingerprint,
@@ -45,8 +51,9 @@ from notable_person_finder.providers.article_versions import EXTRACTOR_VERSION
 
 
 def _config(**changes: object) -> AssessArticleConfig:
+    # Deliberately the shipped defaults: an override here is how the
+    # max_input_tokens overflow escaped review.
     values: dict[str, object] = {
-        "max_input_tokens": 16_384,
         "max_completion_tokens": 1024,
         "max_title_characters": 500,
         "max_summary_characters": 4000,
@@ -544,3 +551,182 @@ def test_build_assess_input_carries_passage_view_metadata() -> None:
     assert value.view.passage_count == len(value.passages)
     assert value.passages[0].id == "p1"
     assert value.screening.rule_id == "default.unclassified"
+
+
+def _full_length_passage_view(config: AssessArticleConfig) -> PassageView:
+    """A view that saturates every configured passage bound.
+
+    Six long paragraphs, a title at ``max_title_characters`` and a dek at
+    ``max_summary_characters`` -- what an ordinary feature article looks like
+    once extracted, not a pathological input.
+    """
+    paragraph = "Élodie N'Diaye " + ("cast bronze in the Paris foundry. " * 60)
+    return select_passages(
+        ("Élodie N'Diaye",),
+        ArticleViewLike(
+            title="Élodie N'Diaye " + ("retrospective " * 40),
+            dek="A survey of sculpture. " * 200,
+            main_text_blocks=tuple(
+                TextBlock(id=f"b{index}", text=paragraph) for index in range(1, 7)
+            ),
+        ),
+        config,
+    )
+
+
+def test_shipped_default_config_can_assess_a_six_paragraph_article() -> None:
+    """C1: the default `max_input_tokens` must fit a real article.
+
+    Uses `AssessArticleConfig()` with no override on purpose. Every other
+    assess test raised `max_input_tokens` to 16384, which is exactly why the
+    shipped 4096 default -- which could not fit the fixed prompt-and-schema
+    floor plus any real body -- reached the branch.
+    """
+    config = AssessArticleConfig()
+    value = build_assess_input(
+        person_id=7,
+        display_name="Élodie N'Diaye",
+        sourced_names=tuple(
+            AssessName(
+                exact_name=f"Élodie N'Diaye {index}",
+                match_key=f"élodie n'diaye {index}",
+                kind="professional",
+            )
+            for index in range(8)
+        ),
+        identity_facts=tuple(
+            AssessFact(
+                local_id=f"f{index}",
+                kind=IdentityFactKind.PROFESSION_OR_ROLE,
+                value="sculptor working in cast bronze and welded steel " * 5,
+            )
+            for index in range(1, 17)
+        ),
+        person_article_id=11,
+        canonical_article_id=22,
+        article_view_id=33,
+        screening_rule_id="default.unclassified",
+        screening_rule_status="unclassified",
+        title="Élodie N'Diaye " + ("retrospective " * 40),
+        dek="A survey of sculpture. " * 200,
+        byline="Staff",
+        published_at="2026-01-01",
+        editorial_labels=("Exhibition",),
+        passage_view=_full_length_passage_view(config),
+        access_kind="full",
+        extraction_quality="full",
+        domain_profile=_profile(),
+        config=config,
+    )
+    rendered = render_assess_request(value)
+    assert rendered.worst_case_input_tokens <= config.max_input_tokens
+
+
+def test_build_assess_input_bounds_title_and_dek_to_configured_caps() -> None:
+    config = AssessArticleConfig()
+    value = _supplied()
+    over_title = "t" * (config.max_title_characters + 500)
+    over_dek = "d" * (config.max_summary_characters + 5000)
+    bounded = build_assess_input(
+        person_id=value.person_id,
+        display_name=value.display_name,
+        sourced_names=value.sourced_names,
+        identity_facts=value.identity_facts,
+        person_article_id=value.person_article_id,
+        canonical_article_id=value.canonical_article_id,
+        article_view_id=value.article_view_id,
+        screening_rule_id=value.screening.rule_id,
+        screening_rule_status=value.screening.rule_status,
+        title=over_title,
+        dek=over_dek,
+        byline=value.byline,
+        published_at=value.published_at,
+        editorial_labels=value.editorial_labels,
+        passage_view=_passage_view(),
+        access_kind="full",
+        extraction_quality="full",
+        domain_profile=_profile(),
+        config=config,
+    )
+    assert bounded.title is not None
+    assert bounded.dek is not None
+    assert len(bounded.title) == config.max_title_characters
+    assert len(bounded.dek) == config.max_summary_characters
+
+
+def test_config_rejects_max_input_tokens_below_the_assess_floor() -> None:
+    """C1(b): the ceiling that could not fit an article must not validate."""
+    minimum = assess_minimum_input_tokens(
+        max_passage_characters=6000,
+        max_title_characters=500,
+        max_summary_characters=4000,
+    )
+    with pytest.raises(ValidationError) as error:
+        AssessArticleConfig(max_input_tokens=4096)
+    assert "max_input_tokens must be at least" in str(error.value)
+
+    with pytest.raises(ValidationError):
+        AssessArticleConfig(max_input_tokens=minimum - 1)
+    # Positive control: exactly the minimum is accepted.
+    assert AssessArticleConfig(max_input_tokens=minimum).max_input_tokens == minimum
+
+
+def test_config_minimum_scales_with_the_passage_and_summary_bounds() -> None:
+    small = assess_minimum_input_tokens(
+        max_passage_characters=6000,
+        max_title_characters=500,
+        max_summary_characters=4000,
+    )
+    large = assess_minimum_input_tokens(
+        max_passage_characters=20_000,
+        max_title_characters=500,
+        max_summary_characters=4000,
+    )
+    assert large - small == 14_000
+    with pytest.raises(ValidationError):
+        AssessArticleConfig(max_passage_characters=20_000, max_input_tokens=small)
+
+
+def test_config_floor_constant_is_not_below_the_rendered_fixed_floor() -> None:
+    """The config copy of the prompt+schema floor must never understate it."""
+    assert assess_fixed_request_tokens() <= ASSESS_FIXED_REQUEST_TOKEN_FLOOR
+    # And must not be padded so far that the validator stops discriminating.
+    assert assess_fixed_request_tokens() * 2 > ASSESS_FIXED_REQUEST_TOKEN_FLOOR
+
+
+def test_assess_input_too_large_is_its_own_error_type() -> None:
+    config = AssessArticleConfig()
+    huge_profile = DomainProfileEvidence(
+        version=1,
+        key="visual-arts-en",
+        label="English visual arts",
+        language="en",
+        attention_examples=(
+            DomainProfileEvidenceExample(
+                category=AttentionCategory.SIGNIFICANT_RECOGNITION,
+                examples=tuple("major art prize " * 40 for _ in range(60)),
+            ),
+        ),
+    )
+    with pytest.raises(AssessInputTooLarge):
+        build_assess_input(
+            person_id=7,
+            display_name="Élodie N'Diaye",
+            sourced_names=(),
+            identity_facts=(),
+            person_article_id=11,
+            canonical_article_id=22,
+            article_view_id=33,
+            screening_rule_id="default.unclassified",
+            screening_rule_status="unclassified",
+            title="Élodie N'Diaye retrospective",
+            dek="A survey of sculpture.",
+            byline="Staff",
+            published_at="2026-01-01",
+            editorial_labels=("Exhibition",),
+            passage_view=_full_length_passage_view(config),
+            access_kind="full",
+            extraction_quality="full",
+            domain_profile=huge_profile,
+            config=config,
+        )

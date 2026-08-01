@@ -91,7 +91,9 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
     assert match.max_summary_characters == 4000
     assess = config.tasks.assess_article
     assert assess.model == "openai/gpt-5.4-mini"
-    assert assess.max_input_tokens == 4096
+    # Counted in UTF-8 bytes, so ~8k real tokens. It must clear the fixed
+    # prompt/schema floor plus the passage, title, and summary bounds.
+    assert assess.max_input_tokens == 32_768
     assert assess.max_completion_tokens == 1024
     assert assess.parameters == GenerationParameters(
         temperature=0.0,

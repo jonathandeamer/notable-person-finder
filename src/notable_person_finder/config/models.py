@@ -254,6 +254,42 @@ _MODEL_SLUG_PATTERN = re.compile(
 )
 
 
+# The prompt + schema + chat-framing floor every ``assess_article`` request
+# pays before a single character of article text. `assess_fixed_request_tokens`
+# in `coverage.assessment` renders the real value; this rounded-up copy exists
+# because configuration must not import the coverage package, and
+# `tests/coverage/test_assessment.py` pins the two together so the copy cannot
+# drift below the real floor.
+ASSESS_FIXED_REQUEST_TOKEN_FLOOR = 3_072
+
+# Names, identity facts, screening, view flags, byline, labels, and the domain
+# profile, each at its own model-level cap. Measured against the shipped
+# profile; an operator profile far larger than the shipped one can still
+# overflow at render time, which the handler records as a `local_refuse`
+# assessment rather than raising.
+ASSESS_BOUNDED_METADATA_TOKEN_ALLOWANCE = 16_384
+
+
+def assess_minimum_input_tokens(
+    *,
+    max_passage_characters: int,
+    max_title_characters: int,
+    max_summary_characters: int,
+) -> int:
+    """The smallest `max_input_tokens` that can carry these assess bounds.
+
+    Worst-case input is measured in UTF-8 bytes, not model tokens, so this is
+    a deliberately conservative floor.
+    """
+    return (
+        ASSESS_FIXED_REQUEST_TOKEN_FLOOR
+        + max_passage_characters
+        + max_title_characters
+        + max_summary_characters
+        + ASSESS_BOUNDED_METADATA_TOKEN_ALLOWANCE
+    )
+
+
 def _exact_model_slug(value: str) -> str:
     if _MODEL_SLUG_PATTERN.fullmatch(value) is None:
         raise ValueError("model must be one exact lowercase author/slug identifier")
@@ -360,7 +396,10 @@ class AssessArticleConfig(_StrictConfigurationModel):
     """
 
     model: str = "openai/gpt-5.4-mini"
-    max_input_tokens: int = Field(default=4096, strict=True, ge=1, le=1_000_000)
+    # Worst-case input is counted in UTF-8 bytes, so 32768 here is roughly 8k
+    # real tokens. 4096 could not fit the fixed prompt-and-schema floor plus a
+    # six-paragraph article, so no real article was assessable.
+    max_input_tokens: int = Field(default=32_768, strict=True, ge=1, le=1_000_000)
     max_completion_tokens: int = Field(default=1024, strict=True, ge=1, le=100_000)
     parameters: GenerationParameters = GenerationParameters()
     max_title_characters: int = Field(default=500, strict=True, ge=1, le=2000)
@@ -400,6 +439,16 @@ class AssessArticleConfig(_StrictConfigurationModel):
             )
         if self.assess_ineligible:
             raise ValueError("assess_ineligible must be false in m5")
+        minimum = assess_minimum_input_tokens(
+            max_passage_characters=self.max_passage_characters,
+            max_title_characters=self.max_title_characters,
+            max_summary_characters=self.max_summary_characters,
+        )
+        if self.max_input_tokens < minimum:
+            raise ValueError(
+                "max_input_tokens must be at least "
+                f"{minimum} for these passage, title, and summary bounds"
+            )
         return self
 
 

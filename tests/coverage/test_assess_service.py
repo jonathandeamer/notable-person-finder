@@ -7,6 +7,8 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pytest
+
 from notable_person_finder.config.models import (
     AssessArticleConfig,
     BraveConfig,
@@ -93,9 +95,10 @@ def _main_config(
             # Distinct match model so coverage-only arms do not collapse with
             # Wikipedia K17 arming on bare named people.
             match_wikipedia_identity=MatchWikipediaIdentityConfig(model=match_model),
+            # No max_input_tokens override: the shipped default must be able
+            # to assess a real article.
             assess_article=AssessArticleConfig(
                 model=assess_model,
-                max_input_tokens=16_384,
                 max_completion_tokens=1024,
             ),
         ),
@@ -1108,3 +1111,80 @@ def test_task_types_for_model_maps_assess_only() -> None:
     config = _main_config()
     assert task_types_for_model(config, ASSESS_MODEL) == (ASSESS_ARTICLE_TASK_TYPE,)
     assert task_types_for_model(config, "openai/gpt-other") == ()
+
+
+def _oversized_profile() -> DomainProfileConfig:
+    """An operator profile far larger than the shipped one.
+
+    `AssessArticleConfig` bounds passages, title, and dek, but nothing bounds
+    the domain profile, so this is the overflow route that survives the
+    configuration validator and must be handled at render time.
+    """
+    return DomainProfileConfig(
+        schema_version=1,
+        key="visual-arts-en",
+        label="English visual arts",
+        language="en",
+        attention_examples={
+            "significant_recognition": tuple(
+                "major art prize awarded by a national institution " * 20
+                for _ in range(60)
+            )
+        },
+    )
+
+
+def test_assess_input_overflow_records_local_refuse_and_advances_plan(
+    connection: sqlite3.Connection,
+) -> None:
+    """C1(c): an input that cannot fit must not wedge the plan.
+
+    A raising `prepare` settles the item `failed_permanent` with no failure, so
+    `persist_failure` never runs. Without a domain row the target stays
+    `fetched`, the plan stays `assessing`, and the person is excluded from
+    coverage eligibility forever.
+    """
+    run_id = insert_run(connection)
+    person_id = _person_with_name(connection, run_id=run_id)
+    plan_id, person_article_id, view_id, _article = _seed_assessable(
+        connection, person_id=person_id, run_id=run_id
+    )
+    _insert_compatible_inspection(connection, run_id=run_id)
+    work_id = _schedule_assess(
+        connection,
+        person_article_id=person_article_id,
+        article_view_id=view_id,
+        run_id=run_id,
+    )
+    work = _work_item(connection, work_id)
+    _claim_and_attempt(connection, work_id=work_id, run_id=run_id)
+    client = ScriptedLlmClient()
+    handler = build_assess_article_handler(
+        connection,
+        client=client,
+        config=_main_config(),
+        profile=_oversized_profile(),
+    )
+    assert handler.prepare is not None
+
+    with pytest.raises(ValueError) as error:
+        handler.prepare(work)
+    assert "input_too_large" in str(error.value)
+    assert client.generate_calls == []
+
+    assessment = load_person_article_assessment_by_fingerprint(
+        connection,
+        person_article_id=person_article_id,
+        task_fingerprint=work.fingerprint,
+    )
+    assert assessment is not None
+    assert assessment.disposition == "failed"
+    assert assessment.failure_category == "local_refuse"
+    assert assessment.attempt_id is None
+    # K25: a failed assessment never becomes the current pointer.
+    assert _person_article_pointer(connection, person_article_id) is None
+
+    plan = load_plan(connection, plan_id=plan_id)
+    assert plan is not None
+    assert plan.status in {"completed", "incomplete", "failed"}
+    assert plan.completed_at is not None

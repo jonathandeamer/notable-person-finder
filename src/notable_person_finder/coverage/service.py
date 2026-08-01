@@ -34,9 +34,11 @@ from notable_person_finder.coverage.assessment import (
     AssessArticleInput,
     AssessArticleOutput,
     AssessFact,
+    AssessInputTooLarge,
     AssessName,
     AssessValidationError,
     CoveragePersonMaterialView,
+    RenderedAssessRequest,
     assess_task_fingerprint,
     build_assess_input,
     coverage_material_fingerprint,
@@ -49,6 +51,7 @@ from notable_person_finder.coverage.models import (
 )  # PersonCoveragePlanRecord used by eligibility/ensure
 from notable_person_finder.coverage.passages import (
     ArticleViewLike,
+    PassageView,
     TextBlock,
     select_passages,
 )
@@ -200,6 +203,10 @@ _UNSAFE_TRUNCATION_CATEGORY = "unsafe_truncation"
 _PARTIAL_RETRIEVAL_EMPTY_CATEGORY = "partial_retrieval_empty"
 _PERMANENT_PROVIDER_CATEGORY = "permanent_provider"
 _INVALID_MODEL_OUTPUT_CATEGORY = "invalid_model_output"
+# The only two failure categories migration 0007 permits on an assessment with
+# no attempt row. A prepare-time refusal made no call, so it must use one.
+_LOCAL_REFUSE_CATEGORY = "local_refuse"
+_WORK_FAILED_PERMANENT_CATEGORY = "work_item_failed_permanent"
 ASSESS_SCHEMA_NAME = "assess_article"
 MALFORMED_ASSESS_DETAIL = "invalid assess output"
 MISSING_INSPECTION_DETAIL = "compatible model inspection is missing"
@@ -207,6 +214,7 @@ MISSING_PRICING_DETAIL = "usable model pricing is missing"
 MISSING_PERSON_ARTICLE_DETAIL = "person_article is missing"
 ASSESS_PREPARE_REFUSED_PREFIX = "assess_prepare_refused:"
 ASSESS_FAILED_SUPPLIED_INPUT_JSON = "{}"
+_ASSESS_INPUT_TOO_LARGE_RATIONALE = "assess input exceeds max_input_tokens"
 _ACTIVE_COVERAGE_PLAN_STATUSES = frozenset({"retrieving", "selecting", "assessing"})
 
 
@@ -3549,28 +3557,40 @@ def build_assess_article_handler(
         if access_kind not in {"full", "partial", "snippets"}:
             access_kind = "snippets"
         domain_profile = _domain_profile_evidence(profile)
-        assess_input = build_assess_input(
-            person_id=person_article.person_id,
-            display_name=display_name,
-            sourced_names=sourced_names,
-            identity_facts=identity_facts,
-            person_article_id=person_article_id,
-            canonical_article_id=person_article.canonical_article_id,
-            article_view_id=view.id,
-            screening_rule_id=context.screening_rule_id,
-            screening_rule_status=context.screening_rule_status,
-            title=view.title,
-            dek=view.dek,
-            byline=view.byline,
-            published_at=view.published_at,
-            editorial_labels=_parse_string_list(view.editorial_labels_json),
-            passage_view=passage_view,
-            access_kind=access_kind,  # type: ignore[arg-type]
-            extraction_quality=view.extraction_quality,
-            domain_profile=domain_profile,
-            config=assess_config,
-        )
-        rendered = render_assess_request(assess_input)
+        try:
+            assess_input, rendered = _build_and_render_assess(
+                person_article=person_article,
+                person_article_id=person_article_id,
+                display_name=display_name,
+                sourced_names=sourced_names,
+                identity_facts=identity_facts,
+                view=view,
+                context=context,
+                passage_view=passage_view,
+                access_kind=access_kind,
+                domain_profile=domain_profile,
+                assess_config=assess_config,
+            )
+        except AssessInputTooLarge:
+            # No call was made and none can be: this input cannot fit the
+            # configured ceiling. Record it as a `local_refuse` assessment and
+            # advance the plan, or nothing settles the target and the plan
+            # stays in `assessing` forever.
+            _record_local_refuse_assessment(
+                connection,
+                person_article=person_article,
+                person_article_id=person_article_id,
+                context=context,
+                run_id=run_id,
+                model_inspection_id=inspection.id,
+                task_fingerprint=task_fingerprint,
+                failure_category=_LOCAL_REFUSE_CATEGORY,
+                rationale=_ASSESS_INPUT_TOO_LARGE_RATIONALE,
+            )
+            raise ValueError(
+                f"{ASSESS_PREPARE_REFUSED_PREFIX}input_too_large "
+                f"person_article {person_article_id}"
+            ) from None
         request = StructuredGenerationRequest(
             model_id=model_id,
             system_prompt=rendered.system_prompt,
@@ -3931,6 +3951,123 @@ def advance_coverage_plan_after_assess(
         targets=targets,
         now=now,
     )
+
+
+def _build_and_render_assess(
+    *,
+    person_article: Any,
+    person_article_id: int,
+    display_name: str,
+    sourced_names: Sequence[AssessName],
+    identity_facts: Sequence[AssessFact],
+    view: Any,
+    context: AssessWorkContext,
+    passage_view: PassageView,
+    access_kind: str,
+    domain_profile: DomainProfileEvidence,
+    assess_config: AssessArticleConfig,
+) -> tuple[AssessArticleInput, RenderedAssessRequest]:
+    """Build then render one assess request; raises ``AssessInputTooLarge``."""
+    assess_input = build_assess_input(
+        person_id=person_article.person_id,
+        display_name=display_name,
+        sourced_names=sourced_names,
+        identity_facts=identity_facts,
+        person_article_id=person_article_id,
+        canonical_article_id=person_article.canonical_article_id,
+        article_view_id=view.id,
+        screening_rule_id=context.screening_rule_id,
+        screening_rule_status=context.screening_rule_status,
+        title=view.title,
+        dek=view.dek,
+        byline=view.byline,
+        published_at=view.published_at,
+        editorial_labels=_parse_string_list(view.editorial_labels_json),
+        passage_view=passage_view,
+        access_kind=access_kind,  # type: ignore[arg-type]
+        extraction_quality=view.extraction_quality,
+        domain_profile=domain_profile,
+        config=assess_config,
+    )
+    return assess_input, render_assess_request(assess_input)
+
+
+def _record_local_refuse_assessment(
+    connection: sqlite3.Connection,
+    *,
+    person_article: Any,
+    person_article_id: int,
+    context: AssessWorkContext,
+    run_id: int,
+    model_inspection_id: int | None,
+    task_fingerprint: str,
+    failure_category: str,
+    rationale: str,
+) -> None:
+    """Write a ``failed`` assessment for a refusal that made no call.
+
+    Migration 0007 permits a NULL ``attempt_id`` only for ``superseded`` and
+    ``local_refuse``, so this is the one shape a prepare-time refusal may take.
+    Advances the plan afterwards: a settlement that bypasses ``persist`` never
+    reaches ``advance_coverage_plan_after_assess`` on its own.
+    """
+    observed_at = _run_started_at(connection, run_id=run_id)
+    owns = not connection.in_transaction
+    if owns:
+        connection.execute("BEGIN IMMEDIATE")
+    try:
+        insert_person_article_assessment(
+            connection,
+            person_article_id=person_article_id,
+            person_id=person_article.person_id,
+            canonical_article_id=person_article.canonical_article_id,
+            plan_id=context.plan_id,
+            article_view_id=context.article_view_id,
+            run_id=run_id,
+            attempt_id=None,
+            model_inspection_id=model_inspection_id,
+            disposition="failed",
+            person_relation=None,
+            coverage_depth=None,
+            content_types_json=None,
+            subject_relationship=None,
+            screening_rule_id=context.screening_rule_id,
+            screening_rule_status=context.screening_rule_status,
+            source_policy_fingerprint=context.source_policy_fingerprint,
+            canonical_supplied_input_json=ASSESS_FAILED_SUPPLIED_INPUT_JSON,
+            validated_output_json=None,
+            prompt_hash=None,
+            schema_hash=None,
+            schema_version=None,
+            task_fingerprint=task_fingerprint,
+            rationale=rationale,
+            failure_category=failure_category,
+            observed_at=observed_at,
+        )
+        # K25: do not move the current pointer on a failed assessment.
+        if context.plan_id is not None:
+            advance_coverage_plan_after_assess(
+                connection,
+                plan_id=context.plan_id,
+                now=observed_at,
+            )
+    except BaseException:
+        if owns:
+            connection.rollback()
+        raise
+    else:
+        if owns:
+            connection.commit()
+
+
+def _run_started_at(connection: sqlite3.Connection, *, run_id: int) -> str:
+    row = connection.execute(
+        "SELECT started_at FROM run WHERE id = ?",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"run {run_id} is missing")
+    return str(row["started_at"])
 
 
 def _prepare_reuse_existing_assessment(

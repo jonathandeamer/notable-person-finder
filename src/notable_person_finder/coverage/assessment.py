@@ -177,6 +177,24 @@ class AssessValidationError(ValueError):
     """A safe rejection of model output that contains no supplied content."""
 
 
+class AssessInputTooLarge(ValueError):
+    """The bounded assess request does not fit ``max_input_tokens``.
+
+    Distinguished from every other ``ValueError`` a caller may raise so that
+    the handler can record a ``local_refuse`` assessment and let the plan
+    advance, instead of wedging it on a settlement that bypasses persist.
+    """
+
+
+def assess_fixed_request_tokens() -> int:
+    """The prompt + schema + chat-framing floor every assess request pays.
+
+    Public so configuration validation can be checked against the real
+    rendered floor rather than a hand-copied number.
+    """
+    return _fixed_request_tokens()
+
+
 def build_assess_input(
     *,
     person_id: int,
@@ -201,6 +219,12 @@ def build_assess_input(
 ) -> AssessArticleInput:
     """Build a strict assess input from already-selected passages and metadata."""
     passages = tuple(_to_assess_passage(passage) for passage in passage_view.passages)
+    # Bound the two free-text article fields to their configured caps. Passage
+    # selection already applies these caps to the body it builds; the raw
+    # title and dek reached the request unbounded, so the configured ceiling
+    # could not be reasoned about at configuration time.
+    title = _prefix(title, config.max_title_characters)
+    dek = _prefix(dek, config.max_summary_characters)
     value = AssessArticleInput(
         task="assess_article",
         person_id=person_id,
@@ -233,11 +257,11 @@ def build_assess_input(
         max_input_tokens=config.max_input_tokens,
     )
     if _fixed_request_tokens() > config.max_input_tokens:
-        raise ValueError(
+        raise AssessInputTooLarge(
             "max_input_tokens cannot fit the fixed prompt, schema, and chat framing"
         )
     if _worst_case_input_tokens(value) > config.max_input_tokens:
-        raise ValueError("max_input_tokens cannot fit bounded assess metadata")
+        raise AssessInputTooLarge("max_input_tokens cannot fit bounded assess metadata")
     return value
 
 
@@ -317,7 +341,9 @@ def render_assess_request(value: AssessArticleInput) -> RenderedAssessRequest:
         token_bearing_utf8_bytes + ASSESS_CHAT_FRAMING_TOKEN_ALLOWANCE
     )
     if worst_case_input_tokens > value.max_input_tokens:
-        raise ValueError("assess request exceeds worst-case input token ceiling")
+        raise AssessInputTooLarge(
+            "assess request exceeds worst-case input token ceiling"
+        )
     schema_envelope = _canonical_json(
         {"schema": schema, "schema_version": ASSESS_SCHEMA_VERSION}
     )
@@ -554,6 +580,12 @@ def _reference_error(
         if reference not in allowed:
             return f"{owner}: unseen passage id {reference}"
     return None
+
+
+def _prefix(value: str | None, limit: int) -> str | None:
+    if value is None:
+        return None
+    return value[:limit]
 
 
 def _token_bearing_utf8_bytes(value: AssessArticleInput) -> int:
