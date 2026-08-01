@@ -89,8 +89,9 @@ Delivered and usable:
   never raw HTML. The `coverage/` package: the Wikipedia eligibility gate
   (only `no_matching_page_found` and `uncertain_identity` people are
   researched, so a current `matching_page_found` stops research), bounded
-  per-person coverage plans with deterministic exact/alias/context query
-  forms, deterministic publisher screening against the versioned source
+  per-person coverage plans with deterministic query forms in four variants
+  (`exact`, `exact_obituary`, `alias`, `context`), deterministic publisher
+  screening against the versioned source
   policy (`curated_eligible` / `curated_ineligible`, with absence of a
   matching rule meaning `unclassified`; first matching rule wins over
   `host_exact`, `host_suffix`, and `path_prefix`), deterministic article
@@ -158,15 +159,37 @@ for regressions:
   real `OPENROUTER_API_KEY`. Offline gates deselect it. An operator must still
   run the live smoke and record model/provider/usage/cost/outcome (without
   secrets) before milestone cutover when a key is available.
-- The three coverage live smokes (`tests/coverage/test_live_brave.py`,
-  `test_live_article_fetch.py`, `test_live_openrouter_assess.py`) are **empty
-  placeholders**: each is a `live`-marked `pass`, unlike the substantive
-  MediaWiki and OpenRouter match smokes in `tests/wikipedia`. They therefore
-  prove nothing about Brave, article fetch, or `assess_article` against real
-  services. Before milestone 5 cutover an operator must give them real bodies
-  and run them with `BRAVE_API_KEY` and `OPENROUTER_API_KEY`, recording
+- **Six test files in `tests/coverage` are stubs that assert nothing.** They
+  were left behind by the interrupted session and were never filled in. They
+  pass, they are counted in the gate, and they protect nothing:
+  - `test_live_brave.py`, `test_live_article_fetch.py`,
+    `test_live_openrouter_assess.py` — each a `live`-marked `pass`, unlike the
+    substantive MediaWiki and OpenRouter match smokes in `tests/wikipedia`.
+  - `test_seams.py` — a `live`-marked `pass`. It is also the reason
+    `uv run pytest tests/coverage -m live` collects **four** tests, not three;
+    the fourth is a no-op cross-component seam, so no coverage seam is
+    exercised live or offline.
+  - `test_run_cli.py` — two lines, `def test_run_cli_coverage_registered():
+    pass`, with no imports. It is *not* `live`-marked, so it runs green in
+    every offline gate while verifying nothing about handler registration.
+  - `test_digest_status.py` — 22 lines whose own comment reads "Testing that
+    the queries don't crash". It calls `coverage_corpus_counts` and
+    `coverage_run_counts` against a freshly migrated, empty database and
+    asserts every counter is `0`. It never populates a plan, never renders the
+    "Coverage evidence" digest section, and never runs a `notable status`
+    line. Delete the whole coverage summary and it still passes.
+
+  So there is **no regression protection at all** for coverage CLI handler
+  registration, for cross-component seams, for the digest section's rendered
+  text, or for the status lines — the four things a reader would most expect
+  the file names to cover. Everything else in `tests/coverage` (schema, Brave
+  and article adapters, screening, selection, passages, queries, eligibility,
+  the assessment contract, the fetch/assess/HTTP services, repository, merge
+  hooks, seed hooks) is substantive. Before milestone 5 cutover these six need
+  real bodies, and the three live smokes then need an operator run with
+  `BRAVE_API_KEY` and `OPENROUTER_API_KEY`, recording
   model/provider/usage/cost/outcome without secrets. Do not read a green
-  `-m live` run of `tests/coverage` as evidence of anything today.
+  `tests/coverage` run — offline or `-m live` — as evidence about any of them.
 
 ## Rewrite Structure
 
@@ -203,11 +226,15 @@ for regressions:
 - `tests/wikipedia/` — MediaWiki adapter, schema, queries/candidates, match
   contract, HTTP and match handlers, seed/merge hooks, digest/status, CLI
   seams, and opt-in MediaWiki/OpenRouter live-smoke tests.
-- `tests/coverage/` — Brave and article adapters, coverage schema, eligibility,
-  queries, screening, selection, passages, the assessment contract, the fetch
-  and assess services, repository, merge hooks, seed/hooks, digest/status, CLI
-  and cross-suite seams, plus three opt-in live-smoke files (Brave, article
-  fetch, OpenRouter assess) that are currently empty placeholders.
+- `tests/coverage/` — substantive coverage for the Brave and article adapters,
+  the coverage schema, eligibility, queries, screening, selection, passages,
+  the assessment contract, the HTTP/fetch/assess services, repository, merge
+  hooks, and seed hooks. Six files in this directory are stubs that assert
+  nothing — `test_run_cli.py`, `test_seams.py`, `test_digest_status.py`, and
+  the three live smokes — so despite their names there is no test protecting
+  coverage CLI registration, cross-component seams, the rendered digest
+  section, or the status lines. See the known gaps above before trusting a
+  green run.
 - `docs/architecture/at-least-once-execution.md` — the operator-facing note on
   the crash windows in which a paid provider call can be repeated. Point at it
   rather than restating it.
@@ -278,7 +305,9 @@ reviewable and executable.
     `uv run pytest tests/wikipedia -m live -v` (OpenRouter key for match smoke)
   - Brave + article fetch + assess OpenRouter:
     `BRAVE_API_KEY=… OPENROUTER_API_KEY=… uv run pytest tests/coverage -m live -v`
-    — these three are still empty placeholders; see the known gaps above.
+    — this collects four tests (the three smokes plus `test_seams.py`) and all
+    four are `pass` stubs, so it needs no key and proves nothing. See the known
+    gaps above.
 - Exercise the installed interface with `uv run notable ...`.
 - Keep default rewrite verification offline and isolate configuration and
   storage with temporary paths.
