@@ -757,11 +757,38 @@ def test_prepare_refuses_when_fingerprint_matches_prior_aggregation(
     ).fetchone()["n"]
     assert lead_count_after_first == 1
 
-    # A second work item scheduled against the same, unchanged evidence:
-    # schedule_work's dedup only covers pending/running/deferred, so this
-    # succeeds in creating a brand-new work item even though nothing about
-    # the person's evidence has changed since the first aggregation.
+    # Settle the first work item to 'succeeded', mirroring exactly what
+    # `runs.repository.complete_work` does in production once a handler's
+    # `persist` commits: state -> succeeded, completed_by_run_id set,
+    # claimed_by_run_id cleared. Without this, the first row would still be
+    # `running`, and `schedule_work`'s dedup (pending/running/deferred,
+    # `runs/repository.py:254-263`) would itself return the *same* work_id
+    # for the "second" schedule call below -- proving nothing about the
+    # succeeded-item gap this test exists to cover.
+    connection.execute(
+        """
+        UPDATE work_item
+           SET state = 'succeeded',
+               reason = NULL,
+               completed_by_run_id = ?,
+               claimed_by_run_id = NULL,
+               updated_at = ?
+         WHERE id = ?
+        """,
+        (run_id, NOW, first_work.id),
+    )
+    connection.commit()
+
+    # A second work item scheduled against the same, unchanged evidence.
+    # schedule_work's dedup only covers pending/running/deferred -- not
+    # succeeded -- so this must produce a genuinely new work_id rather than
+    # returning the first item's id. That is the exact production gap: a
+    # succeeded item's fingerprint is never deduped by schedule_work, so a
+    # fresh work item is created and `prepare`'s own refusal check is the
+    # only thing standing between it and a duplicate aggregation.
     second_work = _run_once("c" * 64)
+    assert second_work.id != first_work.id
+
     with pytest.raises(ValueError, match=AGGREGATE_PREPARE_REFUSED_PREFIX):
         handler.prepare(second_work)
 
