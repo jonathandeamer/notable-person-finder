@@ -70,6 +70,12 @@ _PROMPT_HASH = "1" * 64
 _SCHEMA_HASH = "2" * 64
 
 
+def _fp(tag: str, index: int) -> str:
+    """A distinct, schema-valid (64-char) fingerprint for loop-built fixtures."""
+    raw = f"{tag}{index}"
+    return raw.ljust(64, "0")[:64]
+
+
 def _config() -> MainConfig:
     return MainConfig(
         schema_version=1,
@@ -469,113 +475,168 @@ def _report(run_id: int) -> RunReport:
 def test_corpus_and_run_counters_positive_for_populated_database(
     connection: sqlite3.Connection,
 ) -> None:
-    """I2-style positive controls: every counter is exercised with real rows.
+    """Every counter gets its own distinct value from real repository rows.
 
-    Builds one person per counter so each of `CoverageCorpusCounts` and
-    `CoverageRunCounts` resolves to a real, independently expected non-zero
-    value -- the exact hole the stubbed file left open ("Testing that the
-    queries don't crash" against an empty database, asserting all zeroes).
+    A first version of this test gave every counter the value 1. That made it
+    blind to the wrong-column / swapped-field defect class: a review proved
+    that swapping `model_deferred` and `model_failed` in `CoverageRunCounts`'s
+    return survived the entire file. So each of the nine digest counters here
+    is built from a different *count* of real rows (1 through 9) -- plans
+    completed/incomplete/failed, this-run assessments, corpus-wide assessed
+    people, eligible-remaining people, stopped-matching people, and deferred/
+    failed assess work -- so a swapped pair of fields produces a wrong number
+    that this test actually notices, not two coincidentally-equal 1s.
     """
     run_id = _insert_run(connection, started_at=moment())
     policy = _policy()
 
-    eligible_person = _person(
-        connection, run_id=run_id, name="Eligible Person", fingerprint="a" * 64
-    )
-    _set_wikipedia_outcome(
-        connection,
-        person_id=eligible_person,
-        run_id=run_id,
-        semantic_outcome="no_matching_page_found",
-        fingerprint="b" * 64,
-    )
+    # plans_completed = 1
+    for i in range(1):
+        person = _person(
+            connection,
+            run_id=run_id,
+            name=f"Completed Plan {i}",
+            fingerprint=_fp("cp", i),
+        )
+        plan_id = _open_plan(
+            connection,
+            person_id=person,
+            run_id=run_id,
+            material_fingerprint=_fp("cpf", i),
+            policy_fingerprint=policy.fingerprint,
+        )
+        _settle_plan(connection, plan_id=plan_id, status="completed", completed_at=NOW)
 
-    stopped_person = _person(
-        connection, run_id=run_id, name="Stopped Person", fingerprint="c" * 64
-    )
-    _set_wikipedia_outcome(
-        connection,
-        person_id=stopped_person,
-        run_id=run_id,
-        semantic_outcome="matching_page_found",
-        fingerprint="d" * 64,
-    )
+    # plans_incomplete = 2
+    for i in range(2):
+        person = _person(
+            connection,
+            run_id=run_id,
+            name=f"Incomplete Plan {i}",
+            fingerprint=_fp("ip", i),
+        )
+        plan_id = _open_plan(
+            connection,
+            person_id=person,
+            run_id=run_id,
+            material_fingerprint=_fp("ipf", i),
+            policy_fingerprint=policy.fingerprint,
+        )
+        _settle_plan(connection, plan_id=plan_id, status="incomplete", completed_at=NOW)
 
-    assessed_person = _person(
-        connection, run_id=run_id, name="Assessed Person", fingerprint="e" * 64
+    # plans_failed = 3
+    for i in range(3):
+        person = _person(
+            connection, run_id=run_id, name=f"Failed Plan {i}", fingerprint=_fp("fp", i)
+        )
+        plan_id = _open_plan(
+            connection,
+            person_id=person,
+            run_id=run_id,
+            material_fingerprint=_fp("fpf", i),
+            policy_fingerprint=policy.fingerprint,
+        )
+        _settle_plan(connection, plan_id=plan_id, status="failed", completed_at=NOW)
+
+    # assessments_completed_this_run = 4 (four distinct people, assessed now)
+    for i in range(4):
+        person = _person(
+            connection,
+            run_id=run_id,
+            name=f"Assessed This Run {i}",
+            fingerprint=_fp("ar", i),
+        )
+        _completed_assessment(
+            connection,
+            person_id=person,
+            run_id=run_id,
+            policy_fingerprint=policy.fingerprint,
+            article_url=f"https://example.com/assessed-this-run-{i}",
+            task_fingerprint=_fp("atf", i),
+        )
+
+    # A fifth assessed person, completed in a *different* run, so corpus-wide
+    # `people_with_completed_assessment` (5) is distinct from this-run
+    # `assessments_completed_this_run` (4): the corpus counter is not scoped
+    # to any run, so this person's earlier assessment still counts in it.
+    other_assessment_run = _insert_run(connection, started_at=moment(-100))
+    extra_assessed_person = _person(
+        connection,
+        run_id=other_assessment_run,
+        name="Assessed Other Run",
+        fingerprint=_fp("aor", 0),
     )
     _completed_assessment(
         connection,
-        person_id=assessed_person,
-        run_id=run_id,
+        person_id=extra_assessed_person,
+        run_id=other_assessment_run,
         policy_fingerprint=policy.fingerprint,
-        article_url="https://example.com/assessed-person",
-        task_fingerprint="f" * 64,
+        article_url="https://example.com/assessed-other-run",
+        task_fingerprint=_fp("aotf", 0),
     )
 
-    completed_plan_person = _person(
-        connection, run_id=run_id, name="Completed Plan Person", fingerprint="1" * 64
-    )
-    completed_plan_id = _open_plan(
-        connection,
-        person_id=completed_plan_person,
-        run_id=run_id,
-        material_fingerprint="2" * 64,
-        policy_fingerprint=policy.fingerprint,
-    )
-    _settle_plan(
-        connection, plan_id=completed_plan_id, status="completed", completed_at=NOW
-    )
+    # eligible_remaining = 6
+    for i in range(6):
+        person = _person(
+            connection, run_id=run_id, name=f"Eligible {i}", fingerprint=_fp("el", i)
+        )
+        _set_wikipedia_outcome(
+            connection,
+            person_id=person,
+            run_id=run_id,
+            semantic_outcome="no_matching_page_found",
+            fingerprint=_fp("elf", i),
+        )
 
-    incomplete_plan_person = _person(
-        connection, run_id=run_id, name="Incomplete Plan Person", fingerprint="3" * 64
-    )
-    incomplete_plan_id = _open_plan(
-        connection,
-        person_id=incomplete_plan_person,
-        run_id=run_id,
-        material_fingerprint="4" * 64,
-        policy_fingerprint=policy.fingerprint,
-    )
-    _settle_plan(
-        connection, plan_id=incomplete_plan_id, status="incomplete", completed_at=NOW
-    )
+    # stopped_matching_wikipedia = 7
+    for i in range(7):
+        person = _person(
+            connection, run_id=run_id, name=f"Stopped {i}", fingerprint=_fp("st", i)
+        )
+        _set_wikipedia_outcome(
+            connection,
+            person_id=person,
+            run_id=run_id,
+            semantic_outcome="matching_page_found",
+            fingerprint=_fp("stf", i),
+            page_id=9100 + i,
+        )
 
-    failed_plan_person = _person(
-        connection, run_id=run_id, name="Failed Plan Person", fingerprint="5" * 64
-    )
-    failed_plan_id = _open_plan(
-        connection,
-        person_id=failed_plan_person,
-        run_id=run_id,
-        material_fingerprint="6" * 64,
-        policy_fingerprint=policy.fingerprint,
-    )
-    _settle_plan(connection, plan_id=failed_plan_id, status="failed", completed_at=NOW)
+    # model_deferred = 8
+    for i in range(8):
+        _work_item(
+            connection, run_id=run_id, state="deferred", fingerprint=_fp("md", i)
+        )
 
-    _work_item(connection, run_id=run_id, state="deferred", fingerprint="7" * 64)
-    _work_item(
-        connection, run_id=run_id, state="failed_permanent", fingerprint="8" * 64
-    )
+    # model_failed = 9
+    for i in range(9):
+        _work_item(
+            connection,
+            run_id=run_id,
+            state="failed_permanent",
+            fingerprint=_fp("mf", i),
+        )
 
     corpus = coverage_corpus_counts(connection)
-    assert corpus.assessments_completed == 1
-    assert corpus.people_with_completed_assessment == 1
-    assert corpus.stopped_matching_wikipedia == 1
+    assert corpus.assessments_completed == 5, (
+        "the extra other-run assessment must not be dropped"
+    )
+    assert corpus.people_with_completed_assessment == 5
+    assert corpus.stopped_matching_wikipedia == 7
 
     run_counts = coverage_run_counts(connection, run_id=run_id)
     assert run_counts.plans_completed == 1
-    assert run_counts.plans_incomplete == 1
-    assert run_counts.plans_failed == 1
-    assert run_counts.assessments_completed_this_run == 1
-    assert run_counts.model_deferred == 1
-    assert run_counts.model_failed == 1
+    assert run_counts.plans_incomplete == 2
+    assert run_counts.plans_failed == 3
+    assert run_counts.assessments_completed_this_run == 4
+    assert run_counts.model_deferred == 8
+    assert run_counts.model_failed == 9
 
     config = _config()
     eligible = count_coverage_research_eligible(
         connection, config=config, policy=policy, now=NOW
     )
-    assert eligible == 1
+    assert eligible == 6
 
     # Positive control: a different run_id must not pick up this run's work.
     other_run = _insert_run(connection, started_at=moment(120))
@@ -587,6 +648,8 @@ def test_corpus_and_run_counters_positive_for_populated_database(
     # Render the full digest section from these exact corpus/run numbers and
     # confirm every one of the nine counters lands in the rendered Markdown --
     # the specific hole this task closes (the stub never rendered anything).
+    # Every value below is distinct (1..9), so a swapped-field defect such as
+    # model_deferred <-> model_failed changes what this section says.
     summary = CoverageSummary(
         plans_completed=run_counts.plans_completed,
         plans_incomplete=run_counts.plans_incomplete,
@@ -602,14 +665,14 @@ def test_corpus_and_run_counters_positive_for_populated_database(
     assert "### Coverage evidence" in markdown
     section = markdown.split("### Coverage evidence\n\n", 1)[1]
     assert "- Plans completed this run: 1" in section
-    assert "- Plans incomplete this run: 1" in section
-    assert "- Plans permanently failed this run: 1" in section
-    assert "- Assessments completed this run: 1" in section
-    assert "- People with completed assessment (corpus): 1" in section
-    assert "- Coverage eligible remaining: 1" in section
-    assert "- Stopped matching Wikipedia: 1" in section
-    assert "- Assess model deferred: 1" in section
-    assert "- Assess model permanently failed: 1" in section
+    assert "- Plans incomplete this run: 2" in section
+    assert "- Plans permanently failed this run: 3" in section
+    assert "- Assessments completed this run: 4" in section
+    assert "- People with completed assessment (corpus): 5" in section
+    assert "- Coverage eligible remaining: 6" in section
+    assert "- Stopped matching Wikipedia: 7" in section
+    assert "- Assess model deferred: 8" in section
+    assert "- Assess model permanently failed: 9" in section
 
 
 # ---------------------------------------------------------------------------
