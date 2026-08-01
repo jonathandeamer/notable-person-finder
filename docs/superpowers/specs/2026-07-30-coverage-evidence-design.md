@@ -9,6 +9,29 @@
 | **Programme** | Notable Person Finder clean-slate rewrite |
 | **Depends on** | Milestones 1–4 complete on `refactor/rearchitecture` (HEAD e646e55) |
 
+## Amendments
+
+### 2026-08-01 — publisher policy ships as a tracked artifact
+
+The curated publisher policy ships as the **tracked repository artifact**
+`config/source_policies/visual_arts.toml`, not as an operator-copied
+`*.example.toml`. The curated eligible/ineligible set is product content whose
+changes belong in a reviewed diff, not a per-machine preference, and every
+screening decision stores `source_policy_fingerprint` over it. Wherever this
+design writes `visual_arts.example.toml` (the file tree in the Files section
+and the Source policy section), read `visual_arts.toml`;
+`config/notable.example.toml` points `source_policy_file` at it, and it is a
+config-load error for the file to be missing. Nothing else changes: the policy
+schema, the `curated_eligible` / `curated_ineligible` / absent-rule
+`unclassified` statuses of K8, the first-match-wins ordering of K33, and the
+fingerprint definition are all unchanged.
+
+This is the only decision carried over from the superseded
+`2026-08-01-coverage-research-design.md`. That document and its plan
+(`docs/superpowers/plans/2026-08-01-coverage-discovery.md`) were written
+without knowledge of this branch, were never implemented, and must not be used
+to amend K1–K34 in any other respect.
+
 ## Overview
 
 Milestone 4 records durable Wikipedia identity outcomes, including

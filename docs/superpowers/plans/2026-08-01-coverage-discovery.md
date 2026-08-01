@@ -1,5 +1,14 @@
 # Coverage Discovery (Milestone 5a) Implementation Plan
 
+> **SUPERSEDED — NEVER EXECUTED. DO NOT IMPLEMENT THIS PLAN.** Superseded on
+> 2026-08-01 by `docs/superpowers/plans/2026-07-30-coverage-evidence.md`
+> (Tasks 1–8, all complete), whose design authority is
+> `docs/superpowers/specs/2026-07-30-coverage-evidence-design.md`. This plan
+> was written without knowledge of the `feat/coverage-evidence` branch, which
+> had already shipped the capability. Its own design authority
+> (`2026-08-01-coverage-research-design.md`) is likewise superseded. Retained
+> as a record only; do not delete.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A run takes every person whose Wikipedia identity is

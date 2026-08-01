@@ -1,7 +1,38 @@
 # Coverage Research Design
 
-Status: approved
+> **SUPERSEDED — NEVER IMPLEMENTED. DO NOT BUILD FROM THIS DOCUMENT.**
+>
+> Superseded on 2026-08-01 by
+> [Milestone 5: Coverage Evidence](2026-07-30-coverage-evidence-design.md),
+> which is the reviewed authority and the design the shipped code implements.
+>
+> This document was written on 2026-08-01 without knowledge of the
+> `feat/coverage-evidence` branch, where the same capability had already been
+> designed on 2026-07-30, implemented, and verified. It is redundant, and in
+> places it contradicts locked decisions K1–K34 of the earlier design:
+>
+> - it describes publisher statuses `eligible` / `ineligible` with
+>   longest-path-prefix matching, where K8/K33 shipped `curated_eligible` /
+>   `curated_ineligible` (plus absence-of-rule `unclassified`) with
+>   first-match-wins over `host_exact` / `host_suffix` / `path_prefix`;
+> - it proposes an `assess_person_lead` work kind and the four lead outcomes
+>   `promising_lead`, `possible_lead`, `insufficient_evidence`, and
+>   `assessment_incomplete`, where K2 locks exactly three work kinds
+>   (`brave_web_search`, `fetch_article`, `assess_article`) and K12 forbids
+>   inventing lead outcomes in this milestone. None of those four strings
+>   appears anywhere in `src/`.
+>
+> The one decision here that was *not* covered by K1–K34 — publisher policy as
+> a tracked repository artifact rather than an operator-copied example — has
+> been folded into the 2026-07-30 design as a dated amendment. Nothing else
+> from this document migrates.
+>
+> Retained as a record only. Do not delete, and do not use it to amend the
+> 2026-07-30 design.
+
+Status: superseded (never implemented)
 Date: 2026-08-01
+Superseded by: `2026-07-30-coverage-evidence-design.md`
 Supersedes: nothing
 Depends on:
 
