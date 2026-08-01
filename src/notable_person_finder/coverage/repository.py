@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from notable_person_finder.coverage.models import (
@@ -1269,4 +1270,130 @@ def supersede_pending_targets_for_plan(
             (plan_id,),
         ).rowcount
         or 0
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CoverageCorpusCounts:
+    """Whole-corpus Coverage totals for digest and notable status."""
+
+    assessments_completed: int
+    people_with_completed_assessment: int
+    stopped_matching_wikipedia: int
+
+
+@dataclass(frozen=True, slots=True)
+class CoverageRunCounts:
+    """This-run Coverage totals for the daily digest section."""
+
+    plans_completed: int
+    plans_incomplete: int
+    plans_failed: int
+    assessments_completed_this_run: int
+    model_deferred: int
+    model_failed: int
+
+
+def coverage_corpus_counts(connection: sqlite3.Connection) -> CoverageCorpusCounts:
+    assessments = int(
+        connection.execute(
+            "SELECT COUNT(*) AS n FROM person_article_assessment "
+            "WHERE disposition = 'completed'"
+        ).fetchone()["n"]
+    )
+    people = int(
+        connection.execute(
+            "SELECT COUNT(DISTINCT person_id) AS n FROM person_article_assessment "
+            "WHERE disposition = 'completed'"
+        ).fetchone()["n"]
+    )
+
+    # current completed matching only; positive control test required
+    stopped = int(
+        connection.execute(
+            """
+        SELECT COUNT(*) AS n
+        FROM person p
+        JOIN wikipedia_identity_observation w
+          ON p.current_wikipedia_identity_observation_id = w.id
+        WHERE p.merged_into_person_id IS NULL
+          AND w.semantic_outcome = 'matching_page_found'
+          AND w.disposition = 'completed'
+        """
+        ).fetchone()["n"]
+    )
+
+    return CoverageCorpusCounts(
+        assessments_completed=assessments,
+        people_with_completed_assessment=people,
+        stopped_matching_wikipedia=stopped,
+    )
+
+
+def coverage_run_counts(
+    connection: sqlite3.Connection, *, run_id: int
+) -> CoverageRunCounts:
+    # plans completed / incomplete / failed
+    plans_completed = int(
+        connection.execute(
+            "SELECT COUNT(*) AS n FROM person_coverage_plan "
+            "WHERE run_id = ? AND status = 'completed'",
+            (run_id,),
+        ).fetchone()["n"]
+    )
+    plans_incomplete = int(
+        connection.execute(
+            "SELECT COUNT(*) AS n FROM person_coverage_plan "
+            "WHERE run_id = ? AND status = 'incomplete'",
+            (run_id,),
+        ).fetchone()["n"]
+    )
+    plans_failed = int(
+        connection.execute(
+            "SELECT COUNT(*) AS n FROM person_coverage_plan "
+            "WHERE run_id = ? AND status = 'failed'",
+            (run_id,),
+        ).fetchone()["n"]
+    )
+
+    assessments_completed_this_run = int(
+        connection.execute(
+            "SELECT COUNT(*) AS n FROM person_article_assessment "
+            "WHERE run_id = ? AND disposition = 'completed'",
+            (run_id,),
+        ).fetchone()["n"]
+    )
+
+    model_deferred = int(
+        connection.execute(
+            """
+        SELECT COUNT(*) AS n
+        FROM work_item
+        WHERE task_type = 'assess_article'
+          AND state = 'deferred'
+          AND completed_by_run_id = ?
+        """,
+            (run_id,),
+        ).fetchone()["n"]
+    )
+    model_failed = int(
+        connection.execute(
+            """
+        SELECT COUNT(*) AS n
+        FROM work_item
+        WHERE task_type = 'assess_article'
+          AND state = 'failed_permanent'
+          AND completed_by_run_id = ?
+        """,
+            (run_id,),
+        ).fetchone()["n"]
+    )
+
+    return CoverageRunCounts(
+        plans_completed=plans_completed,
+        plans_incomplete=plans_incomplete,
+        plans_failed=plans_failed,
+        assessments_completed_this_run=assessments_completed_this_run,
+        model_deferred=model_deferred,
+        model_failed=model_failed,
     )

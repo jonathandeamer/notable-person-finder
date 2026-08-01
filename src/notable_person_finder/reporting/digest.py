@@ -128,6 +128,21 @@ class WikipediaRunSummary:
     match_model_failed: int
 
 
+@dataclass(frozen=True, slots=True)
+class CoverageSummary:
+    """Counts rendered in the digest's Coverage Evidence section."""
+
+    plans_completed: int
+    plans_incomplete: int
+    plans_failed: int
+    assessments_completed_this_run: int
+    people_with_completed_assessment: int
+    eligible_remaining: int
+    stopped_matching_wikipedia: int
+    model_deferred: int
+    model_failed: int
+
+
 def render_digest(
     report: RunReport,
     *,
@@ -136,6 +151,7 @@ def render_digest(
     people: PeopleRunSummary | None = None,
     identity: IdentityRunSummary | None = None,
     wikipedia: WikipediaRunSummary | None = None,
+    coverage: CoverageSummary | None = None,
 ) -> str:
     lines = [f"# Notable Person Finder — {local_date}", ""]
 
@@ -327,6 +343,24 @@ def render_digest(
             f"- Match model permanently failed: {wikipedia.match_model_failed}",
         ]
 
+    if coverage is not None:
+        lines += [
+            "",
+            "### Coverage evidence",
+            "",
+            f"- Plans completed this run: {coverage.plans_completed}",
+            f"- Plans incomplete this run: {coverage.plans_incomplete}",
+            f"- Plans permanently failed this run: {coverage.plans_failed}",
+            f"- Assessments completed this run: "
+            f"{coverage.assessments_completed_this_run}",
+            f"- People with completed assessment (corpus): "
+            f"{coverage.people_with_completed_assessment}",
+            f"- Coverage eligible remaining: {coverage.eligible_remaining}",
+            f"- Stopped matching Wikipedia: {coverage.stopped_matching_wikipedia}",
+            f"- Assess model deferred: {coverage.model_deferred}",
+            f"- Assess model permanently failed: {coverage.model_failed}",
+        ]
+
     return "\n".join(lines) + "\n"
 
 
@@ -435,6 +469,7 @@ def write_digest(
     people: PeopleRunSummary | None = None,
     identity: IdentityRunSummary | None = None,
     wikipedia: WikipediaRunSummary | None = None,
+    coverage: CoverageSummary | None = None,
 ) -> DigestRecord:
     """Atomically persist the immutable dated digest and the latest copy.
 
@@ -452,6 +487,7 @@ def write_digest(
         people=people,
         identity=identity,
         wikipedia=wikipedia,
+        coverage=coverage,
     )
     try:
         digests_dir.mkdir(parents=True, exist_ok=True)

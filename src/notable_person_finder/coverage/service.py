@@ -4226,3 +4226,30 @@ def _parse_string_list(raw: str) -> tuple[str, ...]:
     if not isinstance(parsed, list):
         return ()
     return tuple(str(item) for item in parsed if isinstance(item, str))
+
+
+def count_coverage_research_eligible(
+    connection: sqlite3.Connection,
+    *,
+    config: MainConfig,
+    policy: SourcePolicy,
+    now: str,
+) -> int:
+    rows = connection.execute(
+        """
+        SELECT id
+          FROM person
+         WHERE merged_into_person_id IS NULL
+        """
+    ).fetchall()
+    return sum(
+        1
+        for row in rows
+        if is_coverage_research_eligible(
+            connection,
+            person_id=int(row["id"]),
+            config=config,
+            policy=policy,
+            now=now,
+        )
+    )

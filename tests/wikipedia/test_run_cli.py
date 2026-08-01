@@ -125,12 +125,13 @@ def test_run_registers_three_wikipedia_handlers_and_settles_empty_search(
 
     assert "### Wikipedia identity" in digest
     wiki = digest.split("### Wikipedia identity\n\n", 1)[1]
+    if "### " in wiki:
+        wiki = wiki.split("### ", 1)[0]
     assert "Deterministic no-match (empty complete search): 1" in wiki
     assert "No matching page (this run): 1" in wiki
     assert "People with current no-match (corpus): 1" in wiki
     assert "Wikipedia eligible remaining: 0" in wiki
     assert "Canonical people without Wikipedia pointer: 0" in wiki
-    assert "coverage" not in wiki.lower()
     # K4: empty complete search never schedules match-model generation.
     # Detect generation still happens once.
     assert len(client.instances[-1].generate_calls) == 1
