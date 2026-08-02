@@ -155,7 +155,7 @@ def test_detection_uses_prepare_returned_pricing_not_handler_default(
     """
     bootstrap = insert_run(connection)
     item = _seed_source_item(connection, run_id=bootstrap)
-    max_input = 4415
+    max_input = 4428
     max_completion = 512
     config = _main_config(
         hard_budget=True,
@@ -259,7 +259,7 @@ openrouter_usd_per_run = "2.50"
 
 [tasks.detect_people]
 model = "openai/gpt-test"
-max_input_tokens = 4415
+max_input_tokens = 4428
 max_completion_tokens = 512
 max_people = 3
 """
@@ -403,7 +403,11 @@ def test_unseen_references_rejected_in_execute_not_only_persist(
         execute(work_item, 1, prepared)
     assert raised.value.category is FailureCategory.MALFORMED_RESPONSE
     assert raised.value.retryable is True
-    assert raised.value.detail == MALFORMED_DETECTION_DETAIL
+    # A0 appends the reason; the rule under test is that the unseen reference
+    # is what rejected the response, which the reason now names explicitly.
+    assert raised.value.detail == (
+        f"{MALFORMED_DETECTION_DETAIL}: mention[1]: unseen passage id p99"
+    )
     # Persist must not re-validate: it only accepts prevalidated payloads.
     # Engine path: permanent failure after retries, no completed observation body.
     client2 = ScriptedLlmClient(
@@ -672,7 +676,8 @@ def test_failure_detail_and_logs_exclude_raw_model_output_and_secrets(
         with pytest.raises(ProviderFailure) as raised:
             execute(work_item, 1, prepared)
     failure = raised.value
-    assert failure.detail == MALFORMED_DETECTION_DETAIL
+    # The reason is appended (A0), but the payload must never be.
+    assert (failure.detail or "").startswith(MALFORMED_DETECTION_DETAIL)
     assert sentinel_body not in (failure.detail or "")
     assert "SECRET_MODEL_BODY" not in (failure.detail or "")
     assert "SECRET_MODEL_BODY" not in str(failure)

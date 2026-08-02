@@ -21,6 +21,7 @@ from notable_person_finder.config.models import (
     TasksConfig,
 )
 from notable_person_finder.people.detection import (
+    DetectionValidationError,
     build_detection_input,
     render_detection_request,
 )
@@ -89,7 +90,7 @@ def _main_config(
     model: str = MODEL,
     hard_budget: bool = False,
     budget_usd: str | None = None,
-    max_input_tokens: int = 4415,
+    max_input_tokens: int = 4428,
     max_completion_tokens: int = 512,
     max_people: int = 3,
 ) -> MainConfig:
@@ -896,7 +897,7 @@ def test_dynamic_reservation_under_hard_budget(
     item = _seed_source_item(connection, run_id=bootstrap)
     config = _main_config(
         hard_budget=True,
-        max_input_tokens=4415,
+        max_input_tokens=4428,
         max_completion_tokens=512,
     )
     profile = _profile()
@@ -907,7 +908,7 @@ def test_dynamic_reservation_under_hard_budget(
     )
     # The rendered request must be strictly smaller than the ceiling, or this
     # test cannot tell the two apart.
-    assert input_tokens < 4415
+    assert input_tokens < 4428
     expected_reservation = prompt_price * input_tokens + completion_price * 512
     client = ScriptedLlmClient(
         inspection=_compatible_inspection(
@@ -1114,7 +1115,8 @@ def test_malformed_validation_failure_detail_excludes_raw_output() -> None:
     failure = raised.value
     assert failure.category is FailureCategory.MALFORMED_RESPONSE
     assert failure.retryable is True
-    assert failure.detail == MALFORMED_DETECTION_DETAIL
+    # The reason is appended (A0), but the payload must never be.
+    assert (failure.detail or "").startswith(MALFORMED_DETECTION_DETAIL)
     assert sentinel not in (failure.detail or "")
     assert "SECRET_MODEL_BODY" not in (failure.detail or "")
     assert "SECRET_MODEL_BODY" not in str(failure)
@@ -1239,7 +1241,7 @@ def test_budget_refusal_defers_without_generation(
     config = _main_config(
         hard_budget=True,
         budget_usd="0.000001",
-        max_input_tokens=4415,
+        max_input_tokens=4428,
         max_completion_tokens=1024,
     )
     profile = _profile()
@@ -1564,3 +1566,41 @@ def test_seed_untriaged_skips_already_triaged(
 
     seed_untriaged(connection, run_id=run_id, config=config, profile=profile, now=NOW)
     assert len(_detect_work_rows(connection, source_item_id=usable)) == 1
+
+
+def test_validation_detail_names_the_rule_that_rejected_the_response() -> None:
+    """Kills discarding the domain-validation reason (A0).
+
+    Before this, `detail_json` was empty and the log carried only
+    `failure_category`, so diagnosing why a response was rejected cost a live
+    replay of every failing item.
+    """
+    from notable_person_finder.providers.failures import validation_detail
+
+    detail = validation_detail(
+        MALFORMED_DETECTION_DETAIL,
+        DetectionValidationError("mention[1] f2: value is not grounded"),
+    )
+    assert detail == ("invalid detection output: mention[1] f2: value is not grounded")
+
+
+def test_validation_detail_carries_no_supplied_or_model_prose() -> None:
+    """Positive control for the test above.
+
+    The reason may be persisted only because every variable part is either
+    application-supplied or a pydantic-bounded `local_id`. If a message ever
+    carried article text or a secret, persisting it would be a leak.
+    """
+    from notable_person_finder.providers.failures import validation_detail
+
+    secret = "SECRET_MODEL_BODY_SHOULD_NOT_LEAK"
+    detail = validation_detail(
+        MALFORMED_DETECTION_DETAIL,
+        DetectionValidationError("mention[1] f2: value is not grounded"),
+    )
+    assert secret not in detail
+    assert "sculpture" not in detail
+    # An empty reason must not leave a dangling separator.
+    assert validation_detail(MALFORMED_DETECTION_DETAIL, ValueError("")) == (
+        MALFORMED_DETECTION_DETAIL
+    )

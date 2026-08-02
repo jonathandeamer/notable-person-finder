@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Proposed |
+| **Status** | Implemented (A2 withdrawn) |
 | **Date** | 2026-08-02 |
 | **Author** | (design agent) |
 | **Branch** | `fix/model-output-validation` (proposed) |
@@ -159,16 +159,45 @@ into coverage research instead of dying at `failed_permanent`.
 
 The domain validator keeps its rule as defence in depth.
 
-### A2 — Outcome and selected-id nullability become a discriminated union
+### A2 — WITHDRAWN: the outcome/selected-id pairing cannot be expressed
 
-Both `match_schema()` and `resolution_schema()` currently type their selected
-id as `integer | null` with no dependency on `outcome`, so
-`outcome=no_matching_page` with a non-null `selected_page_id` is structurally
-valid and then rejected.
+**Proposed, implemented, and withdrawn after live verification.** Kept here
+because the negative result is the reusable finding.
 
-Both become a two-branch discriminated union on `outcome`, exactly as
-`_pair_signal_kind_with_category` already does for detection signals — a
-pattern already verified live to be accepted by strict structured output.
+The intent was sound: both `match_schema()` and `resolution_schema()` type
+their selected id as `integer | null` with no dependency on `outcome`, so
+`outcome=no_matching_page` carrying a non-null `selected_page_id` is
+structurally valid and rejected only after payment. A two-branch discriminated
+union on `outcome` would make it unrepresentable.
+
+It cannot be sent. **Strict structured output requires the root schema to be
+`type: "object"` and answers HTTP 400 to a root-level `anyOf`.** Probed
+directly against the live provider on 2026-08-02:
+
+| Root shape | Result |
+| --- | --- |
+| root `anyOf` (the union as built) | **REJECTED, HTTP 400** |
+| plain object root, reduced `outcome` enum (A1 alone) | ACCEPTED |
+| object root with nested `anyOf` on a property | ACCEPTED |
+
+The distinction is **nesting, not unions**.
+`_pair_signal_kind_with_category` works because the signal union sits inside
+`mentions.items.signals.items`; the outcome/selected-id dependency is between
+two *root* properties and has nowhere to nest. Strict mode supports neither
+`if`/`then` nor `dependentSchemas`.
+
+The pairing therefore remains a domain-validator rule, and
+`test_match_schema_root_is_an_object_not_a_union` /
+`test_resolution_schema_root_is_an_object_not_a_union` pin the root shape so
+the union is not reintroduced.
+
+**This bounds the governing pattern.** "Express a validator rule in the schema
+wherever strict mode can carry it" is right, but strict mode cannot carry a
+dependency between two root-level properties. Restructuring the output model to
+nest them was considered and rejected as disproportionate: it would move the
+persisted output shape and every fingerprint derived from it, to prevent a
+failure mode that was never observed in the run — cause A, not this, is what
+actually failed.
 
 ### A3 — Grounding is checked against every supplied passage, not only cited ones
 

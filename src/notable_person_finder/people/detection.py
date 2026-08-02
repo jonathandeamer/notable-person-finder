@@ -115,7 +115,7 @@ def build_detection_input(
     title = title_bounded
     summary = summary_bounded
     value = make_value(title, summary)
-    if _fixed_request_tokens() > config.max_input_tokens:
+    if _fixed_request_tokens(config.max_people) > config.max_input_tokens:
         raise ValueError(
             "max_input_tokens cannot fit the fixed prompt, schema, and chat framing"
         )
@@ -146,7 +146,18 @@ def build_detection_input(
     return value
 
 
-def detection_schema() -> dict[str, object]:
+def detection_schema(*, max_people: int) -> dict[str, object]:
+    """The detection output schema, capped at `max_people` mentions.
+
+    `_domain_validation_status` rejects a response returning more mentions
+    than the supplied cap, but the schema declared no `maxItems`, so the
+    overrun was structurally valid: the call was paid for and then discarded.
+    Expressing the cap makes it unrepresentable.
+
+    This is why the schema is config-dependent and callers must pass the
+    configured value rather than a constant -- a fixed cap here would drift
+    from `max_people` silently.
+    """
     schema = DetectionOutput.model_json_schema(mode="validation")
     definitions = schema.get("$defs", {})
     passage_reference_schema: dict[str, object] = {"enum": ["p1", "p2"]}
@@ -216,7 +227,22 @@ def detection_schema() -> dict[str, object]:
         "p": passage_ids_schema,
         "t": bounded_text_schema,
     }
-    return _pair_signal_kind_with_category(compacted)
+    return _cap_mentions(_pair_signal_kind_with_category(compacted), max_people)
+
+
+def _cap_mentions(schema: dict[str, object], max_people: int) -> dict[str, object]:
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return schema
+    mentions = properties.get("mentions")
+    if not isinstance(mentions, dict):
+        return schema
+    result = dict(schema)
+    result["properties"] = {
+        **properties,
+        "mentions": {**mentions, "maxItems": max_people},
+    }
+    return result
 
 
 def _pair_signal_kind_with_category(schema: dict[str, object]) -> dict[str, object]:
@@ -435,7 +461,16 @@ def _literal_is_grounded(
     references: tuple[str, ...],
     passages: dict[str, str],
 ) -> bool:
-    """Is this fact value present verbatim in one of its cited passages?
+    """Is this fact value present verbatim in any supplied passage?
+
+    Searches every supplied passage, not only the ones the model cited. A
+    citation naming the wrong passage is a presentation error; quoting text
+    that was never supplied is invention, and only the second is worth
+    discarding a paid response for. Observed live: `profession_or_role
+    "Artists"` cited to the summary passage while the word appears in the
+    title passage, which failed 3 of 3 replays because the role word and the
+    person names live in different passages. `_reference_error` still rejects
+    a citation naming an unknown passage id, so citations remain validated.
 
     Compared case-insensitively. Feed titles are overwhelmingly title-cased and
     the model quotes them back in sentence case, so a case-sensitive test
@@ -444,13 +479,15 @@ def _literal_is_grounded(
     'Starring ...'. That false negative discards the whole response after the
     call has been paid for, and recurs across every title-cased headline.
 
-    Case folding cannot admit invention: the text must still appear verbatim.
-    `_is_grounded_name` deliberately stays case-sensitive, because `exact_name`
-    is persisted as the person's name and a lowercased proper noun there is a
-    worse artifact rather than a presentation difference.
+    Neither widening can admit invention: the text must still appear verbatim
+    in text this application supplied. `_is_grounded_name` deliberately stays
+    case-sensitive, because `exact_name` is persisted as the person's name and
+    a lowercased proper noun there is a worse artifact rather than a
+    presentation difference.
     """
+    del references
     folded = value.casefold()
-    return any(folded in passages[reference].casefold() for reference in references)
+    return any(folded in passage.casefold() for passage in passages.values())
 
 
 def _outcome_consistency_error(output: DetectionOutput) -> str | None:
@@ -538,9 +575,9 @@ def _worst_case_input_tokens(value: DetectionInput) -> int:
     return _token_bearing_utf8_bytes(value) + DETECTION_CHAT_FRAMING_TOKEN_ALLOWANCE
 
 
-def _fixed_request_tokens() -> int:
+def _fixed_request_tokens(max_people: int) -> int:
     prompt = _system_prompt()
-    schema_json = _canonical_json(detection_schema())
+    schema_json = _canonical_json(detection_schema(max_people=max_people))
     return (
         len(prompt.encode("utf-8"))
         + len(schema_json.encode("utf-8"))
@@ -553,7 +590,7 @@ def _render_parts(
 ) -> tuple[str, str, dict[str, object], str]:
     prompt = _system_prompt()
     user_json = _canonical_json(value.model_dump(mode="json"))
-    schema = detection_schema()
+    schema = detection_schema(max_people=value.max_people)
     schema_json = _canonical_json(schema)
     return prompt, user_json, schema, schema_json
 

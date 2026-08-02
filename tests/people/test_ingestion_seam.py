@@ -56,7 +56,7 @@ def _main_config() -> MainConfig:
         tasks=TasksConfig(
             detect_people=DetectPeopleConfig(
                 model=MODEL,
-                max_input_tokens=4415,
+                max_input_tokens=4428,
                 max_completion_tokens=512,
                 max_people=3,
             )
