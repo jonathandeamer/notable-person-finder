@@ -203,6 +203,47 @@ Not built at all, so do not document, import, or assume any of it:
 Known gaps carried forward, recorded so a later change does not mistake them
 for regressions:
 
+- **Budget reservation charges the configured ceiling, not the real request,
+  so a USD cap throttles at a small fraction of its nominal value.** The
+  reserve for one generation is `max_input_tokens * prompt_price +
+  max_completion_tokens * completion_price`. That is wrong twice over:
+  `max_input_tokens` is a worst-case **UTF-8 byte** ceiling being charged as a
+  **token** count (~4x over), and the worst case is charged rather than the
+  actual request (~8x over). Measured on the first ten-feed run: reserved
+  $0.9679 against $0.0539 actually spent, roughly 31x over-reservation on a
+  ~$0.0017 average `detect_people` call, which deferred 219 items
+  `not_evaluated_budget` while only 5% of the cap was really used. Processing
+  that run's 236 source items needs a nominal cap near $12.70 for about $0.40
+  of real spend. Raising `max_input_tokens` to 65536 (see the entry below)
+  multiplied the per-call reserve by exactly 7, from $0.00768 to $0.05376 — it
+  made this pre-existing flaw visible, it did not create it. Do not "fix" this
+  by lowering the input budgets: 13,141 bytes is the measured `detect_people`
+  floor and `match_wikipedia_identity`'s worst case is near 16k with a hard
+  `ValueError`. The real fix is to reserve against the rendered request's
+  actual size, which is already computed as `token_bearing_utf8_bytes` on each
+  rendered request, and it needs its own design. Until then, set
+  `openrouter_usd_per_run` well above expected real spend; actual cost stays
+  bounded by the per-task character caps regardless of the cap value.
+- **`detect_people` fails model-output validation on a material share of real
+  feed content.** The first ten-feed run produced 17 `malformed_response`
+  failures, of which 6 `detect_people` items exhausted retries and settled
+  `failed_permanent` — 6 of 31 items triaged. The retry coordinator works and
+  most attempts recovered, so this is an output-validity problem rather than a
+  transport one. It never appeared against a single feed; it took nine
+  publishers' worth of content variety to surface. Not yet diagnosed.
+- **Re-seeded `resolve_person_entity` work can fail permanently where the
+  scheduler would have succeeded deterministically.** In the same run,
+  mentions 3 and 5 — both already resolved by an earlier run, then re-seeded
+  because raising `max_input_tokens` changed the resolve fingerprint — settled
+  `failed_permanent` with `prepare raised ValueError`. The scheduler handles an
+  empty candidate set by writing the deterministic `created_new` outcome
+  (`people/service.py:2257`), but the prepare path calls `build_resolve_input`,
+  which raises on that same condition (`people/resolution.py:63`, "resolve
+  model path requires at least one candidate"). The exact trigger is not
+  confirmed and needs systematic debugging; what is confirmed is that the two
+  paths disagree about whether an empty candidate set is routine or fatal.
+  This matters beyond fingerprint changes, since any config change that moves
+  a task fingerprint re-seeds already-settled work.
 - **`notable audit person` does not yet render the complete K11 forensic
   record.** Although the repository loads some of these fields, the command
   currently omits each sourced name's `search_name` and `match_key`; each
@@ -238,6 +279,17 @@ for regressions:
   budget reservation path has now met live pricing. Note `tests/people`'s
   live smokes assert but print no provenance record, unlike the other three
   suites; recording there is still by hand.
+- **Closed 2026-08-02: all ten configured feeds have been fetched for real.**
+  The live ingestion smokes only ever exercise two (`artnet-news` and, for the
+  redirect assertion alone, `hyperallergic`), so the feedparser adapter,
+  canonical URL identity, and publisher-key derivation had never met the other
+  eight publishers' RSS dialects. A `notable run` over the full
+  `config/discovery-feeds.example.toml` set fetched 9 and took one 304 Not
+  Modified, with **0 feeds failed**, producing 236 source items and 236
+  articles. Ingestion is the one layer now exercised against every configured
+  publisher. Note this says nothing about the feeds' *content* passing
+  detection — see the `detect_people` malformed-output gap above, which only
+  appeared once these nine publishers were in play.
 - **The six previously-stub `tests/coverage` files now have real bodies**
   (`test_run_cli.py`, `test_seams.py`, `test_digest_status.py`, and the three
   live smokes), so the CLI-registration, cross-component-seam, digest, and
