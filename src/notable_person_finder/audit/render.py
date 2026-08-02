@@ -9,7 +9,12 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
-from notable_person_finder.audit.models import RunAudit, RunHeader
+from notable_person_finder.audit.models import (
+    AttemptAudit,
+    AttemptLine,
+    RunAudit,
+    RunHeader,
+)
 
 # Section key -> the migration that introduced the table it depends on, used
 # only to word the "section unavailable" fallback line (K3).
@@ -211,5 +216,91 @@ def render_run_audit(audit: RunAudit) -> str:
         )
         lines.append(f"  entry_count: {entry_count}")
         lines.append(f"  see: notable digest show {audit.run.id}")
+
+    return "\n".join(lines) + "\n"
+
+
+_NO_RESULT_ROW_TEXT = (
+    "no persisted result row; the attempt is the only durable evidence of this call"
+)
+
+
+def _format_attempt_line(prefix: str, attempt: AttemptLine) -> list[str]:
+    lines: list[str] = []
+    outcome = attempt.outcome or "in flight"
+    failure = (
+        f" failure_category={attempt.failure_category}"
+        if attempt.failure_category
+        else ""
+    )
+    provider_status = (
+        "n/a" if attempt.provider_status is None else str(attempt.provider_status)
+    )
+    latency_ms = "n/a" if attempt.latency_ms is None else str(attempt.latency_ms)
+    response_bytes = (
+        "n/a" if attempt.response_bytes is None else str(attempt.response_bytes)
+    )
+    destination_host = attempt.destination_host or "n/a"
+    lines.append(
+        f"{prefix}#{attempt.id} work_item={attempt.work_item_id} "
+        f"ordinal={attempt.ordinal} "
+        f"{attempt.provider}/{attempt.operation}: {outcome}{failure}"
+    )
+    lines.append(
+        f"{prefix}  provider_status={provider_status} latency_ms={latency_ms} "
+        f"response_bytes={response_bytes} destination_host={destination_host}"
+    )
+    lines.append(
+        f"{prefix}  reserved={_format_nano_usd(attempt.reserved_nano_usd)} "
+        f"actual={_format_nano_usd(attempt.actual_nano_usd)}"
+    )
+    return lines
+
+
+def render_attempt_audit(audit: AttemptAudit) -> str:
+    lines: list[str] = []
+
+    lines.append("Attempt")
+    lines.extend(_format_attempt_line("  ", audit.attempt))
+    lines.append("")
+
+    lines.append("Work item")
+    work_item = audit.work_item
+    reason = work_item.reason or "no reason recorded"
+    lines.append(f"  id: {work_item.id}")
+    lines.append(f"  task_type: {work_item.task_type}")
+    lines.append(f"  subject: {work_item.subject_kind}:{work_item.subject_id}")
+    lines.append(f"  fingerprint: {work_item.fingerprint}")
+    lines.append(f"  state: {work_item.state}")
+    lines.append(f"  reason: {reason}")
+    lines.append("")
+
+    lines.append("Retry history")
+    if not audit.retry_history:
+        lines.append("  none recorded")
+    else:
+        for retry in audit.retry_history:
+            lines.extend(_format_attempt_line("  ", retry))
+    lines.append("")
+
+    lines.append("Result")
+    if audit.binding is not None and not audit.binding.external:
+        # K10: a task type registered as making no external call has an
+        # attempt anyway -- a data inconsistency, not a missing result.
+        lines.append(
+            f"  data inconsistency: task_type {work_item.task_type!r} is "
+            "registered as making no external call (external=False), but "
+            "an attempt exists for it; no result is rendered"
+        )
+    else:
+        if audit.caveat is not None:
+            lines.append(f"  caveat: {audit.caveat}")
+        if audit.no_result_row:
+            lines.append(f"  {_NO_RESULT_ROW_TEXT}")
+        else:
+            for row in audit.result_rows:
+                for key in sorted(row.keys()):
+                    lines.append(f"    {key}: {row[key]}")
+                lines.append("  ---")
 
     return "\n".join(lines) + "\n"

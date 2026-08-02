@@ -382,3 +382,122 @@ def test_malformed_run_id_is_a_usage_error(
 
     assert status == cli_main.EXIT_USAGE
     assert capsys.readouterr().out == ""
+
+
+def _seed_attempt(connection, *, run_id: int, task_type: str = "detect_people") -> int:
+    connection.execute(
+        """
+        INSERT INTO work_item (
+            task_type, subject_kind, subject_id, fingerprint, required,
+            priority, eligible_at, state, created_by_run_id, created_at,
+            updated_at
+        ) VALUES (?, 'source_item', 1, ?, 1, 10, '2026-08-02T00:00:00Z',
+                  'succeeded', ?, '2026-08-02T00:00:00Z',
+                  '2026-08-02T00:00:00Z')
+        """,
+        (task_type, "d" * 64, run_id),
+    )
+    work_item_id = connection.execute(
+        "SELECT id FROM work_item WHERE fingerprint = ?", ("d" * 64,)
+    ).fetchone()[0]
+    connection.execute(
+        """
+        INSERT INTO attempt (
+            run_id, work_item_id, provider, operation, ordinal, started_at,
+            finished_at, outcome, request_fingerprint, reserved_nano_usd,
+            actual_nano_usd
+        ) VALUES (?, ?, 'openrouter', 'generate_structured', 1,
+                  '2026-08-02T00:00:00Z', '2026-08-02T00:00:01Z',
+                  'succeeded', ?, 0, 100)
+        """,
+        (run_id, work_item_id, "e" * 64),
+    )
+    attempt_id = connection.execute(
+        "SELECT id FROM attempt WHERE request_fingerprint = ?", ("e" * 64,)
+    ).fetchone()[0]
+    return attempt_id
+
+
+def test_attempt_from_another_run_is_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_file, connection = migrated_database(tmp_path)
+    try:
+        run_a = insert_run(connection)
+        run_b = insert_run(connection)
+        attempt_id = _seed_attempt(connection, run_id=run_a)
+        connection.commit()
+    finally:
+        connection.close()
+
+    # The attempt exists, but not in run_b. Answering with run_a's data
+    # would be a correctness bug dressed up as convenience.
+    status = cli_main.command_audit_run(
+        config_file,
+        run_id_argument=str(run_b),
+        attempt_id_argument=str(attempt_id),
+    )
+
+    captured = capsys.readouterr()
+    assert status == cli_main.EXIT_FAILED
+    assert captured.out == ""
+    assert str(attempt_id) in captured.err
+
+
+def test_attempt_without_a_result_row_says_so(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_file, connection = migrated_database(tmp_path)
+    try:
+        run_id = insert_run(connection)
+        attempt_id = _seed_attempt(connection, run_id=run_id)
+        connection.commit()  # no triage_observation inserted
+    finally:
+        connection.close()
+
+    status = cli_main.command_audit_run(
+        config_file, run_id_argument=str(run_id), attempt_id_argument=str(attempt_id)
+    )
+
+    out = capsys.readouterr().out
+    assert status == cli_main.EXIT_OK
+    assert "no persisted result row" in out
+
+
+def test_fetch_feed_attempt_carries_the_unattributable_caveat(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_file, connection = migrated_database(tmp_path)
+    try:
+        run_id = insert_run(connection)
+        attempt_id = _seed_attempt(connection, run_id=run_id, task_type="fetch_feed")
+        connection.commit()
+    finally:
+        connection.close()
+
+    cli_main.command_audit_run(
+        config_file, run_id_argument=str(run_id), attempt_id_argument=str(attempt_id)
+    )
+
+    out = capsys.readouterr().out
+    # feed_fetch records no attempt_id, so per-attempt attribution is
+    # impossible and must be disclosed rather than guessed by position.
+    assert "cannot be attributed to a single attempt" in out
+
+
+def test_malformed_attempt_id_is_a_usage_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_file, connection = migrated_database(tmp_path)
+    try:
+        run_id = insert_run(connection)
+        connection.commit()
+    finally:
+        connection.close()
+
+    status = cli_main.command_audit_run(
+        config_file, run_id_argument=str(run_id), attempt_id_argument="nope"
+    )
+
+    assert status == cli_main.EXIT_USAGE
+    assert capsys.readouterr().out == ""

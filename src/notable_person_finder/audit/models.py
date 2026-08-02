@@ -7,7 +7,10 @@ importing them.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+
+from notable_person_finder.audit.registry import ResultBinding
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,3 +123,14 @@ class RunAudit:
     budget: BudgetSummary
     reporting: ReportingResult | None
     unavailable_sections: tuple[str, ...]  # K3 schema guards
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptAudit:
+    attempt: AttemptLine
+    work_item: WorkItemLine
+    retry_history: tuple[AttemptLine, ...]
+    result_rows: tuple[Mapping[str, object], ...]
+    binding: ResultBinding | None
+    caveat: str | None  # set for fetch_feed
+    no_result_row: bool

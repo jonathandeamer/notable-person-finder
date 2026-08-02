@@ -16,8 +16,12 @@ from notable_person_finder.audit.digest_show import (
     locate_digest,
     read_verified_digest,
 )
-from notable_person_finder.audit.render import render_run_audit
-from notable_person_finder.audit.repository import load_run_audit
+from notable_person_finder.audit.render import render_attempt_audit, render_run_audit
+from notable_person_finder.audit.repository import (
+    AttemptScopeError,
+    load_attempt_audit,
+    load_run_audit,
+)
 from notable_person_finder.config.loader import (
     ConfigLoadError,
     ResolvedConfig,
@@ -1304,20 +1308,34 @@ def command_audit_run(
     run_id_argument: str,
     attempt_id_argument: str | None,
 ) -> int:
-    # attempt_id_argument is accepted now and ignored; Task 4 implements the
-    # `--attempt` drill-down without changing this signature.
-    del attempt_id_argument
     loaded = load_config(config_file, require_secrets=False)
     try:
         run_id = _parse_run_id_argument(run_id_argument)
     except ValueError:
         print(f"invalid run id: {run_id_argument}", file=sys.stderr)
         return EXIT_USAGE
+    attempt_id: int | None = None
+    if attempt_id_argument is not None:
+        try:
+            attempt_id = int(attempt_id_argument)
+        except ValueError:
+            print(f"invalid attempt id: {attempt_id_argument}", file=sys.stderr)
+            return EXIT_USAGE
     if not loaded.paths.database.exists():
         print("no run has been recorded yet", file=sys.stderr)
         return EXIT_FAILED
     connection = connect_database(loaded.paths.database, readonly=True)
     try:
+        if attempt_id is not None:
+            try:
+                attempt_audit = load_attempt_audit(
+                    connection, run_id=run_id, attempt_id=attempt_id
+                )
+            except AttemptScopeError as error:
+                print(str(error), file=sys.stderr)
+                return EXIT_FAILED
+            sys.stdout.write(render_attempt_audit(attempt_audit))
+            return EXIT_OK
         audit = load_run_audit(connection, run_id=run_id)
     finally:
         connection.close()
