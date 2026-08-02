@@ -225,25 +225,58 @@ for regressions:
   `openrouter_usd_per_run` well above expected real spend; actual cost stays
   bounded by the per-task character caps regardless of the cap value.
 - **`detect_people` fails model-output validation on a material share of real
-  feed content.** The first ten-feed run produced 17 `malformed_response`
-  failures, of which 6 `detect_people` items exhausted retries and settled
-  `failed_permanent` — 6 of 31 items triaged. The retry coordinator works and
-  most attempts recovered, so this is an output-validity problem rather than a
-  transport one. It never appeared against a single feed; it took nine
-  publishers' worth of content variety to surface. Not yet diagnosed.
-- **Re-seeded `resolve_person_entity` work can fail permanently where the
-  scheduler would have succeeded deterministically.** In the same run,
-  mentions 3 and 5 — both already resolved by an earlier run, then re-seeded
-  because raising `max_input_tokens` changed the resolve fingerprint — settled
-  `failed_permanent` with `prepare raised ValueError`. The scheduler handles an
-  empty candidate set by writing the deterministic `created_new` outcome
-  (`people/service.py:2257`), but the prepare path calls `build_resolve_input`,
-  which raises on that same condition (`people/resolution.py:63`, "resolve
-  model path requires at least one candidate"). The exact trigger is not
-  confirmed and needs systematic debugging; what is confirmed is that the two
-  paths disagree about whether an empty candidate set is routine or fatal.
-  This matters beyond fingerprint changes, since any config change that moves
-  a task fingerprint re-seeds already-settled work.
+  feed content. Diagnosed: three independent causes, one fixed.** The first
+  ten-feed run produced 17 `malformed_response` failures, 6 of them exhausting
+  retries — 6 of 31 items triaged. Replaying the six failing items against the
+  live model isolated the causes:
+  1. **Response truncation (fixed).** `max_completion_tokens` shipped at 1024
+     while `max_people` shipped at 8. One item measured 693, 713, 851, 960 and
+     962 completion tokens across repeated calls at `max_people = 3`; the
+     longer ones were cut off mid-string and the truncated JSON was rejected.
+     Output length varies per call, which is why this was intermittent and why
+     retries often recovered. `detect_people.max_completion_tokens` is now
+     4096, pinned by `tests/people/test_detection.py::
+     test_shipped_example_completion_budget_scales_with_max_people` at the
+     measured ~300 tokens per permitted mention. Raise it with `max_people`.
+  2. **Signal category/kind mismatch (not fixed — needs a design decision).**
+     `detection_schema()` flattens `AttentionCategory` and `CautionCategory`
+     into a single 12-value `category` enum with no dependency on the sibling
+     `kind` field, so `kind: "attention"` with a caution category is
+     structurally valid under strict structured output. The call is paid for,
+     then `people/detection.py:336-343` rejects the whole response with
+     "category does not match signal kind". This was the dominant failure in
+     replay (3 of 6 items). It cannot be fixed in the schema builder alone:
+     `GroundedSignal` (`people/models.py:126`) carries
+     `category: AttentionCategory | CautionCategory` alongside a separate
+     `kind`, so expressing the constraint on the wire needs a discriminated
+     union — a change to the domain model and the output contract.
+  3. **Ungrounded identity-fact values (not fixable in code).** The model
+     occasionally returns a fact value that is not a literal substring of its
+     cited passage, and `_literal_is_grounded` correctly rejects it. Seen once
+     in replay. This is model quality at `reasoning_effort = "low"`, and it
+     belongs to the unvalidated-model-choice gap: the Promptfoo comparison the
+     pricing research called for was never run.
+- **NOT A DEFECT — `resolve_person_entity` settling `failed_permanent` at a
+  refused prepare is specified behaviour.** An earlier revision of this file
+  recorded it as a bug; that was wrong, and the correction is kept here so it
+  is not "fixed" again. `docs/superpowers/specs/2026-07-30-durable-person-
+  identity-design.md` line 759 (restated at line 1368) requires prepare to call
+  `ensure_resolution_for_mention` first and *then* raise a plain `ValueError`
+  with the log-only prefix `resolve_prepare_refused:`, "so the engine settles
+  this **claimed** work item `failed_permanent` with no new attempt. That
+  permanent state is **accounting noise**, not a domain failure: the mention's
+  durable state was already fixed in step (1)."
+  `tests/people/test_resolution_service.py::
+  test_empty_at_prepare_ensure_then_value_error` and
+  `tests/people/test_reconsideration_service.py::test_missing_peer_prepare_
+  refuse` pin it deliberately. The observable cost is real but cosmetic: the
+  run reports operational failures and goes `partial` for work that in fact
+  completed, and any config change that moves a task fingerprint re-seeds
+  already-settled mentions and so re-triggers it. Making the engine settle a
+  refusal as `succeeded` (for example via a `PrepareRefused` exception the
+  engine recognises) would be a **change to an approved design**, not a fix,
+  and needs a design revision before implementation — not a remediation
+  branch.
 - **`notable audit person` does not yet render the complete K11 forensic
   record.** Although the repository loads some of these fields, the command
   currently omits each sourced name's `search_name` and `match_key`; each

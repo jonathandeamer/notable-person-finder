@@ -897,3 +897,33 @@ def test_shipped_example_input_budget_carries_saturated_content_untruncated() ->
     assert value.view.input_truncated is False
     assert value.view.title_truncated is False
     assert value.view.summary_truncated is False
+
+
+def test_shipped_example_completion_budget_scales_with_max_people() -> None:
+    """`max_completion_tokens` must fit the mentions `max_people` permits.
+
+    Each mention carries identity facts, signals and a rationale, and the item
+    carries its own rationale on top. Measured against real feed content at
+    `max_people = 3`, one item produced 693, 713, 851 and 962 completion tokens
+    across repeated calls. At the previously shipped 1024 the longer responses
+    were cut off mid-string, and the truncated JSON was rejected as
+    `malformed_response` -- intermittently, because output length varies per
+    call, which is why it survived every offline test and a single-feed live
+    run before appearing across nine publishers.
+
+    ~300 tokens per permitted mention is the measured rate (962 / 3), so the
+    ceiling must scale with `max_people` rather than being set independently.
+    """
+    import tomllib
+
+    example = tomllib.loads(
+        (
+            Path(__file__).resolve().parents[2] / "config" / "notable.example.toml"
+        ).read_text(encoding="utf-8")
+    )
+    config = DetectPeopleConfig.model_validate(example["tasks"]["detect_people"])
+
+    measured_tokens_per_mention = 300
+    assert (
+        config.max_completion_tokens >= measured_tokens_per_mention * config.max_people
+    )
