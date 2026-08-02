@@ -263,7 +263,7 @@ openrouter_usd_per_run = "2.50"
 
 [tasks.detect_people]
 model = "openai/gpt-test"
-max_input_tokens = 4415
+max_input_tokens = 4428
 max_completion_tokens = 512
 max_people = 3
 """

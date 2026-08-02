@@ -96,3 +96,21 @@ def parse_retry_after(value: str | None, *, now: datetime) -> int | None:
         target = target.replace(tzinfo=UTC)
     delta_ms = int((target - now).total_seconds() * 1000)
     return max(delta_ms, 0)
+
+
+def validation_detail(base: str, error: Exception) -> str:
+    """Attach a domain-validation reason to a `malformed_response` detail.
+
+    Safe to persist. Every variable part of a validation message is either
+    application-supplied (a mention index, an outcome name, the configured
+    cap) or a `local_id`, which pydantic has already constrained to
+    `^[a-z][a-z0-9_-]{0,63}$` before the message is built -- a bounded
+    lowercase identifier that can carry neither article prose nor a secret.
+    The untrusted payload itself stays discarded; only this reason is kept.
+
+    Without it nothing records *why* a response was rejected: `detail_json`
+    was empty and the log carried only `failure_category`, so diagnosing a
+    validation defect cost a live replay of every failing item.
+    """
+    reason = str(error).strip()
+    return f"{base}: {reason}" if reason else base

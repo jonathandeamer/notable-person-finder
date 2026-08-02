@@ -38,7 +38,11 @@ from notable_person_finder.people.service import (
     inspection_ready,
     routing_fingerprint,
 )
-from notable_person_finder.providers.failures import FailureCategory, ProviderFailure
+from notable_person_finder.providers.failures import (
+    FailureCategory,
+    ProviderFailure,
+    validation_detail,
+)
 from notable_person_finder.providers.mediawiki import (
     PAGE_FACTS_OPERATION,
     SEARCH_OPERATION,
@@ -2452,7 +2456,10 @@ def build_match_wikipedia_handler(
             truncated_unsafe_for_negative=plan.truncated_unsafe_for_negative,
             partial_retrieval=plan.partial_retrieval,
         )
-        rendered = render_match_request(match_input)
+        rendered = render_match_request(
+            match_input,
+            truncated_unsafe_for_negative=plan.truncated_unsafe_for_negative,
+        )
         request = StructuredGenerationRequest(
             model_id=model_id,
             system_prompt=rendered.system_prompt,
@@ -2545,14 +2552,15 @@ def _execute_match_for(
                 prepared.match_input,
                 truncated_unsafe_for_negative=prepared.truncated_unsafe_for_negative,
             )
-        except MatchValidationError:
+        except MatchValidationError as error:
+            detail = validation_detail(MALFORMED_MATCH_DETAIL, error)
             del raw_text, result
             raise ProviderFailure(
                 FailureCategory.MALFORMED_RESPONSE,
                 provider=OPENROUTER_PROVIDER,
                 operation=GENERATE_OPERATION,
                 retryable=True,
-                detail=MALFORMED_MATCH_DETAIL,
+                detail=detail,
             ) from None
         del raw_text
         payload = _MatchPersist(

@@ -55,57 +55,80 @@ Do not compensate by lowering the input budgets: 13,141 bytes is the measured
 with a hard `ValueError`. `max_input_tokens` is the render ceiling that
 produces `input_too_large` refusals; it is no longer the billing estimate.
 
-## `detect_people` fails model-output validation on real feed content
+## Model-output validation: what is fixed, and the one rule that cannot be
 
-Diagnosed: four independent causes, three fixed.
+All causes diagnosed by live replay of the failing items from the first
+ten-feed run and fixed on 2026-08-02. See
+`docs/superpowers/specs/2026-08-02-model-output-validation-design.md`.
 
-The first ten-feed run produced 17 `malformed_response` failures, 6 of them
-exhausting retries — 6 of 31 items triaged. Replaying the six failing items
-against the live model isolated the causes:
+Result on a re-run of the same 246-item corpus: `malformed_response` attempts
+fell 23 -> 7, match permanent failures 6 -> 0, and the pipeline reached
+coverage research and produced a real shortlist for the first time.
 
-1. **Response truncation (fixed).** `max_completion_tokens` shipped at 1024
-   while `max_people` shipped at 8. One item measured 693, 713, 851, 960 and
-   962 completion tokens across repeated calls at `max_people = 3`; the longer
-   ones were cut off mid-string and the truncated JSON was rejected. Output
-   length varies per call, which is why this was intermittent and why retries
-   often recovered. `detect_people.max_completion_tokens` is now 4096, pinned
-   by `tests/people/test_detection.py::
-   test_shipped_example_completion_budget_scales_with_max_people` at the
-   measured ~300 tokens per permitted mention. Raise it with `max_people`.
-2. **Signal category/kind mismatch (fixed).** `detection_schema()` flattened
-   `AttentionCategory` and `CautionCategory` into a single 12-value `category`
-   enum with no dependency on the sibling `kind`, so `kind: "attention"` with a
-   caution category was structurally valid under strict structured output: the
-   call was paid for, then `people/detection.py` rejected the whole response.
-   This was the dominant cause in replay, 3 of 6 items.
-   `_pair_signal_kind_with_category` now emits a two-branch discriminated
-   union, verified live to be accepted by strict mode and to make the invalid
-   pairing unrepresentable. The domain validator stays as defence in depth. The
-   union costs 319 schema bytes, which raised the fixed request floor from
-   3,065 to 3,384 and is why several test fixtures moved from
-   `max_input_tokens=4096` to `4415` — the same free space as before, so every
-   truncation test keeps its intent.
-3. **Ungrounded identity-fact values (fixed).** Not model invention, as first
-   assumed. Feed titles are title-cased and the model quotes them back in
-   sentence case: observed live as `'starring Michael B. Jordan as a Notorious
-   Art Thief'` against a passage reading `'Starring ...'`, the same text
-   differing in one letter's case. `_literal_is_grounded` now compares
-   case-insensitively, which cannot admit invention because the text must still
-   appear verbatim. `_is_grounded_name` stays case-sensitive on purpose:
-   `exact_name` is persisted as the person's name, so a lowercased proper noun
-   there is a worse artifact, not a presentation difference.
-4. **Mention cap overrun (found, not fixed).** With 1-3 fixed, one item still
-   fails with "mentions exceed supplied mention cap 3": the schema sets no
-   `maxItems` on `mentions`, so the model may return more than `max_people` and
-   the response is discarded after payment. Fixing it means making
-   `detection_schema()` depend on `max_people`, which makes the schema hash
-   config-dependent and moves every fingerprint derived from it — real surface,
-   not a contained fix.
+Fixed:
 
-The pattern across all four is the finding worth carrying: **the detection
-schema systematically under-constrains rules the domain validator enforces, and
-every rule left unexpressed is paid for before it is rejected.** Prefer
-expressing a validator rule in the schema wherever strict mode can carry it.
+1. **Response truncation.** `max_completion_tokens` shipped at 1024 against
+   `max_people` 8; now 4096, pinned by `tests/people/test_detection.py::
+   test_shipped_example_completion_budget_scales_with_max_people`. Raise it
+   with `max_people`.
+2. **Signal category/kind mismatch.** `_pair_signal_kind_with_category` emits a
+   two-branch discriminated union so the invalid pairing is unrepresentable.
+3. **Ungrounded identity-fact values — two separate causes.** Case: feed titles
+   are title-cased and the model quotes them in sentence case, so
+   `_literal_is_grounded` compares case-insensitively. Citation: the value was
+   checked only against the passages the model *cited*, so `"Artists"` —
+   present in the title passage but cited to the summary passage — was
+   rejected (3 of 3 replays). It now searches every supplied passage. Neither
+   widening can admit invention: the text must still appear verbatim in
+   application-supplied text, and `_reference_error` still rejects an unknown
+   passage id. `_is_grounded_name` stays case-sensitive on purpose.
+4. **Mention cap overrun.** `detection_schema()` now takes `max_people` and
+   emits `maxItems`. This makes the schema config-dependent, which is why the
+   detection fixed floor moved 3384 -> 3397 and fixtures moved 4415 -> 4428.
+5. **`no_matching_page` offered when the validator forbids it.** The severe
+   one: `capped = uncapped_count > max_candidates` (default 8) held for 111 of
+   118 plans, so the negative outcome was forbidden almost always while the
+   schema still offered it. Six people failed permanently, 12 attempts, zero
+   recoveries — retries re-send byte-identical input. `match_schema()` now
+   omits the outcome when truncated, forcing `uncertain`, which is
+   coverage-eligible. **This is why the earlier run produced zero digest
+   entries: `no_matching_page_found` was unreachable and coverage research is
+   gated on it.**
+
+**Cannot be expressed, do not retry: the outcome/selected-id pairing.**
+`matching_page` must carry `selected_page_id` and other outcomes must leave it
+null (same for resolution's `same_person`). A root-level discriminated union
+would make the invalid pairing unrepresentable — and **strict structured
+output rejects it with HTTP 400, because the root must be `type: "object"`**.
+Probed live 2026-08-02: root `anyOf` REJECTED, plain object root ACCEPTED,
+nested `anyOf` on a property ACCEPTED. Detection's signal union works only
+because it is *nested*; this dependency is between two root properties and has
+nowhere to nest, and strict mode supports neither `if`/`then` nor
+`dependentSchemas`. The pairing stays a domain-validator rule.
+`test_match_schema_root_is_an_object_not_a_union` and its resolution twin pin
+the root shape.
+
+The governing pattern, now bounded: **the schema systematically
+under-constrains rules the domain validator enforces, and every rule left
+unexpressed is paid for before it is rejected — so express a validator rule in
+the schema wherever strict mode can carry it, but strict mode cannot carry a
+dependency between two root-level properties.**
+
+## `uncertain_identity` now absorbs most true negatives
+
+Not a defect; a consequence of the fix above, recorded so the skew is not
+mistaken for a model problem.
+
+Because truncation fires on 111 of 118 plans, a model that would honestly say
+"no page exists" must now answer `uncertain`. Measured on the verification run:
+`uncertain_identity` 25 versus `no_matching_page_found` 4, and 4 of the 5
+shortlist entries are `uncertain_identity`.
+
+Nothing is lost — both outcomes are coverage-eligible — but the distinction
+between "definitely absent" and "cannot tell" is largely collapsed. The lever
+is `max_candidates`, which at 8 is binding almost always. Raising it would let
+more plans answer definitively, at a retrieval-cost and prompt-size tradeoff
+that deserves its own look rather than a quiet bump.
 
 ## `notable audit person` does not render the complete K11 forensic record
 

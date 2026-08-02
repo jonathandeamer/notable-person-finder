@@ -108,7 +108,11 @@ from notable_person_finder.people.resolution import (
     resolution_prompt_and_schema_hashes,
     validate_resolution_output,
 )
-from notable_person_finder.providers.failures import FailureCategory, ProviderFailure
+from notable_person_finder.providers.failures import (
+    FailureCategory,
+    ProviderFailure,
+    validation_detail,
+)
 from notable_person_finder.providers.openrouter import (
     GENERATE_OPERATION,
     INSPECT_OPERATION,
@@ -718,8 +722,13 @@ def _adjudicate(
     )
 
 
-def _detection_prompt_and_schema_hashes() -> tuple[str, str, int]:
-    """Stable hashes for permanent-preflight failed triage observations."""
+def _detection_prompt_and_schema_hashes(config: MainConfig) -> tuple[str, str, int]:
+    """Hashes for permanent-preflight failed triage observations.
+
+    Config-dependent: the detection schema now expresses `max_people` as a
+    `maxItems` cap, so a change to that bound changes the schema actually
+    sent and must move the fingerprints derived from it.
+    """
     prompt = (
         resources.files("notable_person_finder.people")
         .joinpath("prompts", "detect_people.md")
@@ -727,7 +736,9 @@ def _detection_prompt_and_schema_hashes() -> tuple[str, str, int]:
     )
     schema_envelope = json.dumps(
         {
-            "schema": detection_schema(),
+            "schema": detection_schema(
+                max_people=config.tasks.detect_people.max_people
+            ),
             "schema_version": DETECTION_SCHEMA_VERSION,
         },
         sort_keys=True,
@@ -822,7 +833,7 @@ def _settle_dependents(
     resolve_schema_version: int | None = None
     if DETECT_PEOPLE_TASK_TYPE in task_types:
         detect_prompt_hash, detect_schema_hash, detect_schema_version = (
-            _detection_prompt_and_schema_hashes()
+            _detection_prompt_and_schema_hashes(config)
         )
     if (
         RESOLVE_PERSON_ENTITY_TASK_TYPE in task_types
@@ -1316,7 +1327,9 @@ def schedule_source_items(
     required ``detect_people`` work idempotently under a material fingerprint
     and ensure current-run model inspection exists.
     """
-    prompt_hash, schema_hash, schema_version = _detection_prompt_and_schema_hashes()
+    prompt_hash, schema_hash, schema_version = _detection_prompt_and_schema_hashes(
+        config
+    )
     needs_inspection = False
     for source_item_id in source_item_ids:
         if _schedule_one_source_item(
@@ -1423,14 +1436,15 @@ def _execute_detection_for(
             )
         try:
             output = validate_detection_output(raw_text, prepared.detection_input)
-        except DetectionValidationError:
+        except DetectionValidationError as error:
+            detail = validation_detail(MALFORMED_DETECTION_DETAIL, error)
             del raw_text, result
             raise ProviderFailure(
                 FailureCategory.MALFORMED_RESPONSE,
                 provider=PROVIDER,
                 operation=GENERATE_OPERATION,
                 retryable=True,
-                detail=MALFORMED_DETECTION_DETAIL,
+                detail=detail,
             ) from None
         del raw_text
         payload = _DetectionPersist(
@@ -1543,7 +1557,9 @@ def _persist_detection_failure_for(
             raise RuntimeError(
                 f"source item {source_item_id} missing during detection failure persist"
             )
-        prompt_hash, schema_hash, schema_version = _detection_prompt_and_schema_hashes()
+        prompt_hash, schema_hash, schema_version = _detection_prompt_and_schema_hashes(
+            config
+        )
         try:
             detection_input = build_detection_input(
                 record,
@@ -2365,14 +2381,15 @@ def _execute_resolution_for(
             )
         try:
             output = validate_resolution_output(raw_text, prepared.resolve_input)
-        except ResolutionValidationError:
+        except ResolutionValidationError as error:
+            detail = validation_detail(MALFORMED_RESOLUTION_DETAIL, error)
             del raw_text, result
             raise ProviderFailure(
                 FailureCategory.MALFORMED_RESPONSE,
                 provider=PROVIDER,
                 operation=GENERATE_OPERATION,
                 retryable=True,
-                detail=MALFORMED_RESOLUTION_DETAIL,
+                detail=detail,
             ) from None
         del raw_text
         payload = _ResolutionPersist(
@@ -3201,14 +3218,15 @@ def _execute_reconsideration_for(
             )
         try:
             output = validate_resolution_output(raw_text, prepared.resolve_input)
-        except ResolutionValidationError:
+        except ResolutionValidationError as error:
+            detail = validation_detail(MALFORMED_RESOLUTION_DETAIL, error)
             del raw_text, result
             raise ProviderFailure(
                 FailureCategory.MALFORMED_RESPONSE,
                 provider=PROVIDER,
                 operation=GENERATE_OPERATION,
                 retryable=True,
-                detail=MALFORMED_RESOLUTION_DETAIL,
+                detail=detail,
             ) from None
         del raw_text
         payload = _ReconsiderPersist(

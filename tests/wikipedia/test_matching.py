@@ -704,3 +704,72 @@ def test_match_schema_requires_every_property_for_strict_structured_output() -> 
     root_required = schema["required"]
     assert isinstance(root_required, list)
     assert "selected_page_id" in root_required
+
+
+def test_match_schema_omits_no_matching_page_when_truncated() -> None:
+    """Kills offering an outcome the domain validator forbids.
+
+    A model shown `max_candidates` of N candidates cannot safely assert that
+    no page exists, and `_domain_validation_error` rejects it. Leaving the
+    outcome in the enum meant the model returned the honest answer, the call
+    was paid for, and the response was discarded -- 6 of 6 people failed
+    permanently this way, with retries unable to recover.
+    """
+    properties = match_schema(truncated_unsafe_for_negative=True)["properties"]
+    assert isinstance(properties, dict)
+    outcome = properties["outcome"]
+    assert isinstance(outcome, dict)
+    outcomes = set(outcome["enum"])
+    assert "no_matching_page" not in outcomes
+    assert outcomes == {"matching_page", "uncertain"}
+
+
+def test_match_schema_offers_no_matching_page_when_not_truncated() -> None:
+    """Positive control for the test above.
+
+    Without this, that assertion would pass if the outcome were removed
+    unconditionally -- which would make a true negative unreportable.
+    """
+    properties = match_schema(truncated_unsafe_for_negative=False)["properties"]
+    assert isinstance(properties, dict)
+    outcome = properties["outcome"]
+    assert isinstance(outcome, dict)
+    outcomes = set(outcome["enum"])
+    assert "no_matching_page" in outcomes
+    assert outcomes == {"matching_page", "no_matching_page", "uncertain"}
+
+
+def test_match_schema_root_is_an_object_not_a_union() -> None:
+    """Kills expressing the outcome/selected_page_id pairing as a root union.
+
+    That pairing is a real validator rule and a root-level `anyOf` would make
+    the invalid combination unrepresentable -- but strict structured output
+    requires the root to be `type: "object"` and answers HTTP 400 to a root
+    union. Verified live 2026-08-02: root `anyOf` REJECTED, plain object root
+    ACCEPTED, nested `anyOf` on a property ACCEPTED. Detection's signal union
+    works only because it is nested inside `mentions.items`.
+
+    The pairing therefore stays a domain-validator rule. Do not "express it in
+    the schema" at the root; it cannot be sent.
+    """
+    for flag in (False, True):
+        schema = match_schema(truncated_unsafe_for_negative=flag)
+        assert schema.get("type") == "object"
+        assert "anyOf" not in schema
+
+
+def test_match_schema_hash_differs_between_truncation_variants() -> None:
+    """The two variants are different contracts and must not share a hash."""
+    import hashlib
+    import json
+
+    def digest(flag: bool) -> str:
+        canonical = json.dumps(
+            match_schema(truncated_unsafe_for_negative=flag),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    assert digest(True) != digest(False)

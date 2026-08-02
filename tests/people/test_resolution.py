@@ -691,3 +691,15 @@ def test_resolution_schema_requires_every_property_for_strict_structured_output(
     root_required = schema["required"]
     assert isinstance(root_required, list)
     assert "selected_person_id" in root_required
+
+
+def test_resolution_schema_root_is_an_object_not_a_union() -> None:
+    """Kills expressing the outcome/selected_person_id pairing as a root union.
+
+    Strict structured output requires a `type: "object"` root and rejects a
+    root-level `anyOf` with HTTP 400 (verified live 2026-08-02). The pairing
+    stays a domain-validator rule; it cannot be sent as a schema constraint.
+    """
+    schema = resolution_schema()
+    assert schema.get("type") == "object"
+    assert "anyOf" not in schema

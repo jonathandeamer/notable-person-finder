@@ -120,7 +120,83 @@ def _require_every_property(value: object) -> object:
     return value
 
 
-def match_schema() -> dict[str, object]:
+def _without_outcome(schema: dict[str, object], outcome: str) -> dict[str, object]:
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return schema
+    declared = properties.get("outcome")
+    if not isinstance(declared, dict):
+        return schema
+    outcomes = declared.get("enum")
+    if not isinstance(outcomes, list) or outcome not in outcomes:
+        return schema
+    remaining = [name for name in outcomes if name != outcome]
+    if not remaining:
+        raise ValueError("removing the outcome would leave no permitted outcome")
+    result = dict(schema)
+    result["properties"] = {**properties, "outcome": {**declared, "enum": remaining}}
+    return result
+
+
+def _pair_outcome_with_selected_page_id(schema: dict[str, object]) -> dict[str, object]:
+    """Constrain `selected_page_id` nullability by its sibling `outcome`.
+
+    `_domain_validation_error` requires `matching_page` to carry a
+    `selected_page_id` and every other outcome to leave it null, but the schema
+    types the field `integer | null` with no dependency on `outcome`. Both
+    invalid pairings are therefore structurally valid on the wire: the call is
+    made and paid for, and only then rejected as `malformed_response`.
+
+    Splitting the object into a discriminated union on `outcome` makes both
+    unrepresentable. The domain validator stays in place as defence in depth.
+    """
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return schema
+    outcome = properties.get("outcome")
+    if not isinstance(outcome, dict):
+        return schema
+    outcomes = outcome.get("enum")
+    if not isinstance(outcomes, list) or "selected_page_id" not in properties:
+        return schema
+
+    def variant(name: object, page_id: dict[str, object]) -> dict[str, object]:
+        branch_properties = dict(properties)
+        branch_properties["outcome"] = {"enum": [name]}
+        branch_properties["selected_page_id"] = page_id
+        branch = {key: value for key, value in schema.items() if key != "properties"}
+        branch["properties"] = branch_properties
+        branch["required"] = sorted(branch_properties)
+        return branch
+
+    selected: dict[str, object] = {"minimum": 1, "type": "integer"}
+    null: dict[str, object] = {"type": "null"}
+    return {
+        "anyOf": [
+            variant(name, selected if name == "matching_page" else null)
+            for name in outcomes
+        ]
+    }
+
+
+def match_schema(*, truncated_unsafe_for_negative: bool = False) -> dict[str, object]:
+    """The match output schema, optionally without the negative outcome.
+
+    When the candidate list was truncated, `_domain_validation_error` forbids
+    `no_matching_page`: a model shown 8 of N candidates cannot safely assert
+    that no page exists. Leaving that outcome in the enum anyway meant the
+    model returned the honest answer, the call was paid for, and the response
+    was discarded -- and retries could not recover, because the input is
+    byte-identical. Measured live: 6 of 6 affected people failed permanently
+    across 12 attempts, and truncation held for 111 of 118 plans.
+
+    Removing the outcome forces `uncertain`, which is both the semantically
+    correct answer for a partial list and coverage-eligible, so the person
+    flows onward instead of dying.
+
+    The default is the canonical (untruncated) schema, which is what
+    `match_prompt_and_schema_hashes` hashes for seed-time fingerprints.
+    """
     schema = MatchWikipediaIdentityOutput.model_json_schema(mode="validation")
     definitions = schema.get("$defs", {})
 
@@ -176,13 +252,21 @@ def match_schema() -> dict[str, object]:
             return [factor_repeated(child) for child in value]
         return value
 
+    if truncated_unsafe_for_negative:
+        compacted = _without_outcome(compacted, "no_matching_page")
     factored = cast(dict[str, object], factor_repeated(compacted))
     factored["$defs"] = {"t": bounded_text_schema}
     return factored
 
 
-def render_match_request(value: MatchWikipediaIdentityInput) -> RenderedMatchRequest:
-    system_prompt, user_json, schema, schema_json = _render_parts(value)
+def render_match_request(
+    value: MatchWikipediaIdentityInput,
+    *,
+    truncated_unsafe_for_negative: bool = False,
+) -> RenderedMatchRequest:
+    system_prompt, user_json, schema, schema_json = _render_parts(
+        value, truncated_unsafe_for_negative=truncated_unsafe_for_negative
+    )
     token_bearing_utf8_bytes = sum(
         len(part.encode("utf-8")) for part in (system_prompt, user_json, schema_json)
     )
@@ -474,10 +558,12 @@ def _fixed_request_tokens() -> int:
 
 def _render_parts(
     value: MatchWikipediaIdentityInput,
+    *,
+    truncated_unsafe_for_negative: bool = False,
 ) -> tuple[str, str, dict[str, object], str]:
     prompt = _system_prompt()
     user_json = _canonical_json(value.model_dump(mode="json"))
-    schema = match_schema()
+    schema = match_schema(truncated_unsafe_for_negative=truncated_unsafe_for_negative)
     schema_json = _canonical_json(schema)
     return prompt, user_json, schema, schema_json
 

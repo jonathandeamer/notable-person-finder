@@ -74,7 +74,7 @@ def _profile() -> DomainProfileConfig:
 
 def _config(**changes: object) -> DetectPeopleConfig:
     values: dict[str, object] = {
-        "max_input_tokens": 4415,
+        "max_input_tokens": 4428,
         "max_completion_tokens": 512,
         "max_people": 3,
         "max_title_characters": 200,
@@ -199,7 +199,7 @@ def test_character_truncation_is_deterministic_and_marks_each_passage() -> None:
     config = _config(
         max_title_characters=5,
         max_summary_characters=6,
-        max_input_tokens=4415,
+        max_input_tokens=4428,
     )
 
     first = build_detection_input(source, _feed(), _profile(), config)
@@ -223,7 +223,7 @@ def test_token_envelope_truncation_marks_the_summary_view_and_passage() -> None:
         _feed(),
         _profile(),
         _config(
-            max_input_tokens=4415,
+            max_input_tokens=4428,
             max_completion_tokens=128,
             max_summary_characters=6000,
         ),
@@ -285,7 +285,7 @@ def test_dense_ascii_punctuation_cannot_exceed_the_input_token_ceiling() -> None
         _feed(),
         _profile(),
         _config(
-            max_input_tokens=4415,
+            max_input_tokens=4428,
             max_completion_tokens=128,
             max_summary_characters=10_000,
         ),
@@ -302,7 +302,7 @@ def test_dense_ascii_punctuation_cannot_exceed_the_input_token_ceiling() -> None
             rendered.canonical_schema_json,
         )
     )
-    assert rendered.worst_case_input_tokens <= 4415
+    assert rendered.worst_case_input_tokens <= 4428
 
 
 def test_fixed_prompt_schema_and_framing_must_fit_before_text() -> None:
@@ -351,7 +351,7 @@ def test_rendering_hashes_reviewed_prompt_and_explicit_schema_version(
     )
     expected_schema_envelope = json.dumps(
         {
-            "schema": detection_schema(),
+            "schema": detection_schema(max_people=value.max_people),
             "schema_version": DETECTION_SCHEMA_VERSION,
         },
         sort_keys=True,
@@ -949,7 +949,7 @@ def test_detection_schema_pairs_each_signal_kind_with_its_own_categories() -> No
     combination unrepresentable on the wire. The domain validator stays as
     defence in depth; this only moves enforcement earlier.
     """
-    schema = detection_schema()
+    schema = detection_schema(max_people=3)
     mention = schema["properties"]["mentions"]["items"]  # type: ignore[index]
     signals = mention["properties"]["signals"]["items"]  # type: ignore[index]
 
@@ -1007,3 +1007,48 @@ def test_identity_fact_value_is_grounded_across_headline_title_case() -> None:
     # exact_name keeps its stricter, case-sensitive rule.
     assert _is_grounded_name("Michael B. Jordan", ("p1",), passages)
     assert not _is_grounded_name("michael b. jordan", ("p1",), passages)
+
+
+def test_detection_schema_caps_mentions_at_max_people() -> None:
+    """Kills omitting `maxItems`, or hardcoding it away from `max_people`.
+
+    `_domain_validation_status` rejects a response exceeding the supplied cap,
+    so an uncapped schema lets the model overrun and the response is discarded
+    after payment. Observed live once in replay.
+    """
+    for cap in (1, 3, 8, 32):
+        properties = detection_schema(max_people=cap)["properties"]
+        assert isinstance(properties, dict)
+        mentions = properties["mentions"]
+        assert isinstance(mentions, dict)
+        assert mentions["maxItems"] == cap
+
+
+def test_identity_fact_value_grounded_in_uncited_supplied_passage() -> None:
+    """Kills restricting grounding to the passages the model cited.
+
+    Item 66 from the first ten-feed run: `profession_or_role "Artists"` is
+    present in the title passage but the model cited the summary passage, so
+    a cited-only check rejected a correct extraction. Reproduced 3 of 3 live.
+    """
+    passages = {
+        "p1": "Artists' monumental hot dog sculpture returns to Times Square",
+        "p2": "Jen Catron and Paul Outlaw's 65ft-long sculpture is back on display",
+    }
+    assert _literal_is_grounded("Artists", ("p2",), passages) is True
+
+
+def test_identity_fact_value_absent_from_every_passage_is_rejected() -> None:
+    """Positive control: widening grounding must not disable it.
+
+    Without this, the test above would pass if `_literal_is_grounded` simply
+    returned True, which would admit invention -- the one thing the rule
+    exists to prevent.
+    """
+    passages = {
+        "p1": "Artists' monumental hot dog sculpture returns to Times Square",
+        "p2": "Jen Catron and Paul Outlaw's 65ft-long sculpture is back on display",
+    }
+    assert _literal_is_grounded("Nobel Prize in Physics", ("p1", "p2"), passages) is (
+        False
+    )

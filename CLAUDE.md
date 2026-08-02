@@ -102,8 +102,13 @@ it rather than restating its reasoning:
 
 - Budget reservation carries a deliberate ~4x margin (UTF-8 bytes charged as
   tokens). Not a defect — do not "fix" it without reading the entry.
-- `detect_people` model-output validation had four diagnosed causes; three are
-  fixed and the mention-cap overrun is open.
+- Model-output validation: all five diagnosed causes are fixed (2026-08-02),
+  including the one that made `no_matching_page_found` unreachable and so
+  disabled coverage research entirely. The entry also records the one rule
+  that **cannot** be expressed in a schema — strict structured output rejects
+  a root-level `anyOf` — so do not retry it.
+- `uncertain_identity` now absorbs most true negatives, because truncation
+  fires on 111 of 118 plans. Not a defect; the lever is `max_candidates`.
 - `notable audit person` does not yet render the complete K11 forensic record.
 - K1's `canonical_domain` cross-host alias override is not wired in.
 - A non-settling handler discards its payload after an external call.
@@ -120,6 +125,39 @@ Two recorded decisions that look like gaps and are not:
 - Migration `0008_lead_aggregation.sql` was revised in place under its own
   plan's authorization. A database that ran the earlier 0008 must be deleted
   and re-migrated; see `docs/troubleshooting.md`.
+
+## Next Steps
+
+As of 2026-08-02 the pipeline runs end to end and produces a real shortlist.
+A full uncapped ten-feed run over 246 source items cost **$1.08** and yielded
+65 Wikipedia matches, 27 completed coverage plans, 74 article assessments, 7
+`promising_lead` and 19 `possible_lead` outcomes, and 5 digest entries. Both
+earlier blockers — budget over-reservation and the unreachable
+`no_matching_page_found` outcome — are fixed.
+
+In rough priority order:
+
+1. **Raise `max_candidates` (currently 8).** The highest-value open item.
+   Truncation fires on 111 of 118 plans, which forces most true negatives to
+   report as `uncertain_identity` and blurs the shortlist's Wikipedia signal.
+   Needs its own design: it trades retrieval cost and prompt size against
+   answer quality, and it moves match fingerprints.
+2. **Milestone 6b-ii — `compose_lead_summary`.** The remaining unbuilt product
+   surface. Shortlist entries render from deterministic aggregation with no
+   `why_review` narrative. Source reconnaissance for unclassified publishers
+   belongs here too.
+3. **`notable status` budget figures and deferral-reason breakdown.** The
+   digest has both; `status` still cannot explain *why* work deferred.
+4. **`notable audit person` K11 gaps.** Several required forensic fields are
+   loaded but not rendered, or discarded while loading.
+5. **Residual permanent failures.** The verification run ended `partial` on 3
+   (one each of `detect_people`, `mediawiki_search`, `resolve_person_entity`),
+   down from 7. `notable audit run <id> --attempt <id>` now shows the
+   validation reason directly, so these no longer need a live replay to
+   diagnose — start there.
+
+Cutover to `main` remains a separate, explicit decision. The legacy prototype
+is still the operational fallback until then.
 
 ## Rewrite Structure
 
