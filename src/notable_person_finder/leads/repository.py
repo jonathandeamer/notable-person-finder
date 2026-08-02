@@ -573,17 +573,21 @@ def emit_shortlist_entries(
     single transaction covering the whole shortlist. Entries beyond
     `digest_limit` are never passed in here and so stay `pending` untouched.
 
-    Runs in its own top-level transaction (`BEGIN IMMEDIATE` / commit) rather
-    than the caller's, because it is invoked from the CLI's digest-reporting
-    step, outside the run engine's per-work-item transaction scope -- the
-    same reason `runs.repository.create_run`/`finish_run` manage their own
-    transaction boundaries.
+    Manages its own top-level transaction (`BEGIN IMMEDIATE` / commit) when
+    called standalone, matching `runs.repository.schedule_work`'s join-or-own
+    pattern: if the caller already has a transaction open (as `command_run`'s
+    `report_run` does, to commit this together with `record_digest_with_
+    entries` in one atomic step after `write_digest` succeeds -- see that
+    function's own docstring for why), this joins it instead of committing
+    early, so a crash between the two cannot happen.
 
     Returns the candidates paired with their new `queue_transition` id, in
     the same order, so the caller can later attach `digest_entry` rows once
     the digest's real `file_path`/`content_hash` are known.
     """
-    connection.execute("BEGIN IMMEDIATE")
+    owns_transaction = not connection.in_transaction
+    if owns_transaction:
+        connection.execute("BEGIN IMMEDIATE")
     try:
         emitted: list[tuple[ShortlistCandidate, int]] = []
         for candidate in candidates:
@@ -605,10 +609,12 @@ def emit_shortlist_entries(
             )
             emitted.append((candidate, transition_id))
     except BaseException:
-        connection.rollback()
+        if owns_transaction:
+            connection.rollback()
         raise
     else:
-        connection.commit()
+        if owns_transaction:
+            connection.commit()
     return emitted
 
 
@@ -626,13 +632,22 @@ def record_digest_with_entries(
     emitted: Sequence[tuple[ShortlistCandidate, int]],
 ) -> int:
     """Insert the `digest` row for a written digest file and one
-    `digest_entry` per already-emitted shortlist candidate, in a single
-    transaction. Called after `reporting.digest.write_digest` returns, since
-    only then are the real `file_path`/`content_hash` known -- see
-    `emit_shortlist_entries` for why this manages its own transaction rather
-    than the caller's.
+    `digest_entry` per already-emitted shortlist candidate (zero entries is
+    valid -- a run with an empty shortlist still gets a `digest` row, since
+    every run writes a digest file regardless of shortlist size), in a
+    single transaction. Called after `reporting.digest.write_digest`
+    returns, since only then are the real `file_path`/`content_hash` known.
+
+    Joins an already-open transaction (matching `runs.repository.
+    schedule_work`'s join-or-own pattern; see `emit_shortlist_entries`'s
+    docstring) so the caller can commit this together with the `pending ->
+    emitted` transition in one atomic step, rather than owning a separate
+    transaction that could commit and then leave the digest row unwritten
+    on a crash in between.
     """
-    connection.execute("BEGIN IMMEDIATE")
+    owns_transaction = not connection.in_transaction
+    if owns_transaction:
+        connection.execute("BEGIN IMMEDIATE")
     try:
         digest_id = insert_digest(
             connection,
@@ -655,10 +670,12 @@ def record_digest_with_entries(
                 ordinal=ordinal,
             )
     except BaseException:
-        connection.rollback()
+        if owns_transaction:
+            connection.rollback()
         raise
     else:
-        connection.commit()
+        if owns_transaction:
+            connection.commit()
     return digest_id
 
 

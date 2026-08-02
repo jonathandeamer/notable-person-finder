@@ -242,9 +242,55 @@ def test_record_digest_with_entries_writes_digest_and_entry_rows(
 
 
 # ---------------------------------------------------------------------------
-# `_leads_summary` wiring: only the entries selected into the shortlist are
-# transitioned; entries beyond digest_limit stay pending and untouched.
+# `_leads_summary` wiring: it only ranks and reads -- it must not itself
+# transition any digest_queue row. Emission is the caller's (report_run's)
+# job, deliberately deferred until after write_digest succeeds (see the
+# emission-ordering fix report: emitting before the digest file is durably
+# written left a crash window where entries vanished from the queue with no
+# digest ever having shown them). These tests prove _leads_summary selects
+# the right candidates for the shortlist without mutating status, and that
+# a caller-driven emission afterward transitions only those, leaving
+# overflow entries pending and untouched.
 # ---------------------------------------------------------------------------
+
+
+def test_leads_summary_does_not_itself_transition_any_digest_queue_row(
+    tmp_path: Path,
+) -> None:
+    """Regression test for the emission-ordering fix: `_leads_summary` must
+    only rank and read. If it still emitted internally (the pre-fix
+    behaviour), every digest_queue row it selected would already be
+    'emitted' by the time this function returns, before write_digest has
+    even run -- reintroducing the crash window where a write_digest failure
+    left entries committed 'emitted' with no digest ever recording them.
+    """
+    connection = _seeded_connection(tmp_path, person_count=3)
+    _seed_pending_lead(connection, person_id=1, first_pending_at="2026-07-29T00:00:00Z")
+    _seed_pending_lead(connection, person_id=2, first_pending_at="2026-07-30T00:00:00Z")
+    _seed_pending_lead(connection, person_id=3, first_pending_at="2026-07-31T00:00:00Z")
+
+    config = _config(digest_limit=2)
+    report = _report()
+    result = _leads_summary(
+        connection, report, config=config, now="2026-08-01T00:00:00Z"
+    )
+    assert result is not None
+    shortlist_entries, _queue_flow, limited_candidates = result
+
+    assert len(shortlist_entries) == 2
+    assert len(limited_candidates) == 2
+
+    statuses = {
+        row[0]
+        for row in connection.execute("SELECT status FROM digest_queue").fetchall()
+    }
+    # Every row -- selected or overflow -- is still 'pending': _leads_summary
+    # ranked and selected but never emitted.
+    assert statuses == {"pending"}
+    transition_count = connection.execute(
+        "SELECT COUNT(*) FROM queue_transition WHERE to_status = 'emitted'"
+    ).fetchone()[0]
+    assert transition_count == 0
 
 
 def test_leads_summary_emits_selected_entries_and_leaves_overflow_pending(
@@ -264,9 +310,19 @@ def test_leads_summary_emits_selected_entries_and_leaves_overflow_pending(
         connection, report, config=config, now="2026-08-01T00:00:00Z"
     )
     assert result is not None
-    shortlist_entries, _queue_flow, emitted = result
+    shortlist_entries, _queue_flow, limited_candidates = result
 
     assert len(shortlist_entries) == 2
+    assert len(limited_candidates) == 2
+
+    # The caller (report_run) is the one that emits, after write_digest
+    # succeeds -- exercised here directly.
+    emitted = emit_shortlist_entries(
+        connection,
+        run_id=report.run_id,
+        occurred_at="2026-08-01T00:00:00Z",
+        candidates=limited_candidates,
+    )
     assert len(emitted) == 2
     emitted_person_ids = {candidate.person_id for candidate, _tid in emitted}
 
@@ -309,9 +365,17 @@ def test_leads_summary_all_entries_emitted_when_digest_limit_covers_all(
         connection, report, config=config, now="2026-08-01T00:00:00Z"
     )
     assert result is not None
-    shortlist_entries, _queue_flow, emitted = result
+    shortlist_entries, _queue_flow, limited_candidates = result
 
     assert len(shortlist_entries) == 2
+    assert len(limited_candidates) == 2
+
+    emitted = emit_shortlist_entries(
+        connection,
+        run_id=report.run_id,
+        occurred_at="2026-08-01T00:00:00Z",
+        candidates=limited_candidates,
+    )
     assert len(emitted) == 2
     statuses = {
         row[0]
@@ -344,3 +408,159 @@ def test_leads_summary_all_entries_emitted_when_digest_limit_covers_all(
         "SELECT COUNT(*) FROM digest_entry WHERE digest_id = ?", (digest_id,)
     ).fetchone()[0]
     assert entry_rows == 2
+
+
+# ---------------------------------------------------------------------------
+# Atomic emit-and-record: the crash-window fix for the ordering finding.
+# ---------------------------------------------------------------------------
+
+
+def test_emit_shortlist_entries_and_record_digest_join_one_caller_transaction(
+    tmp_path: Path,
+) -> None:
+    """Regression test for the emission-ordering fix: when the caller wraps
+    both calls in its own `BEGIN IMMEDIATE`, neither function may commit or
+    roll back independently -- they must join the caller's transaction, so
+    a failure between them rolls back everything (no entries silently
+    marked 'emitted' with no digest ever recording them) and success
+    commits everything together in one atomic step. This mirrors exactly
+    how `cli.main.command_run`'s `report_run` calls them after
+    `write_digest` succeeds.
+    """
+    connection = _seeded_connection(tmp_path, person_count=1)
+    lead_id = _seed_pending_lead(
+        connection, person_id=1, first_pending_at="2026-08-01T00:00:00Z"
+    )
+    candidate = ShortlistCandidate(
+        person_id=1,
+        display_name="Person 1",
+        eligibility_reason="new",
+        first_pending_at="2026-08-01T00:00:00Z",
+        tier="promising_lead",
+        lead_assessment_id=lead_id,
+        outcome="promising_lead",
+        qualifying_domain_count=2,
+        wikipedia_outcome="no_matching_page_found",
+    )
+
+    connection.execute("BEGIN IMMEDIATE")
+    emitted = emit_shortlist_entries(
+        connection, run_id=1, occurred_at="2026-08-01T12:00:00Z", candidates=[candidate]
+    )
+    digest_id = record_digest_with_entries(
+        connection,
+        run_id=1,
+        file_path="/digests/2026-08-01-run.md",
+        timezone="UTC",
+        window_start="2026-08-01T00:00:00Z",
+        window_end="2026-08-02T00:00:00Z",
+        run_state="complete",
+        content_hash="e" * 64,
+        created_at="2026-08-01T12:00:00Z",
+        emitted=emitted,
+    )
+    # Neither call committed on its own: from a second, independent
+    # connection, nothing is visible yet.
+    other = sqlite3.connect(tmp_path / "test.db")
+    uncommitted_status = other.execute(
+        "SELECT status FROM digest_queue WHERE person_id = 1"
+    ).fetchone()[0]
+    assert uncommitted_status == "pending"
+    other.close()
+
+    connection.commit()
+
+    status = connection.execute(
+        "SELECT status FROM digest_queue WHERE person_id = 1"
+    ).fetchone()[0]
+    assert status == "emitted"
+    digest_row = connection.execute(
+        "SELECT id FROM digest WHERE id = ?", (digest_id,)
+    ).fetchone()
+    assert digest_row is not None
+
+
+def test_emit_shortlist_entries_and_record_digest_roll_back_together_on_failure(
+    tmp_path: Path,
+) -> None:
+    """If the caller's transaction fails after emission but before (or
+    during) recording the digest, both must roll back together -- proving
+    the atomicity the ordering fix relies on. Simulates the failure by
+    rolling back explicitly rather than raising mid-`record_digest_with_
+    entries` (which would require corrupting its arguments); the assertion
+    that matters is that a rollback after both calls undoes both, not just
+    one.
+    """
+    connection = _seeded_connection(tmp_path, person_count=1)
+    lead_id = _seed_pending_lead(
+        connection, person_id=1, first_pending_at="2026-08-01T00:00:00Z"
+    )
+    candidate = ShortlistCandidate(
+        person_id=1,
+        display_name="Person 1",
+        eligibility_reason="new",
+        first_pending_at="2026-08-01T00:00:00Z",
+        tier="promising_lead",
+        lead_assessment_id=lead_id,
+        outcome="promising_lead",
+        qualifying_domain_count=2,
+        wikipedia_outcome="no_matching_page_found",
+    )
+
+    connection.execute("BEGIN IMMEDIATE")
+    emitted = emit_shortlist_entries(
+        connection, run_id=1, occurred_at="2026-08-01T12:00:00Z", candidates=[candidate]
+    )
+    record_digest_with_entries(
+        connection,
+        run_id=1,
+        file_path="/digests/2026-08-01-run.md",
+        timezone="UTC",
+        window_start="2026-08-01T00:00:00Z",
+        window_end="2026-08-02T00:00:00Z",
+        run_state="complete",
+        content_hash="f" * 64,
+        created_at="2026-08-01T12:00:00Z",
+        emitted=emitted,
+    )
+    connection.rollback()
+
+    status = connection.execute(
+        "SELECT status FROM digest_queue WHERE person_id = 1"
+    ).fetchone()[0]
+    assert status == "pending"
+    digest_rows = connection.execute("SELECT COUNT(*) FROM digest").fetchone()[0]
+    assert digest_rows == 0
+
+
+def test_record_digest_with_entries_writes_a_digest_row_for_an_empty_shortlist(
+    tmp_path: Path,
+) -> None:
+    """A run with zero shortlist entries still writes an actual digest file,
+    so it must still get a `digest` row (with zero `digest_entry` rows) --
+    otherwise the `digest` table is not a complete history of every digest
+    actually written. Before this fix, `command_run` guarded the call with
+    `if emitted:`, skipping the digest row entirely on an empty shortlist.
+    """
+    connection = _seeded_connection(tmp_path, person_count=0)
+    digest_id = record_digest_with_entries(
+        connection,
+        run_id=1,
+        file_path="/digests/2026-08-01-run.md",
+        timezone="UTC",
+        window_start="2026-08-01T00:00:00Z",
+        window_end="2026-08-02T00:00:00Z",
+        run_state="complete",
+        content_hash="a" * 64,
+        created_at="2026-08-01T00:00:00Z",
+        emitted=[],
+    )
+    digest_row = connection.execute(
+        "SELECT file_path FROM digest WHERE id = ?", (digest_id,)
+    ).fetchone()
+    assert digest_row is not None
+    assert digest_row[0] == "/digests/2026-08-01-run.md"
+    entry_count = connection.execute(
+        "SELECT COUNT(*) FROM digest_entry WHERE digest_id = ?", (digest_id,)
+    ).fetchone()[0]
+    assert entry_count == 0
