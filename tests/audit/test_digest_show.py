@@ -160,3 +160,57 @@ def test_falls_back_to_run_columns_when_no_digest_row(
 
     assert status == cli_main.EXIT_OK
     assert capsys.readouterr().out == BODY
+
+
+def test_falls_back_to_run_columns_when_digest_table_absent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The `digest` table guard (K3) is real: a database migrated before it
+
+    existed must still work via the `run.digest_path`/`digest_sha256`
+    fallback, not raise sqlite3.OperationalError.
+    """
+    config_file, connection = migrated_database(tmp_path)
+    try:
+        run_id = insert_run(connection)
+        path = tmp_path / "legacy.md"
+        path.write_text(BODY, encoding="utf-8")
+        connection.execute(
+            "UPDATE run SET digest_path = ?, digest_sha256 = ? WHERE id = ?",
+            (str(path), hashlib.sha256(BODY.encode("utf-8")).hexdigest(), run_id),
+        )
+        connection.commit()
+        connection.execute("DROP TABLE digest_entry")
+        connection.execute("DROP TABLE digest")
+        connection.commit()
+    finally:
+        connection.close()
+
+    status = cli_main.command_digest_show(config_file, run_id_argument=str(run_id))
+
+    captured = capsys.readouterr()
+    assert status == cli_main.EXIT_OK
+    assert captured.out == BODY
+
+
+def test_run_with_no_digest_reports_failure_and_prints_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A run that exists but never produced a digest (no `digest` row and no
+
+    `run.digest_path`) must report failure, not fall through silently. This
+    differs from test_unknown_run_reports_failure, which uses a run id that
+    does not exist at all and takes the earlier "no run found" branch.
+    """
+    config_file, connection = migrated_database(tmp_path)
+    try:
+        run_id = insert_run(connection)
+        connection.commit()
+    finally:
+        connection.close()
+
+    status = cli_main.command_digest_show(config_file, run_id_argument=str(run_id))
+
+    captured = capsys.readouterr()
+    assert status == cli_main.EXIT_FAILED
+    assert captured.out == ""
