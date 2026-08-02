@@ -96,7 +96,8 @@ def _canonical_domain_map(policy: SourcePolicy) -> dict[str, str]:
     duck-typed ones.
 
     `PolicyRule` has no `canonical_domain` field (a separately-deferred K1
-    schema gap; do not add it here -- see CLAUDE.md's known gaps). So this
+    schema gap; do not add it here -- see docs/architecture/known-gaps.md).
+    So this
     only collapses two rules that already match the SAME `host_exact`/
     `host_suffix` value to that value; it cannot yet alias two genuinely
     different hosts to one canonical domain.
