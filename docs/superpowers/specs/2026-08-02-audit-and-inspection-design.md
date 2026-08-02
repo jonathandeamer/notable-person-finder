@@ -32,8 +32,9 @@ This milestone owns:
 
 - the `audit/` capability package (view models, read-only repository SQL,
   pure text rendering, digest lookup and verification);
-- an explicit attempt-to-result registry covering every operation that makes
-  an external call;
+- an explicit attempt-to-result registry, keyed on `task_type`, covering
+  every registered handler — the eleven that make an external call and the
+  one local handler, which is marked as making none;
 - the `tests/audit/` package and its addition to the type-checked set.
 
 It performs **no** writes, **no** migrations, **no** model calls, and adds
@@ -234,33 +235,71 @@ attempts sharing `work_item_id`, in `ordinal` order), the owning
 `work_item` (task type, subject kind and id, fingerprint, state, reason),
 and the persisted validated result located through the K9 registry.
 
-### K9 — The attempt-to-result registry
+### K9 — The attempt-to-result registry is keyed on `task_type`
 
-Every domain observation table carries `attempt_id`, most with a composite
-`(attempt_id, run_id)` foreign key back to `attempt`. `feed_fetch` is the
-single exception: it records `run_id` and `requested_url` but no
-`attempt_id`, so its registry entry resolves by `(run_id, requested_url)`.
-This asymmetry is real and is recorded here rather than smoothed over.
+**The registry key is `work_item.task_type`, not `(provider, operation)`.**
 
-The registry maps `(provider, operation)` to a result table, its join
-column or columns, and its provenance columns. It covers ten result
-surfaces:
+`(provider, operation)` is ambiguous and cannot be used. Five distinct task
+types share the single pair `(openrouter, generate_structured)` —
+`detect_people`, `resolve_person_entity`, `reconsider_person_entity`,
+`match_wikipedia_identity`, and `assess_article` — because
+`GENERATE_OPERATION` is one constant in `providers/openrouter.py` reused by
+every structured-generation handler. Keying on that pair would let
+`--attempt` select the wrong result surface.
 
-| Result table | Join |
-| --- | --- |
-| `model_inspection` | `attempt_id` |
-| `triage_observation` | `(attempt_id, run_id)` |
-| `entity_resolution_observation` | `(attempt_id, run_id)` |
-| `mediawiki_search_observation` | `(attempt_id, run_id)` |
-| `wikipedia_page_facts_batch` | `attempt_id` |
-| `wikipedia_identity_observation` | `(attempt_id, run_id)` |
-| `brave_search_observation` | `(attempt_id, run_id)` |
-| `article_view` | `(attempt_id, run_id)` |
-| `person_article_assessment` | `(attempt_id, run_id)` |
-| `feed_fetch` | `(run_id, requested_url)` |
+`task_type` is unambiguous across all twelve registered handlers.
+`inspect_model` is its own task type, so it does not collide with the
+generation tasks that share its provider. An attempt reaches its task type
+through `attempt.work_item_id → work_item.task_type`, which `--attempt`
+already loads to print the owning work item.
 
-For model operations the rendering includes version provenance: model,
+The registry maps each `task_type` to its result table, join columns,
+provenance columns, and whether the task makes an external call:
+
+| `task_type` | Result table | Join | External |
+| --- | --- | --- | --- |
+| `fetch_feed` | `feed_fetch` | `(run_id, work_item.subject_id → feed_identity_id)` | yes |
+| `inspect_model` | `model_inspection` | `attempt_id` | yes |
+| `detect_people` | `triage_observation` | `(attempt_id, run_id)` | yes |
+| `resolve_person_entity` | `entity_resolution_observation` | `(attempt_id, run_id)` | yes |
+| `reconsider_person_entity` | `entity_resolution_observation` | `(attempt_id, run_id)` | yes |
+| `mediawiki_search` | `mediawiki_search_observation` | `(attempt_id, run_id)` | yes |
+| `mediawiki_page_facts` | `wikipedia_page_facts_batch` | `attempt_id` | yes |
+| `match_wikipedia_identity` | `wikipedia_identity_observation` | `(attempt_id, run_id)` | yes |
+| `brave_web_search` | `brave_search_observation` | `(attempt_id, run_id)` | yes |
+| `fetch_article` | `article_view` | `(attempt_id, run_id)` | yes |
+| `assess_article` | `person_article_assessment` | `(attempt_id, run_id)` | yes |
+| `aggregate_person_lead` | `lead_assessment` | `(person_id, run_id)` | **no** |
+
+`resolve_person_entity` and `reconsider_person_entity` legitimately share
+`entity_resolution_observation`; the registry is many-to-one, not a
+bijection. That is fine — the key is unique, the target need not be.
+
+For model tasks the rendering includes version provenance: model,
 `prompt_hash`, `schema_version`, token usage, and cost.
+
+#### `fetch_feed` cannot be resolved to a single attempt
+
+`feed_fetch` records `feed_identity_id`, `run_id`, and `requested_at`, but
+**no `attempt_id`**, and `attempt` records no URL — only
+`request_fingerprint` and `destination_host`. There is therefore no column
+pair that identifies which attempt produced which `feed_fetch` row when a
+work item retried inside one run.
+
+`--attempt` for a `fetch_feed` attempt lists **every** `feed_fetch` row for
+that `(feed_identity_id, run_id)` in `requested_at` order, under an explicit
+caveat:
+
+```text
+feed_fetch records no attempt_id; all fetch rows for this feed and run are
+shown, and cannot be attributed to a single attempt
+```
+
+Showing all candidate rows with a stated limitation is correct. Guessing by
+position would be a heuristic presented as evidence, which is precisely what
+an audit command must not do.
+
+#### The no-result-row case
 
 Where no result row exists — a failed attempt, or the documented case in
 which the engine settles a non-settling handler outcome `failed_permanent`
@@ -276,9 +315,23 @@ empty section.
 ### K10 — Registry completeness is a tested invariant
 
 A test enumerates every handler registered with the run engine and asserts
-that each one's `(provider, operation)` pair has a registry entry. A future
-milestone that adds a work kind without an audit mapping fails that test
-rather than silently producing a blank `--attempt` view.
+that each one's `task_type` has a registry entry. A future milestone that
+adds a work kind without an audit mapping fails that test rather than
+silently producing a blank `--attempt` view.
+
+**The registry covers all twelve registered handlers, including local ones.**
+`aggregate_person_lead` is registered with `LOCAL_PROVIDER` and operation
+`aggregate` and makes no external call, so it creates no `attempt` row and
+can never be the subject of `--attempt`. It is still in the registry, marked
+`external: no`, for two reasons: the completeness test can then enumerate the
+handler set without a hand-maintained exclusion list, and `audit run`'s work
+outcomes section (K7 section 4) can name the result table for a local task
+type just as it does for an external one.
+
+A registry entry marked `external: no` asserts that no attempt row exists
+for that task type. If `--attempt` is somehow given an attempt whose work
+item has a non-external task type, that is a data inconsistency and is
+reported as one, not rendered as a result.
 
 This is the milestone's most important structural test: it is the only
 mechanism preventing audit coverage from decaying as the system grows.
@@ -300,11 +353,25 @@ its verdict:
    match key, and source.
 3. **Relations** — `person_relation` rows on either side: kind, the other
    person, status, opening and closing runs and observations.
-4. **Mentions** — `person_mention` rows reached through
-   `entity_resolution_observation.selected_person_id` and
-   `created_person_id` (`person_mention` itself carries no `person_id`),
-   each with source item, exact name, mention outcome, rationale, and the
-   resolution's `semantic_outcome`.
+4. **Mentions** — `person_mention` rows joined directly on
+   `person_mention.person_id`, each with source item, exact name, mention
+   outcome, rationale, and the `semantic_outcome` of the resolution named by
+   `person_mention.current_entity_resolution_observation_id`.
+
+   Both columns are added to `person_mention` by `ALTER TABLE` in migration
+   `0005_people_identity.sql`, not by the `CREATE TABLE` in `0004`, and
+   `person_mention_by_person` indexes the first. The direct join is the
+   correct primary path: `person_id` is the durable association and the
+   pointer is, per 0005's own comment, "the only mutable entity-resolution
+   state on a mention." Reaching mentions instead through
+   `entity_resolution_observation.selected_person_id` and `created_person_id`
+   would reconstruct that association from history and would misreport any
+   mention whose current association differs from an individual historical
+   observation.
+
+   Historical resolutions are still shown — that is section 5's job. Section
+   4 reports the current association; section 5 reports how it was reached,
+   including superseded observations.
 5. **Entity resolution** — each observation: disposition, semantic outcome,
    candidates considered, selected or created person, `prompt_hash`,
    `schema_version`, `task_fingerprint`, rationale.
@@ -430,7 +497,7 @@ that gap for `tests/leads`; this milestone does not reopen it.
 | `test_digest_show.py` | Resolution with and without `RUN_ID`, latest default, hash match, hash mismatch with empty stdout, missing file, missing run, run with no digest, pre-0008 fallback |
 | `test_audit_run.py` | Each K7 section, `--attempt`, cross-run attempt rejection (K8), the no-result-row wording (K9), budget divergence display |
 | `test_audit_person.py` | Each K11 section, empty-section markers, merged-away banner (K12), unknown id |
-| `test_registry.py` | K10 registry completeness against the engine's registered handlers |
+| `test_registry.py` | K10 completeness against the engine's twelve registered handlers; that the key is `task_type`; that the five task types sharing `(openrouter, generate_structured)` resolve to their own distinct result tables; that `aggregate_person_lead` is present and marked `external: no` |
 | `test_render.py` | Pure rendering on constructed view models, no database |
 | `test_seams.py` | CLI registration, exit statuses (K13), no mutation lock taken (K2), the K1 layering assertion, the K14 redaction positive control |
 
@@ -449,7 +516,19 @@ Rules requiring mutation evidence:
 - K5 no re-rendering (layering).
 - K8 cross-run attempt rejection.
 - K9 the no-result-row branch.
-- K10 registry completeness.
+- K9 the registry key. Re-key the registry on `(provider, operation)` and
+  confirm a named test fails on the five colliding OpenRouter task types. A
+  registry that still resolves correctly under that mutation is not testing
+  the disambiguation this decision exists for.
+- K9 the `fetch_feed` all-rows-with-caveat behaviour.
+- K10 registry completeness, mutated by deleting one entry **and**
+  separately by adding a thirteenth handler with no entry.
+- K11 the mention join. Re-derive mentions from
+  `entity_resolution_observation.selected_person_id` instead of
+  `person_mention.person_id` and confirm a named test fails on a person
+  whose current association differs from a historical observation. This
+  needs a fixture that actually exercises the divergence — a person whose
+  mention was later re-associated — or the mutation will survive.
 - K12 the merged-away banner.
 - K3 the schema-presence guard.
 - K13 each distinct exit status.
