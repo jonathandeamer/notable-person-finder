@@ -11,6 +11,11 @@ from typing import NoReturn
 from zoneinfo import ZoneInfo
 
 from notable_person_finder import __version__
+from notable_person_finder.audit.digest_show import (
+    DigestLookupError,
+    locate_digest,
+    read_verified_digest,
+)
 from notable_person_finder.config.loader import (
     ConfigLoadError,
     ResolvedConfig,
@@ -170,7 +175,18 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("status")
     db = commands.add_parser("db")
     db.add_subparsers(dest="db_command", required=True).add_parser("migrate")
+    digest = commands.add_parser("digest")
+    digest_show = digest.add_subparsers(
+        dest="digest_command", required=True
+    ).add_parser("show")
+    digest_show.add_argument("run_id", nargs="?", default=None)
     return parser
+
+
+def _parse_run_id_argument(value: str) -> int:
+    """Accept `12` or `run-12`. Raises ValueError otherwise."""
+    text = value.removeprefix("run-")
+    return int(text)
 
 
 def command_config_validate(config_file: Path | None) -> int:
@@ -1247,6 +1263,34 @@ def command_status(config_file: Path | None) -> int:
         connection.close()
 
 
+def command_digest_show(
+    config_file: Path | None, *, run_id_argument: str | None
+) -> int:
+    loaded = load_config(config_file, require_secrets=False)
+    if run_id_argument is not None:
+        try:
+            run_id = _parse_run_id_argument(run_id_argument)
+        except ValueError:
+            print(f"invalid run id: {run_id_argument}", file=sys.stderr)
+            return EXIT_USAGE
+    else:
+        run_id = None
+    if not loaded.paths.database.exists():
+        print("no run has been recorded yet", file=sys.stderr)
+        return EXIT_FAILED
+    connection = connect_database(loaded.paths.database, readonly=True)
+    try:
+        location = locate_digest(connection, run_id=run_id)
+        body = read_verified_digest(location)
+    except DigestLookupError as error:
+        print(str(error), file=sys.stderr)
+        return EXIT_FAILED
+    finally:
+        connection.close()
+    sys.stdout.write(body.decode("utf-8"))
+    return EXIT_OK
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     try:
@@ -1261,6 +1305,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return command_status(arguments.config)
         if arguments.command == "db" and arguments.db_command == "migrate":
             return command_db_migrate(arguments.config)
+        if arguments.command == "digest" and arguments.digest_command == "show":
+            return command_digest_show(
+                arguments.config, run_id_argument=arguments.run_id
+            )
         raise UsageError("command is not implemented")
     except UsageError as error:
         parser.print_usage(sys.stderr)
