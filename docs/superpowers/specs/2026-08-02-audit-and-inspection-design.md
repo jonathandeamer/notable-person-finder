@@ -405,9 +405,12 @@ a regression introduced by this milestone:
 - `compose_lead_summary` synthesis and its Promptfoo suite (6b-ii).
 - Source reconnaissance for unclassified publishers (6b-ii).
 - Raw provider payload persistence.
-- `notable status` queue tiers. The lead-aggregation design listed this
-  under 6a; the shipped `status` has backlog and oldest-pending only. It
-  remains a known gap and is **not** silently absorbed here.
+- `notable status` budget figures and deferral-reason breakdown. Milestone
+  6a delivered `status`'s backlog, tier split, and oldest-pending lines, so
+  the queue-reporting gap is closed; what remains is that `status` still
+  prints bare pending and deferred counts and cannot explain *why* work was
+  deferred. `audit run` answers that question per-run (K7 section 4), but
+  it does not change `status`, which stays as 6a left it.
 - JSON output, a `--format` flag, pagination, or any flag beyond
   `--attempt`. A future integration receives an intentional export or
   adapter rather than a scrape of terminal formatting.

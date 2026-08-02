@@ -79,7 +79,7 @@ tests/leads/
   `digest.py`; `render_digest(..., shortlist_entries: list[ShortlistEntry]
   | None = None, queue_flow: QueueFlowSummary | None = None)`.
 
-- [ ] **Step 1: Write the failing digest test with distinct per-counter values**
+- [x] **Step 1: Write the failing digest test with distinct per-counter values**
 
 Follow the milestone-5 `test_digest_status.py` pattern explicitly named in
 the design spec: build a fixture with nine-or-more distinct counter values
@@ -167,12 +167,12 @@ def test_queue_flow_block_renders_distinct_counters():
     assert "insufficient history" in output.lower() or "not clearing" in output.lower()
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `uv run pytest tests/leads/test_digest_status.py -v`
 Expected: FAIL — `ImportError: cannot import name 'ShortlistEntry'`.
 
-- [ ] **Step 3: Implement digest.py changes**
+- [x] **Step 3: Implement digest.py changes**
 
 Add dataclasses near `CoverageSummary` (after line ~144):
 
@@ -291,7 +291,7 @@ Never fabricate a rate or clear-time estimate — `None` must render the
 literal `"insufficient history"` / `"not clearing"` fallback text, per the
 design spec's explicit prohibition.
 
-- [ ] **Step 4: Add `_leads_summary` / `_leads_schema_present` in `cli/main.py`**
+- [x] **Step 4: Add `_leads_summary` / `_leads_schema_present` in `cli/main.py`**
 
 Mirror `_coverage_summary`/`_coverage_schema_present` exactly (lines
 747-772):
@@ -335,12 +335,12 @@ mark where the implementer must write real SQL joining `digest_queue`,
 The step is not complete until this function returns real data and Step 5's
 tests pass without mocking the query result.
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/leads/test_digest_status.py -v`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/notable_person_finder/reporting/digest.py src/notable_person_finder/cli/main.py tests/leads/test_digest_status.py
@@ -359,7 +359,7 @@ git commit -m "feat(digest): real shortlist and queue-flow sections"
 **Interfaces:**
 - Consumes: `_leads_schema_present` (Task 12).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # append to tests/leads/test_digest_status.py
@@ -379,12 +379,12 @@ def test_notable_status_prints_backlog_by_tier(tmp_path, capsys):
     )
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/leads/test_digest_status.py -k backlog -v`
 Expected: FAIL (skip, then real failure once fixture ported).
 
-- [ ] **Step 3: Replace the placeholder comment in `command_status`**
+- [x] **Step 3: Replace the placeholder comment in `command_status`**
 
 ```python
         if _leads_schema_present(connection):
@@ -410,12 +410,12 @@ Expected: FAIL (skip, then real failure once fixture ported).
         return EXIT_OK
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/leads/test_digest_status.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/notable_person_finder/cli/main.py tests/leads/test_digest_status.py
@@ -429,7 +429,7 @@ git commit -m "feat(status): digest backlog and oldest-pending-candidate lines"
 **Files:**
 - Modify: `pyproject.toml` (lines 81-91)
 
-- [ ] **Step 1: Edit the include list**
+- [x] **Step 1: Edit the include list**
 
 ```toml
 [tool.pyright]
@@ -448,7 +448,7 @@ include = [
 exclude = ["**/__pycache__", ".venv", ".worktrees"]
 ```
 
-- [ ] **Step 2: Run pyright to confirm no new failures were hidden by the prior gap**
+- [x] **Step 2: Run pyright to confirm no new failures were hidden by the prior gap**
 
 Run: `uv run pyright`
 Expected: passes, or reveals real type errors in `tests/wikipedia`/
@@ -456,7 +456,7 @@ Expected: passes, or reveals real type errors in `tests/wikipedia`/
 before proceeding (per K12's rationale: this is exactly the gap that let
 `f2e9e76`'s type violation ship unseen).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add pyproject.toml
@@ -474,7 +474,7 @@ git commit -m "fix(config): extend pyright include to tests/wikipedia, tests/cov
 **Interfaces:**
 - Consumes: everything above.
 
-- [ ] **Step 1: Write the same-run firing test**
+- [x] **Step 1: Write the same-run firing test**
 
 ```python
 # append to tests/leads/test_run_cli.py
@@ -497,7 +497,7 @@ def test_aggregation_fires_in_same_run_coverage_settles():
     pytest.skip("port fixture from tests/coverage/test_run_cli.py before this task is done")
 ```
 
-- [ ] **Step 2: Write the fingerprint-reuse test**
+- [x] **Step 2: Write the fingerprint-reuse test**
 
 ```python
 # append to tests/leads/test_service.py
@@ -541,12 +541,12 @@ finishing this task) and have `prepare` raise the same
 `ValueError(f"{...PREPARE_REFUSED_PREFIX}...")` local-refusal pattern used
 by `wikipedia/service.py`'s `prepare` when the fingerprint is unchanged.
 
-- [ ] **Step 3: Run tests to verify they pass**
+- [x] **Step 3: Run tests to verify they pass**
 
 Run: `uv run pytest tests/leads -v`
 Expected: PASS
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/leads/
@@ -559,7 +559,7 @@ git commit -m "test(leads): same-run firing and fingerprint-reuse regression cov
 
 **Files:** none (verification only)
 
-- [ ] **Step 1: Run the full offline gate**
+- [x] **Step 1: Run the full offline gate**
 
 ```bash
 uv run pytest tests/foundation tests/run_engine tests/ingestion tests/people tests/wikipedia tests/coverage tests/leads
@@ -570,7 +570,7 @@ uv run pyright
 
 Expected: all green.
 
-- [ ] **Step 2: Confirm clean working tree**
+- [x] **Step 2: Confirm clean working tree**
 
 ```bash
 git diff --check
@@ -580,7 +580,7 @@ git status --short
 Expected: no whitespace errors, only expected new/modified files listed (no
 stray artifacts).
 
-- [ ] **Step 3: For each K-numbered decision (K1-K13) and each named rule
+- [x] **Step 3: For each K-numbered decision (K1-K13) and each named rule
   in the design spec, mutate the corresponding source line, confirm a
   specific named test fails, then restore**
 
@@ -617,7 +617,7 @@ Restore each mutation with `cp` backup + `diff`, never `git stash`. Run with
 `PYTHONDONTWRITEBYTECODE=1` and clear `__pycache__` between mutations. Report
 which mutation killed which test.
 
-- [ ] **Step 4: Report completion**
+- [x] **Step 4: Report completion**
 
 Summarize: files created/modified, completion-gate output, and the mutation
 kill-list from Step 3.
