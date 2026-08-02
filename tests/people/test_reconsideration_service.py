@@ -78,14 +78,16 @@ _PROMPT = "p" * 64
 _SCHEMA = "s" * 64
 
 
-def _main_config(*, resolve_model: str = MODEL) -> MainConfig:
+def _main_config(
+    *, resolve_model: str = MODEL, hard_budget: bool = False
+) -> MainConfig:
     return MainConfig(
         schema_version=1,
         timezone="Europe/Paris",
         feeds_file=Path("feeds.toml"),
         domain_profile_file=Path("profiles/art.toml"),
         source_policy_file=Path("source_policies/visual_arts.toml"),
-        budget=BudgetConfig(openrouter_usd_per_run=None),
+        budget=BudgetConfig(openrouter_usd_per_run="1.00" if hard_budget else None),
         openrouter=OpenRouterConfig(routing=ProviderRoutingConfig()),
         tasks=TasksConfig(
             detect_people=DetectPeopleConfig(model=MODEL),
@@ -1620,3 +1622,104 @@ def test_reconsider_fingerprint_includes_relation_and_both_sides(
         config=config.tasks.resolve_person_entity,
     )
     assert swapped != expected
+
+
+def test_reconsider_reservation_uses_the_rendered_request_not_the_ceiling(
+    connection: sqlite3.Connection,
+) -> None:
+    """Kills reserving the configured ceiling at the reconsider call site.
+
+    `reconsider_person_entity` shares `resolve_person_entity`'s config and
+    render, but it is a separate reservation call site and reverts
+    independently.
+    """
+    (
+        run_id,
+        attempt_id,
+        _inspection_id,
+        _mention_a,
+        person_a,
+        _person_b,
+        relation_id,
+    ) = _two_people_with_edge(connection)
+    config = _main_config(hard_budget=True)
+    profile = _profile()
+    with immediate(connection):
+        recompute_identity_fingerprint(connection, person_a)
+        maybe_schedule_reconsideration_for_person(
+            connection,
+            person_id=person_a,
+            pre_existing_relation_ids=frozenset({relation_id}),
+            run_id=run_id,
+            config=config,
+            now=NOW,
+        )
+    handler = build_reconsideration_handler(
+        connection,
+        client=ScriptedLlmClient(inspection=_compatible_inspection()),
+        config=config,
+        profile=profile,
+    )
+    work_row = connection.execute(
+        """
+        SELECT id, fingerprint FROM work_item
+         WHERE task_type = ? AND subject_id = ?
+        """,
+        (RECONSIDER_PERSON_ENTITY_TASK_TYPE, relation_id),
+    ).fetchone()
+    assert work_row is not None
+    prompt_price = 100
+    completion_price = 200
+    routing_fp = routing_fingerprint(config.openrouter.routing)
+    connection.execute(
+        """
+        INSERT INTO model_inspection (
+            run_id, attempt_id, configured_model_id, resolved_model_id,
+            routing_fingerprint, supported_parameters_json,
+            supports_strict_structured_output, pricing_usable,
+            prompt_unit_price_nano_usd, completion_unit_price_nano_usd,
+            compatibility, inspected_at
+        ) VALUES (?, ?, ?, ?, ?,
+                  '["response_format"]', 1, 1, ?, ?, 'compatible', ?)
+        """,
+        (
+            run_id,
+            attempt_id,
+            MODEL,
+            MODEL,
+            routing_fp,
+            prompt_price,
+            completion_price,
+            NOW,
+        ),
+    )
+    connection.execute(
+        """
+        UPDATE work_item
+           SET state = 'running', claimed_by_run_id = ?, updated_at = ?
+         WHERE id = ?
+        """,
+        (run_id, NOW, work_row["id"]),
+    )
+    connection.commit()
+    work_item = WorkItem(
+        id=int(work_row["id"]),
+        task_type=RECONSIDER_PERSON_ENTITY_TASK_TYPE,
+        subject_kind="person_relation",
+        subject_id=relation_id,
+        fingerprint=work_row["fingerprint"],
+        required=True,
+        priority=RECONSIDER_PERSON_PRIORITY,
+        state=WorkState.RUNNING,
+    )
+    assert handler.prepare is not None
+    preparation = handler.prepare(work_item)
+
+    assert preparation.reserved_nano_usd is not None
+    assert preparation.reserved_nano_usd > 0
+    resolve_config = config.tasks.resolve_person_entity
+    ceiling_reservation = (
+        prompt_price * resolve_config.max_input_tokens
+        + completion_price * resolve_config.max_completion_tokens
+    )
+    assert preparation.reserved_nano_usd < ceiling_reservation

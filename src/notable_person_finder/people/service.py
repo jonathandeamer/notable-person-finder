@@ -22,7 +22,6 @@ import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from importlib import resources
 from urllib.parse import urlsplit
 
@@ -120,6 +119,7 @@ from notable_person_finder.providers.openrouter import (
     StructuredGenerationRequest,
 )
 from notable_person_finder.runs import repository
+from notable_person_finder.runs.budget import reservation_nano_usd
 from notable_person_finder.runs.clock import utc_timestamp
 from notable_person_finder.runs.engine import TaskHandler, TaskOutcome, TaskPreparation
 from notable_person_finder.runs.models import WorkItem, WorkState
@@ -167,13 +167,8 @@ INSUFFICIENT_INPUT_RATIONALE = "empty title and summary"
 MALFORMED_DETECTION_DETAIL = "invalid detection output"
 MISSING_INSPECTION_DETAIL = "compatible model inspection is missing"
 MISSING_PRICING_DETAIL = "usable unit pricing is required under a hard budget"
-NEGATIVE_PRICING_DETAIL = "unit pricing must not be negative"
-OVERFLOW_PRICING_DETAIL = "worst-case reservation overflows integer nano-USD"
 MISSING_SOURCE_DETAIL = "source item is missing"
 EMPTY_SOURCE_DETAIL = "source item has empty title and summary"
-
-# SQLite INTEGER / attempt reservation bound (signed 64-bit).
-_MAX_SQLITE_INTEGER = (1 << 63) - 1
 
 _PERMANENT_PREFLIGHT_CATEGORIES = frozenset(
     {
@@ -1359,40 +1354,6 @@ def seed_untriaged(
     )
 
 
-def _checked_product(unit_price_nano_usd: int, tokens: int) -> int:
-    """Ceiling unit_price * tokens as a non-negative SQLite integer."""
-    if unit_price_nano_usd < 0:
-        raise ValueError(NEGATIVE_PRICING_DETAIL)
-    if tokens < 0:
-        raise ValueError("token bound must not be negative")
-    try:
-        product = (Decimal(unit_price_nano_usd) * Decimal(tokens)).to_integral_value(
-            rounding=ROUND_CEILING
-        )
-    except InvalidOperation as error:
-        raise ValueError(OVERFLOW_PRICING_DETAIL) from error
-    if product < 0 or product > _MAX_SQLITE_INTEGER:
-        raise ValueError(OVERFLOW_PRICING_DETAIL)
-    return int(product)
-
-
-def _worst_case_reservation_nano_usd(
-    *,
-    prompt_unit_price_nano_usd: int,
-    completion_unit_price_nano_usd: int,
-    max_input_tokens: int,
-    max_completion_tokens: int,
-) -> int:
-    prompt_cost = _checked_product(prompt_unit_price_nano_usd, max_input_tokens)
-    completion_cost = _checked_product(
-        completion_unit_price_nano_usd, max_completion_tokens
-    )
-    total = prompt_cost + completion_cost
-    if total > _MAX_SQLITE_INTEGER:
-        raise ValueError(OVERFLOW_PRICING_DETAIL)
-    return total
-
-
 @dataclass(frozen=True, slots=True)
 class _DetectionCall:
     """Application-thread inputs for the worker-thread generation call."""
@@ -1714,10 +1675,10 @@ def build_detection_handler(
             or completion_price is None
         ):
             raise ValueError(MISSING_PRICING_DETAIL)
-        reserved = _worst_case_reservation_nano_usd(
+        reserved = reservation_nano_usd(
             prompt_unit_price_nano_usd=prompt_price,
             completion_unit_price_nano_usd=completion_price,
-            max_input_tokens=detect.max_input_tokens,
+            input_tokens=rendered.worst_case_input_tokens,
             max_completion_tokens=detect.max_completion_tokens,
         )
         return TaskPreparation(payload=call, reserved_nano_usd=reserved)
@@ -2880,10 +2841,10 @@ def build_resolution_handler(
             or completion_price is None
         ):
             raise ValueError(MISSING_PRICING_DETAIL)
-        reserved = _worst_case_reservation_nano_usd(
+        reserved = reservation_nano_usd(
             prompt_unit_price_nano_usd=prompt_price,
             completion_unit_price_nano_usd=completion_price,
-            max_input_tokens=resolve.max_input_tokens,
+            input_tokens=rendered.worst_case_input_tokens,
             max_completion_tokens=resolve.max_completion_tokens,
         )
         return TaskPreparation(payload=call, reserved_nano_usd=reserved)
@@ -3680,10 +3641,10 @@ def build_reconsideration_handler(
             or completion_price is None
         ):
             raise ValueError(MISSING_PRICING_DETAIL)
-        reserved = _worst_case_reservation_nano_usd(
+        reserved = reservation_nano_usd(
             prompt_unit_price_nano_usd=prompt_price,
             completion_unit_price_nano_usd=completion_price,
-            max_input_tokens=resolve.max_input_tokens,
+            input_tokens=rendered.worst_case_input_tokens,
             max_completion_tokens=resolve.max_completion_tokens,
         )
         return TaskPreparation(payload=call, reserved_nano_usd=reserved)

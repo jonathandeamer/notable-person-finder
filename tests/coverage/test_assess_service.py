@@ -565,6 +565,46 @@ def test_assess_handler_pool_priority_provider_operation(
     assert ASSESS_ARTICLE_PRIORITY == 70
 
 
+def test_assess_reservation_uses_the_rendered_request_not_the_ceiling(
+    connection: sqlite3.Connection,
+) -> None:
+    """Kills reserving `assess_article.max_input_tokens` at this call site.
+
+    Four other task types share the same reservation helper, so a per-site
+    test is the only thing that catches one site reverting on its own.
+    """
+    run_id = insert_run(connection)
+    person_id = _person_with_name(connection, run_id=run_id)
+    _plan_id, person_article_id, view_id, _article = _seed_assessable(
+        connection, person_id=person_id, run_id=run_id
+    )
+    _insert_compatible_inspection(
+        connection, run_id=run_id, prompt_price=150, completion_price=600
+    )
+    work_id = _schedule_assess(
+        connection,
+        person_article_id=person_article_id,
+        article_view_id=view_id,
+        run_id=run_id,
+    )
+    work = _work_item(connection, work_id)
+    _claim_and_attempt(connection, work_id=work_id, run_id=run_id)
+    config = _main_config(hard_budget=True)
+    handler = build_assess_article_handler(
+        connection, client=ScriptedLlmClient(), config=config, profile=_profile()
+    )
+    assert handler.prepare is not None
+    prepared = handler.prepare(work)
+
+    assert prepared.reserved_nano_usd is not None
+    assert prepared.reserved_nano_usd > 0
+    assess_config = config.tasks.assess_article
+    ceiling_reservation = (
+        150 * assess_config.max_input_tokens + 600 * assess_config.max_completion_tokens
+    )
+    assert prepared.reserved_nano_usd < ceiling_reservation
+
+
 def test_happy_assess_path_sets_pointer_and_signals(
     connection: sqlite3.Connection,
 ) -> None:

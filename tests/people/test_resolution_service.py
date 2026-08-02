@@ -60,7 +60,7 @@ from notable_person_finder.providers.openrouter import (
 from notable_person_finder.runs import repository
 from notable_person_finder.runs.clock import FakeClock
 from notable_person_finder.runs.engine import ReportArtifact, RunEngine
-from notable_person_finder.runs.models import WorkState
+from notable_person_finder.runs.models import WorkItem, WorkState
 from notable_person_finder.runs.retry import RetryPolicy
 from notable_person_finder.runs.scheduler import (
     BoundedScheduler,
@@ -77,14 +77,16 @@ _PROMPT = "p" * 64
 _SCHEMA = "s" * 64
 
 
-def _main_config(*, resolve_model: str = MODEL) -> MainConfig:
+def _main_config(
+    *, resolve_model: str = MODEL, hard_budget: bool = False
+) -> MainConfig:
     return MainConfig(
         schema_version=1,
         timezone="Europe/Paris",
         feeds_file=Path("feeds.toml"),
         domain_profile_file=Path("profiles/art.toml"),
         source_policy_file=Path("source_policies/visual_arts.toml"),
-        budget=BudgetConfig(openrouter_usd_per_run=None),
+        budget=BudgetConfig(openrouter_usd_per_run="1.00" if hard_budget else None),
         openrouter=OpenRouterConfig(routing=ProviderRoutingConfig()),
         tasks=TasksConfig(
             detect_people=DetectPeopleConfig(model=MODEL),
@@ -325,6 +327,7 @@ def _run_engine(
     *,
     seed: Callable[[int], None] | None = None,
     max_attempts: int = 2,
+    budget_limit_nano_usd: int | None = None,
 ) -> int:
     clock = FakeClock()
     with SchedulerSet({WorkerPool.LLM: BoundedScheduler(max_workers=1)}) as pools:
@@ -337,7 +340,7 @@ def _run_engine(
             clock=clock,
             timezone="Europe/Paris",
             window_start="2026-07-24T06:00:00Z",
-            budget_limit_nano_usd=None,
+            budget_limit_nano_usd=budget_limit_nano_usd,
             snapshot_fingerprint="a" * 64,
             snapshot_json="{}",
             reporter=lambda report: ReportArtifact(path=None, sha256=None, markdown=""),
@@ -1643,8 +1646,6 @@ def test_persist_failure_noops_when_er_exists(
     handler = build_resolution_handler(
         connection, client=ScriptedLlmClient(), config=config, profile=profile
     )
-    from notable_person_finder.runs.models import WorkItem
-
     work_item = WorkItem(
         id=work_id,
         task_type=RESOLVE_PERSON_ENTITY_TASK_TYPE,
@@ -1747,3 +1748,64 @@ def test_cli_registers_resolve_handler_and_seed_order() -> None:
     run_source = inspect.getsource(cli_main.command_run)
     assert "build_resolution_handler" in run_source
     assert "RESOLVE_PERSON_ENTITY_TASK_TYPE" in run_source
+
+
+def test_resolve_reservation_uses_the_rendered_request_not_the_ceiling(
+    connection: sqlite3.Connection,
+) -> None:
+    """Kills reserving `resolve_person_entity.max_input_tokens` at this site.
+
+    Five task types share one reservation helper, so only a per-site test
+    catches this site alone reverting to the configured ceiling.
+    """
+    run_id, _a, _inspection_id, mention_id = _seed_mention_graph(connection)
+    peer = _prepare_resolve_work(connection, run_id=run_id, mention_id=mention_id)
+    config = _main_config(hard_budget=True)
+    profile = _profile()
+    client = ScriptedLlmClient(
+        inspection=_compatible_inspection(),
+        generate_results=[
+            _generation_result(
+                _resolve_output(outcome="same_person", selected_person_id=peer)
+            )
+        ],
+    )
+
+    def seed(engine_run_id: int) -> None:
+        from notable_person_finder.people.service import (
+            ensure_model_inspections_for_run,
+        )
+
+        ensure_model_inspections_for_run(
+            connection, run_id=engine_run_id, config=config, now=NOW
+        )
+
+    engine_run = _run_engine(
+        connection,
+        _handlers(connection, client, config, profile),
+        seed=seed,
+        budget_limit_nano_usd=10_000_000_000,
+    )
+    row = connection.execute(
+        """
+        SELECT a.reserved_nano_usd AS reserved
+          FROM attempt a
+          JOIN work_item w ON w.id = a.work_item_id
+         WHERE a.run_id = ? AND a.operation = ? AND w.task_type = ?
+        """,
+        (engine_run, GENERATE_OPERATION, RESOLVE_PERSON_ENTITY_TASK_TYPE),
+    ).fetchone()
+    assert row is not None
+    reserved = row["reserved"]
+    assert reserved > 0
+
+    inspection = _compatible_inspection()
+    prompt_price = inspection.prompt_unit_price_nano_usd
+    completion_price = inspection.completion_unit_price_nano_usd
+    assert prompt_price is not None and completion_price is not None
+    resolve_config = config.tasks.resolve_person_entity
+    ceiling_reservation = (
+        prompt_price * resolve_config.max_input_tokens
+        + completion_price * resolve_config.max_completion_tokens
+    )
+    assert reserved < ceiling_reservation

@@ -100,9 +100,8 @@ Live, diagnosed gaps in shipped behaviour are recorded in full in
 for a regression. Read it before working in the areas it covers, and point at
 it rather than restating its reasoning:
 
-- Budget reservation charges the configured ceiling rather than the real
-  request, so a USD cap throttles at a small fraction of its nominal value.
-  Set `openrouter_usd_per_run` well above expected real spend.
+- Budget reservation carries a deliberate ~4x margin (UTF-8 bytes charged as
+  tokens). Not a defect — do not "fix" it without reading the entry.
 - `detect_people` model-output validation had four diagnosed causes; three are
   fixed and the mention-cap overrun is open.
 - `notable audit person` does not yet render the complete K11 forensic record.

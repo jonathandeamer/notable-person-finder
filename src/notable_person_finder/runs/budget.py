@@ -1,6 +1,13 @@
 from __future__ import annotations
 
 import sqlite3
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
+
+NEGATIVE_PRICING_DETAIL = "unit pricing must not be negative"
+OVERFLOW_PRICING_DETAIL = "worst-case reservation overflows integer nano-USD"
+
+# SQLite INTEGER / attempt reservation bound (signed 64-bit).
+_MAX_SQLITE_INTEGER = (1 << 63) - 1
 
 # These reserve/reconcile helpers are driven by `RunEngine.execute` through
 # `repository.start_attempt`/`finish_attempt` on every attempt -- see
@@ -160,3 +167,56 @@ def reconcile_in_transaction(
         """,
         (reserved_nano_usd, actual_nano_usd, actual_nano_usd, run_id),
     )
+
+
+def _checked_product(unit_price_nano_usd: int, tokens: int) -> int:
+    """Ceiling unit_price * tokens as a non-negative SQLite integer."""
+    if unit_price_nano_usd < 0:
+        raise ValueError(NEGATIVE_PRICING_DETAIL)
+    if tokens < 0:
+        raise ValueError("token bound must not be negative")
+    try:
+        product = (Decimal(unit_price_nano_usd) * Decimal(tokens)).to_integral_value(
+            rounding=ROUND_CEILING
+        )
+    except InvalidOperation as error:
+        raise ValueError(OVERFLOW_PRICING_DETAIL) from error
+    if product < 0 or product > _MAX_SQLITE_INTEGER:
+        raise ValueError(OVERFLOW_PRICING_DETAIL)
+    return int(product)
+
+
+def reservation_nano_usd(
+    *,
+    prompt_unit_price_nano_usd: int,
+    completion_unit_price_nano_usd: int,
+    input_tokens: int,
+    max_completion_tokens: int,
+) -> int:
+    """Budget to reserve for one generation, before the call is made.
+
+    ``input_tokens`` is this specific request's measured size, taken from the
+    render's ``worst_case_input_tokens`` -- not the task's configured
+    ``max_input_tokens`` ceiling. Charging the ceiling reserved roughly 31x
+    real spend on the first ten-feed run and deferred 219 of 236 items at 5%
+    real cap usage; see
+    docs/superpowers/specs/2026-08-02-budget-reservation-sizing-design.md.
+
+    The measured size is a UTF-8 **byte** count charged as a token count, which
+    leaves roughly a 4x margin over real token cost. That margin is deliberate
+    (K2): it needs no tokenizer, so reservation stays deterministic and
+    offline, and over-reserving against a known request size is the safe
+    direction for a spend cap. Reconciliation replaces the reserve with actual
+    cost, so the margin costs in-run headroom only.
+
+    The completion side stays worst-case (K3): output length is not knowable
+    before the call.
+    """
+    prompt_cost = _checked_product(prompt_unit_price_nano_usd, input_tokens)
+    completion_cost = _checked_product(
+        completion_unit_price_nano_usd, max_completion_tokens
+    )
+    total = prompt_cost + completion_cost
+    if total > _MAX_SQLITE_INTEGER:
+        raise ValueError(OVERFLOW_PRICING_DETAIL)
+    return total

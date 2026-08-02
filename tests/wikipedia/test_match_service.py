@@ -828,6 +828,14 @@ def test_budget_reservation_under_hard_cap(
     prepared = handler.prepare(work)
     assert prepared.reserved_nano_usd is not None
     assert prepared.reserved_nano_usd > 0
+    # The reservation must come from this request's rendered size, not from
+    # the configured `max_input_tokens` ceiling. Reserving the ceiling is the
+    # ~31x over-reservation this suite's call site must not reintroduce.
+    match_config = config.tasks.match_wikipedia_identity
+    ceiling_reservation = (
+        100 * match_config.max_input_tokens + 200 * match_config.max_completion_tokens
+    )
+    assert prepared.reserved_nano_usd < ceiling_reservation
     # MediaWiki handlers stay at zero reservation.
     from notable_person_finder.wikipedia.service import (
         build_mediawiki_search_handler,

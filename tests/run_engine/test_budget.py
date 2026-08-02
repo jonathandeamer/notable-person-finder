@@ -13,6 +13,7 @@ from notable_person_finder.runs.budget import (
     reconcile,
     reconcile_in_transaction,
     remaining,
+    reservation_nano_usd,
     reserve,
     reserve_in_transaction,
 )
@@ -393,3 +394,41 @@ def test_reserve_refuses_to_reuse_a_connection_already_mid_transaction(
         reserve(connection, run_id=run_id, nano_usd=100_000_000)
     connection.rollback()
     connection.close()
+
+
+def test_reservation_uses_supplied_input_tokens() -> None:
+    """Kills a reservation that ignores the request size it is handed.
+
+    The input side must scale with `input_tokens`. A helper that returned a
+    fixed figure -- or that reached past its argument for a configured
+    ceiling -- would make every request reserve the same amount, which is the
+    defect this whole change exists to remove.
+    """
+    prices = {
+        "prompt_unit_price_nano_usd": 150,
+        "completion_unit_price_nano_usd": 600,
+        "max_completion_tokens": 512,
+    }
+    small = reservation_nano_usd(input_tokens=3_400, **prices)
+    large = reservation_nano_usd(input_tokens=65_536, **prices)
+
+    assert small < large
+    assert small == 150 * 3_400 + 600 * 512
+    assert large == 150 * 65_536 + 600 * 512
+
+
+def test_reservation_keeps_the_completion_side_at_the_configured_ceiling() -> None:
+    """Pins K3: output length is not knowable before the call.
+
+    Positive control for the test above -- it proves the completion term is
+    actually reachable, so `small < large` there is about the input side and
+    not about a completion term that never contributes.
+    """
+    prices = {
+        "prompt_unit_price_nano_usd": 150,
+        "completion_unit_price_nano_usd": 600,
+        "input_tokens": 3_400,
+    }
+    assert reservation_nano_usd(max_completion_tokens=512, **prices) < (
+        reservation_nano_usd(max_completion_tokens=4_096, **prices)
+    )
