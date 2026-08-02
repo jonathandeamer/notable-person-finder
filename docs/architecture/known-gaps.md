@@ -35,13 +35,20 @@ above real token cost. That margin is intentional:
 The completion side stays at the configured ceiling because output length is
 not knowable before the call.
 
+Measured on a real ten-feed run at a $1.00 cap (2026-08-02), the residual is
+4.6x on `match_wikipedia_identity`, 5.1x on `resolve_person_entity`, and 9.5x
+on `detect_people` — wider than the ~4x a prose byte/token ratio predicts,
+because JSON tokenizes denser and because the fixed worst-case **completion**
+term dominates whenever the input is small. Any further reduction has to come
+from the completion side, which is the harder problem.
+
 **History.** Until 2026-08-02 the input side charged `max_input_tokens`
 instead, compounding the byte/token margin with a worst-case-versus-actual
-error. Measured on the first ten-feed run: reserved $0.9679 against $0.0539
-actually spent, roughly 31x over, which deferred 219 of 236 items
-`not_evaluated_budget` while only 5% of the cap was really used.
-`docs/superpowers/specs/2026-08-02-budget-reservation-sizing-design.md` fixed
-the second error and deliberately kept the first.
+error. That same $1.00 cap triaged 17 of 236 items and deferred 219
+`not_evaluated_budget`, reserving $0.9679 against $0.0539 spent. After the fix
+it triaged 246 of 246 and spent $0.6541 — roughly 14x the work per dollar of
+cap. See
+`docs/superpowers/specs/2026-08-02-budget-reservation-sizing-design.md`.
 
 Do not compensate by lowering the input budgets: 13,141 bytes is the measured
 `detect_people` floor and `match_wikipedia_identity`'s worst case is near 16 kB

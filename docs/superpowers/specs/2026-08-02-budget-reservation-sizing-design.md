@@ -283,6 +283,52 @@ the `not_evaluated_budget` deferral count. The change is only demonstrated if
 that run processes materially more than the 17 of 236 items the same cap
 processed before it. Record the figures, no secrets.
 
+## Measured Outcome (2026-08-02)
+
+A real ten-feed `notable run` at `openrouter_usd_per_run = "1.00"`, against the
+same configuration as the run that motivated this change:
+
+| | Before | After |
+| --- | --- | --- |
+| Source items triaged | 17 of 236 | **246 of 246** |
+| `detect_people` deferred `not_evaluated_budget` | 219 | **0** |
+| Reserved | $0.9679 | $0.9948 |
+| Actually spent | $0.0539 | **$0.6541** |
+| People created | — | 108 |
+| Wikipedia identities matched | — | 22 |
+
+The same cap now buys roughly 14x the work. Detection and resolution ran to
+completion; the cap was then genuinely exhausted at the Wikipedia stage, which
+deferred 80 `match_wikipedia_identity` items `not_evaluated_budget`. That is
+real exhaustion after real work, not the phantom throttling this change
+removes, and the run ended `partial` as it should.
+
+Per-call reserved versus actual, from that run's `attempt` rows:
+
+| Task | Calls | Avg reserved | Avg actual | Ratio |
+| --- | --- | --- | --- | --- |
+| `detect_people` | 253 | $0.022159 | $0.002333 | 9.5x |
+| `match_wikipedia_identity` | 34 | $0.011945 | $0.002614 | 4.6x |
+| `resolve_person_entity` | 22 | $0.006701 | $0.001312 | 5.1x |
+
+**K2's ~4x estimate was optimistic; measured residual is 4.6-9.5x.** Two
+reasons, both understood:
+
+1. JSON-heavy content (the schema and the canonical input document) tokenizes
+   at fewer than 4 bytes per token, so the byte-as-token margin is wider than
+   prose-based arithmetic predicted.
+2. More importantly, the residual is now dominated by **K3's worst-case
+   completion side**, not the input side. `detect_people` reserves 4,096
+   completion tokens against real completions near 700. That term is fixed per
+   call, so it dominates exactly where the input is small -- which is why
+   `detect_people` shows the widest ratio despite having the best-measured
+   input.
+
+This does not change any decision. K3 is deliberate and output length remains
+unknowable before the call. It does mean a future reduction in over-reservation
+would have to come from the completion side, which is a harder problem than the
+one solved here.
+
 ## Open Questions
 
 1. **Should the retained margin be explicit rather than incidental?** K2 keeps
