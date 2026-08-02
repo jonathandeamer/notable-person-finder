@@ -226,10 +226,18 @@ for regressions:
 - Two crash windows can repeat a paid provider call; see
   `docs/architecture/at-least-once-execution.md`. Do not restate those windows
   elsewhere.
-- OpenRouter live smoke (`uv run pytest tests/people -m live -v`) requires a
-  real `OPENROUTER_API_KEY`. Offline gates deselect it. An operator must still
-  run the live smoke and record model/provider/usage/cost/outcome (without
-  secrets) before milestone cutover when a key is available.
+- **Closed 2026-08-02: every live smoke has now been executed against real
+  providers and passes** — all 14 across `tests/ingestion` (4), `tests/people`
+  (3), `tests/wikipedia` (4), and `tests/coverage` (3). Recorded provenance,
+  no secrets: configured and resolved model `openai/gpt-5.4-mini` for every
+  OpenRouter call, `supports_strict` true, pricing usable. `match_wikipedia_
+  identity` served by Azure, 452 prompt + 73 completion tokens, 667,500
+  nano-USD, outcome `matching_page`. `assess_article` served by Azure, 1,029
+  prompt + 275 completion tokens, 2,009,250 nano-USD, outcome `validated`
+  (`same_person` / `significant`). Reported cost is therefore real and the
+  budget reservation path has now met live pricing. Note `tests/people`'s
+  live smokes assert but print no provenance record, unlike the other three
+  suites; recording there is still by hand.
 - **The six previously-stub `tests/coverage` files now have real bodies**
   (`test_run_cli.py`, `test_seams.py`, `test_digest_status.py`, and the three
   live smokes), so the CLI-registration, cross-component-seam, digest, and
@@ -245,16 +253,43 @@ for regressions:
   counter values (1 through 9) and asserts each one's exact rendered line in
   both the digest section and `notable status` output, catching a
   swapped-field defect that the old all-zero version could not.
-- **Two of the three live smokes have been written but never executed
-  against a real provider.** No `BRAVE_API_KEY` or `OPENROUTER_API_KEY` is
-  available in this environment. Every field in `test_live_brave.py` and
-  `test_live_openrouter_assess.py` was checked against adapter source by two
-  independent agents, but static construction is not the same as a passing
-  live run. An operator must run both with real keys and record
-  model/provider/usage/cost/outcome (without secrets) before milestone 5
-  cutover. `test_live_article_fetch.py` is the exception: it is keyless, it
-  makes one real GET to `en.wikipedia.org`, and it currently passes — the
-  only one of the three genuinely verified so far.
+- **Fixed 2026-08-02: `tests/coverage`'s Brave and OpenRouter assess smokes
+  have now been run against real providers and pass.** Both were previously
+  written but never executed. Running them exposed two real defects that
+  static review by two independent agents had missed, both now fixed on
+  `fix/omit-unsupported-sampling-parameters` — see the two entries below.
+  This is the concrete case for why a written live smoke is not evidence
+  until it has actually run.
+- **Fixed 2026-08-02: sending `temperature`/`top_p` made every structured
+  generation fail with HTTP 404.** `[openrouter.routing]` sets
+  `require_parameters: True`, which tells OpenRouter to exclude any endpoint
+  that does not declare every supplied parameter. No endpoint serving
+  `openai/gpt-5.4-mini` declares `temperature` or `top_p` — it is a reasoning
+  model, controlled by `reasoning_effort` — so supplying them left no
+  eligible endpoint and the router answered 404 for all four model tasks.
+  `GenerationParameters.temperature` and `.top_p` are now `float | None`
+  defaulting to `None`, and `providers/openrouter.py` omits each key when it
+  is `None`, exactly as `reasoning_effort` already did. Note this ground was
+  contested: `f2e9e76` introduced the omission for the right reason but
+  attributed it to null serialization and made the smoke pass `None` into
+  then-`float` fields; `7045697` correctly caught that type violation but
+  fixed it by making both parameters unconditional, which reintroduced the
+  404. Widening the types is what makes the omission legitimate. Do not
+  restore either parameter unconditionally; set one only for a model whose
+  endpoints advertise it.
+- **Fixed 2026-08-02: `resolve_person_entity` and `match_wikipedia_identity`
+  sent a schema strict structured output rejects, failing with HTTP 400.**
+  Strict mode requires `required` to list every key in `properties`;
+  optionality must be carried by a nullable type. Pydantic omits a field
+  that has a default, so `selected_person_id` and `selected_page_id` were
+  absent from `required` and the provider rejected the schema outright
+  ("'required' is required to be supplied and to be an array including every
+  key in properties"). Both builders now pass their compacted schema through
+  a module-private `_require_every_property` before returning. `detection`
+  and `assessment` were already compliant and are unchanged, so no schema
+  hash moved for them. The transform is idempotent for a compliant schema.
+  This defect was invisible offline because no fake ever enforced the
+  provider's strict-schema contract.
 - **Fixed:** `config/loader.py`'s `load_config` previously resolved
   `source_policy_file` to an absolute path only into a local variable and the
   configuration snapshot dict, never into the `MainConfig` object itself, so
@@ -370,10 +405,8 @@ for regressions:
   the assessment contract, the HTTP/fetch/assess services, repository, merge
   hooks, seed hooks, CLI registration and integration (`test_run_cli.py`),
   cross-component seams (`test_seams.py`), and digest/status rendering
-  (`test_digest_status.py`), plus three opt-in live smokes. Two of the three
-  live smokes (Brave, OpenRouter assess) are written but not yet executed
-  against a real provider; see the known gaps above before treating a green
-  `-m live` run as proof for those two.
+  (`test_digest_status.py`), plus three opt-in live smokes, all three of
+  which have now been executed against real providers and pass.
 - `tests/leads/` — lead aggregation and digest queue: aggregation and ranking
   logic, queue lifecycle, repository SQL, the handler service and its
   scheduling and fingerprint-reuse behaviour (`test_service.py`), merge hooks,
@@ -460,11 +493,10 @@ reviewable and executable.
     `uv run pytest tests/wikipedia -m live -v` (OpenRouter key for match smoke)
   - Brave + article fetch + assess OpenRouter:
     `BRAVE_API_KEY=… OPENROUTER_API_KEY=… uv run pytest tests/coverage -m live -v`
-    — this collects three real tests. The article-fetch smoke is keyless and
-    currently passes against a live GET. The Brave and OpenRouter assess
-    smokes still need an operator run with real keys before cutover; they
-    have not been executed against a real provider in this environment. See
-    the known gaps above.
+    — this collects three real tests, all of which now pass against real
+    providers. An adjacent `.env` supplies both keys, so `set -a && . ./.env
+    && set +a` before the command is enough; never pass a key inline in a way
+    that lands in shell history or output.
 - Exercise the installed interface with `uv run notable ...`.
 - Keep default rewrite verification offline and isolate configuration and
   storage with temporary paths.
