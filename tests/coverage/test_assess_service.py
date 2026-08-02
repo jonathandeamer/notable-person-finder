@@ -79,6 +79,8 @@ _OTHER = "c" * 64
 NOW = moment()
 ASSESS_MODEL = "openai/gpt-assess"
 MATCH_MODEL = "openai/gpt-match"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_VISUAL_ARTS_POLICY = _REPO_ROOT / "config" / "source_policies" / "visual_arts.toml"
 
 
 def _main_config(
@@ -86,13 +88,14 @@ def _main_config(
     assess_model: str = ASSESS_MODEL,
     match_model: str = MATCH_MODEL,
     hard_budget: bool = False,
+    source_policy_file: Path = _VISUAL_ARTS_POLICY,
 ) -> MainConfig:
     return MainConfig(
         schema_version=1,
         timezone="Europe/Paris",
         feeds_file=Path("feeds.toml"),
         domain_profile_file=Path("profiles/art.toml"),
-        source_policy_file=Path("source_policies/visual_arts.toml"),
+        source_policy_file=source_policy_file,
         budget=BudgetConfig(openrouter_usd_per_run="1.00" if hard_budget else None),
         openrouter=OpenRouterConfig(routing=ProviderRoutingConfig()),
         brave=BraveConfig(),
@@ -1193,6 +1196,17 @@ def test_assess_input_overflow_records_local_refuse_and_advances_plan(
     assert plan is not None
     assert plan.status in {"completed", "incomplete", "failed"}
     assert plan.completed_at is not None
+
+    aggregate_work = connection.execute(
+        """
+        SELECT subject_kind, subject_id
+          FROM work_item
+         WHERE task_type = 'aggregate_person_lead'
+        """
+    ).fetchall()
+    assert len(aggregate_work) == 1
+    assert aggregate_work[0]["subject_kind"] == "person"
+    assert aggregate_work[0]["subject_id"] == person_id
 
 
 def test_sweep_terminalizes_a_plan_whose_assess_work_died_without_a_row(

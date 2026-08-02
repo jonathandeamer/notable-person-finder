@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from notable_person_finder.config.models import MainConfig
+from notable_person_finder.coverage.repository import open_plan, update_plan_status
 from notable_person_finder.coverage.screening import (
     SourcePolicy,
     source_policy_from_mapping,
@@ -226,6 +227,20 @@ def _seed_person_and_articles(
     return person_id, paa_id
 
 
+def _seed_person(connection: sqlite3.Connection, run_id: int) -> int:
+    with immediate(connection):
+        person_id = connection.execute(
+            """
+            INSERT INTO person (
+                created_by_run_id, display_name, identity_fingerprint, created_at
+            ) VALUES (?, 'Test Person', ?, ?)
+            """,
+            (run_id, "d" * 64, NOW),
+        ).lastrowid
+        assert person_id is not None
+    return int(person_id)
+
+
 def test_prepare_execute_persist_round_trip(
     connection: sqlite3.Connection, empty_policy: SourcePolicy
 ) -> None:
@@ -308,6 +323,84 @@ def test_prepare_execute_persist_round_trip(
     assert transition_row is not None
     assert transition_row["to_status"] == "pending"
     assert transition_row["lead_assessment_id"] == lead_id
+
+
+def test_terminal_incomplete_coverage_with_no_positive_is_incomplete(
+    connection: sqlite3.Connection, empty_policy: SourcePolicy
+) -> None:
+    """A terminal incomplete coverage plan with no useful evidence is not negative.
+
+    Production break this catches: if `aggregate_person_lead` stops passing
+    the person's terminal coverage completeness into `aggregate_lead`, the
+    persisted outcome becomes `insufficient_evidence`.
+    """
+    run_id = insert_run(connection)
+    person_id = _seed_person(connection, run_id=run_id)
+    with immediate(connection) as conn:
+        plan_id = open_plan(
+            conn,
+            person_id=person_id,
+            run_id=run_id,
+            material_fingerprint="m" * 64,
+            source_policy_fingerprint="p" * 64,
+            retrieval_target=5,
+            created_at=NOW,
+        )
+        update_plan_status(
+            conn,
+            plan_id=plan_id,
+            status="incomplete",
+            completed_at=NOW,
+            failure_category="unsafe_truncation",
+            truncated_unsafe=True,
+        )
+
+    work_id = schedule_aggregate_person_lead(
+        connection,
+        person_id=person_id,
+        material_fingerprint="i" * 64,
+        run_id=run_id,
+        now=NOW,
+    )
+    connection.execute(
+        "UPDATE work_item SET state = 'running', claimed_by_run_id = ? WHERE id = ?",
+        (run_id, work_id),
+    )
+    connection.commit()
+    work = WorkItem(
+        id=work_id,
+        task_type=AGGREGATE_PERSON_LEAD_TASK_TYPE,
+        subject_kind="person",
+        subject_id=person_id,
+        fingerprint="i" * 64,
+        required=True,
+        priority=AGGREGATE_PERSON_LEAD_PRIORITY,
+        state=WorkState.RUNNING,
+    )
+    handler = build_aggregate_person_lead_handler(
+        connection, config=_main_config(), policy=empty_policy
+    )
+
+    assert handler.prepare is not None
+    prepared = handler.prepare(work)
+    outcome = handler.execute(work, 1, prepared.payload)
+    assert handler.persist is not None
+    with immediate(connection):
+        handler.persist(work, outcome)
+
+    lead_row = connection.execute(
+        """
+        SELECT outcome, incompleteness_reason
+          FROM lead_assessment
+         WHERE person_id = ?
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (person_id,),
+    ).fetchone()
+    assert lead_row is not None
+    assert lead_row["outcome"] == "assessment_incomplete"
+    assert lead_row["incompleteness_reason"] is not None
 
 
 def test_prepare_execute_persist_removed_when_wikipedia_matched(
