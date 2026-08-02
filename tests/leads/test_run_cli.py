@@ -91,21 +91,30 @@ def test_aggregation_fires_in_same_run_coverage_settles(
 def test_second_run_with_unchanged_evidence_still_reports_exit_ok(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Direct regression test for the required=True steady-state bug found
-    in Task 16's verification pass: ``aggregate_person_lead``'s K6 prepare()
-    refuses (raises) when a person's material fingerprint is unchanged since
-    their last aggregation, and the run engine settles any raising prepare()
-    as ``failed_permanent``. When the work item was registered
-    ``required=True``, that made every steady-state second run (one where at
-    least one person's evidence has not changed) report ``EXIT_PARTIAL``
-    forever, because ``seed_lead_aggregation`` unconditionally reschedules
-    the item every run and the refusal is expected, not a failure.
-    ``aggregate_person_lead`` must be scheduled ``required=False`` so this
-    expected local refusal does not gate ``RunState``/exit code. The first
-    run aggregates fresh evidence for the person; the second run's
-    fingerprint is unchanged (no new coverage evidence arrived), so its
-    prepare() refuses -- but the run as a whole must still report
-    ``EXIT_OK``.
+    """Direct regression test for the steady-state bug found in Task 16's
+    verification pass, since fixed at the root in the final review pass:
+    ``aggregate_person_lead``'s K6 prepare() refuses (raises) when a
+    person's material fingerprint is unchanged since their last
+    aggregation, and the run engine settles any raising prepare() as
+    ``failed_permanent``.
+
+    The scheduling hooks (``_schedule_lead_aggregation_after_settled``,
+    reused by ``seed_lead_aggregation``) now compare the freshly computed
+    fingerprint against the person's stored one *before* scheduling, and
+    skip calling ``schedule_aggregate_person_lead`` entirely when they
+    match -- so a steady-state second run never creates a work item for an
+    unchanged person in the first place, rather than creating one and
+    relying on a non-required refusal to keep it off the exit code. (An
+    earlier fix registered the work item ``required=False`` to paper over
+    the same symptom; that made a *genuine* aggregation bug just as
+    invisible as the expected no-op, and left one work_item row behind per
+    person per run forever. This test still exercises the same user-visible
+    behaviour -- ``EXIT_OK`` on both runs -- but see
+    ``test_second_run_with_unchanged_evidence_schedules_no_new_work_item``
+    for the mechanism-level assertion.) The first run aggregates fresh
+    evidence for the person; the second run's fingerprint is unchanged (no
+    new coverage evidence arrived), so no work item is even scheduled for
+    them -- but the run as a whole must still report ``EXIT_OK``.
     """
     config = write_people_graph(tmp_path, feeds=_single_feed())
     _wire(monkeypatch, rss=RESEARCH_FEED.encode())
@@ -125,8 +134,9 @@ def test_second_run_with_unchanged_evidence_still_reports_exit_ok(
         connection.close()
 
     # Second run: no new feed content, no new coverage evidence -- the
-    # person's material fingerprint is unchanged, so aggregate_person_lead's
-    # prepare() will refuse (K6). The run overall must still be EXIT_OK.
+    # person's material fingerprint is unchanged, so the scheduling hook
+    # skips them and no aggregate_person_lead work item is even created.
+    # The run overall must still be EXIT_OK.
     _wire(monkeypatch, rss=RESEARCH_FEED.encode())
     assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
 
@@ -137,8 +147,58 @@ def test_second_run_with_unchanged_evidence_still_reports_exit_ok(
             (person_id,),
         ).fetchone()[0]
         assert lead_count == 1, (
-            "expected no additional lead_assessment row from the refused "
-            "second-run aggregation attempt"
+            "expected no additional lead_assessment row: the second run's "
+            "unchanged fingerprint should have skipped scheduling entirely"
+        )
+    finally:
+        connection.close()
+
+
+def test_second_run_with_unchanged_evidence_schedules_no_new_work_item(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Root-cause regression test for the unbounded work_item growth this
+    fix wave closed: when nothing about a person's evidence has changed
+    since their last aggregation, the second run's seed sweep
+    (``seed_lead_aggregation`` -> ``_schedule_lead_aggregation_after_settled``)
+    must not create a new ``aggregate_person_lead`` work_item row at all --
+    not merely create one that is then refused by ``prepare()``. Before this
+    fix, ``schedule_work``'s active-state dedup (``pending``/``running``/
+    ``deferred``) does not cover a ``failed_permanent`` row, so a fresh
+    work_item was inserted on every steady-state run forever.
+    """
+    config = write_people_graph(tmp_path, feeds=_single_feed())
+    _wire(monkeypatch, rss=RESEARCH_FEED.encode())
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
+
+    person_id = _sole_person_id(config)
+    database = config.parent / "portable" / "data" / "notable.sqlite3"
+
+    connection = connect_database(database, readonly=True)
+    try:
+        first_run_work_item_count = connection.execute(
+            "SELECT COUNT(*) FROM work_item WHERE task_type = ? AND subject_id = ?",
+            (AGGREGATE_PERSON_LEAD_TASK_TYPE, person_id),
+        ).fetchone()[0]
+        assert first_run_work_item_count == 1
+    finally:
+        connection.close()
+
+    # Second run: unchanged evidence. The skip-gate in
+    # _schedule_lead_aggregation_after_settled must stop a second work_item
+    # row from ever being created for this person.
+    _wire(monkeypatch, rss=RESEARCH_FEED.encode())
+    assert cli_main.command_run(config, verbose=False) == cli_main.EXIT_OK
+
+    connection = connect_database(database, readonly=True)
+    try:
+        second_run_work_item_count = connection.execute(
+            "SELECT COUNT(*) FROM work_item WHERE task_type = ? AND subject_id = ?",
+            (AGGREGATE_PERSON_LEAD_TASK_TYPE, person_id),
+        ).fetchone()[0]
+        assert second_run_work_item_count == 1, (
+            "expected no new aggregate_person_lead work_item row on a "
+            "steady-state run with unchanged evidence"
         )
     finally:
         connection.close()

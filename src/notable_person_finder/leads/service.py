@@ -222,21 +222,22 @@ def schedule_aggregate_person_lead(
         subject_kind="person",
         subject_id=person_id,
         fingerprint=material_fingerprint,
-        # Not required: K6's unchanged-fingerprint refusal in prepare() is
-        # the expected steady-state outcome for a person whose evidence
-        # hasn't changed since their last aggregation, not a failure. This
-        # item is still scheduled and attempted every run (seed_lead_
-        # aggregation sweeps every person with completed coverage evidence
-        # unconditionally); only its failed_permanent settlement stops
-        # counting toward RunState/exit-code computation. required=True
-        # previously forced RunState.PARTIAL on every run following a
-        # person's first aggregation, since a raising prepare() always
-        # settles failed_permanent (runs/engine.py) and
-        # required_failed_permanent > 0 forces PARTIAL whenever the run
-        # also produced meaningful results (runs/engine.py's
-        # derive_run_state) -- i.e. forever, once any person had been
-        # aggregated once.
-        required=False,
+        # required=True: the K6 unchanged-fingerprint case is now filtered
+        # out before scheduling (see _schedule_lead_aggregation_after_settled
+        # and seed_lead_aggregation, which compare the freshly computed
+        # fingerprint against fetch_current_lead_assessment_material_
+        # fingerprint and skip calling this function entirely when they
+        # match), so a work item only ever reaches here when the person's
+        # evidence actually changed. A failed_permanent settlement from here
+        # on is therefore a genuine, unexpected aggregation bug, not routine
+        # steady state -- required=False previously made exactly that kind
+        # of failure invisible to RunCounters (it landed in neither
+        # optional_succeeded nor any digest-visible failure count) and let
+        # one work_item row accumulate per person per run forever, even when
+        # nothing had changed. prepare()'s own refusal check stays as a
+        # defensive backstop for a race between the skip-check here and a
+        # concurrent settlement, but should rarely if ever fire now.
+        required=True,
         priority=AGGREGATE_PERSON_LEAD_PRIORITY,
         eligible_at=now,
         run_id=run_id,
@@ -627,6 +628,23 @@ def _schedule_lead_aggregation_after_settled(
         policy=policy,
         config=config,
     )
+
+    # K6 steady state: skip scheduling entirely when nothing about this
+    # person's evidence has changed since their last completed aggregation,
+    # rather than scheduling a work item that prepare()'s own refusal check
+    # would only reject anyway. This is what makes required=True safe on
+    # schedule_aggregate_person_lead (a failed_permanent settlement is then
+    # a genuine bug, not routine no-op churn) and what stops one work_item
+    # row from accumulating per person on every run forever, even when
+    # nothing changed -- seed_lead_aggregation sweeps every person with
+    # completed coverage evidence unconditionally on every run, so without
+    # this check the table grows without bound in steady state.
+    stored_fingerprint = fetch_current_lead_assessment_material_fingerprint(
+        connection, person_id=person_id
+    )
+    if stored_fingerprint is not None and stored_fingerprint == fingerprint:
+        return
+
     schedule_aggregate_person_lead(
         connection,
         person_id=person_id,
