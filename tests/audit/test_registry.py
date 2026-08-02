@@ -1,6 +1,56 @@
 from __future__ import annotations
 
+import ast
+import inspect
+
+import notable_person_finder.cli.main as cli_main
 from notable_person_finder.audit.registry import REGISTRY, binding_for
+
+
+def _engine_registered_task_types() -> set[str]:
+    """The task types the run engine actually registers.
+
+    Parses `cli/main.py`'s source with `ast` to find the `handlers = {...}`
+    dict literal built inside `command_run`, then resolves each dict key
+    (a `Name` node referencing a module-level `*_TASK_TYPE` constant) to its
+    real string value via `getattr` on the imported module. This is the
+    engine's source of truth for K10 completeness — not a second hand-
+    maintained literal that could drift from it.
+    """
+    source = inspect.getsource(cli_main)
+    tree = ast.parse(source)
+
+    handlers_dict: ast.Dict | None = None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "handlers"
+            and isinstance(node.value, ast.Dict)
+        ):
+            handlers_dict = node.value
+            break
+
+    assert handlers_dict is not None, (
+        "could not find a `handlers = {...}` dict literal in cli/main.py"
+    )
+
+    task_types: set[str] = set()
+    for key in handlers_dict.keys:
+        assert key is not None and isinstance(key, ast.Name), (
+            f"handlers dict key is not a plain Name node: {key!r}"
+        )
+        task_types.add(getattr(cli_main, key.id))
+    return task_types
+
+
+def test_registry_matches_the_engines_registered_handlers() -> None:
+    # K10: the registry must track the run engine's actual handler
+    # registration, not a second hand-maintained literal. This derives the
+    # expected set from cli/main.py's `handlers = {...}` dict via ast so a
+    # future handler added without an audit binding fails here.
+    assert set(REGISTRY) == _engine_registered_task_types()
 
 
 def test_every_registered_handler_task_type_has_a_binding() -> None:
