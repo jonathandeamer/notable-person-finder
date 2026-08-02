@@ -203,6 +203,18 @@ Not built at all, so do not document, import, or assume any of it:
 Known gaps carried forward, recorded so a later change does not mistake them
 for regressions:
 
+- **`notable audit person` does not yet render the complete K11 forensic
+  record.** Although the repository loads some of these fields, the command
+  currently omits each sourced name's `search_name` and `match_key`; each
+  mention's persisted `rationale`; each assessment's `content_types_json`
+  judgment; and queue-history `last_material_change_at` and `removed_reason`.
+  Lead-history rows additionally discard ordering factors,
+  `lead_policy_fingerprint`, and `material_fingerprint` while loading, so the
+  renderer cannot show them. This leaves identity lookup evidence, mention
+  outcomes, assessment content-type judgments, lead provenance/ranking, and
+  queue lifecycle evidence incomplete. These are all required by K11 in
+  `docs/superpowers/specs/2026-08-02-audit-and-inspection-design.md` and need
+  a follow-up audit remediation.
 - `notable status` prints bare pending and deferred counts, with no budget
   figures and no deferral-reason breakdown, so it still cannot explain *why*
   work was deferred. The digest now can; `status` has not caught up.
