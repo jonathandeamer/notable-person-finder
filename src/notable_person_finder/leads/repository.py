@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 from notable_person_finder.leads.aggregation import LeadOutcome
@@ -529,6 +529,50 @@ def fetch_queue_flow_counts(
         ending_backlog_possible=ending_backlog_possible,
         arrival_rate_7d=arrival_rate_7d,
         emission_rate_7d=emission_rate_7d,
+        oldest_pending_days=oldest_pending_days,
+    )
+
+
+def compensate_queue_flow_for_pending_emission(
+    counts: QueueFlowCounts,
+    *,
+    all_pending_candidates: Sequence[ShortlistCandidate],
+    limited_candidates: Sequence[ShortlistCandidate],
+    now: str,
+) -> QueueFlowCounts:
+    """Adjust `counts`'s ending-backlog and oldest-pending fields to exclude
+    `limited_candidates` -- the shortlist this run is about to emit but has
+    not yet committed as `emitted` in `digest_queue` (emission is deferred
+    until after `write_digest` succeeds; see `_leads_summary`'s docstring in
+    `cli/main.py`). `counts.ending_backlog_*` and `counts.oldest_pending_days`
+    were read while every about-to-be-emitted candidate was still `pending`,
+    so they overstate the backlog this digest actually leaves behind. This
+    mirrors, for the ending-backlog and oldest-pending fields, the same kind
+    of local, in-memory compensation the caller already applies to
+    `counts.emitted` via `emitted_for_render`.
+    """
+    limited_ids = {candidate.person_id for candidate in limited_candidates}
+    remaining = [
+        candidate
+        for candidate in all_pending_candidates
+        if candidate.person_id not in limited_ids
+    ]
+    promising_in_limited = sum(
+        1 for candidate in limited_candidates if candidate.tier == "promising_lead"
+    )
+    possible_in_limited = sum(
+        1 for candidate in limited_candidates if candidate.tier == "possible_lead"
+    )
+    oldest_pending_days: int | None = None
+    if remaining:
+        oldest = min(candidate.first_pending_at for candidate in remaining)
+        oldest_pending_days = _days_between(oldest, now)
+    return replace(
+        counts,
+        ending_backlog_promising=(
+            counts.ending_backlog_promising - promising_in_limited
+        ),
+        ending_backlog_possible=(counts.ending_backlog_possible - possible_in_limited),
         oldest_pending_days=oldest_pending_days,
     )
 

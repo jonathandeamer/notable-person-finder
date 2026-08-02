@@ -44,6 +44,7 @@ from notable_person_finder.leads.aggregation import LeadOutcome
 from notable_person_finder.leads.ranking import QueueEntry, rank_key
 from notable_person_finder.leads.repository import (
     ShortlistCandidate,
+    compensate_queue_flow_for_pending_emission,
     count_attention_signals_for_lead,
     emit_shortlist_entries,
     fetch_pending_shortlist_candidates,
@@ -845,6 +846,19 @@ def _leads_summary(
     # this run's own digest still reflects the entries this digest is about
     # to emit.
     emitted_for_render = counts.emitted + len(limited_candidates)
+    # For the same reason, `counts.ending_backlog_*` and
+    # `counts.oldest_pending_days` were read while every candidate in
+    # `limited_candidates` was still `status = 'pending'`, so they overstate
+    # the backlog this digest actually leaves behind (and may report the
+    # about-to-be-emitted top-ranked candidate as the "oldest pending"
+    # entry). Compensate locally using the already-known shortlist, the same
+    # way `emitted_for_render` compensates the emission count above.
+    counts = compensate_queue_flow_for_pending_emission(
+        counts,
+        all_pending_candidates=candidates,
+        limited_candidates=limited_candidates,
+        now=now,
+    )
     net_queue_growth = (
         counts.newly_queued - emitted_for_render - counts.removed_matching_wikipedia
     )

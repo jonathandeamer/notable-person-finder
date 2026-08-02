@@ -533,6 +533,72 @@ def test_emit_shortlist_entries_and_record_digest_roll_back_together_on_failure(
     assert digest_rows == 0
 
 
+def test_leads_summary_queue_flow_excludes_own_emissions_from_backlog(
+    tmp_path: Path,
+) -> None:
+    """Regression test for the backlog-inflation defect found in review of
+    milestone 6a-iv: `fetch_queue_flow_counts` runs (deliberately) before
+    this run's own shortlist is committed 'emitted' -- see this run's
+    `emitted_for_render` compensation just above it in `_leads_summary`. But
+    nothing compensated `ending_backlog_*` or `oldest_pending_days`, so both
+    counted every about-to-be-emitted candidate as still backlog, and
+    `oldest_pending_days` could report the age of the very entry ranked #1
+    for this digest instead of the oldest entry genuinely left behind.
+
+    Three people are seeded pending, oldest first_pending_at first (so
+    ranking favours them and they are exactly the ones this digest selects
+    with digest_limit=2), leaving person 3 (newest) as the only genuine
+    overflow. Before the fix: ending_backlog_promising=3 (all still
+    'pending' at query time) and oldest_pending_days derived from person 1's
+    2026-07-29 timestamp (3 days old). After the fix: ending_backlog_
+    promising=1 and oldest_pending_days derived from person 3's 2026-07-31
+    timestamp (1 day old) -- the only row genuinely left pending once this
+    digest's own emissions are excluded.
+    """
+    connection = _seeded_connection(tmp_path, person_count=3)
+    _seed_pending_lead(connection, person_id=1, first_pending_at="2026-07-29T00:00:00Z")
+    _seed_pending_lead(connection, person_id=2, first_pending_at="2026-07-30T00:00:00Z")
+    _seed_pending_lead(connection, person_id=3, first_pending_at="2026-07-31T00:00:00Z")
+
+    config = _config(digest_limit=2)
+    report = _report()
+    result = _leads_summary(
+        connection, report, config=config, now="2026-08-01T00:00:00Z"
+    )
+    assert result is not None
+    _shortlist_entries, queue_flow, limited_candidates = result
+
+    # Persons 1 and 2 (oldest) are selected for this digest's shortlist;
+    # person 3 is the sole genuine overflow.
+    assert {c.person_id for c in limited_candidates} == {1, 2}
+
+    assert queue_flow.ending_backlog_promising == 1
+    assert queue_flow.ending_backlog_possible == 0
+    assert queue_flow.oldest_pending_days == 1
+
+    # Cross-check against reality: once the caller actually emits this
+    # digest's shortlist (as `report_run` does after `write_digest`
+    # succeeds), the real remaining pending count in `digest_queue` must
+    # match what queue_flow already reported as the ending backlog.
+    emit_shortlist_entries(
+        connection,
+        run_id=report.run_id,
+        occurred_at="2026-08-01T00:00:00Z",
+        candidates=limited_candidates,
+    )
+    remaining_pending = connection.execute(
+        "SELECT COUNT(*) FROM digest_queue WHERE status = 'pending'"
+    ).fetchone()[0]
+    assert (
+        remaining_pending
+        == queue_flow.ending_backlog_promising + queue_flow.ending_backlog_possible
+    )
+    remaining_person_id = connection.execute(
+        "SELECT person_id FROM digest_queue WHERE status = 'pending'"
+    ).fetchone()[0]
+    assert remaining_person_id == 3
+
+
 def test_record_digest_with_entries_writes_a_digest_row_for_an_empty_shortlist(
     tmp_path: Path,
 ) -> None:
