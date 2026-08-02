@@ -108,6 +108,27 @@ def build_resolve_input(
     return value
 
 
+def _require_every_property(value: object) -> object:
+    """List every property of every object in ``required``.
+
+    OpenAI-style strict structured output rejects a schema whose ``required``
+    omits any key in ``properties``; optionality must be carried by a nullable
+    type, not by absence from ``required``. Pydantic leaves a field with a
+    default out of ``required``, which is why ``selected_person_id`` produced
+    HTTP 400. This only widens ``required`` in the schema sent to the provider
+    -- Python-side validation still accepts the field's default.
+    """
+    if isinstance(value, dict):
+        result = {key: _require_every_property(child) for key, child in value.items()}
+        properties = result.get("properties")
+        if result.get("type") == "object" and isinstance(properties, dict):
+            result["required"] = sorted(properties)
+        return result
+    if isinstance(value, list):
+        return [_require_every_property(child) for child in value]
+    return value
+
+
 def resolution_schema() -> dict[str, object]:
     schema = ResolvePersonEntityOutput.model_json_schema(mode="validation")
     definitions = schema.get("$defs", {})
@@ -149,7 +170,7 @@ def resolution_schema() -> dict[str, object]:
             return [compact(child) for child in value]
         return value
 
-    compacted = cast(dict[str, object], compact(schema))
+    compacted = cast(dict[str, object], _require_every_property(compact(schema)))
     bounded_text_schema: dict[str, object] = {
         "maxLength": 1000,
         "minLength": 1,

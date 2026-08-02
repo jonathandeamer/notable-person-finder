@@ -44,11 +44,17 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
     assert config.tasks.detect_people.model == "openai/gpt-5.4-mini"
     assert config.tasks.detect_people.max_input_tokens == 4096
     assert config.tasks.detect_people.max_completion_tokens == 1024
+    # temperature and top_p default to None, meaning "do not send this
+    # parameter". Reasoning models declare support for neither, and supplying
+    # one under the strict provider routing above excludes every endpoint that
+    # serves the model, which OpenRouter reports as HTTP 404.
     assert config.tasks.detect_people.parameters == GenerationParameters(
-        temperature=0.0,
-        top_p=1.0,
+        temperature=None,
+        top_p=None,
         reasoning_effort=None,
     )
+    assert config.tasks.detect_people.parameters.temperature is None
+    assert config.tasks.detect_people.parameters.top_p is None
     assert config.tasks.detect_people.max_people == 8
     assert config.tasks.detect_people.max_title_characters == 500
     assert config.tasks.detect_people.max_summary_characters == 4000
@@ -56,8 +62,8 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
     assert config.tasks.resolve_person_entity.max_input_tokens == 4096
     assert config.tasks.resolve_person_entity.max_completion_tokens == 1024
     assert config.tasks.resolve_person_entity.parameters == GenerationParameters(
-        temperature=0.0,
-        top_p=1.0,
+        temperature=None,
+        top_p=None,
         reasoning_effort=None,
     )
     assert config.tasks.resolve_person_entity.max_candidates == 8
@@ -70,8 +76,8 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
     assert match.max_input_tokens == 4096
     assert match.max_completion_tokens == 1024
     assert match.parameters == GenerationParameters(
-        temperature=0.0,
-        top_p=1.0,
+        temperature=None,
+        top_p=None,
         reasoning_effort=None,
     )
     assert match.max_candidates == 8
@@ -96,8 +102,8 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
     assert assess.max_input_tokens == 32_768
     assert assess.max_completion_tokens == 1024
     assert assess.parameters == GenerationParameters(
-        temperature=0.0,
-        top_p=1.0,
+        temperature=None,
+        top_p=None,
         reasoning_effort=None,
     )
     assert assess.retrieval_target == 5

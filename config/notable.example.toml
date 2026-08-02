@@ -64,20 +64,32 @@ extra_snippets = false
 
 [tasks.detect_people]
 model = "openai/gpt-5.4-mini"
-max_input_tokens = 4096
+# Measured in worst-case UTF-8 bytes, not model tokens. It must exceed this
+# task's fixed prompt+schema+framing floor PLUS its own content caps, or the
+# request is silently truncated (detect) or rejected (resolve/match). At 4096
+# a saturated detect_people request truncated the title to ~13 characters and
+# the model correctly reported it could identify nobody. 65536 leaves roughly
+# 5x headroom over the measured requirement; the real spend guard is
+# [budget] openrouter_usd_per_run, not this ceiling.
+max_input_tokens = 65536
 max_completion_tokens = 1024
 max_people = 8
 max_title_characters = 500
 max_summary_characters = 4000
 
 [tasks.detect_people.parameters]
-temperature = 0.0
-top_p = 1.0
+# temperature and top_p are deliberately unset. The default models are
+# reasoning models whose OpenRouter endpoints declare support for neither,
+# and [openrouter.routing] requires an endpoint to support every supplied
+# parameter, so sending either one leaves no eligible endpoint (HTTP 404).
+# Set them only for a model whose endpoints advertise them.
+# temperature = 0.0
+# top_p = 1.0
 reasoning_effort = "low"
 
 [tasks.resolve_person_entity]
 model = "openai/gpt-5.4-mini"
-max_input_tokens = 4096
+max_input_tokens = 65536
 max_completion_tokens = 1024
 max_candidates = 8
 max_facts_per_candidate = 12
@@ -86,13 +98,18 @@ max_title_characters = 500
 max_summary_characters = 4000
 
 [tasks.resolve_person_entity.parameters]
-temperature = 0.0
-top_p = 1.0
+# temperature and top_p are deliberately unset. The default models are
+# reasoning models whose OpenRouter endpoints declare support for neither,
+# and [openrouter.routing] requires an endpoint to support every supplied
+# parameter, so sending either one leaves no eligible endpoint (HTTP 404).
+# Set them only for a model whose endpoints advertise them.
+# temperature = 0.0
+# top_p = 1.0
 reasoning_effort = "low"
 
 [tasks.match_wikipedia_identity]
 model = "openai/gpt-5.4-mini"
-max_input_tokens = 4096
+max_input_tokens = 65536
 max_completion_tokens = 1024
 max_candidates = 8
 max_query_forms = 6
@@ -111,8 +128,13 @@ max_title_characters = 500
 max_summary_characters = 4000
 
 [tasks.match_wikipedia_identity.parameters]
-temperature = 0.0
-top_p = 1.0
+# temperature and top_p are deliberately unset. The default models are
+# reasoning models whose OpenRouter endpoints declare support for neither,
+# and [openrouter.routing] requires an endpoint to support every supplied
+# parameter, so sending either one leaves no eligible endpoint (HTTP 404).
+# Set them only for a model whose endpoints advertise them.
+# temperature = 0.0
+# top_p = 1.0
 reasoning_effort = "low"
 
 # Plan-level bounds (including coverage_refresh_interval_hours) live under
@@ -124,10 +146,11 @@ reasoning_effort = "low"
 [tasks.assess_article]
 model = "openai/gpt-5.4-mini"
 # Worst-case assess input is measured in UTF-8 bytes, not model tokens, so this
-# is roughly 8k real tokens. It must stay at or above the fixed prompt/schema
+# is roughly 16k real tokens. It must stay at or above the fixed prompt/schema
 # floor plus max_passage_characters, max_title_characters, and
-# max_summary_characters, or configuration validation rejects it.
-max_input_tokens = 32768
+# max_summary_characters, or configuration validation rejects it. Unlike the
+# three text tasks, this one has a real floor validator.
+max_input_tokens = 65536
 max_completion_tokens = 1024
 max_title_characters = 500
 max_summary_characters = 4000
@@ -148,8 +171,13 @@ reject_altered_query = false
 assess_ineligible = false
 
 [tasks.assess_article.parameters]
-temperature = 0.0
-top_p = 1.0
+# temperature and top_p are deliberately unset. The default models are
+# reasoning models whose OpenRouter endpoints declare support for neither,
+# and [openrouter.routing] requires an endpoint to support every supplied
+# parameter, so sending either one leaves no eligible endpoint (HTTP 404).
+# Set them only for a model whose endpoints advertise them.
+# temperature = 0.0
+# top_p = 1.0
 reasoning_effort = "low"
 
 [tasks.aggregate_lead]

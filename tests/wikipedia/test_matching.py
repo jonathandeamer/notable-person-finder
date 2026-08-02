@@ -667,3 +667,40 @@ def test_schema_errors_retain_no_raw_provider_or_source_content() -> None:
     assert "MatchValidationError" in "".join(
         traceback.format_exception(type(error), error, error.__traceback__)
     )
+
+
+def test_match_schema_requires_every_property_for_strict_structured_output() -> None:
+    """Strict structured output rejects a `required` that omits any property.
+
+    `selected_page_id` is nullable with a pydantic default, so pydantic left it
+    out of `required` and OpenRouter answered HTTP 400 ("'required' is required
+    to be supplied and to be an array including every key in properties").
+    Optionality must ride on the nullable type instead.
+    """
+    schema = match_schema()
+
+    def objects(node: object) -> list[dict[str, object]]:
+        found: list[dict[str, object]] = []
+        if isinstance(node, dict):
+            if node.get("type") == "object" and isinstance(
+                node.get("properties"), dict
+            ):
+                found.append(node)
+            for child in node.values():
+                found.extend(objects(child))
+        elif isinstance(node, list):
+            for child in node:
+                found.extend(objects(child))
+        return found
+
+    checked = objects(schema)
+    assert checked, "expected at least one object schema to check"
+    for node in checked:
+        properties = node["properties"]
+        required = node.get("required", [])
+        assert isinstance(properties, dict)
+        assert isinstance(required, list)
+        assert set(required) == set(properties)
+    root_required = schema["required"]
+    assert isinstance(root_required, list)
+    assert "selected_page_id" in root_required

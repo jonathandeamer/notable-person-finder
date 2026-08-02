@@ -106,8 +106,8 @@ class StructuredGenerationRequest:
     json_schema: Mapping[str, Any]
     schema_name: str
     max_completion_tokens: int
-    temperature: float
-    top_p: float
+    temperature: float | None = None
+    top_p: float | None = None
     reasoning_effort: str | None = None
 
 
@@ -456,8 +456,6 @@ class OpenRouterClient:
             ],
             "model": request.model_id,
             "max_completion_tokens": request.max_completion_tokens,
-            "temperature": request.temperature,
-            "top_p": request.top_p,
             "stream": False,
             "response_format": {
                 "type": "json_schema",
@@ -472,6 +470,15 @@ class OpenRouterClient:
             "retries": self._retry,
             "timeout_ms": self._timeout_ms,
         }
+        # An omitted sampling parameter and a null-valued one are not the same
+        # request. Under provider.require_parameters=True OpenRouter excludes
+        # every endpoint that does not declare a supplied parameter, and
+        # reasoning models declare neither temperature nor top_p, so sending
+        # them leaves no eligible endpoint and the router answers 404.
+        if request.temperature is not None:
+            kwargs["temperature"] = request.temperature
+        if request.top_p is not None:
+            kwargs["top_p"] = request.top_p
         if request.reasoning_effort is not None:
             kwargs["reasoning_effort"] = request.reasoning_effort
         try:
