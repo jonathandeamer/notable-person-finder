@@ -1003,7 +1003,8 @@ def test_canonical_domain_map_reads_host_exact_and_host_suffix_from_real_policy(
     code read the right attribute.
 
     `PolicyRule` has no `canonical_domain` field (a separately-deferred K1
-    schema gap -- see CLAUDE.md's known gaps; adding it would change every
+    schema gap -- see docs/architecture/known-gaps.md; adding it would change
+    every
     tracked policy's content fingerprint, out of scope for this fix). So
     this only proves same-host collapsing: two rules matching the same
     `host_exact`/`host_suffix` value collapse to that one value, and an

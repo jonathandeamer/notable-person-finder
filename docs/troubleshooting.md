@@ -21,6 +21,23 @@ The values under `[secrets]` must be uppercase environment-variable names. Put
 the actual values in the process environment or in an adjacent `.env`; a
 nonblank process value takes precedence.
 
+## `db migrate` fails on a migration checksum mismatch
+
+Migrations are forward-only and checksummed, so a migration file that changed
+after it ran against your database is refused rather than silently reapplied.
+
+There is one known cause before cutover. `0008_lead_aggregation.sql` was
+revised in place (adding `material_fingerprint` to `lead_assessment`) rather
+than superseded by a new migration file, under the milestone plan's own
+authorization: no operator had deployed a database against the prior version.
+Any pre-existing local or development database that already ran the earlier
+0008 must be deleted and re-migrated from scratch. This is a deliberate
+pre-cutover schema revision, not a relaxation of the forward-only invariant.
+
+If you hit a checksum mismatch on any *other* migration, do not edit the
+migration or the `schema_migrations` table to make it pass — that hides a real
+divergence between the file and what your database actually ran.
+
 ## Another mutating command holds the lock
 
 Only one mutating command may use a data root at a time. Wait for the active

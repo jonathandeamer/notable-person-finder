@@ -70,6 +70,10 @@ def load_config(
     feeds_path = _source_path(main_path.parent, main.feeds_file)
     domain_profile_path = _source_path(main_path.parent, main.domain_profile_file)
     source_policy_path = _source_path(main_path.parent, main.source_policy_file)
+    # Resolve onto the model itself, not just into the snapshot below. Callers
+    # such as wikipedia/service.py and people/merge.py read the path off
+    # MainConfig; left relative, they re-resolve it against the process CWD and
+    # silently no-op outside the configuration directory.
     main = main.model_copy(update={"source_policy_file": source_policy_path})
     feeds_data = _read_toml(feeds_path, errors)
     domain_profile_data = _read_toml(domain_profile_path, errors)
