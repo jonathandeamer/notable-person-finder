@@ -225,7 +225,7 @@ for regressions:
   `openrouter_usd_per_run` well above expected real spend; actual cost stays
   bounded by the per-task character caps regardless of the cap value.
 - **`detect_people` fails model-output validation on a material share of real
-  feed content. Diagnosed: three independent causes, one fixed.** The first
+  feed content. Diagnosed: four independent causes, three fixed.** The first
   ten-feed run produced 17 `malformed_response` failures, 6 of them exhausting
   retries — 6 of 31 items triaged. Replaying the six failing items against the
   live model isolated the causes:
