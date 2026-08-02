@@ -216,7 +216,59 @@ def detection_schema() -> dict[str, object]:
         "p": passage_ids_schema,
         "t": bounded_text_schema,
     }
-    return compacted
+    return _pair_signal_kind_with_category(compacted)
+
+
+def _pair_signal_kind_with_category(schema: dict[str, object]) -> dict[str, object]:
+    """Constrain a signal's `category` by its sibling `kind`.
+
+    `_semantic_failure` rejects an `attention` signal carrying a caution
+    category and vice versa, but `GroundedSignal` declares
+    `category: AttentionCategory | CautionCategory` beside a separate `kind`,
+    so pydantic emits one flat 12-value enum with no dependency between them.
+    That makes the invalid pairing structurally valid on the wire: the call is
+    made and paid for, and only then rejected as `malformed_response`.
+
+    Splitting the signal object into a two-branch discriminated union makes the
+    invalid combination unrepresentable, so a strict-structured-output provider
+    cannot emit it. This changes nothing for a valid signal, and the domain
+    validator stays in place as defence in depth.
+    """
+    mentions = schema.get("properties")
+    if not isinstance(mentions, dict):
+        return schema
+    mention_items = mentions.get("mentions")
+    if not isinstance(mention_items, dict):
+        return schema
+    item = mention_items.get("items")
+    if not isinstance(item, dict):
+        return schema
+    item_properties = item.get("properties")
+    if not isinstance(item_properties, dict):
+        return schema
+    signals = item_properties.get("signals")
+    if not isinstance(signals, dict):
+        return schema
+    signal_item = signals.get("items")
+    if not isinstance(signal_item, dict) or "properties" not in signal_item:
+        return schema
+
+    def variant(kind: str, categories: list[str]) -> dict[str, object]:
+        properties = dict(cast(dict[str, object], signal_item["properties"]))
+        properties["kind"] = {"enum": [kind]}
+        properties["category"] = {"enum": categories}
+        branch = {key: value for key, value in signal_item.items()}
+        branch["properties"] = properties
+        branch["required"] = sorted(properties)
+        return branch
+
+    signals["items"] = {
+        "anyOf": [
+            variant("attention", [member.value for member in AttentionCategory]),
+            variant("caution", [member.value for member in CautionCategory]),
+        ]
+    }
+    return schema
 
 
 def render_detection_request(value: DetectionInput) -> RenderedDetectionRequest:
@@ -383,7 +435,22 @@ def _literal_is_grounded(
     references: tuple[str, ...],
     passages: dict[str, str],
 ) -> bool:
-    return any(value in passages[reference] for reference in references)
+    """Is this fact value present verbatim in one of its cited passages?
+
+    Compared case-insensitively. Feed titles are overwhelmingly title-cased and
+    the model quotes them back in sentence case, so a case-sensitive test
+    rejects text that is genuinely present -- observed live as 'starring
+    Michael B. Jordan as a Notorious Art Thief' against a passage reading
+    'Starring ...'. That false negative discards the whole response after the
+    call has been paid for, and recurs across every title-cased headline.
+
+    Case folding cannot admit invention: the text must still appear verbatim.
+    `_is_grounded_name` deliberately stays case-sensitive, because `exact_name`
+    is persisted as the person's name and a lowercased proper noun there is a
+    worse artifact rather than a presentation difference.
+    """
+    folded = value.casefold()
+    return any(folded in passages[reference].casefold() for reference in references)
 
 
 def _outcome_consistency_error(output: DetectionOutput) -> str | None:

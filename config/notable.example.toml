@@ -72,7 +72,13 @@ model = "openai/gpt-5.4-mini"
 # 5x headroom over the measured requirement; the real spend guard is
 # [budget] openrouter_usd_per_run, not this ceiling.
 max_input_tokens = 65536
-max_completion_tokens = 1024
+# Sized for max_people mentions, each carrying identity facts, signals and a
+# rationale, plus the item-level rationale. Measured against real feed content
+# at max_people = 3: 693-962 completion tokens across repeated calls on one
+# item. At 1024 the longer responses were cut off mid-string, and the truncated
+# JSON was rejected as malformed_response -- intermittently, because output
+# length varies per call. Raise this with max_people, not independently.
+max_completion_tokens = 4096
 max_people = 8
 max_title_characters = 500
 max_summary_characters = 4000

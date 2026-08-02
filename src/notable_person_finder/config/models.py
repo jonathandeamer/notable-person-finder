@@ -309,8 +309,12 @@ def _exact_model_slug(value: str) -> str:
 
 class DetectPeopleConfig(_StrictConfigurationModel):
     model: str = "openai/gpt-5.4-mini"
-    max_input_tokens: int = Field(default=4096, strict=True, ge=1, le=1_000_000)
-    max_completion_tokens: int = Field(default=1024, strict=True, ge=1, le=100_000)
+    max_input_tokens: int = Field(default=65_536, strict=True, ge=1, le=1_000_000)
+    # Sized for max_people mentions. Measured at ~300 completion tokens per
+    # permitted mention against real feed content; at 1024 the longer responses
+    # were cut off mid-string and rejected as malformed_response. Raise this
+    # with max_people, not independently.
+    max_completion_tokens: int = Field(default=4096, strict=True, ge=1, le=100_000)
     parameters: GenerationParameters = GenerationParameters()
     max_people: int = Field(default=8, strict=True, ge=1, le=32)
     max_title_characters: int = Field(default=500, strict=True, ge=1, le=2000)
@@ -334,7 +338,7 @@ class DetectPeopleConfig(_StrictConfigurationModel):
 
 class ResolvePersonEntityConfig(_StrictConfigurationModel):
     model: str = "openai/gpt-5.4-mini"
-    max_input_tokens: int = Field(default=4096, strict=True, ge=1, le=1_000_000)
+    max_input_tokens: int = Field(default=65_536, strict=True, ge=1, le=1_000_000)
     max_completion_tokens: int = Field(default=1024, strict=True, ge=1, le=100_000)
     parameters: GenerationParameters = GenerationParameters()
     max_candidates: int = Field(default=8, strict=True, ge=1, le=16)
@@ -361,7 +365,7 @@ class ResolvePersonEntityConfig(_StrictConfigurationModel):
 
 class MatchWikipediaIdentityConfig(_StrictConfigurationModel):
     model: str = "openai/gpt-5.4-mini"
-    max_input_tokens: int = Field(default=4096, strict=True, ge=1, le=1_000_000)
+    max_input_tokens: int = Field(default=65_536, strict=True, ge=1, le=1_000_000)
     max_completion_tokens: int = Field(default=1024, strict=True, ge=1, le=100_000)
     parameters: GenerationParameters = GenerationParameters()
     max_candidates: int = Field(default=8, strict=True, ge=1, le=16)

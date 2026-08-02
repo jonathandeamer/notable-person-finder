@@ -26,6 +26,11 @@ from notable_person_finder.people import (
     render_detection_request,
     validate_detection_output,
 )
+from notable_person_finder.people.detection import (
+    _is_grounded_name,
+    _literal_is_grounded,
+)
+from notable_person_finder.people.models import AttentionCategory, CautionCategory
 
 FIXTURES = Path(__file__).with_name("fixtures")
 
@@ -69,7 +74,7 @@ def _profile() -> DomainProfileConfig:
 
 def _config(**changes: object) -> DetectPeopleConfig:
     values: dict[str, object] = {
-        "max_input_tokens": 4096,
+        "max_input_tokens": 4415,
         "max_completion_tokens": 512,
         "max_people": 3,
         "max_title_characters": 200,
@@ -194,7 +199,7 @@ def test_character_truncation_is_deterministic_and_marks_each_passage() -> None:
     config = _config(
         max_title_characters=5,
         max_summary_characters=6,
-        max_input_tokens=4096,
+        max_input_tokens=4415,
     )
 
     first = build_detection_input(source, _feed(), _profile(), config)
@@ -218,7 +223,7 @@ def test_token_envelope_truncation_marks_the_summary_view_and_passage() -> None:
         _feed(),
         _profile(),
         _config(
-            max_input_tokens=4096,
+            max_input_tokens=4415,
             max_completion_tokens=128,
             max_summary_characters=6000,
         ),
@@ -280,7 +285,7 @@ def test_dense_ascii_punctuation_cannot_exceed_the_input_token_ceiling() -> None
         _feed(),
         _profile(),
         _config(
-            max_input_tokens=4096,
+            max_input_tokens=4415,
             max_completion_tokens=128,
             max_summary_characters=10_000,
         ),
@@ -297,7 +302,7 @@ def test_dense_ascii_punctuation_cannot_exceed_the_input_token_ceiling() -> None
             rendered.canonical_schema_json,
         )
     )
-    assert rendered.worst_case_input_tokens <= 4096
+    assert rendered.worst_case_input_tokens <= 4415
 
 
 def test_fixed_prompt_schema_and_framing_must_fit_before_text() -> None:
@@ -897,3 +902,108 @@ def test_shipped_example_input_budget_carries_saturated_content_untruncated() ->
     assert value.view.input_truncated is False
     assert value.view.title_truncated is False
     assert value.view.summary_truncated is False
+
+
+def test_shipped_example_completion_budget_scales_with_max_people() -> None:
+    """`max_completion_tokens` must fit the mentions `max_people` permits.
+
+    Each mention carries identity facts, signals and a rationale, and the item
+    carries its own rationale on top. Measured against real feed content at
+    `max_people = 3`, one item produced 693, 713, 851 and 962 completion tokens
+    across repeated calls. At the previously shipped 1024 the longer responses
+    were cut off mid-string, and the truncated JSON was rejected as
+    `malformed_response` -- intermittently, because output length varies per
+    call, which is why it survived every offline test and a single-feed live
+    run before appearing across nine publishers.
+
+    ~300 tokens per permitted mention is the measured rate (962 / 3), so the
+    ceiling must scale with `max_people` rather than being set independently.
+    """
+    import tomllib
+
+    example = tomllib.loads(
+        (
+            Path(__file__).resolve().parents[2] / "config" / "notable.example.toml"
+        ).read_text(encoding="utf-8")
+    )
+    config = DetectPeopleConfig.model_validate(example["tasks"]["detect_people"])
+
+    measured_tokens_per_mention = 300
+    assert (
+        config.max_completion_tokens >= measured_tokens_per_mention * config.max_people
+    )
+
+
+def test_detection_schema_pairs_each_signal_kind_with_its_own_categories() -> None:
+    """A signal's `category` must be constrained by its sibling `kind`.
+
+    `people/detection.py` rejects an `attention` signal carrying a caution
+    category, and vice versa. The schema previously flattened both enums into
+    one 12-value `category` list with no dependency on `kind`, so the invalid
+    pairing was structurally valid under strict structured output: the call was
+    made and paid for, and only then rejected as `malformed_response`. In a
+    replay of the ten-feed run's failures this was the dominant cause, 3 of 6
+    items.
+
+    Expressing the pairing as a discriminated union makes the invalid
+    combination unrepresentable on the wire. The domain validator stays as
+    defence in depth; this only moves enforcement earlier.
+    """
+    schema = detection_schema()
+    mention = schema["properties"]["mentions"]["items"]  # type: ignore[index]
+    signals = mention["properties"]["signals"]["items"]  # type: ignore[index]
+
+    variants = signals.get("anyOf")
+    assert isinstance(variants, list), "signal items must be a discriminated union"
+    assert len(variants) == 2
+
+    by_kind = {v["properties"]["kind"]["enum"][0]: v for v in variants}
+    assert set(by_kind) == {"attention", "caution"}
+
+    attention = set(by_kind["attention"]["properties"]["category"]["enum"])
+    caution = set(by_kind["caution"]["properties"]["category"]["enum"])
+    assert attention == {member.value for member in AttentionCategory}
+    assert caution == {member.value for member in CautionCategory}
+    # The whole point: neither variant may admit the other's categories.
+    assert not (attention & caution)
+    assert "significance_unclear" not in attention
+    assert "major_achievement" not in caution
+    # Strict mode still requires every property listed in `required`.
+    for variant in variants:
+        assert set(variant["required"]) == set(variant["properties"])
+        assert variant["additionalProperties"] is False
+
+
+def test_identity_fact_value_is_grounded_across_headline_title_case() -> None:
+    """A fact value quoted from a title-cased headline is still grounded.
+
+    Feed titles are overwhelmingly title-cased, and the model quotes them back
+    in sentence case. Observed live: the model returned
+    'starring Michael B. Jordan as a Notorious Art Thief' against the passage
+    'Starring Michael B. Jordan as a Notorious Art Thief' -- the same text,
+    differing only in the case of one letter. A case-sensitive check rejects
+    the whole response as `malformed_response` after the call has been paid
+    for, so this false negative recurs across every title-cased headline.
+
+    Case folding cannot admit invention: the text must still appear verbatim in
+    the cited passage. `exact_name` stays case-sensitive on purpose -- it is
+    persisted as the person's name, so a lowercased proper noun there is a
+    worse artifact, not a harmless presentation difference.
+    """
+    passages = {
+        "p1": (
+            "See the Trailer for the New Thomas Crown Affair Movie, "
+            "Starring Michael B. Jordan as a Notorious Art Thief"
+        )
+    }
+
+    assert _literal_is_grounded(
+        "starring Michael B. Jordan as a Notorious Art Thief", ("p1",), passages
+    )
+    # Positive control: genuinely absent text is still rejected.
+    assert not _literal_is_grounded(
+        "starring Denzel Washington as a Notorious Art Thief", ("p1",), passages
+    )
+    # exact_name keeps its stricter, case-sensitive rule.
+    assert _is_grounded_name("Michael B. Jordan", ("p1",), passages)
+    assert not _is_grounded_name("michael b. jordan", ("p1",), passages)
