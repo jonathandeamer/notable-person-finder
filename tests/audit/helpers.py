@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Mapping
 from pathlib import Path
 
 from notable_person_finder.config.loader import load_config
@@ -29,8 +30,9 @@ def insert_run(
     state: str = "complete",
     started_at: str | None = None,
     finished_at: str | None = None,
+    configuration_snapshot_id: int | None = None,
 ) -> int:
-    snapshot_id = insert_configuration_snapshot(connection)
+    snapshot_id = configuration_snapshot_id or insert_configuration_snapshot(connection)
     started = started_at or moment()
     finished = finished_at if finished_at is not None else moment()
     if state == "running":
@@ -48,6 +50,39 @@ def insert_run(
     run_id = cursor.lastrowid
     assert run_id is not None
     return run_id
+
+
+def insert_real_configuration_snapshot(
+    connection: sqlite3.Connection,
+    config_file: Path,
+    *,
+    environ: Mapping[str, str],
+) -> int:
+    """Insert a `configuration_snapshot` row built by the real `load_config`.
+
+    `tests.ingestion.helpers.insert_configuration_snapshot` always writes the
+    literal string `'{}'` as `canonical_json` -- fine for tests that only
+    need a row to satisfy a foreign key, but it means secrets set in
+    `environ` can never reach the database through it, which makes a
+    redaction assertion built on top of it vacuous (I4). This instead runs
+    the production snapshot-building path (`load_config` -> `_snapshot`),
+    which folds credentials in only as `secret_availability` booleans, and
+    persists that real `snapshot_json`/`fingerprint` pair -- so a secret set
+    in `environ` genuinely is reachable into `canonical_json` if the
+    redaction logic that keeps it out ever regresses.
+    """
+    resolved = load_config(config_file, environ=environ, require_secrets=False)
+    cursor = connection.execute(
+        """
+        INSERT INTO configuration_snapshot (fingerprint, canonical_json, created_at)
+        VALUES (?, ?, ?)
+        """,
+        (resolved.fingerprint, resolved.snapshot_json, moment()),
+    )
+    snapshot_id = cursor.lastrowid
+    assert snapshot_id is not None
+    connection.commit()
+    return snapshot_id
 
 
 def insert_digest_row(

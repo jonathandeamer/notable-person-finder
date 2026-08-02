@@ -11,7 +11,11 @@ import pytest
 
 from notable_person_finder.cli import main as cli_main
 from notable_person_finder.config.loader import load_config
-from tests.audit.helpers import insert_run, migrated_database
+from tests.audit.helpers import (
+    insert_real_configuration_snapshot,
+    insert_run,
+    migrated_database,
+)
 
 AUDIT_PACKAGE = Path("src/notable_person_finder/audit")
 FORBIDDEN = {
@@ -198,22 +202,53 @@ def test_secrets_never_appear_in_audit_output(
 ) -> None:
     """K14. Positive control included: an assertion that a sentinel is
     absent proves nothing unless the sentinel was reachable in the first
-    place."""
+    place.
+
+    This must build a REAL configuration snapshot through `load_config` with
+    the sentinels set in the environment, and insert its ACTUAL
+    `canonical_json` -- not the placeholder `'{}'`
+    `tests.ingestion.helpers.insert_configuration_snapshot` writes for tests
+    that only need a foreign key satisfied. With the placeholder, the
+    sentinels can never reach the database at all, so `not in output` passes
+    for a reason that has nothing to do with redaction (I4).
+    """
     brave_sentinel = "brave-sentinel-6b1i-do-not-leak"
     openrouter_sentinel = "openrouter-sentinel-6b1i-do-not-leak"
-    monkeypatch.setenv("BRAVE_API_KEY", brave_sentinel)
-    monkeypatch.setenv("OPENROUTER_API_KEY", openrouter_sentinel)
+    # `write_people_graph` (via `migrated_database`) configures
+    # `[secrets]` as `openrouter_api_key = "TEST_OPENROUTER"` and
+    # `brave_api_key = "TEST_BRAVE"` -- not the default `OPENROUTER_API_KEY`
+    # / `BRAVE_API_KEY` env var names -- so the sentinels must be set under
+    # those names for `load_config` to actually pick them up.
+    monkeypatch.setenv("TEST_BRAVE", brave_sentinel)
+    monkeypatch.setenv("TEST_OPENROUTER", openrouter_sentinel)
 
     # Positive control: the sentinels ARE readable in this process, so a
     # later "not in output" assertion is meaningful rather than vacuous.
     import os
 
-    assert os.environ["BRAVE_API_KEY"] == brave_sentinel
-    assert os.environ["OPENROUTER_API_KEY"] == openrouter_sentinel
+    assert os.environ["TEST_BRAVE"] == brave_sentinel
+    assert os.environ["TEST_OPENROUTER"] == openrouter_sentinel
 
     config_file, connection = migrated_database(tmp_path)
     try:
-        run_id = insert_run(connection)
+        snapshot_id = insert_real_configuration_snapshot(
+            connection, config_file, environ=os.environ
+        )
+        # Second positive control: the sentinels really did make it into the
+        # persisted row this run points at -- as availability, not value --
+        # so the assertion below is checking real reachable data, not an
+        # empty snapshot.
+        canonical_json = connection.execute(
+            "SELECT canonical_json FROM configuration_snapshot WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()[0]
+        assert canonical_json != "{}"
+        assert "TEST_OPENROUTER" in canonical_json
+        assert "TEST_BRAVE" in canonical_json
+        assert brave_sentinel not in canonical_json
+        assert openrouter_sentinel not in canonical_json
+
+        run_id = insert_run(connection, configuration_snapshot_id=snapshot_id)
         connection.commit()
     finally:
         connection.close()

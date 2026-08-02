@@ -193,6 +193,40 @@ def test_falls_back_to_run_columns_when_digest_table_absent(
     assert captured.out == BODY
 
 
+def test_default_skips_a_newer_digest_less_run_and_prints_the_last_good_digest(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """K4 says the default is "the row with the highest run_id" of the
+
+    DIGEST table, not the highest run_id overall. A newer run that was
+    interrupted before writing a digest must not make `digest show` error;
+    the last run that actually produced a digest is still printed.
+    """
+    config_file, connection = migrated_database(tmp_path)
+    try:
+        older_body = "# older, but the last one with a digest\n"
+        older_run_id = insert_run(connection)
+        older_path = tmp_path / f"digest-{older_run_id}.md"
+        older_path.write_text(older_body, encoding="utf-8")
+        insert_digest_row(
+            connection,
+            run_id=older_run_id,
+            file_path=str(older_path),
+            content_hash=hashlib.sha256(older_body.encode("utf-8")).hexdigest(),
+        )
+        # A newer run that never wrote a digest (e.g. interrupted).
+        insert_run(connection)
+        connection.commit()
+    finally:
+        connection.close()
+
+    status = cli_main.command_digest_show(config_file, run_id_argument=None)
+
+    captured = capsys.readouterr()
+    assert status == cli_main.EXIT_OK
+    assert captured.out == older_body
+
+
 def test_run_with_no_digest_reports_failure_and_prints_nothing(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -144,11 +144,15 @@ Delivered and usable:
   outcomes, attempts, failures, budget, and reporting — or, with `--attempt`,
   the single named attempt's persisted validated result, retry history,
   usage, and version provenance located through the `audit/registry.py`
-  binding for its `(provider, operation)` pair. `notable audit person
+  binding for its `task_type` (not `(provider, operation)`, which is
+  ambiguous: five task types share the single OpenRouter
+  `generate_structured` operation). `notable audit person
   <person_id>` renders one person's full lifecycle-ordered evidence chain —
   identity, sourced names, relations, mentions, entity resolution,
   Wikipedia, coverage, assessments, lead history, queue history, and digest
-  history — redirecting a merged-away person to its survivor with a banner.
+  history — printing a banner naming the survivor and merging run followed
+  by the merged person's own recorded history, with a pointer to
+  `notable audit person <survivor_id>`, for a merged-away person.
   Every section degrades to an explicit "section unavailable" marker rather
   than raising when the database predates the table it needs (K3). All three
   commands are read-only: they open the database with `readonly=True` and
@@ -294,7 +298,9 @@ for regressions:
   clause"), not an oversight or a milestone 6b-i shortcut. `--attempt`
   renders the attempt's outcome, failure category, provider status, latency,
   byte counts, reserved and actual cost, the handler-owned result row located
-  through the `(provider, operation)` registry binding, and retry history in
+  through the `task_type` registry binding (not `(provider, operation)`,
+  which is ambiguous: five task types share the single OpenRouter
+  `generate_structured` operation), and retry history in
   ordinal order — never a raw request or response body. Adding raw payload
   persistence was considered and rejected; it remains out of scope until a
   later, explicitly approved design revisits it.
@@ -331,9 +337,11 @@ for regressions:
   - `audit/` — read-only audit and inspection: the `notable digest show`
     hash-verified digest re-read, the `notable audit run` / `notable audit
     person` repository queries with per-section `_table_present` degradation
-    (K3), the `(provider, operation)` result-binding registry
-    (`registry.py`), and Markdown rendering (`render.py`). Opens the database
-    `readonly=True` and takes no mutation lock.
+    (K3), the `task_type`-keyed result-binding registry (`registry.py` — not
+    `(provider, operation)`, which is ambiguous because five task types
+    share the single OpenRouter `generate_structured` operation), and
+    Markdown rendering (`render.py`). Opens the database `readonly=True` and
+    takes no mutation lock.
   - `obs/` — redacting structured logging.
   - `reporting/` — the daily digest writer.
 - `tests/foundation/` — application-foundation tests.
@@ -360,8 +368,8 @@ for regressions:
   CLI registration and same-run firing (`test_run_cli.py`), and digest and
   `notable status` rendering (`test_digest_status.py`). No live smokes: the
   milestone makes no external call.
-- `tests/audit/` — digest-hash verification and lookup, the `(provider,
-  operation)` result-binding registry, Markdown rendering for run, attempt,
+- `tests/audit/` — digest-hash verification and lookup, the `task_type`-keyed
+  result-binding registry, Markdown rendering for run, attempt,
   and person audits, repository queries including per-section schema-
   degradation (K3), CLI integration for all three commands, and cross-
   component seams (`test_seams.py`, including the layering check that

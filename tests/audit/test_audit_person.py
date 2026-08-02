@@ -281,11 +281,17 @@ def test_merged_away_person_shows_a_banner_and_its_own_history(
 
     out = capsys.readouterr().out
     assert status == cli_main.EXIT_OK
-    # Must NOT redirect: the merged person's own name and the survivor's id
-    # both appear, because a merge is exactly what the operator came to
-    # understand.
+    # Must NOT redirect: the merged person's own name and its own Identity
+    # section both appear, because a merge is exactly what the operator came
+    # to understand.
     assert "Merged Away" in out
-    assert str(survivor) in out
+    # Discriminating banner assertions (I3): a bare `str(survivor) in out`
+    # is satisfied by unrelated single-digit numbers elsewhere in the
+    # rendered output (e.g. `created_by_run_id: 1`) and survives deleting
+    # the banner block entirely. The literal marker text and the full
+    # `notable audit person <id>` pointer string cannot appear by accident.
+    assert "MERGED AWAY" in out
+    assert f"notable audit person {survivor}" in out
 
 
 def test_unknown_person_reports_failure(
