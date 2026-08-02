@@ -16,10 +16,15 @@ from notable_person_finder.audit.digest_show import (
     locate_digest,
     read_verified_digest,
 )
-from notable_person_finder.audit.render import render_attempt_audit, render_run_audit
+from notable_person_finder.audit.render import (
+    render_attempt_audit,
+    render_person_audit,
+    render_run_audit,
+)
 from notable_person_finder.audit.repository import (
     AttemptScopeError,
     load_attempt_audit,
+    load_person_audit,
     load_run_audit,
 )
 from notable_person_finder.config.loader import (
@@ -191,6 +196,8 @@ def build_parser() -> argparse.ArgumentParser:
     audit_run = audit_commands.add_parser("run")
     audit_run.add_argument("run_id")
     audit_run.add_argument("--attempt", dest="attempt_id", default=None)
+    audit_person = audit_commands.add_parser("person")
+    audit_person.add_argument("person_id")
     return parser
 
 
@@ -1346,6 +1353,29 @@ def command_audit_run(
     return EXIT_OK
 
 
+def command_audit_person(config_file: Path | None, *, person_id_argument: str) -> int:
+    loaded = load_config(config_file, require_secrets=False)
+    try:
+        # Bare integer only (D2) -- unlike run ids, there is no `person-N` form.
+        person_id = int(person_id_argument)
+    except ValueError:
+        print(f"invalid person id: {person_id_argument}", file=sys.stderr)
+        return EXIT_USAGE
+    if not loaded.paths.database.exists():
+        print("no run has been recorded yet", file=sys.stderr)
+        return EXIT_FAILED
+    connection = connect_database(loaded.paths.database, readonly=True)
+    try:
+        audit = load_person_audit(connection, person_id=person_id)
+    finally:
+        connection.close()
+    if audit is None:
+        print(f"no person found with id {person_id}", file=sys.stderr)
+        return EXIT_FAILED
+    sys.stdout.write(render_person_audit(audit))
+    return EXIT_OK
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     try:
@@ -1369,6 +1399,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.config,
                 run_id_argument=arguments.run_id,
                 attempt_id_argument=arguments.attempt_id,
+            )
+        if arguments.command == "audit" and arguments.audit_command == "person":
+            return command_audit_person(
+                arguments.config, person_id_argument=arguments.person_id
             )
         raise UsageError("command is not implemented")
     except UsageError as error:
