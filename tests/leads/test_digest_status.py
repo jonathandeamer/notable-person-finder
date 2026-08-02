@@ -71,6 +71,13 @@ def _build_report(**overrides: object) -> RunReport:
 
 
 def test_shortlist_renders_ranked_entries_with_distinct_fields() -> None:
+    """Every rendered field gets its own exact-line assertion, not a
+    substring-presence check. A substring check on only a handful of this
+    entry's ~9 fields (as the previous version of this test did) cannot
+    catch e.g. `depth`/`visibility` transposed in the qualifying-source
+    render f-string, or `eligibility_reason`/`wikipedia_outcome` swapped --
+    both values would still appear *somewhere* in the output.
+    """
     report = _build_report()
     entries = [
         ShortlistEntry(
@@ -91,15 +98,23 @@ def test_shortlist_renders_ranked_entries_with_distinct_fields() -> None:
                 ),
             ),
             attention_signals=("Award nomination",),
-            caution_signals=(),
-            unresolved_issues=(),
+            caution_signals=("Estate dispute",),
+            unresolved_issues=("Birth year uncertain",),
         )
     ]
     output = render_digest(report, local_date="2026-08-01", shortlist_entries=entries)
-    assert "Person One" in output
-    assert "promising_lead" in output
-    assert "example.com" in output
-    assert "Award nomination" in output
+    lines = output.splitlines()
+
+    assert "### Person One — promising_lead" in lines
+    assert "- Why shown: new" in lines
+    assert "- Wikipedia: no_matching_page_found" in lines
+    assert "- Qualifying domains: 2" in lines
+    assert (
+        '  - example.com — "Title One" (2026-07-01, article, significant, full)'
+    ) in lines
+    assert "- Attention: Award nomination" in lines
+    assert "- Caution: Estate dispute" in lines
+    assert "- Unresolved: Birth year uncertain" in lines
 
 
 def test_shortlist_placeholder_text_absent_when_entries_present() -> None:
@@ -129,6 +144,16 @@ def test_shortlist_placeholder_text_present_when_no_entries() -> None:
 
 
 def test_queue_flow_block_renders_distinct_counters() -> None:
+    """Every one of the nine queue-flow lines gets its own exact-line
+    assertion. A substring-in-whole-output check (as the previous version
+    of this test did, checking only that "1".."9" each appeared somewhere)
+    cannot catch a swapped field -- e.g. `newly_queued`(1)/`emitted`(2), or
+    the two backlog counts (4/5), or `arrival_rate_7d`(6.0)/
+    `emission_rate_7d`(7.0) transposed -- because both values are still
+    present somewhere in the output either way. Mirrors this file's own
+    correct sibling, `test_queue_flow_arrival_and_emission_lines_are_
+    independent`.
+    """
     report = _build_report()
     flow = QueueFlowSummary(
         newly_queued=1,
@@ -143,9 +168,17 @@ def test_queue_flow_block_renders_distinct_counters() -> None:
         estimated_clear_days=None,
     )
     output = render_digest(report, local_date="2026-08-01", queue_flow=flow)
-    for expected in ("1", "2", "3", "4", "5", "6.0", "7.0", "8", "9"):
-        assert expected in output
-    assert "insufficient history" in output.lower() or "not clearing" in output.lower()
+    lines = output.splitlines()
+
+    assert "- Newly queued: 1" in lines
+    assert "- Emitted: 2" in lines
+    assert "- Removed (matched Wikipedia): 3" in lines
+    assert "- Ending backlog: 4 promising, 5 possible" in lines
+    assert "- 7-day arrival rate: 6.0/day" in lines
+    assert "- 7-day emission rate: 7.0/day" in lines
+    assert "- Net queue growth: 8" in lines
+    assert "- Oldest pending: 9 days" in lines
+    assert "- Estimated clear time: not clearing" in lines
 
 
 def test_queue_flow_block_absent_by_default() -> None:
