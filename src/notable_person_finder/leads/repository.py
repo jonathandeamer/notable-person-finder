@@ -478,14 +478,18 @@ def fetch_queue_flow_counts(
     ending_backlog_promising = backlog_by_tier.get("promising_lead", 0)
     ending_backlog_possible = backlog_by_tier.get("possible_lead", 0)
 
-    has_any_history = (
-        connection.execute("SELECT 1 FROM queue_transition LIMIT 1").fetchone()
-        is not None
+    cutoff = shift_utc_days(now, -7)
+    earliest_row = connection.execute(
+        "SELECT MIN(occurred_at) AS earliest FROM queue_transition"
+    ).fetchone()
+    has_seven_days_of_history = (
+        earliest_row is not None
+        and earliest_row["earliest"] is not None
+        and earliest_row["earliest"] <= cutoff
     )
     arrival_rate_7d: float | None = None
     emission_rate_7d: float | None = None
-    if has_any_history:
-        cutoff = shift_utc_days(now, -7)
+    if has_seven_days_of_history:
         arrivals_7d = int(
             connection.execute(
                 """

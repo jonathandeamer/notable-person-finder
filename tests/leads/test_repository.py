@@ -6,6 +6,7 @@ from notable_person_finder.leads.queue import PriorLeadState
 from notable_person_finder.leads.repository import (
     fetch_pending_queue_entries,
     fetch_prior_queue_state,
+    fetch_queue_flow_counts,
     insert_digest,
     insert_digest_entry,
     insert_lead_assessment,
@@ -293,3 +294,98 @@ def test_insert_digest_and_entry(tmp_path):
         (digest_id,),
     ).fetchone()
     assert de_row == (digest_id, 7, lead_id, transition_id, 1)
+
+
+def _seeded_row_connection(tmp_path):
+    """Same fixture as `_seeded_connection`, but with `sqlite3.Row` enabled --
+    needed for `fetch_queue_flow_counts`, which reads columns by name."""
+    connection = _seeded_connection(tmp_path)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _seed_queue_transition(
+    connection, *, occurred_at: str, reason: str, to_status: str
+) -> None:
+    outcome = LeadOutcome(
+        outcome="possible_lead",
+        qualifying_domain_count=1,
+        qualifying_articles=(),
+        contributing_signals=(),
+        wikipedia_outcome="no_matching_page_found",
+    )
+    lead_id = insert_lead_assessment(
+        connection,
+        person_id=7,
+        run_id=1,
+        outcome=outcome,
+        lead_policy_fingerprint="a" * 64,
+        ordering_factors_json="{}",
+        decided_at=occurred_at,
+    )
+    insert_queue_transition(
+        connection,
+        person_id=7,
+        run_id=1,
+        lead_assessment_id=lead_id,
+        tier="possible_lead",
+        from_status=None,
+        to_status=to_status,
+        reason=reason,
+        occurred_at=occurred_at,
+    )
+    connection.commit()
+
+
+def test_fetch_queue_flow_counts_reports_no_rate_with_less_than_seven_days_history(
+    tmp_path,
+):
+    """A two-day-old install with real queue_transition rows must not
+    fabricate a 7-day rate by dividing a partial-window count by a hard-coded
+    7.0 -- the global constraint against fabricating a rate from less than a
+    full window of real history. Before the fix, the gate was "does any
+    queue_transition row exist at all," which this same fixture would have
+    satisfied and produced a bogus rate.
+    """
+    connection = _seeded_row_connection(tmp_path)
+    _seed_queue_transition(
+        connection,
+        occurred_at="2026-07-31T00:00:00Z",
+        reason="new",
+        to_status="pending",
+    )
+    _seed_queue_transition(
+        connection,
+        occurred_at="2026-08-01T00:00:00Z",
+        reason="new",
+        to_status="pending",
+    )
+
+    counts = fetch_queue_flow_counts(connection, run_id=1, now="2026-08-02T00:00:00Z")
+
+    assert counts.arrival_rate_7d is None
+    assert counts.emission_rate_7d is None
+
+
+def test_fetch_queue_flow_counts_reports_a_rate_once_seven_days_of_history_exists(
+    tmp_path,
+):
+    """Once the earliest queue_transition row is at least seven days old,
+    the 7-day rates are real averages over that full window."""
+    connection = _seeded_row_connection(tmp_path)
+    _seed_queue_transition(
+        connection,
+        occurred_at="2026-07-26T00:00:00Z",
+        reason="new",
+        to_status="pending",
+    )
+    _seed_queue_transition(
+        connection,
+        occurred_at="2026-08-01T00:00:00Z",
+        reason="new",
+        to_status="pending",
+    )
+
+    counts = fetch_queue_flow_counts(connection, run_id=1, now="2026-08-02T00:00:00Z")
+
+    assert counts.arrival_rate_7d == 2 / 7.0
