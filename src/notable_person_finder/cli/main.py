@@ -16,6 +16,8 @@ from notable_person_finder.audit.digest_show import (
     locate_digest,
     read_verified_digest,
 )
+from notable_person_finder.audit.render import render_run_audit
+from notable_person_finder.audit.repository import load_run_audit
 from notable_person_finder.config.loader import (
     ConfigLoadError,
     ResolvedConfig,
@@ -180,6 +182,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="digest_command", required=True
     ).add_parser("show")
     digest_show.add_argument("run_id", nargs="?", default=None)
+    audit = commands.add_parser("audit")
+    audit_commands = audit.add_subparsers(dest="audit_command", required=True)
+    audit_run = audit_commands.add_parser("run")
+    audit_run.add_argument("run_id")
+    audit_run.add_argument("--attempt", dest="attempt_id", default=None)
     return parser
 
 
@@ -1291,6 +1298,36 @@ def command_digest_show(
     return EXIT_OK
 
 
+def command_audit_run(
+    config_file: Path | None,
+    *,
+    run_id_argument: str,
+    attempt_id_argument: str | None,
+) -> int:
+    # attempt_id_argument is accepted now and ignored; Task 4 implements the
+    # `--attempt` drill-down without changing this signature.
+    del attempt_id_argument
+    loaded = load_config(config_file, require_secrets=False)
+    try:
+        run_id = _parse_run_id_argument(run_id_argument)
+    except ValueError:
+        print(f"invalid run id: {run_id_argument}", file=sys.stderr)
+        return EXIT_USAGE
+    if not loaded.paths.database.exists():
+        print("no run has been recorded yet", file=sys.stderr)
+        return EXIT_FAILED
+    connection = connect_database(loaded.paths.database, readonly=True)
+    try:
+        audit = load_run_audit(connection, run_id=run_id)
+    finally:
+        connection.close()
+    if audit is None:
+        print(f"no run found with id {run_id}", file=sys.stderr)
+        return EXIT_FAILED
+    sys.stdout.write(render_run_audit(audit))
+    return EXIT_OK
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     try:
@@ -1308,6 +1345,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "digest" and arguments.digest_command == "show":
             return command_digest_show(
                 arguments.config, run_id_argument=arguments.run_id
+            )
+        if arguments.command == "audit" and arguments.audit_command == "run":
+            return command_audit_run(
+                arguments.config,
+                run_id_argument=arguments.run_id,
+                attempt_id_argument=arguments.attempt_id,
             )
         raise UsageError("command is not implemented")
     except UsageError as error:
