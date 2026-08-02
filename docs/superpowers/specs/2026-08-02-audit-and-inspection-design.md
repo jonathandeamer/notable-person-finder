@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Draft (revision 1) |
+| **Status** | Implemented (revision 2) |
 | **Date** | 2026-08-02 |
 | **Author** | (design agent) |
 | **Branch** | `feat/audit-commands` (proposed) |
@@ -159,9 +159,22 @@ was rejected because it would waste the `content_hash` 6a already records
 and would print a hand-edited digest as though it were authentic.
 
 Resolution: with `RUN_ID`, the `digest` row for that run; without, the row
-with the highest `run_id`. `record_digest_with_entries` inserts exactly one
-row per run that writes a digest, including runs whose shortlist is empty,
-so the table is a complete digest history.
+with the highest `run_id` **present in the `digest` table**.
+`record_digest_with_entries` inserts exactly one row per run that writes a
+digest, including runs whose shortlist is empty, so the table is a complete
+digest history.
+
+The emphasis is load-bearing and was added after implementation. "Highest
+`run_id`" can be read two ways: the newest run, or the newest run that
+actually produced a digest. The first reading breaks the command's only job
+whenever the newest run was interrupted before writing a digest — the
+operator asks for the latest digest and gets an error, even though a
+perfectly good digest from the previous run is on disk. Since a run that
+fails or is interrupted is precisely when an operator reaches for `digest
+show`, the default resolves against the `digest` table and skips runs that
+wrote none. `tests/audit/test_digest_show.py::
+test_default_skips_a_newer_digest_less_run_and_prints_the_last_good_digest`
+pins it.
 
 Fallback: if the run exists but has no `digest` row (a run predating
 migration 0008), fall back to `run.digest_path` and `run.digest_sha256`,
@@ -417,22 +430,55 @@ is a usage error, status `64`. Success is `0`. These commands never return
 ### K14 — Redaction is proven by a positive control
 
 Audit deliberately shows detailed persisted evidence, which makes it the
-highest-risk surface in the application for secret leakage. Three defences
+highest-risk surface in the application for secret leakage. Two defences
 apply:
 
-- all output passes through the existing `obs/` redaction helpers;
 - the configuration snapshot is printed from `canonical_json`, which the
-  foundation invariant already guarantees contains no secrets;
-- that guarantee becomes a tested claim rather than an assumption.
+  foundation invariant already guarantees contains no secrets — `config/
+  loader.py` folds credentials in only as a `secret_availability` mapping of
+  environment-variable name to boolean, never as values;
+- that guarantee is a tested claim rather than an assumption.
 
-The test constructs a configuration with `BRAVE_API_KEY` and
-`OPENROUTER_API_KEY` set to distinctive sentinel values, runs `audit run`,
-and asserts neither sentinel appears in stdout or stderr. It is a
-**positive control**: it also asserts the sentinels are readable from the
-environment in the same test, so `assert sentinel not in output` cannot
-pass merely because the value was never reachable. That is the exact
-failure mode `CLAUDE.md`'s Test Evidence section warns about, and a
-redaction test is the worst possible place to repeat it.
+**Amended after implementation.** This decision originally listed a third
+defence: "all output passes through the existing `obs/` redaction helpers."
+That was not implemented and is now withdrawn rather than left as an
+aspiration the code does not meet. `audit/` imports no sibling package at
+all — not even the `config/`, `db/`, and `obs/` that K1 permits — because
+every module takes an open connection or a view model as a parameter. That
+is stricter than K1 requires and worth keeping. Routing output through
+`obs/` would add the milestone's only cross-package dependency to defend
+against values the snapshot cannot contain. If a future change puts real
+secrets into any audited table, that decision must be revisited, and the
+test below is what will catch it.
+
+The test builds a **real** configuration snapshot through `load_config`
+with sentinel secret values set in the environment, inserts that snapshot's
+actual `canonical_json`, runs `audit run`, and asserts neither sentinel
+appears in stdout or stderr.
+
+Two details are essential, and both were got wrong on the first
+implementation:
+
+- **The sentinels must reach the database.** The first version used the
+  shared ingestion fixture, which seeds `canonical_json` as the literal
+  `'{}'`. The sentinels never reached persisted state, so the absence
+  assertion was structurally guaranteed to pass. Confirmed by mutation:
+  making `_secret_availability` return raw credential values instead of
+  booleans — a genuine secrets-in-snapshot regression — left every audit
+  test green.
+- **The sentinels must use the environment-variable names the fixture
+  actually declares.** The first version set `BRAVE_API_KEY` and
+  `OPENROUTER_API_KEY`; the test configuration declares `TEST_BRAVE` and
+  `TEST_OPENROUTER`. Setting names nothing reads is a second, independent
+  route to a vacuous pass.
+
+A positive control is therefore required, and asserting that the sentinels
+are readable from `os.environ` is **not** one — that proves the fixture
+set them, not that they were reachable into rendered output. The control
+must establish reachability along the real path: the sentinel is present in
+the persisted `canonical_json` the command reads. The test is only
+meaningful if a real leak would fail it, and that is now demonstrated by
+the mutation above.
 
 ## Amendments to Approved Specifications
 
@@ -529,10 +575,37 @@ Rules requiring mutation evidence:
   whose current association differs from a historical observation. This
   needs a fixture that actually exercises the divergence — a person whose
   mention was later re-associated — or the mutation will survive.
-- K12 the merged-away banner.
-- K3 the schema-presence guard.
+- K12 the merged-away banner. Delete the banner block entirely and confirm a
+  named test fails. Asserting the person's own display name is **not**
+  sufficient — the identity section already prints it, and the survivor's id
+  will collide with any other small integer in the output. Assert the banner
+  marker and the full `notable audit person <survivor_id>` pointer string,
+  which only the banner can produce.
+- K3 the schema-presence guard. Cover more than one section: a fixture
+  migrated through 0006 exercises the coverage guard but not the Wikipedia
+  guard, whose tables that fixture already has.
 - K13 each distinct exit status.
-- K14 redaction, including its positive control.
+- K14 redaction. See K14 for the two ways this test passed vacuously and
+  what its positive control must establish.
+
+### Mutations that cannot be killed, and why
+
+Recorded so a later reader does not mistake them for missing coverage or
+try to force a kill:
+
+- **Removing `ORDER BY ordinal` from the retry-history query.** `attempt`
+  carries `UNIQUE (work_item_id, ordinal)`, and SQLite backs that constraint
+  with an autoindex that cannot be dropped. A query filtering on
+  `work_item_id` therefore returns ordinal-ascending rows whether or not the
+  clause is present. Verified with `EXPLAIN QUERY PLAN` and reproduced
+  independently. The clause stays as correct defensive SQL; the test asserts
+  the operator-visible ordering and would still catch a render-side
+  reordering bug.
+- **Printing the configuration snapshot without redaction.** There is no
+  redaction step to delete — see K14. The protection is structural.
+
+A mutation that survives for a structural reason is a finding to record, not
+a test to weaken and not a mutation to adjust until it kills something.
 
 ## Completion Gate
 
