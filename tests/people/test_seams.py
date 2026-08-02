@@ -154,7 +154,7 @@ def test_detection_uses_prepare_returned_pricing_not_handler_default(
     """
     bootstrap = insert_run(connection)
     item = _seed_source_item(connection, run_id=bootstrap)
-    max_input = 4096
+    max_input = 4415
     max_completion = 512
     config = _main_config(
         hard_budget=True,
@@ -242,7 +242,7 @@ openrouter_usd_per_run = "2.50"
 
 [tasks.detect_people]
 model = "openai/gpt-test"
-max_input_tokens = 4096
+max_input_tokens = 4415
 max_completion_tokens = 512
 max_people = 3
 """

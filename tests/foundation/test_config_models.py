@@ -42,8 +42,12 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
     assert config.brave == BraveConfig.model_validate({})
     assert config.brave.endpoint == "https://api.search.brave.com/res/v1/web/search"
     assert config.tasks.detect_people.model == "openai/gpt-5.4-mini"
-    assert config.tasks.detect_people.max_input_tokens == 4096
-    assert config.tasks.detect_people.max_completion_tokens == 1024
+    # 4096 could not carry this task's own content caps: the fixed
+    # prompt+schema+framing floor plus the supplied-input envelope left ~13
+    # characters for the title, so detection was handed almost nothing. The
+    # completion ceiling is sized at ~300 tokens per permitted mention.
+    assert config.tasks.detect_people.max_input_tokens == 65_536
+    assert config.tasks.detect_people.max_completion_tokens == 4096
     # temperature and top_p default to None, meaning "do not send this
     # parameter". Reasoning models declare support for neither, and supplying
     # one under the strict provider routing above excludes every endpoint that
@@ -59,7 +63,7 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
     assert config.tasks.detect_people.max_title_characters == 500
     assert config.tasks.detect_people.max_summary_characters == 4000
     assert config.tasks.resolve_person_entity.model == "openai/gpt-5.4-mini"
-    assert config.tasks.resolve_person_entity.max_input_tokens == 4096
+    assert config.tasks.resolve_person_entity.max_input_tokens == 65_536
     assert config.tasks.resolve_person_entity.max_completion_tokens == 1024
     assert config.tasks.resolve_person_entity.parameters == GenerationParameters(
         temperature=None,
@@ -73,7 +77,7 @@ def test_model_configuration_accepts_conservative_defaults() -> None:
     assert config.tasks.resolve_person_entity.max_summary_characters == 4000
     match = config.tasks.match_wikipedia_identity
     assert match.model == "openai/gpt-5.4-mini"
-    assert match.max_input_tokens == 4096
+    assert match.max_input_tokens == 65_536
     assert match.max_completion_tokens == 1024
     assert match.parameters == GenerationParameters(
         temperature=None,

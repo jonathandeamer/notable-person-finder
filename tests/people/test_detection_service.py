@@ -89,7 +89,7 @@ def _main_config(
     model: str = MODEL,
     hard_budget: bool = False,
     budget_usd: str | None = None,
-    max_input_tokens: int = 4096,
+    max_input_tokens: int = 4415,
     max_completion_tokens: int = 512,
     max_people: int = 3,
 ) -> MainConfig:
@@ -775,13 +775,13 @@ def test_dynamic_reservation_under_hard_budget(
     item = _seed_source_item(connection, run_id=bootstrap)
     config = _main_config(
         hard_budget=True,
-        max_input_tokens=4096,
+        max_input_tokens=4415,
         max_completion_tokens=512,
     )
     profile = _profile()
     prompt_price = 150
     completion_price = 600
-    expected_reservation = prompt_price * 4096 + completion_price * 512
+    expected_reservation = prompt_price * 4415 + completion_price * 512
     client = ScriptedLlmClient(
         inspection=_compatible_inspection(
             prompt_price=prompt_price, completion_price=completion_price
@@ -1112,7 +1112,7 @@ def test_budget_refusal_defers_without_generation(
     config = _main_config(
         hard_budget=True,
         budget_usd="0.000001",
-        max_input_tokens=4096,
+        max_input_tokens=4415,
         max_completion_tokens=1024,
     )
     profile = _profile()

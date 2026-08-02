@@ -238,24 +238,41 @@ for regressions:
      4096, pinned by `tests/people/test_detection.py::
      test_shipped_example_completion_budget_scales_with_max_people` at the
      measured ~300 tokens per permitted mention. Raise it with `max_people`.
-  2. **Signal category/kind mismatch (not fixed — needs a design decision).**
-     `detection_schema()` flattens `AttentionCategory` and `CautionCategory`
-     into a single 12-value `category` enum with no dependency on the sibling
-     `kind` field, so `kind: "attention"` with a caution category is
-     structurally valid under strict structured output. The call is paid for,
-     then `people/detection.py:336-343` rejects the whole response with
-     "category does not match signal kind". This was the dominant failure in
-     replay (3 of 6 items). It cannot be fixed in the schema builder alone:
-     `GroundedSignal` (`people/models.py:126`) carries
-     `category: AttentionCategory | CautionCategory` alongside a separate
-     `kind`, so expressing the constraint on the wire needs a discriminated
-     union — a change to the domain model and the output contract.
-  3. **Ungrounded identity-fact values (not fixable in code).** The model
-     occasionally returns a fact value that is not a literal substring of its
-     cited passage, and `_literal_is_grounded` correctly rejects it. Seen once
-     in replay. This is model quality at `reasoning_effort = "low"`, and it
-     belongs to the unvalidated-model-choice gap: the Promptfoo comparison the
-     pricing research called for was never run.
+  2. **Signal category/kind mismatch (fixed).** `detection_schema()` flattened
+     `AttentionCategory` and `CautionCategory` into a single 12-value
+     `category` enum with no dependency on the sibling `kind`, so
+     `kind: "attention"` with a caution category was structurally valid under
+     strict structured output: the call was paid for, then
+     `people/detection.py` rejected the whole response. This was the dominant
+     cause in replay, 3 of 6 items. `_pair_signal_kind_with_category` now emits
+     a two-branch discriminated union, verified live to be accepted by strict
+     mode and to make the invalid pairing unrepresentable. The domain validator
+     stays as defence in depth. The union costs 319 schema bytes, which raised
+     the fixed request floor from 3,065 to 3,384 and is why several test
+     fixtures moved from `max_input_tokens=4096` to `4415` — the same free
+     space as before, so every truncation test keeps its intent.
+  3. **Ungrounded identity-fact values (fixed).** Not model invention, as first
+     assumed. Feed titles are title-cased and the model quotes them back in
+     sentence case: observed live as `'starring Michael B. Jordan as a
+     Notorious Art Thief'` against a passage reading `'Starring ...'`, the same
+     text differing in one letter's case. `_literal_is_grounded` now compares
+     case-insensitively, which cannot admit invention because the text must
+     still appear verbatim. `_is_grounded_name` stays case-sensitive on
+     purpose: `exact_name` is persisted as the person's name, so a lowercased
+     proper noun there is a worse artifact, not a presentation difference.
+  4. **Mention cap overrun (found, not fixed).** With 1-3 fixed, one item still
+     fails with "mentions exceed supplied mention cap 3": the schema sets no
+     `maxItems` on `mentions`, so the model may return more than `max_people`
+     and the response is discarded after payment. Fixing it means making
+     `detection_schema()` depend on `max_people`, which makes the schema hash
+     config-dependent and moves every fingerprint derived from it — real
+     surface, not a contained fix.
+
+  The pattern across all four is the finding worth carrying: **the detection
+  schema systematically under-constrains rules the domain validator enforces,
+  and every rule left unexpressed is paid for before it is rejected.** Prefer
+  expressing a validator rule in the schema wherever strict mode can carry it.
+
 - **NOT A DEFECT — `resolve_person_entity` settling `failed_permanent` at a
   refused prepare is specified behaviour.** An earlier revision of this file
   recorded it as a bug; that was wrong, and the correction is kept here so it
