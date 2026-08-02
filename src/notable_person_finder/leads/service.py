@@ -86,11 +86,23 @@ def _extract_domain(url: str) -> str:
 
 
 def _canonical_domain_map(policy: SourcePolicy) -> dict[str, str]:
+    """Map each rule's own `host_exact`/`host_suffix` match to a canonical
+    domain.
+
+    `host_exact`/`host_suffix` live on `PolicyRule.match` (a `PolicyMatch`),
+    not on `PolicyRule` itself, so they are read via `rule.match.host_exact`
+    / `rule.match.host_suffix` -- real, statically-known attribute paths, not
+    duck-typed ones.
+
+    `PolicyRule` has no `canonical_domain` field (a separately-deferred K1
+    schema gap; do not add it here -- see CLAUDE.md's known gaps). So this
+    only collapses two rules that already match the SAME `host_exact`/
+    `host_suffix` value to that value; it cannot yet alias two genuinely
+    different hosts to one canonical domain.
+    """
     mapping: dict[str, str] = {}
     for rule in policy.rules:
-        own_domain = getattr(rule, "host_exact", None) or getattr(
-            rule, "host_suffix", None
-        )
+        own_domain = rule.match.host_exact or rule.match.host_suffix
         canonical = getattr(rule, "canonical_domain", None) or own_domain
         if own_domain and canonical:
             mapping[own_domain] = canonical

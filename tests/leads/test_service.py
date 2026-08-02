@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
-from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 
 import pytest
 
 from notable_person_finder.config.models import MainConfig
-from notable_person_finder.coverage.screening import PolicyRule, SourcePolicy
+from notable_person_finder.coverage.screening import (
+    SourcePolicy,
+    source_policy_from_mapping,
+)
 from notable_person_finder.db.migrate import apply_migrations
 from notable_person_finder.leads.service import (
     AGGREGATE_PERSON_LEAD_PRIORITY,
@@ -891,49 +892,57 @@ def test_prepare_proceeds_when_evidence_changed_since_prior_aggregation(
     assert lead_count_after_second == 2
 
 
-def test_canonical_domain_map_applies_policy_canonical_domain_override() -> None:
-    """K1: a source-policy rule's own host aliases to an explicit
-    ``canonical_domain`` override when the rule carries one, and otherwise
-    maps to its own host as-is.
+def test_canonical_domain_map_reads_host_exact_and_host_suffix_from_real_policy() -> (
+    None
+):
+    """K1: `_canonical_domain_map` must read `host_exact`/`host_suffix` off
+    `rule.match` (a `PolicyMatch`), not off `rule` itself.
 
-    ``PolicyRule`` (``coverage/screening.py``) does not currently declare a
-    ``canonical_domain`` field, so this override is unreachable through any
-    policy built from a real TOML file via ``source_policy_from_mapping``/
-    ``load_source_policy`` -- adding that field is out of scope here because
-    ``fingerprint_source_policy_document`` hashes the full validated model
-    dump, so a new field would change every existing tracked policy's
-    content fingerprint (a much larger, non-remediation change; see the
-    Task 16 fix report). This test instead exercises
-    ``_canonical_domain_map``'s own aliasing logic directly, through a
-    minimal duck-typed stand-in carrying only the attributes it actually
-    reads (``host_exact``, ``canonical_domain``), ``cast`` to ``PolicyRule``
-    for the type checker.
+    This is a regression test for a defect where `_canonical_domain_map`
+    used `getattr(rule, "host_exact", None)` -- `PolicyRule` has no
+    `host_exact` attribute at its top level, only on its nested `match`, so
+    that always evaluated to `None` and the map was always empty for every
+    real policy. Building the policy through `source_policy_from_mapping`
+    (the same real validation path `load_source_policy` uses) is what makes
+    this test actually exercise the defect: the old test's duck-typed
+    `_FakeRule` carried `host_exact` at the top level, mirroring the bug
+    instead of the real schema, so it passed whether or not the production
+    code read the right attribute.
+
+    `PolicyRule` has no `canonical_domain` field (a separately-deferred K1
+    schema gap -- see CLAUDE.md's known gaps; adding it would change every
+    tracked policy's content fingerprint, out of scope for this fix). So
+    this only proves same-host collapsing: two rules matching the same
+    `host_exact`/`host_suffix` value collapse to that one value, and an
+    unrelated `host_suffix` rule maps to itself.
     """
-
-    @dataclass(frozen=True, slots=True)
-    class _FakeRule:
-        host_exact: str | None = None
-        host_suffix: str | None = None
-        canonical_domain: str | None = None
-
-    override_rule = cast(
-        PolicyRule,
-        _FakeRule(host_exact="www.example.com", canonical_domain="example.com"),
-    )
-    plain_rule = cast(
-        PolicyRule,
-        _FakeRule(host_exact="standalone.example"),
-    )
-
-    policy = SourcePolicy(
-        schema_version=1,
-        key="test_policy",
-        label="Test Policy",
-        rules=(override_rule, plain_rule),
-        fingerprint="a" * 64,
+    policy = source_policy_from_mapping(
+        {
+            "schema_version": 1,
+            "key": "test-policy",
+            "label": "Test Policy",
+            "rules": [
+                {
+                    "id": "exact.example.com",
+                    "status": "curated_eligible",
+                    "match": {"host_exact": "www.example.com"},
+                    "rationale": "test",
+                    "review_date": "2026-07-24",
+                },
+                {
+                    "id": "suffix.standalone.example",
+                    "status": "curated_eligible",
+                    "match": {"host_suffix": "standalone.example"},
+                    "rationale": "test",
+                    "review_date": "2026-07-24",
+                },
+            ],
+        }
     )
 
     mapping = _canonical_domain_map(policy)
 
-    assert mapping["www.example.com"] == "example.com"
-    assert mapping["standalone.example"] == "standalone.example"
+    assert mapping == {
+        "www.example.com": "www.example.com",
+        "standalone.example": "standalone.example",
+    }

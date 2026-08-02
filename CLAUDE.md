@@ -194,27 +194,42 @@ for regressions:
   `source_policy_file` already absolute
   (`tests/foundation/test_review_findings.py::
   test_source_policy_file_is_resolved_absolute_on_the_main_config`).
-- **K1's canonical-domain-aliasing schema field was never wired in.**
-  `docs/superpowers/specs/2026-08-01-lead-aggregation-and-digest-queue-design.md`
-  locks K1: "`config/source_policies/*.toml` rules gain an optional
-  `canonical_domain` key." `leads/service.py`'s `_canonical_domain_map`
-  reads `getattr(rule, "canonical_domain", None)`, but `PolicyRule` in
+- **K1's `canonical_domain` cross-host alias override is not wired in; same-
+  host collapsing already works.** `docs/superpowers/specs/2026-08-01-lead-
+  aggregation-and-digest-queue-design.md` locks K1: "`config/source_policies/
+  *.toml` rules gain an optional `canonical_domain` key." `PolicyRule` in
   `coverage/screening.py` has no such field — its only fields are `id`,
-  `status`, `match`, `rationale`, `review_date`, `provenance_url`. The
-  override is therefore unreachable from any policy loaded via
-  `source_policy_from_mapping`/`load_source_policy`; two source-policy rules
-  sharing a publisher today never count as one domain for the promising-lead
-  threshold. `tests/leads/test_service.py::
-  test_canonical_domain_map_applies_policy_canonical_domain_override` covers
-  `_canonical_domain_map`'s aliasing logic directly against a duck-typed
-  stand-in, not through the real schema, so it does not paper over this gap.
-  Adding the field is deliberately deferred, not done inline: every
-  `PolicyRule` change alters `fingerprint_source_policy_document`'s hash
-  (full pydantic `model_dump`), which would move
-  `config/source_policies/visual_arts.toml`'s tracked fingerprint and every
-  fingerprint-pinned test, coverage plan fingerprint, and merge
-  reconciliation path that depends on it — real schema/feature surface, not
-  a remediation-scoped fix.
+  `status`, `match`, `rationale`, `review_date`, `provenance_url` — so a
+  policy author cannot yet explicitly alias two *different* hosts (e.g.
+  `www.example.com` and `example.org`) to one canonical domain for the
+  promising-lead threshold. `leads/service.py`'s `_canonical_domain_map` now
+  correctly reads each rule's own `host_exact`/`host_suffix` from
+  `rule.match` (previously it read `getattr(rule, "host_exact", None)` off
+  `rule` itself, which is always `None` since that attribute lives on the
+  nested `PolicyMatch`, so the whole map was always empty for every real
+  policy — fixed as part of this fix wave). This means two rules that match
+  the *same* `host_exact`/`host_suffix` value (or one rule matching many
+  articles from that host) already collapse to one domain today; only the
+  explicit alias-across-different-hosts override via a `canonical_domain`
+  key remains unreachable. `tests/leads/test_service.py::
+  test_canonical_domain_map_reads_host_exact_and_host_suffix_from_real_policy`
+  builds a real `SourcePolicy` via `source_policy_from_mapping` and proves
+  the same-host collapsing path. Adding the `canonical_domain` field is
+  deliberately deferred, not done inline: every `PolicyRule` change alters
+  `fingerprint_source_policy_document`'s hash (full pydantic `model_dump`),
+  which would move `config/source_policies/visual_arts.toml`'s tracked
+  fingerprint and every fingerprint-pinned test, coverage plan fingerprint,
+  and merge reconciliation path that depends on it — real schema/feature
+  surface, not a remediation-scoped fix.
+- **Migration `0008_lead_aggregation.sql` was revised in place** (adding
+  `material_fingerprint` to `lead_assessment`) rather than superseded by a
+  new migration file, per this milestone's own plan authorization — no
+  operator had deployed a database against the prior version of 0008 before
+  this revision. Any pre-existing local/dev database that already ran the
+  old migration 0008 must be deleted and re-migrated from scratch
+  (`notable db migrate` will otherwise fail on a checksum mismatch); this is
+  a deliberate pre-cutover schema revision, not a violation of the forward-
+  only-migrations invariant.
 
 ## Rewrite Structure
 
