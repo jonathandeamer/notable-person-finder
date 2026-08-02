@@ -6,7 +6,10 @@ model to `str`. All queries live in `audit/repository.py`.
 
 from __future__ import annotations
 
-from notable_person_finder.audit.models import RunAudit
+import json
+from datetime import datetime
+
+from notable_person_finder.audit.models import RunAudit, RunHeader
 
 # Section key -> the migration that introduced the table it depends on, used
 # only to word the "section unavailable" fallback line (K3).
@@ -32,6 +35,25 @@ def _unavailable_line(section: str) -> str:
     return f"  section unavailable: schema predates migration {migration}"
 
 
+def _format_duration(run: RunHeader) -> str:
+    if run.finished_at is None:
+        return "not finished"
+    try:
+        started = datetime.fromisoformat(run.started_at)
+        finished = datetime.fromisoformat(run.finished_at)
+    except ValueError:
+        return "unknown"
+    return f"{(finished - started).total_seconds():.3f}s"
+
+
+def _format_pretty_json(canonical_json: str) -> str:
+    try:
+        parsed = json.loads(canonical_json)
+    except json.JSONDecodeError:
+        return canonical_json
+    return json.dumps(parsed, indent=2, sort_keys=True)
+
+
 def render_run_audit(audit: RunAudit) -> str:
     lines: list[str] = []
     unavailable = set(audit.unavailable_sections)
@@ -43,6 +65,7 @@ def render_run_audit(audit: RunAudit) -> str:
     lines.append(f"  window: {audit.run.window_start} .. {audit.run.window_end}")
     lines.append(f"  started_at: {audit.run.started_at}")
     lines.append(f"  finished_at: {audit.run.finished_at or 'not finished'}")
+    lines.append(f"  duration: {_format_duration(audit.run)}")
     lines.append("")
 
     lines.append("Configuration")
@@ -55,6 +78,9 @@ def render_run_audit(audit: RunAudit) -> str:
         lines.append(f"  snapshot_id: {configuration.snapshot_id}")
         lines.append(f"  fingerprint: {configuration.fingerprint}")
         lines.append(f"  created_at: {configuration.created_at}")
+        lines.append("  canonical_json:")
+        for json_line in _format_pretty_json(configuration.canonical_json).splitlines():
+            lines.append(f"    {json_line}")
     lines.append("")
 
     lines.append("Transitions")
@@ -105,13 +131,34 @@ def render_run_audit(audit: RunAudit) -> str:
         for attempt in audit.attempts:
             outcome = attempt.outcome or "in flight"
             failure = (
-                f", failure={attempt.failure_category}"
+                f" failure_category={attempt.failure_category}"
                 if attempt.failure_category
                 else ""
             )
+            provider_status = (
+                "n/a"
+                if attempt.provider_status is None
+                else str(attempt.provider_status)
+            )
+            latency_ms = (
+                "n/a" if attempt.latency_ms is None else str(attempt.latency_ms)
+            )
+            response_bytes = (
+                "n/a" if attempt.response_bytes is None else str(attempt.response_bytes)
+            )
+            destination_host = attempt.destination_host or "n/a"
             lines.append(
                 f"  #{attempt.id} work_item={attempt.work_item_id} "
-                f"{attempt.provider}/{attempt.operation}: {outcome}{failure}"
+                f"ordinal={attempt.ordinal} {attempt.provider}/{attempt.operation}: "
+                f"{outcome}{failure}"
+            )
+            lines.append(
+                f"    provider_status={provider_status} latency_ms={latency_ms} "
+                f"response_bytes={response_bytes} destination_host={destination_host}"
+            )
+            lines.append(
+                f"    reserved={_format_nano_usd(attempt.reserved_nano_usd)} "
+                f"actual={_format_nano_usd(attempt.actual_nano_usd)}"
             )
     lines.append("")
 
@@ -122,9 +169,11 @@ def render_run_audit(audit: RunAudit) -> str:
         lines.append("  none recorded")
     else:
         for failure in audit.failures:
+            outcomes_text = ", ".join(failure.outcomes)
             lines.append(
                 f"  {failure.failure_category}: {failure.count} "
-                f"(e.g. {failure.example_provider}/{failure.example_operation})"
+                f"(outcomes={outcomes_text}, "
+                f"e.g. {failure.example_provider}/{failure.example_operation})"
             )
     lines.append("")
 
@@ -153,7 +202,14 @@ def render_run_audit(audit: RunAudit) -> str:
     if audit.reporting is None:
         lines.append("  no digest recorded for this run")
     else:
-        lines.append(f"  digest_path: {audit.reporting.digest_path}")
-        lines.append(f"  digest_sha256: {audit.reporting.digest_sha256}")
+        reporting = audit.reporting
+        lines.append(f"  digest_path: {reporting.digest_path}")
+        lines.append(f"  digest_sha256: {reporting.digest_sha256}")
+        lines.append(f"  run_state: {reporting.run_state}")
+        entry_count = (
+            "unknown" if reporting.entry_count is None else str(reporting.entry_count)
+        )
+        lines.append(f"  entry_count: {entry_count}")
+        lines.append(f"  see: notable digest show {audit.run.id}")
 
     return "\n".join(lines) + "\n"

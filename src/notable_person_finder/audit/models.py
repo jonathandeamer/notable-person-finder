@@ -39,6 +39,7 @@ class ConfigurationProvenance:
     snapshot_id: int
     fingerprint: str
     created_at: str
+    canonical_json: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,8 +73,13 @@ class AttemptLine:
     work_item_id: int
     provider: str
     operation: str
+    ordinal: int
     outcome: str | None
     failure_category: str | None
+    provider_status: int | None
+    latency_ms: int | None
+    response_bytes: int | None
+    destination_host: str | None
     reserved_nano_usd: int
     actual_nano_usd: int | None
 
@@ -84,6 +90,7 @@ class FailureGroup:
     count: int
     example_provider: str
     example_operation: str
+    outcomes: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +105,8 @@ class BudgetSummary:
 class ReportingResult:
     digest_path: str | None
     digest_sha256: str | None
+    run_state: str | None
+    entry_count: int | None  # None when unknown (pre-0008 run-column fallback)
 
 
 @dataclass(frozen=True, slots=True)

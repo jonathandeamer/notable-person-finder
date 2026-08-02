@@ -42,7 +42,8 @@ def _load_configuration(
         unavailable.append("configuration")
         return None
     row = connection.execute(
-        "SELECT id, fingerprint, created_at FROM configuration_snapshot WHERE id = ?",
+        "SELECT id, fingerprint, canonical_json, created_at "
+        "FROM configuration_snapshot WHERE id = ?",
         (snapshot_id,),
     ).fetchone()
     if row is None:
@@ -51,6 +52,7 @@ def _load_configuration(
         snapshot_id=int(row["id"]),
         fingerprint=row["fingerprint"],
         created_at=row["created_at"],
+        canonical_json=row["canonical_json"],
     )
 
 
@@ -136,8 +138,9 @@ def _load_attempts(
         return ()
     rows = connection.execute(
         """
-        SELECT id, work_item_id, provider, operation, outcome, failure_category,
-               reserved_nano_usd, actual_nano_usd
+        SELECT id, work_item_id, provider, operation, ordinal, outcome,
+               failure_category, provider_status, latency_ms, response_bytes,
+               destination_host, reserved_nano_usd, actual_nano_usd
         FROM attempt
         WHERE run_id = ?
         ORDER BY id
@@ -150,8 +153,17 @@ def _load_attempts(
             work_item_id=int(row["work_item_id"]),
             provider=row["provider"],
             operation=row["operation"],
+            ordinal=int(row["ordinal"]),
             outcome=row["outcome"],
             failure_category=row["failure_category"],
+            provider_status=(
+                None if row["provider_status"] is None else int(row["provider_status"])
+            ),
+            latency_ms=(None if row["latency_ms"] is None else int(row["latency_ms"])),
+            response_bytes=(
+                None if row["response_bytes"] is None else int(row["response_bytes"])
+            ),
+            destination_host=row["destination_host"],
             reserved_nano_usd=int(row["reserved_nano_usd"]),
             actual_nano_usd=(
                 None if row["actual_nano_usd"] is None else int(row["actual_nano_usd"])
@@ -167,22 +179,30 @@ def _load_failures(
     if not _table_present(connection, "attempt"):
         unavailable.append("failures")
         return ()
+    # `failure_category` is NULL exactly on `interrupted` attempts (the
+    # schema forbids it being NULL on `failed` ones and forbids it being
+    # non-NULL on any other outcome), so grouping on
+    # `COALESCE(failure_category, 'interrupted')` buckets every interrupted
+    # attempt together without colliding with a real failure category.
     rows = connection.execute(
         """
-        SELECT failure_category, COUNT(*) AS n, provider, operation
+        SELECT COALESCE(failure_category, 'interrupted') AS category,
+               COUNT(*) AS n, provider, operation,
+               GROUP_CONCAT(DISTINCT outcome) AS outcomes
         FROM attempt
-        WHERE run_id = ? AND outcome = 'failed'
-        GROUP BY failure_category
-        ORDER BY failure_category
+        WHERE run_id = ? AND outcome IN ('failed', 'interrupted')
+        GROUP BY category
+        ORDER BY category
         """,
         (run_id,),
     ).fetchall()
     return tuple(
         FailureGroup(
-            failure_category=row["failure_category"] or "unknown",
+            failure_category=row["category"],
             count=int(row["n"]),
             example_provider=row["provider"],
             example_operation=row["operation"],
+            outcomes=tuple((row["outcomes"] or "").split(",")),
         )
         for row in rows
     )
@@ -216,20 +236,39 @@ def _load_reporting(
 ) -> ReportingResult | None:
     if _table_present(connection, "digest"):
         row = connection.execute(
-            "SELECT file_path, content_hash FROM digest "
+            "SELECT id, file_path, content_hash, run_state FROM digest "
             "WHERE run_id = ? ORDER BY id DESC LIMIT 1",
             (run_id,),
         ).fetchone()
         if row is not None:
+            entry_count: int | None = None
+            if _table_present(connection, "digest_entry"):
+                entry_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM digest_entry WHERE digest_id = ?",
+                        (row["id"],),
+                    ).fetchone()[0]
+                )
             return ReportingResult(
-                digest_path=row["file_path"], digest_sha256=row["content_hash"]
+                digest_path=row["file_path"],
+                digest_sha256=row["content_hash"],
+                run_state=row["run_state"],
+                entry_count=entry_count,
             )
 
     file_path = run_row["digest_path"]
     content_hash = run_row["digest_sha256"]
     if file_path is None and content_hash is None:
         return None
-    return ReportingResult(digest_path=file_path, digest_sha256=content_hash)
+    # Pre-0008 fallback: the `digest` table (and its entry count) do not
+    # exist yet, so the best available `run_state` is the run's current
+    # state rather than the state recorded at write time.
+    return ReportingResult(
+        digest_path=file_path,
+        digest_sha256=content_hash,
+        run_state=run_row["state"],
+        entry_count=None,
+    )
 
 
 def load_run_audit(connection: sqlite3.Connection, *, run_id: int) -> RunAudit | None:
