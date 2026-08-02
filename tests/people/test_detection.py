@@ -847,3 +847,53 @@ def test_malformed_errors_never_echo_raw_model_output(raw: str) -> None:
         validate_detection_output(raw, _supplied())
 
     assert raw not in str(caught.value)
+
+
+def test_shipped_example_input_budget_carries_saturated_content_untruncated() -> None:
+    """The shipped `max_input_tokens` must fit this task's own content caps.
+
+    `max_input_tokens` is a worst-case UTF-8 byte ceiling, and the fixed
+    prompt+schema+framing floor is charged against it before any content. The
+    example previously shipped 4096, which left so little room that a real
+    article title was truncated to 13 characters ("Lost Elizabet") and the
+    model correctly reported it could identify nobody -- a live run that cost
+    money, reported no failures, and found no one. A budget that cannot carry
+    max_title_characters plus max_summary_characters is misconfigured.
+    """
+    import tomllib
+
+    example = tomllib.loads(
+        (
+            Path(__file__).resolve().parents[2] / "config" / "notable.example.toml"
+        ).read_text(encoding="utf-8")
+    )
+    config = DetectPeopleConfig.model_validate(example["tasks"]["detect_people"])
+    profile = DomainProfileConfig.model_validate(
+        tomllib.loads(
+            (
+                Path(__file__).resolve().parents[2]
+                / "config"
+                / "discovery_profiles"
+                / "art.example.toml"
+            ).read_text(encoding="utf-8")
+        )
+    )
+    feed = FeedConfig(
+        key="artnet-news", label="Artnet News", url="https://news.artnet.com/feed"
+    )
+    source_item = types.SimpleNamespace(
+        id=1,
+        canonical_article_id=1,
+        feed_identity_id=1,
+        title_text="T" * config.max_title_characters,
+        summary_text="S" * config.max_summary_characters,
+        original_url="https://news.artnet.com/art-world/" + "u" * 80,
+        published_at=None,
+        publisher_label="Artnet News",
+    )
+
+    value = build_detection_input(source_item, feed, profile, config)
+
+    assert value.view.input_truncated is False
+    assert value.view.title_truncated is False
+    assert value.view.summary_truncated is False
