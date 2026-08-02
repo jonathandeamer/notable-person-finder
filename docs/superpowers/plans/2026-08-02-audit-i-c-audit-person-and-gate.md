@@ -490,13 +490,17 @@ def _imported_sibling_packages(path: Path) -> set[str]:
 
 
 def test_audit_package_imports_no_forbidden_sibling() -> None:
-    # K1. Positive control: the assertion below can only pass because the
-    # detector finds real imports, which this line proves it does.
-    assert "db" in {
+    detected = {
         package
         for source in AUDIT_PACKAGE.glob("*.py")
         for package in _imported_sibling_packages(source)
-    } | {"db"}
+    }
+    # Positive control. `audit/` genuinely imports from `db` and `config`, so
+    # a detector that silently returned an empty set -- a broken AST walk, a
+    # wrong glob, a renamed package -- fails HERE rather than making the
+    # forbidden-import assertion below pass for the wrong reason.
+    assert "db" in detected
+    assert "config" in detected
 
     for source in AUDIT_PACKAGE.glob("*.py"):
         assert not (_imported_sibling_packages(source) & FORBIDDEN), source
