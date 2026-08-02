@@ -358,16 +358,20 @@ def _work_item_line(row: sqlite3.Row) -> WorkItemLine:
 
 
 def _feed_fetch_rows(
-    connection: sqlite3.Connection, *, feed_identity_id: int | None, run_id: int
+    connection: sqlite3.Connection,
+    binding: ResultBinding,
+    *,
+    feed_identity_id: int | None,
+    run_id: int,
 ) -> tuple[Mapping[str, object], ...]:
-    if not _table_present(connection, "feed_fetch"):
+    # The table name comes off the registry binding rather than a hardcoded
+    # literal, so `fetch_feed`'s result table has exactly one source of
+    # truth: `audit/registry.py`.
+    if not _table_present(connection, binding.result_table):
         return ()
     rows = connection.execute(
-        """
-        SELECT * FROM feed_fetch
-        WHERE feed_identity_id = ? AND run_id = ?
-        ORDER BY requested_at
-        """,
+        f"SELECT * FROM {binding.result_table}"  # noqa: S608
+        " WHERE feed_identity_id = ? AND run_id = ? ORDER BY requested_at",
         (feed_identity_id, run_id),
     ).fetchall()
     return tuple(dict(row) for row in rows)
@@ -448,7 +452,7 @@ def load_attempt_audit(
     elif work_item.task_type == "fetch_feed":
         caveat = _FETCH_FEED_CAVEAT
         result_rows = _feed_fetch_rows(
-            connection, feed_identity_id=work_item.subject_id, run_id=run_id
+            connection, binding, feed_identity_id=work_item.subject_id, run_id=run_id
         )
         no_result_row = not result_rows
     else:

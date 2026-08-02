@@ -460,8 +460,9 @@ def test_attempt_without_a_result_row_says_so(
     )
 
     out = capsys.readouterr().out
+    result_section = _section(out, "Result")
     assert status == cli_main.EXIT_OK
-    assert "no persisted result row" in out
+    assert "no persisted result row" in result_section
 
 
 def test_fetch_feed_attempt_carries_the_unattributable_caveat(
@@ -480,9 +481,10 @@ def test_fetch_feed_attempt_carries_the_unattributable_caveat(
     )
 
     out = capsys.readouterr().out
+    result_section = _section(out, "Result")
     # feed_fetch records no attempt_id, so per-attempt attribution is
     # impossible and must be disclosed rather than guessed by position.
-    assert "cannot be attributed to a single attempt" in out
+    assert "cannot be attributed to a single attempt" in result_section
 
 
 def test_malformed_attempt_id_is_a_usage_error(
@@ -501,3 +503,298 @@ def test_malformed_attempt_id_is_a_usage_error(
 
     assert status == cli_main.EXIT_USAGE
     assert capsys.readouterr().out == ""
+
+
+def _seed_work_item_only(
+    connection, *, run_id: int, fingerprint: str, task_type: str = "detect_people"
+) -> int:
+    connection.execute(
+        """
+        INSERT INTO work_item (
+            task_type, subject_kind, subject_id, fingerprint, required,
+            priority, eligible_at, state, created_by_run_id, created_at,
+            updated_at
+        ) VALUES (?, 'source_item', 1, ?, 1, 10, '2026-08-02T00:00:00Z',
+                  'succeeded', ?, '2026-08-02T00:00:00Z',
+                  '2026-08-02T00:00:00Z')
+        """,
+        (task_type, fingerprint, run_id),
+    )
+    work_item_id = connection.execute(
+        "SELECT id FROM work_item WHERE fingerprint = ?", (fingerprint,)
+    ).fetchone()[0]
+    return work_item_id
+
+
+def _insert_attempt(
+    connection,
+    *,
+    run_id: int,
+    work_item_id: int,
+    ordinal: int,
+    request_fingerprint: str,
+    destination_host: str | None = None,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO attempt (
+            run_id, work_item_id, provider, operation, ordinal, started_at,
+            finished_at, outcome, request_fingerprint, destination_host,
+            reserved_nano_usd, actual_nano_usd
+        ) VALUES (?, ?, 'openrouter', 'generate_structured', ?,
+                  '2026-08-02T00:00:00Z', '2026-08-02T00:00:01Z', 'succeeded',
+                  ?, ?, 0, 0)
+        """,
+        (run_id, work_item_id, ordinal, request_fingerprint, destination_host),
+    )
+
+
+def _seed_completed_detect_people_result(
+    connection,
+    *,
+    run_id: int,
+    attempt_id: int,
+    source_item_key: str,
+    feed_key: str,
+    rationale: str,
+    validated_output_json: str,
+    schema_version: int,
+    routing_fingerprint: str,
+) -> None:
+    """A real `triage_observation` row (K7/K9's registered result table for
+    `detect_people`) joined on `(attempt_id, run_id)`, satisfying the
+    `disposition = 'completed'` CHECK constraint in
+    `db/migrations/0004_people_detection.sql` (non-NULL attempt_id,
+    model_inspection_id, semantic_outcome, validated_output_json, overflow;
+    NULL failure_category)."""
+    feed_id = connection.execute(
+        """
+        INSERT INTO feed_identity (
+            key, current_label, current_url, first_seen_at, last_seen_at
+        ) VALUES (?, 'Feed', ?, '2026-08-02T00:00:00Z', '2026-08-02T00:00:00Z')
+        """,
+        (feed_key, f"https://example.com/{feed_key}"),
+    ).lastrowid
+    fetch_id = connection.execute(
+        """
+        INSERT INTO feed_fetch (
+            feed_identity_id, run_id, requested_at, requested_url, outcome
+        ) VALUES (?, ?, '2026-08-02T00:00:00Z', ?, 'modified')
+        """,
+        (feed_id, run_id, f"https://example.com/{feed_key}"),
+    ).lastrowid
+    source_item_id = connection.execute(
+        """
+        INSERT INTO source_item (
+            feed_identity_id, discovered_by_fetch_id, discovered_by_run_id,
+            source_entry_id, title_text, summary_text, discovered_at
+        ) VALUES (?, ?, ?, ?, 'Title', 'Summary', '2026-08-02T00:00:00Z')
+        """,
+        (feed_id, fetch_id, run_id, source_item_key),
+    ).lastrowid
+    inspection_id = connection.execute(
+        """
+        INSERT INTO model_inspection (
+            run_id, attempt_id, configured_model_id, resolved_model_id,
+            routing_fingerprint, supported_parameters_json,
+            supports_strict_structured_output, pricing_usable,
+            prompt_unit_price_nano_usd, completion_unit_price_nano_usd,
+            compatibility, inspected_at
+        ) VALUES (?, ?, 'm', 'm', ?, '[]', 1, 1, 1, 1, 'compatible',
+                  '2026-08-02T00:00:00Z')
+        """,
+        (run_id, attempt_id, routing_fingerprint),
+    ).lastrowid
+    connection.execute(
+        """
+        INSERT INTO triage_observation (
+            source_item_id, run_id, attempt_id, model_inspection_id,
+            disposition, semantic_outcome, canonical_supplied_input_json,
+            validated_output_json, prompt_hash, schema_hash, schema_version,
+            task_fingerprint, input_truncated, overflow, rationale, observed_at
+        ) VALUES (?, ?, ?, ?, 'completed', 'research_people', '{}', ?,
+                  ?, ?, ?, ?, 0, 0, ?, '2026-08-02T00:00:00Z')
+        """,
+        (
+            source_item_id,
+            run_id,
+            attempt_id,
+            inspection_id,
+            validated_output_json,
+            "n" * 64,
+            "o" * 64,
+            schema_version,
+            "q" * 64,
+            rationale,
+        ),
+    )
+
+
+def test_result_row_from_a_matching_result_table_is_rendered(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_file, connection = migrated_database(tmp_path)
+    try:
+        run_id = insert_run(connection)
+        attempt_id = _seed_attempt(connection, run_id=run_id)
+
+        # Decoy: a second attempt, on a second work item, in the SAME run.
+        # Its triage_observation shares `run_id` with the target but has a
+        # different `attempt_id`. If the generic result join ever dropped
+        # the `attempt_id` column (matching on `run_id` alone), this decoy's
+        # markers would leak into the target attempt's rendered result.
+        decoy_work_item_id = _seed_work_item_only(
+            connection, run_id=run_id, fingerprint="v" * 64
+        )
+        _insert_attempt(
+            connection,
+            run_id=run_id,
+            work_item_id=decoy_work_item_id,
+            ordinal=1,
+            request_fingerprint="w" * 64,
+        )
+        decoy_attempt_id = connection.execute(
+            "SELECT id FROM attempt WHERE request_fingerprint = ?", ("w" * 64,)
+        ).fetchone()[0]
+        _seed_completed_detect_people_result(
+            connection,
+            run_id=run_id,
+            attempt_id=decoy_attempt_id,
+            source_item_key="decoy-entry",
+            feed_key="decoy-feed",
+            rationale="DECOY_RATIONALE_11223",
+            validated_output_json='{"marker": "DECOY_VALIDATED_44556"}',
+            schema_version=99,
+            routing_fingerprint="m" * 64,
+        )
+
+        _seed_completed_detect_people_result(
+            connection,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            source_item_key="target-entry",
+            feed_key="target-feed",
+            rationale="TARGET_RATIONALE_78901",
+            validated_output_json='{"marker": "TARGET_VALIDATED_23457"}',
+            schema_version=42,
+            routing_fingerprint="n" * 64,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    status = cli_main.command_audit_run(
+        config_file, run_id_argument=str(run_id), attempt_id_argument=str(attempt_id)
+    )
+
+    out = capsys.readouterr().out
+    result_section = _section(out, "Result")
+    assert status == cli_main.EXIT_OK
+    # The real persisted result: the whole point of this command.
+    assert "TARGET_RATIONALE_78901" in result_section
+    assert "TARGET_VALIDATED_23457" in result_section
+    assert "42" in result_section
+    assert "no persisted result row" not in result_section
+    # A wrong (or dropped) join column would leak the decoy's row in
+    # alongside -- or instead of -- the target's.
+    assert "DECOY_RATIONALE_11223" not in result_section
+    assert "DECOY_VALIDATED_44556" not in result_section
+
+
+def test_local_handler_attempt_is_reported_as_a_data_inconsistency(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_file, connection = migrated_database(tmp_path)
+    try:
+        run_id = insert_run(connection)
+        # `aggregate_person_lead` is the one registered task type that never
+        # makes an external call (`external=False`); an attempt existing for
+        # it anyway is a data inconsistency, not a missing result.
+        attempt_id = _seed_attempt(
+            connection, run_id=run_id, task_type="aggregate_person_lead"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    status = cli_main.command_audit_run(
+        config_file, run_id_argument=str(run_id), attempt_id_argument=str(attempt_id)
+    )
+
+    out = capsys.readouterr().out
+    result_section = _section(out, "Result")
+    assert status == cli_main.EXIT_OK
+    assert "aggregate_person_lead" in result_section
+    assert "external" in result_section
+    # This is a distinct failure mode from "no persisted result row": naming
+    # the inconsistency, not claiming the attempt is simply unevidenced.
+    assert "no persisted result row" not in result_section
+
+
+def test_retry_history_renders_in_ordinal_order_even_when_inserted_out_of_order(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_file, connection = migrated_database(tmp_path)
+    try:
+        run_id = insert_run(connection)
+        work_item_id = _seed_work_item_only(
+            connection, run_id=run_id, fingerprint="r" * 64
+        )
+        # Inserted out of ordinal order (3, then 1, then 2). A query that
+        # relied on insertion/rowid order instead of `ORDER BY ordinal`
+        # would still pass a same-order seed; this seed is designed to fail
+        # under exactly that regression.
+        _insert_attempt(
+            connection,
+            run_id=run_id,
+            work_item_id=work_item_id,
+            ordinal=3,
+            request_fingerprint="s" * 64,
+            destination_host="host-three",
+        )
+        _insert_attempt(
+            connection,
+            run_id=run_id,
+            work_item_id=work_item_id,
+            ordinal=1,
+            request_fingerprint="t" * 64,
+            destination_host="host-one",
+        )
+        _insert_attempt(
+            connection,
+            run_id=run_id,
+            work_item_id=work_item_id,
+            ordinal=2,
+            request_fingerprint="u" * 64,
+            destination_host="host-two",
+        )
+        attempt_id = connection.execute(
+            "SELECT id FROM attempt WHERE request_fingerprint = ?", ("t" * 64,)
+        ).fetchone()[0]
+        # NOTE (see task-4-report.md fix-round mutation evidence): `attempt`
+        # carries `UNIQUE (work_item_id, ordinal)`, and SQLite backs a
+        # UNIQUE constraint with its own autoindex that cannot be dropped
+        # (`DROP INDEX` on it raises "index associated with UNIQUE or
+        # PRIMARY KEY constraint cannot be dropped"). `EXPLAIN QUERY PLAN`
+        # confirms the retry-history query always resolves via a COVERING
+        # INDEX keyed `(work_item_id, ordinal)`, so it returns ordinal order
+        # even with no `ORDER BY` in the SQL at all. No seed can defeat that:
+        # this test still pins the real, operator-visible contract (retry
+        # history renders in ordinal order), it just cannot be used as
+        # standalone proof that the query's own `ORDER BY ordinal` clause is
+        # what produces it on this schema.
+        connection.commit()
+    finally:
+        connection.close()
+
+    status = cli_main.command_audit_run(
+        config_file, run_id_argument=str(run_id), attempt_id_argument=str(attempt_id)
+    )
+
+    out = capsys.readouterr().out
+    retry_section = _section(out, "Retry history")
+    assert status == cli_main.EXIT_OK
+    first = retry_section.index("host-one")
+    second = retry_section.index("host-two")
+    third = retry_section.index("host-three")
+    assert first < second < third
