@@ -652,3 +652,42 @@ def test_domain_failure_retains_no_sensitive_values() -> None:
     _assert_error_retains_no_sensitive_values(
         error, supplied, provider_sentinel, source_sentinel, raw
     )
+
+
+def test_resolution_schema_requires_every_property_for_strict_structured_output() -> (
+    None
+):
+    """Strict structured output rejects a `required` that omits any property.
+
+    `selected_person_id` is nullable with a pydantic default, so pydantic left
+    it out of `required` and OpenRouter answered HTTP 400 ("'required' is
+    required to be supplied and to be an array including every key in
+    properties"). Optionality must ride on the nullable type instead.
+    """
+    schema = resolution_schema()
+
+    def objects(node: object) -> list[dict[str, object]]:
+        found: list[dict[str, object]] = []
+        if isinstance(node, dict):
+            if node.get("type") == "object" and isinstance(
+                node.get("properties"), dict
+            ):
+                found.append(node)
+            for child in node.values():
+                found.extend(objects(child))
+        elif isinstance(node, list):
+            for child in node:
+                found.extend(objects(child))
+        return found
+
+    checked = objects(schema)
+    assert checked, "expected at least one object schema to check"
+    for node in checked:
+        properties = node["properties"]
+        required = node.get("required", [])
+        assert isinstance(properties, dict)
+        assert isinstance(required, list)
+        assert set(required) == set(properties)
+    root_required = schema["required"]
+    assert isinstance(root_required, list)
+    assert "selected_person_id" in root_required
