@@ -356,3 +356,43 @@ def test_coverage_section_degrades_on_a_database_migrated_only_through_0006(
     assert status == cli_main.EXIT_OK
     coverage_section = _section(out, "Coverage")
     assert "section unavailable" in coverage_section.lower()
+
+
+def test_wikipedia_section_degrades_on_a_database_migrated_only_through_0005(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """K3: a database that predates milestone 4 has `person` and
+    `entity_resolution_observation` (migration 0005) but no
+    `wikipedia_identity_plan` (0006). The Wikipedia section must degrade with
+    the "section unavailable" marker instead of raising
+    `sqlite3.OperationalError` from a query against a table that does not
+    exist yet. This is a distinct guard from the Coverage-section test above:
+    that fixture is migrated through 0006, where `wikipedia_identity_plan`
+    already exists, so it cannot exercise this earlier guard.
+    """
+    config_file = write_people_graph(tmp_path, feeds=_single_feed())
+    loaded = load_config(config_file, require_secrets=False)
+    database = loaded.paths.database
+    database.parent.mkdir(parents=True, exist_ok=True)
+    connection = connect_database(database)
+    partial_migrations = [
+        migration for migration in load_migrations() if migration.version <= 5
+    ]
+    apply_migrations(connection, database, loaded.paths.backups, partial_migrations)
+    try:
+        run_id = insert_run(connection)
+        person_id = _person(
+            connection, run_id=run_id, name="Earlier Schema", fingerprint="8" * 64
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    status = cli_main.command_audit_person(
+        config_file, person_id_argument=str(person_id)
+    )
+
+    out = capsys.readouterr().out
+    assert status == cli_main.EXIT_OK
+    wikipedia_section = _section(out, "Wikipedia")
+    assert "section unavailable" in wikipedia_section.lower()

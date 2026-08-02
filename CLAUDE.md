@@ -22,15 +22,17 @@ tasks already recorded complete.
 
 ## What Is Actually Built
 
-Eight milestones are complete: the application foundation, the run engine and
+Nine milestones are complete: the application foundation, the run engine and
 shared transport, feed ingestion, the OpenRouter model gateway with person
 detection (3b1), durable person identity with first-pass resolution,
 reconsideration, and confirmed merges (3b2), Wikipedia identity matching
 with MediaWiki retrieval and semantic match (milestone 4), coverage
 evidence — bounded Brave Web Search, article fetch and extraction, and
-per-article assessment (milestone 5) — and lead aggregation with the digest
-queue, deterministic ranking, and the real digest shortlist (milestone 6a).
-A cold-starting agent should assume nothing beyond this list.
+per-article assessment (milestone 5), lead aggregation with the digest
+queue, deterministic ranking, and the real digest shortlist (milestone 6a),
+and read-only audit and inspection commands — `notable digest show`,
+`notable audit run`, and `notable audit person` (milestone 6b-i). A
+cold-starting agent should assume nothing beyond this list.
 
 Milestone 5's authorities are
 `docs/superpowers/specs/2026-07-30-coverage-evidence-design.md` (locked
@@ -46,9 +48,12 @@ Milestone 6a's authorities are
 `docs/superpowers/plans/2026-08-01-lead-aggregation-*.md`, all of whose steps
 are recorded complete.
 
-The next milestone is 6b-i, audit and inspection commands, specified by
+Milestone 6b-i's authorities are
 `docs/superpowers/specs/2026-08-02-audit-and-inspection-design.md` (locked
-decisions K1–K14). It is not implemented.
+decisions K1–K14, plus the recorded `--attempt` "raw response" amendment) and
+the three sequential sub-plans
+`docs/superpowers/plans/2026-08-02-audit-i-*.md`, all of whose steps are
+recorded complete.
 
 Delivered and usable:
 
@@ -129,6 +134,25 @@ Delivered and usable:
   digest shortlist and queue-flow sections, and the `digest` / `digest_entry`
   history written on every run that writes a digest, including runs with an
   empty shortlist.
+- Read-only audit and inspection commands (milestone 6b-i), in the new
+  `audit/` package. `notable digest show [run_id]` re-reads a previously
+  written digest body from disk, verifies it against its recorded hash, and
+  prints it unchanged — defaulting to the highest `run_id` when none is
+  given, and refusing to print anything on a hash mismatch. `notable audit
+  run <run_id> [--attempt <attempt_id>]` renders the full lifecycle-ordered
+  evidence for one run — configuration provenance, state transitions, work
+  outcomes, attempts, failures, budget, and reporting — or, with `--attempt`,
+  the single named attempt's persisted validated result, retry history,
+  usage, and version provenance located through the `audit/registry.py`
+  binding for its `(provider, operation)` pair. `notable audit person
+  <person_id>` renders one person's full lifecycle-ordered evidence chain —
+  identity, sourced names, relations, mentions, entity resolution,
+  Wikipedia, coverage, assessments, lead history, queue history, and digest
+  history — redirecting a merged-away person to its survivor with a banner.
+  Every section degrades to an explicit "section unavailable" marker rather
+  than raising when the database predates the table it needs (K3). All three
+  commands are read-only: they open the database with `readonly=True` and
+  take no mutation lock.
 
 Delivered only in part — do not describe these as finished:
 
@@ -168,10 +192,8 @@ Not built at all, so do not document, import, or assume any of it:
 
 - The `compose_lead_summary` optional model synthesis and its Promptfoo
   suite, and source reconnaissance for unclassified publishers. A shortlist
-  entry has no model-written summary.
-- `notable digest show`, `notable audit run`, `notable audit person`. These
-  are specified by the milestone 6b-i design cited above but not implemented;
-  there is no `audit/` package and no `tests/audit/`.
+  entry has no model-written summary. These remain milestone 6b-ii scope and
+  were not touched by 6b-i.
 - Drafting. The application never generates or publishes Wikipedia content.
 
 Known gaps carried forward, recorded so a later change does not mistake them
@@ -263,6 +285,19 @@ for regressions:
   (`notable db migrate` will otherwise fail on a checksum mismatch); this is
   a deliberate pre-cutover schema revision, not a violation of the forward-
   only-migrations invariant.
+- **`notable audit run --attempt` shows the persisted validated result plus
+  provenance, not raw provider request/response bodies, because no raw
+  payload is persisted anywhere in the current schema.** This is a
+  deliberate recorded amendment to the operator-experience design in
+  `docs/superpowers/specs/2026-08-02-audit-and-inspection-design.md`
+  ("Amendments to Approved Specifications" → "The `--attempt` "raw response"
+  clause"), not an oversight or a milestone 6b-i shortcut. `--attempt`
+  renders the attempt's outcome, failure category, provider status, latency,
+  byte counts, reserved and actual cost, the handler-owned result row located
+  through the `(provider, operation)` registry binding, and retry history in
+  ordinal order — never a raw request or response body. Adding raw payload
+  persistence was considered and rejected; it remains out of scope until a
+  later, explicitly approved design revisits it.
 
 ## Rewrite Structure
 
@@ -293,6 +328,12 @@ for regressions:
     queue lifecycle and transitions, repository SQL for the lead, queue, and
     digest tables, the `aggregate_person_lead` handler and its scheduling and
     sweep hooks, and merge reconciliation.
+  - `audit/` — read-only audit and inspection: the `notable digest show`
+    hash-verified digest re-read, the `notable audit run` / `notable audit
+    person` repository queries with per-section `_table_present` degradation
+    (K3), the `(provider, operation)` result-binding registry
+    (`registry.py`), and Markdown rendering (`render.py`). Opens the database
+    `readonly=True` and takes no mutation lock.
   - `obs/` — redacting structured logging.
   - `reporting/` — the daily digest writer.
 - `tests/foundation/` — application-foundation tests.
@@ -318,6 +359,13 @@ for regressions:
   scheduling and fingerprint-reuse behaviour (`test_service.py`), merge hooks,
   CLI registration and same-run firing (`test_run_cli.py`), and digest and
   `notable status` rendering (`test_digest_status.py`). No live smokes: the
+  milestone makes no external call.
+- `tests/audit/` — digest-hash verification and lookup, the `(provider,
+  operation)` result-binding registry, Markdown rendering for run, attempt,
+  and person audits, repository queries including per-section schema-
+  degradation (K3), CLI integration for all three commands, and cross-
+  component seams (`test_seams.py`, including the layering check that
+  `audit/` never imports `reporting/digest.py`). No live smokes: the
   milestone makes no external call.
 - `docs/architecture/at-least-once-execution.md` — the operator-facing note on
   the crash windows in which a paid provider call can be repeated. Point at it
@@ -379,8 +427,9 @@ reviewable and executable.
 - For completed coverage evidence, use `uv run pytest tests/coverage`.
 - For completed lead aggregation and the digest queue, use
   `uv run pytest tests/leads`.
-- The eight completed milestones together gate with
-  `uv run pytest tests/foundation tests/run_engine tests/ingestion tests/people tests/wikipedia tests/coverage tests/leads`.
+- For completed audit and inspection commands, use `uv run pytest tests/audit`.
+- The nine completed milestones together gate with
+  `uv run pytest tests/foundation tests/run_engine tests/ingestion tests/people tests/wikipedia tests/coverage tests/leads tests/audit`.
   Run it from a real checkout: it needs the tracked `config/` directory,
   including `config/source_policies/`.
   Default pytest `addopts` deselect `live`. Opt-in live smokes:
