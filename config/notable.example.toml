@@ -71,8 +71,13 @@ max_title_characters = 500
 max_summary_characters = 4000
 
 [tasks.detect_people.parameters]
-temperature = 0.0
-top_p = 1.0
+# temperature and top_p are deliberately unset. The default models are
+# reasoning models whose OpenRouter endpoints declare support for neither,
+# and [openrouter.routing] requires an endpoint to support every supplied
+# parameter, so sending either one leaves no eligible endpoint (HTTP 404).
+# Set them only for a model whose endpoints advertise them.
+# temperature = 0.0
+# top_p = 1.0
 reasoning_effort = "low"
 
 [tasks.resolve_person_entity]
@@ -86,8 +91,13 @@ max_title_characters = 500
 max_summary_characters = 4000
 
 [tasks.resolve_person_entity.parameters]
-temperature = 0.0
-top_p = 1.0
+# temperature and top_p are deliberately unset. The default models are
+# reasoning models whose OpenRouter endpoints declare support for neither,
+# and [openrouter.routing] requires an endpoint to support every supplied
+# parameter, so sending either one leaves no eligible endpoint (HTTP 404).
+# Set them only for a model whose endpoints advertise them.
+# temperature = 0.0
+# top_p = 1.0
 reasoning_effort = "low"
 
 [tasks.match_wikipedia_identity]
@@ -111,8 +121,13 @@ max_title_characters = 500
 max_summary_characters = 4000
 
 [tasks.match_wikipedia_identity.parameters]
-temperature = 0.0
-top_p = 1.0
+# temperature and top_p are deliberately unset. The default models are
+# reasoning models whose OpenRouter endpoints declare support for neither,
+# and [openrouter.routing] requires an endpoint to support every supplied
+# parameter, so sending either one leaves no eligible endpoint (HTTP 404).
+# Set them only for a model whose endpoints advertise them.
+# temperature = 0.0
+# top_p = 1.0
 reasoning_effort = "low"
 
 # Plan-level bounds (including coverage_refresh_interval_hours) live under
@@ -148,8 +163,13 @@ reject_altered_query = false
 assess_ineligible = false
 
 [tasks.assess_article.parameters]
-temperature = 0.0
-top_p = 1.0
+# temperature and top_p are deliberately unset. The default models are
+# reasoning models whose OpenRouter endpoints declare support for neither,
+# and [openrouter.routing] requires an endpoint to support every supplied
+# parameter, so sending either one leaves no eligible endpoint (HTTP 404).
+# Set them only for a model whose endpoints advertise them.
+# temperature = 0.0
+# top_p = 1.0
 reasoning_effort = "low"
 
 [tasks.aggregate_lead]

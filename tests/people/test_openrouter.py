@@ -336,6 +336,34 @@ def test_generate_structured_omits_reasoning_effort_when_absent() -> None:
     assert call.get("reasoning_effort") is None
 
 
+def test_generate_structured_omits_temperature_when_absent() -> None:
+    """Reasoning models declare no ``temperature`` support.
+
+    Sending it under ``provider.require_parameters=True`` excludes every
+    endpoint and OpenRouter answers 404. ``None`` must mean "omit the key",
+    not "serialize null" -- the same contract ``reasoning_effort`` already has.
+    """
+    sdk = FakeOpenRouterSdk(chat_result=default_chat_result())
+    _client(sdk).generate_structured(_generation_request(temperature=None))
+    assert "temperature" not in sdk.chat_send_calls[0]
+
+
+def test_generate_structured_omits_top_p_when_absent() -> None:
+    """``top_p`` is unsupported on the same endpoints as ``temperature``."""
+    sdk = FakeOpenRouterSdk(chat_result=default_chat_result())
+    _client(sdk).generate_structured(_generation_request(top_p=None))
+    assert "top_p" not in sdk.chat_send_calls[0]
+
+
+def test_generate_structured_still_sends_sampling_parameters_when_configured() -> None:
+    """Positive control: omission must be driven by ``None``, not unconditional."""
+    sdk = FakeOpenRouterSdk(chat_result=default_chat_result())
+    _client(sdk).generate_structured(_generation_request(temperature=0.25, top_p=0.9))
+    call = sdk.chat_send_calls[0]
+    assert call["temperature"] == 0.25
+    assert call["top_p"] == 0.9
+
+
 # --- Broken-variant pins -------------------------------------------------------
 
 

@@ -311,9 +311,9 @@ def test_smallest_strict_schema_generation_is_parseable() -> None:
         json_schema=_MINIMAL_STRICT_SCHEMA,
         schema_name=_MINIMAL_SCHEMA_NAME,
         max_completion_tokens=32,
-        temperature=0.0,
-        top_p=1.0,
-        reasoning_effort=None,
+        temperature=detect.parameters.temperature,
+        top_p=detect.parameters.top_p,
+        reasoning_effort=detect.parameters.reasoning_effort,
     )
 
     with _configured_client(api_key) as client:

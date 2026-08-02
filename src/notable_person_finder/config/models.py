@@ -249,8 +249,12 @@ ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
 
 
 class GenerationParameters(_StrictConfigurationModel):
-    temperature: float = Field(default=0.0, ge=0.0, le=2.0, allow_inf_nan=False)
-    top_p: float = Field(default=1.0, ge=0.0, le=1.0, allow_inf_nan=False)
+    # Unset means "do not send this parameter at all". Reasoning models declare
+    # support for neither, and supplying one under the strict provider routing
+    # in ProviderRoutingConfig excludes every endpoint that serves the model.
+    # Set them only for a model whose endpoints advertise them.
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0, allow_inf_nan=False)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
     reasoning_effort: ReasoningEffort | None = None
 
 
