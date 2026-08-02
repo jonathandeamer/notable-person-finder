@@ -90,5 +90,6 @@ include = [
     "tests/wikipedia",
     "tests/coverage",
     "tests/leads",
+    "tests/audit",
 ]
 exclude = ["**/__pycache__", ".venv", ".worktrees"]
