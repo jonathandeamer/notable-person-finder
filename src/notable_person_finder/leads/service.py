@@ -68,6 +68,7 @@ class _AggregatePayload:
     articles: list[ArticleEvidence]
     signals: list[SignalEvidence]
     wikipedia_outcome: str | None
+    assessment_terminal: bool
     material_fingerprint: str
 
 
@@ -191,6 +192,7 @@ def _compute_material_fingerprint(
     article_assessment_ids: list[int],
     signal_ids: list[int],
     wikipedia_outcome: str | None,
+    assessment_terminal: bool = True,
     policy: SourcePolicy,
     config: MainConfig,
 ) -> str:
@@ -199,6 +201,7 @@ def _compute_material_fingerprint(
         "article_assessment_ids": sorted(article_assessment_ids),
         "signal_ids": sorted(signal_ids),
         "wikipedia_outcome": wikipedia_outcome,
+        "assessment_terminal": assessment_terminal,
         "source_policy_fingerprint": policy.fingerprint,
         "promising_domain_threshold": lead_cfg.promising_domain_threshold,
         "starvation_days": lead_cfg.starvation_days,
@@ -206,6 +209,25 @@ def _compute_material_fingerprint(
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _assessment_terminal_for_person(
+    connection: sqlite3.Connection, *, person_id: int
+) -> bool:
+    row = connection.execute(
+        """
+        SELECT status
+          FROM person_coverage_plan
+         WHERE person_id = ?
+           AND status IN ('completed', 'incomplete', 'failed')
+         ORDER BY completed_at DESC, id DESC
+         LIMIT 1
+        """,
+        (person_id,),
+    ).fetchone()
+    if row is None:
+        return True
+    return row["status"] == "completed"
 
 
 def schedule_aggregate_person_lead(
@@ -310,11 +332,15 @@ def build_aggregate_person_lead_handler(
             canonical_domains=canonical_domains,
         )
         signals = _load_signal_evidence(connection, person_id=person_id)
+        assessment_terminal = _assessment_terminal_for_person(
+            connection, person_id=person_id
+        )
 
         material_fingerprint = _compute_material_fingerprint(
             article_assessment_ids=[a.person_article_assessment_id for a in articles],
             signal_ids=[s.article_assessment_signal_id for s in signals],
             wikipedia_outcome=wikipedia_outcome,
+            assessment_terminal=assessment_terminal,
             policy=policy,
             config=config,
         )
@@ -336,6 +362,7 @@ def build_aggregate_person_lead_handler(
                 articles=articles,
                 signals=signals,
                 wikipedia_outcome=wikipedia_outcome,
+                assessment_terminal=assessment_terminal,
                 material_fingerprint=material_fingerprint,
             ),
             reserved_nano_usd=0,
@@ -348,6 +375,7 @@ def build_aggregate_person_lead_handler(
             signals=prepared.signals,
             wikipedia_outcome=prepared.wikipedia_outcome,
             promising_domain_threshold=config.tasks.aggregate_lead.promising_domain_threshold,
+            assessment_terminal=prepared.assessment_terminal,
         )
         return TaskOutcome(
             state=WorkState.SUCCEEDED,
@@ -488,18 +516,23 @@ def reaggregate_person_lead(
         canonical_domains=canonical_domains,
     )
     signals = _load_signal_evidence(connection, person_id=person_id)
+    assessment_terminal = _assessment_terminal_for_person(
+        connection, person_id=person_id
+    )
 
     lead_outcome = aggregate_lead(
         articles=articles,
         signals=signals,
         wikipedia_outcome=wikipedia_outcome,
         promising_domain_threshold=config.tasks.aggregate_lead.promising_domain_threshold,
+        assessment_terminal=assessment_terminal,
     )
 
     material_fingerprint = _compute_material_fingerprint(
         article_assessment_ids=[a.person_article_assessment_id for a in articles],
         signal_ids=[s.article_assessment_signal_id for s in signals],
         wikipedia_outcome=wikipedia_outcome,
+        assessment_terminal=assessment_terminal,
         policy=policy,
         config=config,
     )
@@ -608,6 +641,9 @@ def _schedule_lead_aggregation_after_settled(
         (person_id,),
     ).fetchall()
     signal_ids = [r[0] for r in signals]
+    assessment_terminal = _assessment_terminal_for_person(
+        connection, person_id=person_id
+    )
 
     row = connection.execute(
         "SELECT current_wikipedia_identity_observation_id FROM person WHERE id = ?",
@@ -625,6 +661,7 @@ def _schedule_lead_aggregation_after_settled(
         article_assessment_ids=article_assessment_ids,
         signal_ids=signal_ids,
         wikipedia_outcome=wikipedia_outcome,
+        assessment_terminal=assessment_terminal,
         policy=policy,
         config=config,
     )
@@ -662,16 +699,21 @@ def seed_lead_aggregation(
     docs/architecture/at-least-once-execution.md).
 
     Reuses `_schedule_lead_aggregation_after_settled` for every person with
-    completed coverage evidence, so scheduling stays fingerprint-deduplicated
-    against any work item a hook already enqueued this run or a prior one --
-    matching `seed_coverage_research`'s iterate-all-then-let-dedup-handle-it
-    shape rather than trying to detect "missed" people directly.
+    terminal coverage or completed coverage evidence, so scheduling stays
+    fingerprint-deduplicated against any work item a hook already enqueued
+    this run or a prior one -- matching `seed_coverage_research`'s
+    iterate-all-then-let-dedup-handle-it shape rather than trying to detect
+    "missed" people directly.
     """
     rows = connection.execute(
         """
         SELECT DISTINCT person_id
-        FROM person_article_assessment
-        WHERE disposition = 'completed'
+          FROM person_article_assessment
+         WHERE disposition = 'completed'
+        UNION
+        SELECT DISTINCT person_id
+          FROM person_coverage_plan
+         WHERE status IN ('completed', 'incomplete', 'failed')
         """
     ).fetchall()
     for row in rows:

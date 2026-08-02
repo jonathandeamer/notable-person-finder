@@ -32,6 +32,7 @@ from notable_person_finder.coverage.repository import (
     insert_query_forms,
     mark_query_form_completed,
     open_plan,
+    update_plan_status,
 )
 from notable_person_finder.coverage.service import advance_coverage_plan_after_assess
 from notable_person_finder.db.connection import connect_database
@@ -191,6 +192,50 @@ def test_seed_lead_aggregation_catches_missed_settlement_hook(
     config = _config()
     run_id = insert_run(connection)
     person_id, _paa_id = _seed_person_and_articles(connection, run_id=run_id)
+
+    seed_lead_aggregation(connection, run_id=run_id, config=config, now=NOW)
+
+    work_items = connection.execute(
+        "SELECT task_type, subject_kind, subject_id FROM work_item "
+        "WHERE task_type = 'aggregate_person_lead'"
+    ).fetchall()
+    assert len(work_items) == 1
+    assert work_items[0]["subject_kind"] == "person"
+    assert work_items[0]["subject_id"] == person_id
+
+
+def test_seed_lead_aggregation_catches_terminal_plan_without_completed_assessments(
+    connection: sqlite3.Connection,
+) -> None:
+    """A terminal incomplete plan with no completed rows still needs aggregation.
+
+    Production break this catches: seeding only from completed
+    `person_article_assessment` rows misses the crash window between terminal
+    incomplete coverage settlement and the same-run aggregation hook.
+    """
+    config = _config()
+    run_id = insert_run(connection)
+    person_id = _person(
+        connection, run_id=run_id, name="No Positive Evidence", fingerprint="c" * 64
+    )
+    with immediate(connection) as conn:
+        plan_id = open_plan(
+            conn,
+            person_id=person_id,
+            run_id=run_id,
+            material_fingerprint="m" * 64,
+            source_policy_fingerprint="p" * 64,
+            retrieval_target=5,
+            created_at=NOW,
+        )
+        update_plan_status(
+            conn,
+            plan_id=plan_id,
+            status="incomplete",
+            completed_at=NOW,
+            failure_category="unsafe_truncation",
+            truncated_unsafe=True,
+        )
 
     seed_lead_aggregation(connection, run_id=run_id, config=config, now=NOW)
 

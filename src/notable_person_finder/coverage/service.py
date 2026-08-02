@@ -3851,6 +3851,7 @@ def build_assess_article_handler(
                 task_fingerprint=task_fingerprint,
                 failure_category=_LOCAL_REFUSE_CATEGORY,
                 rationale=_ASSESS_INPUT_TOO_LARGE_RATIONALE,
+                config=config,
             )
             raise ValueError(
                 f"{ASSESS_PREPARE_REFUSED_PREFIX}input_too_large "
@@ -4288,6 +4289,7 @@ def _record_local_refuse_assessment(
     task_fingerprint: str,
     failure_category: str,
     rationale: str,
+    config: MainConfig,
 ) -> None:
     """Write a ``failed`` assessment for a refusal that made no call.
 
@@ -4319,6 +4321,7 @@ def _record_local_refuse_assessment(
                 connection,
                 plan_id=context.plan_id,
                 now=observed_at,
+                config=config,
             )
     except BaseException:
         if owns:
