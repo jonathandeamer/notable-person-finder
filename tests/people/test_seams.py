@@ -28,6 +28,7 @@ from notable_person_finder.people.repository import (
     DETECT_PEOPLE_TASK_TYPE,
     load_current_triage_observation,
     load_person_mentions,
+    load_source_item_record,
 )
 from notable_person_finder.people.service import (
     INSPECT_MODEL_TASK_TYPE,
@@ -164,8 +165,24 @@ def test_detection_uses_prepare_returned_pricing_not_handler_default(
     profile = _profile()
     prompt_price = 150
     completion_price = 600
-    expected = prompt_price * max_input + completion_price * max_completion
+    record = load_source_item_record(connection, source_item_id=item)
+    assert record is not None
+    rendered = render_detection_request(
+        build_detection_input(
+            record,
+            FeedConfig(key="feed-a", label="Arts News", url="https://example.com/feed"),
+            profile,
+            config.tasks.detect_people,
+        )
+    )
+    # Derived from this item's own render, never a constant: a hardcoded
+    # number would keep passing if the call site reverted to reserving the
+    # configured `max_input_tokens` ceiling.
+    input_tokens = rendered.worst_case_input_tokens
+    assert input_tokens < max_input
+    expected = prompt_price * input_tokens + completion_price * max_completion
     assert expected != 0
+    assert expected != prompt_price * max_input + completion_price * max_completion
     client = ScriptedLlmClient(
         inspection=_compatible_inspection(
             prompt_price=prompt_price, completion_price=completion_price

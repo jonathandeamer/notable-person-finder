@@ -768,6 +768,127 @@ def test_detection_prepare_uses_exact_source_context(
     assert current.run_id == run_id
 
 
+def test_reservation_tracks_the_rendered_request_not_the_configured_ceiling(
+    connection: sqlite3.Connection,
+) -> None:
+    """Kills reserving the configured `max_input_tokens` ceiling.
+
+    Two items with materially different summary lengths render to materially
+    different request sizes under one configuration. Their reservations must
+    differ in the same direction. Reserving the ceiling makes both identical,
+    which is the ~31x over-reservation measured on the first ten-feed run.
+    """
+    bootstrap = insert_run(connection)
+    config = _main_config(
+        hard_budget=True,
+        max_input_tokens=65_536,
+        max_completion_tokens=512,
+    )
+    profile = _profile()
+    prompt_price = 150
+    completion_price = 600
+
+    reservations: list[int] = []
+    token_counts: list[int] = []
+    for entry, summary in (
+        ("entry-small", "Short."),
+        ("entry-large", "A far longer summary. " * 200),
+    ):
+        item = _seed_source_item(
+            connection,
+            run_id=bootstrap,
+            source_entry_id=entry,
+            summary_text=summary,
+            key=f"feed-{entry}",
+        )
+        token_counts.append(
+            _rendered_input_tokens(
+                connection, source_item_id=item, config=config, profile=profile
+            )
+        )
+        client = ScriptedLlmClient(
+            inspection=_compatible_inspection(
+                prompt_price=prompt_price, completion_price=completion_price
+            ),
+            generate_results=[
+                _generation_result(_zero_mentions_output().model_dump_json())
+            ],
+        )
+        run_id = _run_engine(
+            connection,
+            _handlers(connection, client, config, profile),
+            seed=_people_seed(connection, config, profile, source_item_ids=[item]),
+            hard_budget_limit=10_000_000_000,
+        )
+        row = connection.execute(
+            """
+            SELECT reserved_nano_usd FROM attempt
+             WHERE run_id = ? AND operation = ?
+            """,
+            (run_id, GENERATE_OPERATION),
+        ).fetchone()
+        assert row is not None
+        reservations.append(row["reserved_nano_usd"])
+
+    # The fixture must actually discriminate, or the assertion below is vacuous.
+    assert token_counts[0] < token_counts[1]
+    assert reservations[0] < reservations[1]
+    ceiling_reservation = prompt_price * 65_536 + completion_price * 512
+    assert reservations[1] < ceiling_reservation
+
+
+def test_reservation_never_exceeds_the_configured_ceiling_reservation(
+    connection: sqlite3.Connection,
+) -> None:
+    """Pins K5: the change can only lower a reservation, never raise one.
+
+    Every render refuses an input larger than `max_input_tokens`, so the
+    rendered size is bounded by the ceiling by construction. That is what
+    guarantees no run passing under a cap today starts failing on budget.
+    """
+    bootstrap = insert_run(connection)
+    item = _seed_source_item(connection, run_id=bootstrap)
+    config = _main_config(
+        hard_budget=True,
+        max_input_tokens=65_536,
+        max_completion_tokens=512,
+    )
+    profile = _profile()
+    input_tokens = _rendered_input_tokens(
+        connection, source_item_id=item, config=config, profile=profile
+    )
+    assert input_tokens <= config.tasks.detect_people.max_input_tokens
+
+
+def _rendered_input_tokens(
+    connection: sqlite3.Connection,
+    *,
+    source_item_id: int,
+    config: MainConfig,
+    profile: DomainProfileConfig,
+) -> int:
+    """This item's own rendered request size, as the handler computes it.
+
+    Derived, never hardcoded: a constant here would keep passing if a call
+    site reverted to reserving the configured ``max_input_tokens`` ceiling.
+    """
+    record = load_source_item_record(connection, source_item_id=source_item_id)
+    assert record is not None
+    rendered = render_detection_request(
+        build_detection_input(
+            record,
+            FeedConfig(
+                key=record.feed_key,
+                label=record.feed_label,
+                url="https://example.com/feed",
+            ),
+            profile,
+            config.tasks.detect_people,
+        )
+    )
+    return rendered.worst_case_input_tokens
+
+
 def test_dynamic_reservation_under_hard_budget(
     connection: sqlite3.Connection,
 ) -> None:
@@ -781,7 +902,13 @@ def test_dynamic_reservation_under_hard_budget(
     profile = _profile()
     prompt_price = 150
     completion_price = 600
-    expected_reservation = prompt_price * 4415 + completion_price * 512
+    input_tokens = _rendered_input_tokens(
+        connection, source_item_id=item, config=config, profile=profile
+    )
+    # The rendered request must be strictly smaller than the ceiling, or this
+    # test cannot tell the two apart.
+    assert input_tokens < 4415
+    expected_reservation = prompt_price * input_tokens + completion_price * 512
     client = ScriptedLlmClient(
         inspection=_compatible_inspection(
             prompt_price=prompt_price, completion_price=completion_price

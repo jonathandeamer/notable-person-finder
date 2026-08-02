@@ -120,7 +120,6 @@ from notable_person_finder.people.models import (
 )
 from notable_person_finder.people.repository import load_model_inspection
 from notable_person_finder.people.service import (
-    _worst_case_reservation_nano_usd,
     inspection_ready,
     routing_fingerprint,
 )
@@ -153,6 +152,7 @@ from notable_person_finder.providers.openrouter import (
     PROVIDER as OPENROUTER_PROVIDER,
 )
 from notable_person_finder.runs import repository as runs_repository
+from notable_person_finder.runs.budget import reservation_nano_usd
 from notable_person_finder.runs.clock import utc_timestamp
 from notable_person_finder.runs.engine import TaskHandler, TaskOutcome, TaskPreparation
 from notable_person_finder.runs.models import WorkItem, WorkState
@@ -3897,10 +3897,10 @@ def build_assess_article_handler(
             or completion_price is None
         ):
             raise ValueError(MISSING_PRICING_DETAIL)
-        reserved = _worst_case_reservation_nano_usd(
+        reserved = reservation_nano_usd(
             prompt_unit_price_nano_usd=prompt_price,
             completion_unit_price_nano_usd=completion_price,
-            max_input_tokens=assess_config.max_input_tokens,
+            input_tokens=rendered.worst_case_input_tokens,
             max_completion_tokens=assess_config.max_completion_tokens,
         )
         return TaskPreparation(payload=call, reserved_nano_usd=reserved)

@@ -2,10 +2,10 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Proposed |
+| **Status** | Implemented |
 | **Date** | 2026-08-02 |
 | **Author** | (design agent) |
-| **Branch** | `fix/reserve-against-rendered-request` (proposed) |
+| **Branch** | `fix/reserve-against-rendered-request` |
 | **Programme** | Notable Person Finder clean-slate rewrite |
 | **Depends on** | Milestones 1–6b-i complete on `refactor/rearchitecture` (HEAD `6703e2c`) |
 | **Revises** | The per-generation budget reservation contract established in `docs/superpowers/specs/2026-07-29-model-gateway-and-detection-design.md` |

@@ -12,34 +12,41 @@ Resolved findings are not kept here. A fix is held by its named regression test
 and, where the reasoning is needed to avoid re-breaking it, by a comment at the
 code. Look in git history for how something came to be the way it is.
 
-## Budget reservation charges the configured ceiling, not the real request
+## Budget reservation carries a deliberate ~4x margin
 
-A USD cap therefore throttles at a small fraction of its nominal value.
+**Not a defect. Do not "fix" it without replacing the reasoning below.**
 
-The reserve for one generation is `max_input_tokens * prompt_price +
-max_completion_tokens * completion_price`. That is wrong twice over:
-`max_input_tokens` is a worst-case **UTF-8 byte** ceiling being charged as a
-**token** count (~4x over), and the worst case is charged rather than the
-actual request (~8x over).
+The reserve for one generation is `input_tokens * prompt_price +
+max_completion_tokens * completion_price`, where `input_tokens` is *this*
+request's measured size (`worst_case_input_tokens`), not the task's configured
+`max_input_tokens` ceiling.
 
-Measured on the first ten-feed run: reserved $0.9679 against $0.0539 actually
-spent, roughly 31x over-reservation on a ~$0.0017 average `detect_people` call,
-which deferred 219 items `not_evaluated_budget` while only 5% of the cap was
-really used. Processing that run's 236 source items needs a nominal cap near
-$12.70 for about $0.40 of real spend.
+That measured size is a UTF-8 **byte** count charged as a **token** count.
+English prose runs roughly 4 bytes per token, so the reservation sits about 4x
+above real token cost. That margin is intentional:
 
-Raising `max_input_tokens` to 65536 multiplied the per-call reserve by exactly
-7, from $0.00768 to $0.05376 — it made this pre-existing flaw visible, it did
-not create it.
+- it needs no tokenizer, so reservation stays deterministic and offline, and
+  does not have to guess which endpoint OpenRouter will route to;
+- over-reserving against a request whose size is known is the safe direction
+  for a spend cap; and
+- reconciliation at `finish_attempt` replaces the reserve with actual cost, so
+  the margin costs in-run headroom only, never reported accuracy.
 
-Do not "fix" this by lowering the input budgets: 13,141 bytes is the measured
-`detect_people` floor and `match_wikipedia_identity`'s worst case is near 16k
-with a hard `ValueError`. The real fix is to reserve against the rendered
-request's actual size, which is already computed as `token_bearing_utf8_bytes`
-on each rendered request, and it needs its own design.
+The completion side stays at the configured ceiling because output length is
+not knowable before the call.
 
-Until then, set `openrouter_usd_per_run` well above expected real spend; actual
-cost stays bounded by the per-task character caps regardless of the cap value.
+**History.** Until 2026-08-02 the input side charged `max_input_tokens`
+instead, compounding the byte/token margin with a worst-case-versus-actual
+error. Measured on the first ten-feed run: reserved $0.9679 against $0.0539
+actually spent, roughly 31x over, which deferred 219 of 236 items
+`not_evaluated_budget` while only 5% of the cap was really used.
+`docs/superpowers/specs/2026-08-02-budget-reservation-sizing-design.md` fixed
+the second error and deliberately kept the first.
+
+Do not compensate by lowering the input budgets: 13,141 bytes is the measured
+`detect_people` floor and `match_wikipedia_identity`'s worst case is near 16 kB
+with a hard `ValueError`. `max_input_tokens` is the render ceiling that
+produces `input_too_large` refusals; it is no longer the billing estimate.
 
 ## `detect_people` fails model-output validation on real feed content
 
