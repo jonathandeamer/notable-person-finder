@@ -32,6 +32,13 @@ FORBIDDEN = {
 # `render.py` legitimately has -- `ReportingResult.digest_path`).
 _REPORTING_DIGEST_REFERENCE = re.compile(r"reporting\.digest\b")
 
+# The other idiomatic way to reach the digest renderer: importing the name
+# directly out of the `reporting` package rather than qualifying it. Handles
+# both the bare form and a parenthesised multi-name import list.
+_REPORTING_DIGEST_IMPORT_STATEMENT = re.compile(
+    r"from\s+notable_person_finder\.reporting\s+import\s+(?:\([^)]*)?\bdigest\b"
+)
+
 
 def _imported_sibling_packages(path: Path) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -73,22 +80,62 @@ def test_import_detector_finds_sibling_packages_in_a_synthetic_file(
     assert detected == {"db", "config", "reporting"}
 
 
+# The forbidden-import loops below iterate whatever the glob returns. If
+# AUDIT_PACKAGE were misspelled, pointed at the wrong directory, or the glob
+# pattern were wrong, that loop would iterate zero files and both guard
+# tests would pass vacuously -- the exact failure mode the synthetic-file
+# positive control (above) closed one level down. This is the matching
+# control one level up: known filenames that must be present.
+_EXPECTED_AUDIT_SOURCE_FILENAMES = {
+    "models.py",
+    "registry.py",
+    "repository.py",
+    "render.py",
+    "digest_show.py",
+}
+
+
+def _audit_source_files() -> list[Path]:
+    return sorted(AUDIT_PACKAGE.glob("*.py"))
+
+
+def test_audit_package_glob_discovers_the_real_source_files() -> None:
+    # Positive control for the file-discovery step itself, independent of
+    # what any individual file does or doesn't import. Without this, a
+    # broken AUDIT_PACKAGE path or glob pattern would make every test below
+    # that loops over `AUDIT_PACKAGE.glob("*.py")` pass by iterating nothing.
+    sources = _audit_source_files()
+    assert sources, f"no .py files found under {AUDIT_PACKAGE}"
+    discovered = {source.name for source in sources}
+    assert discovered >= _EXPECTED_AUDIT_SOURCE_FILENAMES
+
+
 def test_audit_package_imports_no_forbidden_sibling() -> None:
     # `audit/` is documented (see its `models.py` module docstring) as
     # permitted to import `config/`, `db/`, and `obs/` -- it just does not
     # currently need to, reading every other package's tables with its own
     # SQL instead of importing them. This test is the negative check; the
     # detector itself is proven by the synthetic-file positive control
-    # above.
-    for source in AUDIT_PACKAGE.glob("*.py"):
+    # above, and the file-discovery step by the glob control above.
+    sources = _audit_source_files()
+    assert sources, f"no .py files found under {AUDIT_PACKAGE}"
+    for source in sources:
         assert not (_imported_sibling_packages(source) & FORBIDDEN), source
 
 
 def test_audit_does_not_import_the_digest_renderer() -> None:
-    # K5: digest show reads bytes; it must never re-render.
-    for source in AUDIT_PACKAGE.glob("*.py"):
+    # K5: digest show reads bytes; it must never re-render. Covers both the
+    # dotted-attribute form (`reporting.digest`) and the
+    # `from notable_person_finder.reporting import digest` form. A bare
+    # `import notable_person_finder.reporting` (no `digest` mentioned in the
+    # text at all) is not this guard's job -- the AST layering scan above
+    # already forbids importing `reporting` in any form whatsoever.
+    sources = _audit_source_files()
+    assert sources, f"no .py files found under {AUDIT_PACKAGE}"
+    for source in sources:
         text = source.read_text(encoding="utf-8")
         assert not _REPORTING_DIGEST_REFERENCE.search(text), source
+        assert not _REPORTING_DIGEST_IMPORT_STATEMENT.search(text), source
 
 
 def test_commands_succeed_while_another_handle_holds_the_database(

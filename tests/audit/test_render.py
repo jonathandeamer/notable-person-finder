@@ -143,7 +143,7 @@ def test_render_run_audit_renders_distinct_field_values() -> None:
             limit_nano_usd=50_000,
             reserved_nano_usd=9_000,
             actual_nano_usd=8_000,
-            attempt_actual_sum_nano_usd=8_000,
+            attempt_actual_sum_nano_usd=6_000,
         ),
         reporting=ReportingResult(
             digest_path="/data/digests/2026-01-01.md",
@@ -184,10 +184,58 @@ def test_render_run_audit_renders_distinct_field_values() -> None:
     assert "  limit: $0.000050 (50000 nano-USD)" in text
     assert "  reserved: $0.000009 (9000 nano-USD)" in text
     assert "  actual (run total): $0.000008 (8000 nano-USD)" in text
+    assert "  actual (summed from attempts): $0.000006 (6000 nano-USD)" in text
+    # actual_nano_usd (8000) and attempt_actual_sum_nano_usd (7500) are
+    # deliberately distinct: equal values would leave the divergence branch
+    # at render.py:201-205 unexercised, and the "summed from attempts" line
+    # indistinguishable from a swapped field. See the matching no-divergence
+    # test below for the other side of this conditional.
+    assert (
+        "  divergence: run total and attempt sum disagree "
+        "(cross-check failed, both values shown above)" in text
+    )
     assert "  digest_path: /data/digests/2026-01-01.md" in text
     assert "  digest_sha256: digest-sha-abc123" in text
     assert "  entry_count: 12" in text
     assert "  see: notable digest show 101" in text
+
+
+def test_render_run_audit_budget_agreement_shows_no_divergence_warning() -> None:
+    # The other side of the render.py:201-205 conditional: when the run
+    # total and the attempt sum agree, the divergence warning line must be
+    # absent. Paired with the distinct-values assertion above, this pins
+    # the branch in both directions.
+    budget = BudgetSummary(
+        limit_nano_usd=50_000,
+        reserved_nano_usd=9_000,
+        actual_nano_usd=8_000,
+        attempt_actual_sum_nano_usd=8_000,
+    )
+    audit = RunAudit(
+        run=RunHeader(
+            id=901,
+            state="complete",
+            started_at="2026-01-01T00:00:00+00:00",
+            finished_at="2026-01-01T00:05:00+00:00",
+            timezone="UTC",
+            window_start="2026-01-01",
+            window_end="2026-01-02",
+        ),
+        configuration=None,
+        transitions=(),
+        work_outcomes=WorkOutcomes(counts=(), failed_permanent=(), deferred=()),
+        attempts=(),
+        failures=(),
+        budget=budget,
+        reporting=None,
+        unavailable_sections=(),
+    )
+
+    text = render.render_run_audit(audit)
+
+    assert "  actual (run total): $0.000008 (8000 nano-USD)" in text
+    assert "  actual (summed from attempts): $0.000008 (8000 nano-USD)" in text
+    assert "divergence" not in text
 
 
 def test_render_attempt_audit_renders_distinct_field_values() -> None:
@@ -323,7 +371,7 @@ def test_render_person_audit_renders_distinct_field_values() -> None:
                 person_mention_id=3301,
                 person_relation_id=None,
                 disposition="created_new",
-                semantic_outcome="created_new",
+                semantic_outcome="possible_same_person",
                 candidate_person_ids_json="[]",
                 selected_person_id=None,
                 created_person_id=3001,
@@ -377,7 +425,7 @@ def test_render_person_audit_renders_distinct_field_values() -> None:
                 WikipediaIdentityObservationLine(
                     id=3505,
                     disposition="matching_page_found",
-                    semantic_outcome="matching_page_found",
+                    semantic_outcome="uncertain_identity",
                     matched_mediawiki_page_id=3506,
                     task_fingerprint="wiki-task-fp-3507",
                     rationale="page facts uniquely match the person",
@@ -527,7 +575,7 @@ def test_render_person_audit_renders_distinct_field_values() -> None:
     assert "    current_semantic_outcome: created_new" in text
     assert (
         "  #3401 mention=3301 disposition=created_new "
-        "semantic_outcome=created_new" in text
+        "semantic_outcome=possible_same_person" in text
     )
     assert "    selected_person=None created_person=3001 candidates=[]" in text
     assert "  plan #3501 status=complete" in text
@@ -537,7 +585,7 @@ def test_render_person_audit_renders_distinct_field_values() -> None:
     )
     assert (
         "  identity_observation #3505 [CURRENT] disposition=matching_page_found "
-        "semantic_outcome=matching_page_found matched_page=3506" in text
+        "semantic_outcome=uncertain_identity matched_page=3506" in text
     )
     assert "  plan #3601 status=complete created_at=2026-01-02T00:00:06+00:00" in text
     assert (
