@@ -193,7 +193,7 @@ Each module has one purpose and no knowledge of the engine calling it.
 
 ```python
 def run(cfg, store) -> Digest:
-    leads, settled, stuck, status = [], [], [], "ok"
+    leads, settled, incomplete, capped = [], [], [], False
     try:
         for item in feeds.fetch_new(cfg, store):
             item_leads = []
@@ -207,16 +207,17 @@ def run(cfg, store) -> Digest:
                     articles = coverage.research(mention, cfg)
                     item_leads.append(rank.assess(mention, verdict, articles, cfg))
             except Incomplete:
-                stuck.append(item)               # retried next run, up to a cap
+                incomplete.append(item)          # retried next run, up to a cap
                 continue
             leads.extend(item_leads)
             settled.append(item)
     except BudgetExceeded:
-        status = "partial"                       # render what finished
+        capped = True                            # render what finished
+    summary = RunSummary(settled, incomplete, capped, llm.spend())
     shortlist = rank.shortlist(leads, store, cfg)   # selection order below
     written = digest.write(shortlist, cfg)          # temp file, atomic rename
-    store.commit(settled, stuck, shortlist)         # state, after the file lands
-    store.log(status, leads, written, llm.spend())  # best effort, separate txn
+    store.commit(settled, incomplete, shortlist)    # state, after the file lands
+    store.log(summary, leads, written)              # best effort, separate txn
     return written
 ```
 
@@ -237,12 +238,25 @@ Four invariants are load-bearing and must not be refactored away:
    inside the mention loop would leak an unsettled item's leads into the digest.
 4. **`BudgetExceeded` is caught here, not at the CLI.** The partial digest
    renders from leads local to this function and unreachable from `cli.py`. It
-   sets `status`, which reaches the run log; it is not swallowed.
+   sets `capped`, which reaches the run log; it is not swallowed.
 
 Two nested `try` blocks is the honest amount: `Incomplete` is per item and
 recoverable, `BudgetExceeded` ends the pass. The Wikipedia verdict is threaded
 into `rank.assess` rather than discarded — ranking needs it, and the lead log
 records it.
+
+**`RunSummary` carries everything the run log needs**, so `store.log` populates
+its columns from an explicit argument rather than from hidden coupling:
+`n_items_settled` and `n_items_incomplete` from the two lists, `cost_usd` from
+the spend counter, and
+
+```python
+status = "partial" if (incomplete or capped) else "ok"
+```
+
+derived in one place. Two conditions make a run partial — items that raised
+`Incomplete`, and a run cut short by the cap — and a mutable status string set
+only on the budget path would report a run with failed items as `ok`.
 
 Execution is **sequential**: no thread pools, no concurrency manager. A 246-item
 run takes ~40 minutes rather than ~10, traded for readable stack traces.
@@ -350,20 +364,32 @@ lead — a suppressed lead is dropped, not deferred.
 
 ### Item lifecycle and the attempt cap
 
-An item has three states: unseen, settled (`settled_at` set), and **stuck**
-(`attempts` at the cap, `settled_at` null).
+An item has three states, defined by `settled_at` and `attempts`:
 
-Without the third, a permanently poisonous item — a response that fails domain
-validation every time, or an article behind a hard 404 — never settles and is
-retried on **every subsequent daily run, forever**, re-paying for the failing
-call each time. One bad item becomes a permanent daily tax and a permanent
-silent recall loss.
+| State | Condition | Meaning |
+| --- | --- | --- |
+| **eligible** | `settled_at` null, `attempts < max_item_attempts` | new, or previously incomplete and retryable |
+| **settled** | `settled_at` set | fully researched; never revisited |
+| **abandoned** | `settled_at` null, `attempts >= max_item_attempts` | gave up |
 
-`store.commit` increments `attempts` for each item in `stuck`.
-`feeds.fetch_new` skips items that are settled *or* at `cfg.max_item_attempts`
-(default 3). A stuck item computes no outcome and is never surfaced; it is
-abandoned, and `sqlite3` finds it:
-`SELECT url FROM item WHERE settled_at IS NULL AND attempts >= 3`.
+"Eligible" deliberately covers both a never-seen item and one that failed twice:
+nothing downstream distinguishes them, and naming the retryable case separately
+invites a fourth code path that does. `feeds.fetch_new` selects exactly the
+eligible set.
+
+Without the abandoned state, a permanently poisonous item — a response failing
+domain validation every time, or an article behind a hard 404 — never settles
+and is retried on **every subsequent daily run, forever**, re-paying for the
+failing call each time. One bad item becomes a permanent daily tax and a
+permanent silent recall loss.
+
+`store.commit` increments `attempts` for each item in the `incomplete` list.
+An abandoned item computes no outcome and is never surfaced, and `sqlite3`
+finds it: `SELECT url FROM item WHERE settled_at IS NULL AND attempts >= 3`.
+
+The in-memory list is named `incomplete`, not `stuck`: it holds every item that
+raised this run, most of which are still retryable. Only the ones that reach the
+cap become abandoned, and that is a property of the row, not of the list.
 
 Two extra columns on one table, not a fifth table. The budget holds.
 
@@ -528,7 +554,8 @@ removed.
 | **Namesake safety** | Two different people sharing a name, each with one qualifying domain, give two `possible_lead`s — never one `promising_lead`. A companion asserts the collapse is visible in the rendered note. |
 | **Collapsing precedes the cut** | A run whose top `digest_size` leads all share one name still renders other people below them, not a one-entry digest. |
 | **Suppression is applied** | An identity surfaced inside the resurface window does not reappear; one outside it does. |
-| **A crash writes nothing** | A run interrupted before `store.commit` leaves all four tables untouched, and the re-run produces the same digest with zero new provider calls. |
+| **A crash writes nothing** | A run interrupted before `store.commit` leaves all four tables untouched. |
+| **No completed call is paid for twice** | Crash midway, then re-run: every provider call the first run completed is served from cache on the second. The half never reached does make new calls — that is work, not duplication — so the invariant is about *duplicate* cost, not total cost. |
 | **A log failure cannot block state** | With `store.log` forced to raise, state is still committed and the digest still exists, so the next run progresses. |
 | **Incomplete discards the whole item** | An item where mention three raises leaves no leads at all, is not settled, and never appears as `insufficient_evidence`. |
 | **Poison items are abandoned** | An item raising every time stops being retried at `max_item_attempts` and makes no further provider calls. |
@@ -559,6 +586,21 @@ Branch `mvp` off `main`. `main` remains the operational fallback;
 Each phase ends with a live run, and that run's cache directory becomes the next
 phase's fixture set. **Phase 1 is the phase to get right**; everything else
 hangs off the skeleton.
+
+**A digest appearing is not the success condition for a live run.** Nothing in
+this document has met a provider, and `docs/findings.md` records that the prior
+programme's two most expensive defects were invisible offline and survived two
+independent static reviews. Before a run's cache is promoted to a reference
+fixture — which makes it the pass/fail gate for everything after — inspect:
+
+- raw model responses, not just the parsed results;
+- validation failures and their reasons, including any silent truncation;
+- cache hit and miss counts on a second run, confirming replay actually works;
+- measured spend against the estimate;
+- provider pacing and any 429s.
+
+A fixture recorded from an unexamined run encodes its bugs as expected
+behaviour.
 
 ## Guardrails
 
@@ -594,7 +636,8 @@ syndication inference; automated article drafting or editing.
 
 - `notable run` fetches feeds, detects people, checks English Wikipedia,
   researches coverage, and writes a dated digest plus `latest.md`;
-- a crashed run re-runs to completion at near-zero provider cost;
+- a crashed run re-runs to completion paying only for the work it had not yet
+  reached — no completed provider call is paid for twice;
 - the spend cap produces a partial digest rather than a failure;
 - source is under 3,000 lines and the main loop fits on one screen;
 - **the fixed-corpus regression passes.** One recorded cache directory from a
