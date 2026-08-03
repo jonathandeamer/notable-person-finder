@@ -7,7 +7,9 @@ from notable.errors import ProviderFailure
 from notable.http import Transport
 
 CONFIG = TransportConfig(
-    contact_url="https://example.com/c", per_host_min_interval_ms=0, initial_backoff_seconds=0
+    contact_url="https://example.com/c",
+    per_host_min_interval_ms=0,
+    initial_backoff_seconds=0,
 )
 
 
@@ -48,7 +50,10 @@ def test_sends_fixed_headers_and_no_cookies(tmp_path):
     transport = _transport(tmp_path, handler)
     for _ in range(2):
         transport.request(
-            provider="t", method="GET", url="https://a.test/x", ttl_seconds=None,
+            provider="t",
+            method="GET",
+            url="https://a.test/x",
+            ttl_seconds=None,
             bypass_cache=True,
         )
     assert "example.com/c" in seen[0].headers["user-agent"]
@@ -143,7 +148,12 @@ def test_contact_url_is_part_of_the_request_profile(tmp_path):
 
 def test_a_cache_hit_is_flagged_so_callers_can_skip_charging_for_it(tmp_path):
     transport = _transport(tmp_path, lambda r: httpx.Response(200, text="ok"))
-    kwargs = {"provider": "t", "method": "GET", "url": "https://a.test/x", "ttl_seconds": None}
+    kwargs = {
+        "provider": "t",
+        "method": "GET",
+        "url": "https://a.test/x",
+        "ttl_seconds": None,
+    }
     assert transport.request(**kwargs).from_cache is False
     assert transport.request(**kwargs).from_cache is True
 
@@ -159,8 +169,11 @@ def test_a_deferred_response_is_not_cached_until_commit(tmp_path):
 
     transport = _transport(tmp_path, handler)
     kwargs = {
-        "provider": "t", "method": "GET", "url": "https://a.test/x",
-        "ttl_seconds": None, "defer_cache": True,
+        "provider": "t",
+        "method": "GET",
+        "url": "https://a.test/x",
+        "ttl_seconds": None,
+        "defer_cache": True,
     }
     transport.request(**kwargs)
     transport.request(**kwargs)
@@ -174,8 +187,11 @@ def test_a_deferred_response_is_not_cached_until_commit(tmp_path):
 def test_committing_twice_is_harmless(tmp_path):
     transport = _transport(tmp_path, lambda r: httpx.Response(200, text="ok"))
     response = transport.request(
-        provider="t", method="GET", url="https://a.test/x",
-        ttl_seconds=None, defer_cache=True,
+        provider="t",
+        method="GET",
+        url="https://a.test/x",
+        ttl_seconds=None,
+        defer_cache=True,
     )
     response.commit()
     response.commit()  # must not raise
@@ -183,7 +199,12 @@ def test_committing_twice_is_harmless(tmp_path):
 
 def test_committing_a_cache_hit_is_a_no_op(tmp_path):
     transport = _transport(tmp_path, lambda r: httpx.Response(200, text="ok"))
-    kwargs = {"provider": "t", "method": "GET", "url": "https://a.test/x", "ttl_seconds": None}
+    kwargs = {
+        "provider": "t",
+        "method": "GET",
+        "url": "https://a.test/x",
+        "ttl_seconds": None,
+    }
     transport.request(**kwargs)
     hit = transport.request(**kwargs)
     assert hit.from_cache is True
@@ -200,11 +221,27 @@ def test_bypass_skips_the_read_but_still_stores(tmp_path):
         return httpx.Response(200, text=f"body {len(calls)}")
 
     transport = _transport(tmp_path, handler)
-    kwargs = {"provider": "t", "method": "GET", "url": "https://a.test/x", "ttl_seconds": 3600}
+    kwargs = {
+        "provider": "t",
+        "method": "GET",
+        "url": "https://a.test/x",
+        "ttl_seconds": 3600,
+    }
     assert transport.request(**kwargs).text == "body 1"
-    assert transport.request(**kwargs).text == "body 1"      # cached
-    assert transport.request(**kwargs | {"bypass_cache": True}).text == "body 2"
-    assert transport.request(**kwargs).text == "body 2", "the bypass refreshed the entry"
+    assert transport.request(**kwargs).text == "body 1"  # cached
+    assert (
+        transport.request(
+            provider="t",
+            method="GET",
+            url="https://a.test/x",
+            ttl_seconds=3600,
+            bypass_cache=True,
+        ).text
+        == "body 2"
+    )
+    assert transport.request(**kwargs).text == "body 2", (
+        "the bypass refreshed the entry"
+    )
     assert len(calls) == 2
 
 
@@ -214,7 +251,9 @@ def test_recovered_rate_limits_are_counted(tmp_path):
     responses = [httpx.Response(429, text="slow down"), httpx.Response(200, text="ok")]
 
     transport = _transport(tmp_path, lambda r: responses.pop(0))
-    transport.request(provider="t", method="GET", url="https://a.test/x", ttl_seconds=None)
+    transport.request(
+        provider="t", method="GET", url="https://a.test/x", ttl_seconds=None
+    )
     assert transport.stats.rate_limited == 1
     assert transport.stats.retries == 1
 
@@ -224,7 +263,9 @@ def test_pacing_sleeps_between_calls_to_one_host(tmp_path):
     client = httpx.Client(
         transport=httpx.MockTransport(lambda r: httpx.Response(200, text="ok"))
     )
-    config = TransportConfig(contact_url="https://e.test/c", per_host_min_interval_ms=900)
+    config = TransportConfig(
+        contact_url="https://e.test/c", per_host_min_interval_ms=900
+    )
     transport = Transport(config, Cache(tmp_path), client=client, sleep=slept.append)
     for path in ("a", "b"):
         transport.request(

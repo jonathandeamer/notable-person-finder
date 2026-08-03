@@ -1,8 +1,11 @@
+from typing import cast
+
 import pytest
 
 from notable.detect import people_in
 from notable.errors import BudgetExceeded, Incomplete, ProviderFailure
 from notable.feeds import SourceItem
+from notable.llm import LlmClient
 
 ITEM = SourceItem(
     url="https://a.test/1",
@@ -56,12 +59,12 @@ def test_the_validator_is_passed_to_the_client_not_applied_after(make_config):
     # rejects, so every retry replays the same bad answer for free until the
     # item hits its attempt cap.
     llm = FakeLlm(result=GOOD)
-    people_in(ITEM, make_config(), llm)
+    people_in(ITEM, make_config(), cast(LlmClient, llm))
     assert callable(llm.calls[0]["validate"])
 
 
 def test_returns_validated_mentions(make_config):
-    mentions = people_in(ITEM, make_config(), FakeLlm(result=GOOD))
+    mentions = people_in(ITEM, make_config(), cast(LlmClient, FakeLlm(result=GOOD)))
     assert [m.exact_name for m in mentions] == ["Ana Poy"]
     assert mentions[0].research_worthy is True
 
@@ -69,13 +72,13 @@ def test_returns_validated_mentions(make_config):
 def test_an_item_with_no_usable_text_makes_no_model_call(make_config):
     llm = FakeLlm(result=GOOD)
     empty = SourceItem(ITEM.url, None, None, None, "a", "A")
-    assert people_in(empty, make_config(), llm) == ()
+    assert people_in(empty, make_config(), cast(LlmClient, llm)) == ()
     assert llm.calls == [], "an empty item must not be paid for"
 
 
 def test_the_call_carries_the_ported_prompt_and_capped_schema(make_config):
     llm = FakeLlm(result=GOOD)
-    people_in(ITEM, make_config(), llm)
+    people_in(ITEM, make_config(), cast(LlmClient, llm))
     call = llm.calls[0]
     assert call["task"] == "detect_people"
     assert "Return strict schema" in call["system"]
@@ -86,18 +89,18 @@ def test_the_call_carries_the_ported_prompt_and_capped_schema(make_config):
 def test_a_validation_failure_raises_incomplete_and_is_not_retried(make_config):
     llm = FakeLlm(result={"item_outcome": "research_people"})  # missing fields
     with pytest.raises(Incomplete):
-        people_in(ITEM, make_config(), llm)
+        people_in(ITEM, make_config(), cast(LlmClient, llm))
     assert len(llm.calls) == 1, "a validation failure must not be re-paid for in-run"
 
 
 def test_a_provider_failure_raises_incomplete(make_config):
     llm = FakeLlm(error=ProviderFailure("boom", permanent=False))
     with pytest.raises(Incomplete):
-        people_in(ITEM, make_config(), llm)
+        people_in(ITEM, make_config(), cast(LlmClient, llm))
 
 
 def test_budget_exceeded_propagates_rather_than_becoming_incomplete(make_config):
     # BudgetExceeded ends the pass; Incomplete only ends the item.
     llm = FakeLlm(error=BudgetExceeded("cap"))
     with pytest.raises(BudgetExceeded):
-        people_in(ITEM, make_config(), llm)
+        people_in(ITEM, make_config(), cast(LlmClient, llm))

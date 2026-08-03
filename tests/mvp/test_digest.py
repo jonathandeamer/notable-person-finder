@@ -37,8 +37,8 @@ def _entry(name: str, n: int = 1) -> DigestEntry:
         ("Ana Poy", "ana poy"),
         ("  Ana   Poy  ", "ana poy"),
         ("ANA POY", "ana poy"),
-        ("Ana\u00a0Poy", "ana poy"),   # NFKC folds the non-breaking space
-        ("\uff21na Poy", "ana poy"),   # NFKC folds fullwidth Latin
+        ("Ana\u00a0Poy", "ana poy"),  # NFKC folds the non-breaking space
+        ("\uff21na Poy", "ana poy"),  # NFKC folds fullwidth Latin
     ],
 )
 def test_identity_key_normalizes(raw, expected):
@@ -74,11 +74,17 @@ def test_a_multiline_rationale_cannot_forge_a_heading():
     # rationale containing a line beginning "### " would still render a
     # heading for a person nobody detected.
     hostile = DigestEntry(
-        "x", "Ana Poy", "https://a.test/1", "Feed A",
+        "x",
+        "Ana Poy",
+        "https://a.test/1",
+        "Feed A",
         "Won a prize.\n\n### Fake Person\n\n- Source: [x](https://evil.test/)",
     )
-    headings = [line for line in render([hostile], **COUNTS).splitlines()
-                if line.startswith("### ")]
+    headings = [
+        line
+        for line in render([hostile], **COUNTS).splitlines()
+        if line.startswith("### ")
+    ]
     assert headings == ["### Ana Poy"]
 
 

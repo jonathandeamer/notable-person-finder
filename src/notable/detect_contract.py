@@ -15,17 +15,30 @@ from notable.feeds import SourceItem
 ITEM_OUTCOMES = ("research_people", "do_not_research", "uncertain")
 MENTION_OUTCOMES = ("research", "do_not_research", "uncertain")
 IDENTITY_FACT_KINDS = (
-    "name", "profession_or_role", "place", "nationality",
-    "era_or_date", "work", "affiliation", "other",
+    "name",
+    "profession_or_role",
+    "place",
+    "nationality",
+    "era_or_date",
+    "work",
+    "affiliation",
+    "other",
 )
 ATTENTION_CATEGORIES = (
-    "significant_recognition", "enduring_contribution", "significant_work",
-    "institutional_recognition", "sustained_field_attention",
-    "major_achievement", "influential_role",
+    "significant_recognition",
+    "enduring_contribution",
+    "significant_work",
+    "institutional_recognition",
+    "sustained_field_attention",
+    "major_achievement",
+    "influential_role",
 )
 CAUTION_CATEGORIES = (
-    "single_event_only", "inherited_association", "routine_role_or_listing",
-    "primary_or_promotional", "significance_unclear",
+    "single_event_only",
+    "inherited_association",
+    "routine_role_or_listing",
+    "primary_or_promotional",
+    "significance_unclear",
 )
 PASSAGE_IDS = ("p1", "p2")
 
@@ -230,7 +243,9 @@ def validate_detection(
     try:
         output = DetectionOutput.model_validate(raw)
     except ValidationError as error:
-        raise DetectionInvalid(f"detection output failed validation: {error}") from error
+        raise DetectionInvalid(
+            f"detection output failed validation: {error}"
+        ) from error
 
     if len(output.mentions) > max_people:
         raise DetectionInvalid(
@@ -275,11 +290,14 @@ def validate_detection(
                     "domain_profile grounding requires a supplied profile; none is"
                 )
             expected = (
-                ATTENTION_CATEGORIES if signal.kind == "attention" else CAUTION_CATEGORIES
+                ATTENTION_CATEGORIES
+                if signal.kind == "attention"
+                else CAUTION_CATEGORIES
             )
             if signal.category not in expected:
                 raise DetectionInvalid(
-                    f"category {signal.category} is not valid for a {signal.kind} signal"
+                    f"category {signal.category} is not valid "
+                    f"for a {signal.kind} signal"
                 )
 
     _check_item_outcome(output)
@@ -310,6 +328,4 @@ def _check_item_outcome(output: DetectionOutput) -> None:
     # an empty result satisfies both `do_not_research` and `uncertain` -- so
     # enforcing them as full biconditionals would reject valid output.
     if output.item_outcome == "uncertain" and "research" in outcomes:
-        raise DetectionInvalid(
-            "item_outcome uncertain contradicts a research mention"
-        )
+        raise DetectionInvalid("item_outcome uncertain contradicts a research mention")

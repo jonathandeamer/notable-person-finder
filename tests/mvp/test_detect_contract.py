@@ -12,7 +12,10 @@ from notable.feeds import SourceItem
 CONFIG = DetectConfig(model="m", max_title_characters=20, max_summary_characters=30)
 
 
-def _item(title="Sculptor Ana Poy wins prize", summary="Ana Poy showed in Paris."):
+def _item(
+    title: str | None = "Sculptor Ana Poy wins prize",
+    summary: str | None = "Ana Poy showed in Paris.",
+):
     return SourceItem(
         url="https://a.test/1",
         title=title,
@@ -29,7 +32,11 @@ def _mention(**overrides):
         "outcome": "research",
         "supporting_passage_ids": ["p1"],
         "identity_facts": [
-            {"kind": "profession_or_role", "value": "Sculptor", "supporting_passage_ids": ["p1"]}
+            {
+                "kind": "profession_or_role",
+                "value": "Sculptor",
+                "supporting_passage_ids": ["p1"],
+            }
         ],
         "signals": [],
         "rationale": "Named subject.",
@@ -47,10 +54,13 @@ def _output(**overrides):
     return base | overrides
 
 
-PASSAGES = build_passages(_item(title="Sculptor Ana Poy", summary="Ana Poy in Paris."), CONFIG)
+PASSAGES = build_passages(
+    _item(title="Sculptor Ana Poy", summary="Ana Poy in Paris."), CONFIG
+)
 
 
 # -- passages ------------------------------------------------------------
+
 
 def test_passages_are_bounded_and_flagged_when_truncated():
     passages = build_passages(_item(title="x" * 100, summary="y" * 100), CONFIG)
@@ -65,6 +75,7 @@ def test_absent_fields_produce_no_passage():
 
 # -- schema --------------------------------------------------------------
 
+
 def test_schema_root_is_an_object_not_a_union():
     # Strict structured output rejects a root-level anyOf with HTTP 400.
     schema = detection_schema(max_people=8)
@@ -74,7 +85,12 @@ def test_schema_root_is_an_object_not_a_union():
 
 def test_schema_caps_mentions_at_max_people():
     # The cap must be unrepresentable, not merely rejected after payment.
-    assert detection_schema(max_people=3)["properties"]["mentions"]["maxItems"] == 3
+    schema = detection_schema(max_people=3)
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    mentions = properties["mentions"]
+    assert isinstance(mentions, dict)
+    assert mentions["maxItems"] == 3
 
 
 def test_schema_forbids_additional_properties_everywhere():
@@ -92,9 +108,21 @@ def test_schema_forbids_additional_properties_everywhere():
     walk(detection_schema(max_people=8))
 
 
-def _signal_schema():
-    mention = detection_schema(max_people=8)["properties"]["mentions"]["items"]
-    return mention["properties"]["signals"]["items"]
+def _signal_schema() -> dict:
+    schema = detection_schema(max_people=8)
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    mentions = properties["mentions"]
+    assert isinstance(mentions, dict)
+    items = mentions["items"]
+    assert isinstance(items, dict)
+    item_props = items["properties"]
+    assert isinstance(item_props, dict)
+    signals = item_props["signals"]
+    assert isinstance(signals, dict)
+    signal_items = signals["items"]
+    assert isinstance(signal_items, dict)
+    return signal_items
 
 
 def test_signal_kind_and_category_are_paired_in_the_schema():
@@ -102,9 +130,7 @@ def test_signal_kind_and_category_are_paired_in_the_schema():
     # to use here. Independent enums let the model emit a caution category
     # under kind "attention" -- billable, then rejected.
     variants = {
-        arm["properties"]["kind"]["enum"][0]: set(
-            arm["properties"]["category"]["enum"]
-        )
+        arm["properties"]["kind"]["enum"][0]: set(arm["properties"]["category"]["enum"])
         for arm in _signal_schema()["anyOf"]
     }
     assert set(variants) == {"attention", "caution"}
@@ -123,6 +149,7 @@ def test_schema_does_not_offer_domain_profile_grounding():
 
 # -- validation ----------------------------------------------------------
 
+
 def test_valid_output_parses():
     result = validate_detection(_output(), passages=PASSAGES, max_people=8)
     assert result.mentions[0].exact_name == "Ana Poy"
@@ -132,7 +159,9 @@ def test_research_and_uncertain_mentions_are_research_worthy():
     for outcome in ("research", "uncertain"):
         result = validate_detection(
             _output(
-                item_outcome="research_people" if outcome == "research" else "uncertain",
+                item_outcome="research_people"
+                if outcome == "research"
+                else "uncertain",
                 mentions=[_mention(outcome=outcome)],
             ),
             passages=PASSAGES,
@@ -143,7 +172,10 @@ def test_research_and_uncertain_mentions_are_research_worthy():
 
 def test_do_not_research_is_not_research_worthy():
     result = validate_detection(
-        _output(item_outcome="do_not_research", mentions=[_mention(outcome="do_not_research")]),
+        _output(
+            item_outcome="do_not_research",
+            mentions=[_mention(outcome="do_not_research")],
+        ),
         passages=PASSAGES,
         max_people=8,
     )

@@ -1,7 +1,6 @@
 """Shared fixtures. Tasks 6, 8, and 10 all need a Config and a Transport."""
 
 from collections.abc import Callable
-from pathlib import Path
 
 import httpx
 import pytest
