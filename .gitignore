@@ -45,3 +45,10 @@ what-is-openclaw.md
 /data/
 /digests/
 /cache/
+
+# Phase 1 live recording (local only)
+/config/mvp.local.toml
+/config/mvp.feeds.local.toml
+/cache-phase1/
+/data-phase1/
+/digests-phase1/
