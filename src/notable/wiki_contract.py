@@ -15,7 +15,6 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 MATCH_OUTCOMES = ("matching_page", "no_matching_page", "uncertain")
-FACT_FIELDS = ("description", "extract", "category")
 
 _MAIN_NAMESPACE = 0
 

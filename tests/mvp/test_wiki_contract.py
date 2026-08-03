@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from notable.wiki_contract import (
@@ -12,30 +14,22 @@ from notable.wiki_contract import (
 )
 
 
-def _page(**overrides: object) -> PageFact:
-    base: dict[str, object] = {
-        "page_id": 1,
-        "title": "Ana Poy",
-        "namespace": 0,
-        "missing": False,
-        "is_redirect": False,
-        "is_disambiguation": False,
-        "description": "Sculptor",
-        "extract": "Ana Poy is a sculptor.",
-        "categories": ("Sculptors",),
-    }
-    merged = base | overrides
+def _base_page() -> PageFact:
     return PageFact(
-        page_id=merged["page_id"],  # type: ignore[arg-type]
-        title=merged["title"],  # type: ignore[arg-type]
-        namespace=merged["namespace"],  # type: ignore[arg-type]
-        missing=merged["missing"],  # type: ignore[arg-type]
-        is_redirect=merged["is_redirect"],  # type: ignore[arg-type]
-        is_disambiguation=merged["is_disambiguation"],  # type: ignore[arg-type]
-        description=merged["description"],  # type: ignore[arg-type]
-        extract=merged["extract"],  # type: ignore[arg-type]
-        categories=merged["categories"],  # type: ignore[arg-type]
+        page_id=1,
+        title="Ana Poy",
+        namespace=0,
+        missing=False,
+        is_redirect=False,
+        is_disambiguation=False,
+        description="Sculptor",
+        extract="Ana Poy is a sculptor.",
+        categories=("Sculptors",),
     )
+
+
+def _page(**overrides: object) -> PageFact:
+    return replace(_base_page(), **overrides)  # type: ignore[arg-type]
 
 
 def _candidates(**overrides) -> tuple[Candidate, ...]:
