@@ -69,9 +69,18 @@ rather than left to the implementation.
 **Key composition.** The key is a SHA-256 over a canonical JSON encoding of:
 provider name, HTTP method, full URL including query, the request body, and —
 for model calls — the model id and the structured-output schema. Two calls that
-could return different results must never collide. **Authorization headers,
-API keys, and cookies are excluded from the key**, so a rotated key does not
-invalidate the cache and no secret is written to disk.
+could return different results must never collide. **Authorization headers and
+API keys are excluded from the key**, so a rotated key does not invalidate the
+cache and no secret is written to disk.
+
+Excluding headers wholesale would break the collision guarantee, since
+`Accept`, `Accept-Language`, and cookies can all change a response. The
+guarantee is restored by constraining the transport instead: **`http.py` sends
+one fixed set of headers and keeps no cookie jar.** Cookies are never sent or
+stored, and the fixed header values are folded into the key as a single
+`transport_profile` string, so changing them invalidates the cache rather than
+silently reusing responses negotiated under the old ones. A per-request header
+override would break this and is not offered.
 
 **Atomic writes.** Entries are written to a temporary file in the same
 directory and `os.replace`d into place. Without this, the precise event the
@@ -257,7 +266,7 @@ operations.
 
 ```python
 def run(cfg, store) -> Digest:
-    leads, settled, stuck = [], [], []
+    leads, settled, stuck, status = [], [], [], "ok"
     try:
         for item in feeds.fetch_new(cfg, store):
             item_leads = []
@@ -276,10 +285,11 @@ def run(cfg, store) -> Digest:
             leads.extend(item_leads)
             settled.append(item)
     except BudgetExceeded:
-        pass                                     # render what finished
-    shortlist = rank.order(leads)[: cfg.digest_size]
-    written = digest.write(shortlist, cfg)       # temp file, atomic rename
-    store.commit(settled, stuck, leads, written) # only after the file lands
+        status = "partial"                       # render what finished
+    shortlist = rank.shortlist(leads, store, cfg)   # see selection order below
+    written = digest.write(shortlist, cfg)          # temp file, atomic rename
+    store.commit(settled, stuck, shortlist)         # state, after the file lands
+    store.log(status, leads, written, llm.spend())  # best effort, separate txn
     return written
 ```
 
@@ -302,9 +312,32 @@ Four invariants are load-bearing and must not be refactored away:
    `Incomplete`, the leads from mentions one and two are discarded with it.
    Extending `leads` inside the mention loop would leak an unsettled item's
    leads into the digest.
-4. **`BudgetExceeded` is caught around the item loop, not at the CLI.** The
-   partial digest renders from the leads already in memory. Catching it further
-   out would lose them, since they are local to this function.
+4. **`BudgetExceeded` is caught around the item loop, not at the CLI.**
+   `pipeline.run` is its only owner. The partial digest renders from the leads
+   already in memory, which are local to this function and unreachable from
+   `cli.py`. It sets `status`, which reaches the run log; it is not swallowed.
+
+### Selection order
+
+`rank.shortlist` is a single function with a fixed order, because every step
+changes what the next one sees and getting them out of order loses people
+silently:
+
+1. **filter** out `insufficient_evidence` — these carry no `OUTCOME_RANK`;
+2. **suppress** identities in `surfaced` within `cfg.resurface_after_days`;
+3. **collapse** same-name duplicates to one representative — the highest-ranked
+   lead for that `identity_key` — retaining the discarded leads' source URLs on
+   the representative for the "further leads share this name" note;
+4. **rank** the representatives by the tuple below;
+5. **cut** to `cfg.digest_size`.
+
+Slicing before collapsing is the trap: twenty top-ranked mentions of one name
+would fill the whole shortlist and render as a single entry, while every other
+person that day fell off the end. Collapsing before ranking is what makes the
+cut mean "the top N *people*".
+
+Suppression must also precede the cut, or a digest can be entirely composed of
+entries that are then removed for having been shown last week.
 
 The Wikipedia verdict is threaded into `rank.assess` rather than discarded:
 ranking needs it, and the lead log records it.
@@ -359,21 +392,36 @@ recovery mechanism, and it must not blur.
 **`item` and `surfaced` are state.** The pipeline reads them, and they change
 what it does: `item` decides what to fetch, `surfaced` decides what to show.
 
-**`run` and `lead` are append-only logs.** They are written by `store.commit`
-after the digest file lands, and **the pipeline never reads them.** Nothing
-branches on their contents; no recovery path consults them; no digest is
-rendered from them. They exist so a human with `sqlite3` can ask what happened
-and why — which is the entire audit story, at the cost of two `INSERT`s and
-zero invariants.
+**`run` and `lead` are append-only logs.** The pipeline never reads them.
+Nothing branches on their contents; no recovery path consults them; no digest
+is rendered from them.
+
+**They are written by `store.log`, in a separate transaction, after
+`store.commit` has already committed the state tables, and a failure to write
+them is caught and warned about rather than raised.** This is not fussiness. If
+the logs shared `store.commit`'s transaction, a `detail_json` serialization
+error or a log-table constraint failure would roll back the item markers *after
+the digest file had already been written* — so the next run would repeat all
+the work, rewrite the digest, and hit the identical deterministic failure. One
+bad log row would livelock the product. Sharing a transaction with state is
+precisely what would make "zero invariants" false.
+
+`lead` earns its place despite being unread, and the reason is concrete rather
+than an appeal to auditability: **tuning recall is this product's main
+development activity**, and it is done by querying stored leads. The decision
+to re-add the dropped signal rule, for instance, is specified as a query over
+`insufficient_evidence` leads carrying a transferable signal. Without the log
+that question can only be answered by another paid run.
 
 A row the application never reads is a log, not state. If a future change makes
-the pipeline read `lead`, that is the durable-workflow system growing back, and
-it needs an explicit decision rather than a patch.
+the pipeline read `lead`, or puts it back inside the state transaction, the
+durable-workflow system is growing back and it needs an explicit decision
+rather than a patch.
 
 ### The digest renders from this run only
 
-`rank.order(leads)` ranks the leads produced by the current pass, takes the top
-`cfg.digest_size`, and **discards the tail.**
+`rank.shortlist` sees only the leads produced by the current pass, and
+**discards the tail** below `cfg.digest_size`.
 
 There is no backlog, no pending queue, and no rendering from history. An
 earlier draft had the digest select every unsurfaced lead ever stored,
@@ -455,9 +503,10 @@ They are tuned against real content and expensive to rediscover.
 A running counter, not a reservation system.
 
 Actual cost is read from OpenRouter's `usage` field after each call and
-accumulated. When the total exceeds the configured cap, the pipeline raises
-`BudgetExceeded`, which `cli.py` catches at the top level and renders a partial
-digest from the leads completed so far. The run is recorded `partial`.
+accumulated by `llm.py`. When the total exceeds the configured cap, the next
+call raises `BudgetExceeded`. **`pipeline.run` catches it** — it is the only
+handler — sets the run status to `partial`, and renders the digest from the
+leads already in memory. `llm.spend()` supplies the total to the run log.
 
 **This is a soft cap, and one-call overshoot is accepted.** Cost is knowable
 only after a call returns, so a run can exceed the configured amount by at most
@@ -563,7 +612,7 @@ hits `continue` in the loop and never becomes a lead, so no third branch is
 reachable. If a third value ever becomes necessary, the loop's skip has changed
 and both must move together.
 
-**`rank.order` filters `insufficient_evidence` before sorting.** Those leads
+**`rank.shortlist` filters `insufficient_evidence` first, in step 1.** Those leads
 carry no `OUTCOME_RANK` entry, so ranking one is a `KeyError` — deliberately,
 as the loud failure is better than an arbitrary ordering. They are stored for
 inspection and never rendered.
@@ -613,7 +662,7 @@ it were themselves complexity drivers, and are in scope for this rebuild.
   to a rendered digest.
 - Live smoke tests are opt-in and marked, one per provider.
 
-Seven tests pin invariants that are cheap to break and expensive to notice.
+These tests pin invariants that are cheap to break and expensive to notice.
 Each must fail if its rule is removed:
 
 - **Namesake safety.** Two mentions of different people sharing one name, each
@@ -641,6 +690,14 @@ Each must fail if its rule is removed:
   provider calls thereafter.
 - **Failures are not cached.** A transport failure followed by a success must
   return the success, not a replayed failure.
+- **Collapsing precedes the cut.** A run whose top `digest_size` leads all
+  share one name must still render other people below them, not a one-entry
+  digest. Pins the selection order.
+- **Suppression is applied.** An identity surfaced within the resurface window
+  must not appear again; one outside it must.
+- **A log failure cannot block state.** With `store.log` forced to raise, the
+  item markers and `surfaced` must still be committed and the digest file must
+  still exist, so the next run makes progress rather than repeating forever.
 
 **The mutation-evidence protocol is dropped.** It was a rational response to a
 71,000-line suite whose coverage claims could not be trusted. At this size it
