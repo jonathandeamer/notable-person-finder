@@ -61,17 +61,50 @@ through one caching wrapper keyed by a hash of the canonical request. A run
 that crashes is simply re-run, and every prior call is a cache hit, so the
 retry costs approximately nothing.
 
-### What is cacheable
+### The cache contract
 
-**Feed fetches are not permanently cacheable.** A feed URL's whole purpose is
-to return different content tomorrow; caching it by request hash would replay
-the first response forever, and combined with the seen-set that yields an empty
-digest every day thereafter. Feed requests therefore take a TTL
-(`cache.feed_ttl_seconds`, default 3600 — comfortably longer than a full run,
-so a crash-and-restart does not re-fetch, and far shorter than a day, so the
-daily run always sees fresh content), and `notable run --fresh-feeds` bypasses
-it. Recorded feed responses remain perfectly good *fixtures*; the TTL governs
-production only.
+The cache carries the entire recovery guarantee, so its contract is specified
+rather than left to the implementation.
+
+**Key composition.** The key is a SHA-256 over a canonical JSON encoding of:
+provider name, HTTP method, full URL including query, the request body, and —
+for model calls — the model id and the structured-output schema. Two calls that
+could return different results must never collide. **Authorization headers,
+API keys, and cookies are excluded from the key**, so a rotated key does not
+invalidate the cache and no secret is written to disk.
+
+**Atomic writes.** Entries are written to a temporary file in the same
+directory and `os.replace`d into place. Without this, the precise event the
+cache exists to survive — a crash mid-run — can leave a truncated entry that
+poisons every subsequent replay.
+
+**Corrupt entries are misses.** A entry that fails to parse is deleted and
+treated as absent, never raised. A cache is an optimization; it may not be a
+source of failure.
+
+### Time-to-live classes
+
+Three classes, because "cache everything forever" is wrong for anything that
+describes the live web.
+
+| Class | Calls | TTL | Why |
+| --- | --- | --- | --- |
+| Feed | RSS/Atom fetches | `feed_ttl_seconds`, default 43200 (12h) | Their whole purpose is to change |
+| Discovery | Brave search, MediaWiki search and facts | `discovery_ttl_seconds`, default 86400 (24h) | Coverage and Wikipedia status change over time |
+| Stable | Article fetches, model calls | permanent | Content at a URL, and a model's answer to a fixed prompt, are treated as fixed |
+
+**Discovery calls must not be permanent.** A person researched once would
+otherwise replay the same Brave results and the same Wikipedia verdict
+indefinitely — so a person who *gained* a Wikipedia page, or gained coverage,
+would be judged forever on a stale snapshot. A 24-hour TTL still makes
+same-day crash recovery free, which is all recovery needs.
+
+The feed TTL is 12 hours rather than one: a run takes roughly 40 minutes, so a
+one-hour TTL can expire during a crash-and-restart and hand the re-run a
+different feed snapshot, silently dropping items that had scrolled off. Twelve
+hours comfortably covers a restart while still refreshing daily.
+`notable run --fresh-feeds` bypasses the feed class. Recorded responses remain
+perfectly good *fixtures*; TTLs govern production only.
 
 **Only durable successes are cached.** A response is written to the cache only
 when it is a provider success *and*, for model calls, passes schema and domain
@@ -223,54 +256,75 @@ operations.
 `pipeline.py`'s main loop must fit on one screen:
 
 ```python
-def run(cfg, store, run_id) -> Digest:
-    for item in feeds.fetch_new(cfg, store):
-        item_leads = []
-        try:
-            for mention in detect.people_in(item, cfg):
-                if not mention.research_worthy:
-                    continue
-                verdict = wiki.match(mention, cfg)
-                if verdict.has_page:
-                    continue
-                articles = coverage.research(mention, cfg)
-                item_leads.append(rank.assess(mention, verdict, articles, cfg))
-        except Incomplete:
-            store.record_attempt(item)         # unsettled; retried next run
-            continue
-        store.settle(item, item_leads, run_id) # leads + seen marker, one txn
-    return digest.render(store, cfg)
+def run(cfg, store) -> Digest:
+    leads, settled, stuck = [], [], []
+    try:
+        for item in feeds.fetch_new(cfg, store):
+            item_leads = []
+            try:
+                for mention in detect.people_in(item, cfg):
+                    if not mention.research_worthy:
+                        continue
+                    verdict = wiki.match(mention, cfg)
+                    if verdict.has_page:
+                        continue
+                    articles = coverage.research(mention, cfg)
+                    item_leads.append(rank.assess(mention, verdict, articles, cfg))
+            except Incomplete:
+                stuck.append(item)               # retried next run, up to a cap
+                continue
+            leads.extend(item_leads)
+            settled.append(item)
+    except BudgetExceeded:
+        pass                                     # render what finished
+    shortlist = rank.order(leads)[: cfg.digest_size]
+    written = digest.write(shortlist, cfg)       # temp file, atomic rename
+    store.commit(settled, stuck, leads, written) # only after the file lands
+    return written
 ```
 
 The *shape* is a design constraint, not an illustration: if the loop stops
 fitting on one screen, the abstraction is wrong and the fix belongs in the
-modules, not in the loop. The sketch elides only the run row's opening and
-closing, which `pipeline.py` owns via a context manager.
+modules, not in the loop.
 
 Four invariants are load-bearing and must not be refactored away:
 
-1. **Leads are buffered per item and published only on settlement.**
-   `item_leads` is local to the item. If mention three of five raises
-   `Incomplete`, the leads from mentions one and two are discarded with it —
-   they are not ranked, not stored, and not surfaced. Appending to a run-level
-   list inside the mention loop would leak the leads of an unsettled item into
-   the digest, contradicting the incompleteness rule below.
-2. **`store.settle` writes the item's lead rows and its seen marker in one
-   transaction**, per item, never once over a batch. This is what makes a
-   crashed run recoverable: an item is either fully durable with its leads, or
-   entirely absent and retried. A batch marker, or lead rows held only in
-   memory, would silently lose the work of every settled item on any crash.
-3. **`Incomplete` skips settlement but records an attempt.** Raised for a
-   provider failure, a validation failure, or an exhausted retry, it leaves the
-   item unseen so the next run retries it at cache-warm cost — bounded by the
-   attempt cap below.
-4. **`BudgetExceeded` is not caught here.** It propagates to `cli.py`, which
-   renders the digest from `store`. Because every settled item is already
-   durable, the partial digest is complete for the work that finished; items
-   not yet reached are simply still unseen, which is the correct state.
+1. **Nothing durable is written until the digest file exists.** The run is one
+   in-memory pass followed by one commit. There is no per-item settlement, no
+   durable intermediate state, and no reconstruction of results across runs.
+2. **Recovery is replay, not reconstruction.** A crash at any point before
+   `store.commit` leaves the database untouched, so the re-run reprocesses
+   every item — and every provider call it already made is a cache hit, so the
+   replay is nearly free. This is the design's strongest idea, followed all the
+   way through: because replay is cheap, durability of intermediate results
+   buys nothing and costs a great deal.
+3. **Leads are buffered per item.** If mention three of five raises
+   `Incomplete`, the leads from mentions one and two are discarded with it.
+   Extending `leads` inside the mention loop would leak an unsettled item's
+   leads into the digest.
+4. **`BudgetExceeded` is caught around the item loop, not at the CLI.** The
+   partial digest renders from the leads already in memory. Catching it further
+   out would lose them, since they are local to this function.
 
 The Wikipedia verdict is threaded into `rank.assess` rather than discarded:
-ranking needs it, and `detail_json` records it.
+ranking needs it, and the lead log records it.
+
+Two nested `try` blocks is the honest amount of nesting here: `Incomplete` is
+per item and recoverable, `BudgetExceeded` ends the pass. They are not the same
+failure and should not share a handler.
+
+### Commit ordering
+
+`digest.write` and `store.commit` cannot share a transaction — one writes files
+and the other writes SQLite. The ordering is therefore load-bearing:
+
+1. write the dated digest to a temporary file and `os.replace` it into place;
+2. `os.replace` `latest.md`;
+3. commit `surfaced`, the item markers, and the logs.
+
+A crash between 2 and 3 repeats a digest on the next run. A crash in the other
+ordering would mark leads surfaced that the user never saw, hiding them for the
+whole resurface window. Repeating is recoverable; hiding is not.
 
 Execution is **sequential**. No thread pools, no per-origin concurrency
 manager. A 246-item run takes roughly 40 minutes instead of 10; for a
@@ -297,31 +351,55 @@ its per-article assessments, and the reasoning behind the outcome.
 questions the prior `audit/` package answered in ~2,600 lines of source, and
 adding a field to a lead costs no migration.
 
-### The digest renders from unsurfaced leads, not from this run
+### Two tables are state; two are logs
 
-This is the rule that closes crash recovery, and it is easy to get wrong.
+This distinction is what keeps the persistence layer from becoming a second
+recovery mechanism, and it must not blur.
 
-A crashed run's settled items are durable and marked seen, so the **re-run
-never researches them again** — correctly, since that is the whole point of
-per-item settlement. But the re-run is a *new* `run_id`. If `digest.render`
-selected leads by `run_id`, every lead from before the crash would be
-permanently invisible: never rendered by the crashed run, which died, and never
-by the re-run, which skipped the items.
+**`item` and `surfaced` are state.** The pipeline reads them, and they change
+what it does: `item` decides what to fetch, `surfaced` decides what to show.
 
-So `digest.render(store, cfg)` selects **every lead not currently suppressed by
-`surfaced`**, regardless of `run_id`, ranks them, and takes the top
-`cfg.digest_size`. `run_id` on `lead` is provenance, never a render filter. The
-in-memory `item_leads` list is a per-item buffer only; nothing renders from it.
+**`run` and `lead` are append-only logs.** They are written by `store.commit`
+after the digest file lands, and **the pipeline never reads them.** Nothing
+branches on their contents; no recovery path consults them; no digest is
+rendered from them. They exist so a human with `sqlite3` can ask what happened
+and why — which is the entire audit story, at the cost of two `INSERT`s and
+zero invariants.
+
+A row the application never reads is a log, not state. If a future change makes
+the pipeline read `lead`, that is the durable-workflow system growing back, and
+it needs an explicit decision rather than a patch.
+
+### The digest renders from this run only
+
+`rank.order(leads)` ranks the leads produced by the current pass, takes the top
+`cfg.digest_size`, and **discards the tail.**
+
+There is no backlog, no pending queue, and no rendering from history. An
+earlier draft had the digest select every unsurfaced lead ever stored,
+regardless of run — which was a persistent digest queue with none of its
+semantics: leads below the cutoff pending forever, old leads becoming eligible
+again after the resurface window and recurring indefinitely, and `possible_lead`
+entries starving behind a steady supply of `promising_lead` ones. The prior
+programme built a real queue with a real starvation guard to handle exactly
+this, and it was expensive. Backlog delivery is a product feature, not a
+side effect of a render filter; if it is wanted, it gets its own design.
+
+The cost is accepted and stated: **a lead that ranks below the cutoff on a busy
+day is not shown, and its item is marked seen, so it will not be found again.**
+It remains in the `lead` log. Set `digest_size` generously — this is a personal
+daily digest, and 20 entries costs nothing to skim.
 
 ### Suppression window
 
-`surfaced` is written by `digest.render`, in the same transaction that records
-the digest, for each `identity_key` it actually renders. A lead is suppressed
-while `last_surfaced_at` is within `cfg.resurface_after_days` (default 30).
+`surfaced` records each `identity_key` the digest actually rendered, committed
+in step 3 of the ordering above. A lead is suppressed while `last_surfaced_at`
+is within `cfg.resurface_after_days` (default 30).
 
-The window is what makes rendering-from-all-leads terminate: without it every
-lead ever produced would compete in every digest forever. With it, the digest
-is "leads found recently that you have not already been shown."
+Its job is narrow: two *different* items about the same person, days apart,
+each produce a lead, and without suppression the person appears in two digests.
+It is not a queue and never resurrects a lead — a suppressed lead is dropped,
+not deferred.
 
 ### Item lifecycle and the attempt cap
 
@@ -336,8 +414,9 @@ forever**, re-paying for the failing model call each time, since validation
 failures are deliberately not cached. One bad item becomes a permanent daily
 tax and a permanent silent recall loss.
 
-`store.record_attempt` increments `attempts`. `feeds.fetch_new` skips items
-that are settled *or* at `cfg.max_item_attempts` (default 3). A stuck item
+`store.commit` increments `attempts` for every item in the `stuck` list.
+`feeds.fetch_new` skips items that are settled *or* at
+`cfg.max_item_attempts` (default 3). A stuck item
 computes no lead outcome and is never surfaced; it is simply abandoned, and
 `sqlite3` finds it: `SELECT url FROM item WHERE settled_at IS NULL AND
 attempts >= 3`.
@@ -457,13 +536,13 @@ table**:
   incomplete research, so it never has to detect it. Empty coverage results
   therefore mean the search genuinely ran and returned nothing, which is
   honestly `insufficient_evidence`.
-- **No lead outcome is computed for incomplete research** — and, by invariant 1
+- **No lead outcome is computed for incomplete research** — and, by invariant 3
   of the loop, no lead already computed for *earlier mentions of the same item*
   is kept either. The whole item is discarded and retried.
 - The item is not settled, so the next run retries it at cache-warm cost, up to
   `cfg.max_item_attempts`.
-- The run is recorded `partial`, and `run.n_items_incomplete` counts the items
-  that raised. The run context manager owns this alongside the run row.
+- The run is logged `partial`, with `n_items_incomplete` counting the items that
+  raised. `store.commit` writes this from the `stuck` list.
 
 ### Ranking
 
@@ -534,7 +613,7 @@ it were themselves complexity drivers, and are in scope for this rebuild.
   to a rendered digest.
 - Live smoke tests are opt-in and marked, one per provider.
 
-Four tests pin invariants that are cheap to break and expensive to notice.
+Seven tests pin invariants that are cheap to break and expensive to notice.
 Each must fail if its rule is removed:
 
 - **Namesake safety.** Two mentions of different people sharing one name, each
@@ -547,10 +626,16 @@ Each must fail if its rule is removed:
 - **Incomplete discards the whole item.** An item where mention three raises
   `Incomplete` must leave no lead rows at all — including for mentions one and
   two — must not be settled, and must not appear as `insufficient_evidence`.
-- **Crash recovery renders prior leads.** Run once, settle some items, crash;
-  re-run. The re-run's digest must contain the leads from the first run's
-  settled items. This fails if `digest.render` filters by `run_id`, which is
-  the natural thing to write and permanently loses data.
+- **A crash writes nothing.** A run interrupted before `store.commit` must
+  leave `item`, `surfaced`, `run`, and `lead` untouched, and the re-run must
+  produce the same digest making zero new provider calls. This pins both
+  halves of the recovery model: nothing durable before the digest, and replay
+  covered entirely by the cache.
+- **Cache entries survive a truncated write.** A half-written entry must be
+  treated as a miss and refetched, not raised and not replayed.
+- **Discovery calls expire.** A Brave or MediaWiki call repeated past
+  `discovery_ttl_seconds` must re-request rather than replay, or a person's
+  Wikipedia status freezes at whatever it was the first time.
 - **Poison items are abandoned.** An item that raises `Incomplete` every time
   must stop being retried at `max_item_attempts`, and must make no further
   provider calls thereafter.
@@ -628,7 +713,14 @@ The MVP is complete when:
 - a crashed run re-runs to completion at near-zero provider cost;
 - the spend cap produces a partial digest rather than a failure;
 - source is under 3,000 lines and `pipeline.py`'s main loop fits on one screen;
-- a live run over the ten configured feeds produces a shortlist comparable to
-  the prior rewrite's verified run (5 digest entries from 246 items at $1.08),
-  at comparable or lower cost; and
+- **the fixed-corpus regression passes.** One recorded cache directory from a
+  real ten-feed run is committed as a fixture, together with an expected-results
+  file naming, for each person the corpus should surface, the required outcome
+  class (`promising_lead` or `possible_lead`) and the people that must *not* be
+  surfaced. This is the pass/fail gate, and it runs offline in seconds. "A
+  shortlist comparable to the prior run" is not a criterion — it cannot be
+  evaluated, and a rebuild needs a test that can fail;
+- the live ten-feed run remains as a qualitative smoke check, compared against
+  the prior rewrite's verified figures (5 digest entries from 246 items at
+  $1.08) for cost and order of magnitude, not for pass/fail; and
 - no code path creates, drafts, or edits Wikipedia content.
