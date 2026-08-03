@@ -46,7 +46,11 @@ one model call:
    redirect targets.
 4. **One bounded redirect-resolution pass.** If that set is non-empty, one
    more `get_page_facts` batch resolves those targets to their terminal
-   pages, which replace the redirect entries as candidates. This is a single
+   pages. Those terminal pages pass through the **same** namespace/
+   disambiguation filter as step 3 before they may replace the redirect
+   entries as candidates — a redirect can terminate outside the main
+   namespace or on a disambiguation page, and that is exactly as
+   disqualifying as a search hit landing there directly. This is a single
    extra wave, not a loop: a target that is itself a redirect (a second hop)
    is dropped rather than chased. This is a rare case and the cache means it
    costs nothing to pick up correctly on a later run if it ever matters for a
@@ -64,24 +68,41 @@ MediaWiki's search response reports whether more results existed beyond what
 was returned (`continue`/`sroffset` present). When that flag is set, the wave
 is `truncated`.
 
-**A `truncated` wave may never produce `no_matching_page`.** The candidate
-universe the model saw was incomplete, so "no page exists" would be a false
-negative manufactured by a config knob (`max_candidates`) rather than by
-evidence. This is enforced in the domain validator, not the prompt: if the
-model returns `no_matching_page` on a truncated wave, that is `MatchInvalid`
-and the mention becomes `Incomplete` — not silently coerced to `uncertain`,
-because coercing a judgment the model wasn't actually asked to make is worse
-than retrying on a later run against a possibly-different (or reconfigured)
-candidate set. `matching_page` and `uncertain` are unaffected by truncation.
+**A `truncated` wave with at least one candidate may never produce
+`no_matching_page`.** The candidate universe the model saw was incomplete, so
+"no page exists" would be a false negative manufactured by a config knob
+(`max_candidates`) rather than by evidence. This is enforced in the domain
+validator, not the prompt: if the model returns `no_matching_page` on a
+truncated wave, that is `MatchInvalid` and the mention becomes `Incomplete` —
+not silently coerced to `uncertain`, because coercing a judgment the model
+wasn't actually asked to make is worse than retrying on a later run against a
+possibly-different (or reconfigured) candidate set. `matching_page` and
+`uncertain` are unaffected by truncation. (Zero candidates and truncated is
+handled before any model call exists to validate — see the short-circuit
+above.)
 
 ### Empty-candidate short-circuit
 
 Zero candidates after step 5, **and not truncated**, yields `no_matching_page`
 deterministically, with no model call. This mirrors `detect.py`'s handling of
 an item with no usable passages: a call that cannot possibly say anything
-useful is not made. Zero candidates *and* truncated is not a short-circuit —
-it is the same "wave saw an incomplete universe" case as above, and must not
-silently resolve to `no_matching_page`.
+useful is not made.
+
+**Zero candidates *and* truncated is a second, distinct deterministic
+short-circuit: `uncertain`, also with no model call.** This is not the same
+case as above and must not resolve to `no_matching_page`. It is also not left
+to the model: with zero candidates, `matching_page` is unreachable
+(`selected_page_id` would have to name a candidate that doesn't exist), and
+`no_matching_page` is forbidden by the truncation rule below — so the model's
+only valid answer is already `uncertain` before the prompt is built, and
+sending the call would only spend money to confirm what the validator already
+knows. Nor is it `Incomplete`: the search response is cached for
+`discovery_ttl_seconds`, so a later run would replay the identical truncated
+result and hit the identical dead end, burning the item's attempt cap until
+it is abandoned — silently dropping a mention that never got the chance to
+reach coverage research. `uncertain` is the honest label ("evidence
+insufficient to decide") and, under the master spec's high-recall rule,
+continues to coverage research exactly as a non-empty `uncertain` would.
 
 ## Contract: `wiki_contract.py`
 
@@ -171,10 +192,11 @@ table — each pins a rule that is cheap to break and expensive to notice:
 | --- | --- |
 | **Namespace/dab filtering** | A disambiguation page and a non-main-namespace hit are never candidates. |
 | **Truncation blocks the negative** | A truncated search followed by model output `no_matching_page` is rejected (`Incomplete`), never silently coerced to `uncertain`. |
-| **Empty search short-circuits** | Zero candidates, not truncated, yields `no_matching_page` with zero model calls. |
-| **Empty-but-truncated does not short-circuit** | Zero candidates *with* truncation still requires a model decision path (or `Incomplete`), never a free `no_matching_page`. |
-| **One redirect hop resolves** | A search hit that is a redirect is replaced by its terminal page as a candidate. |
+| **Empty search short-circuits to `no_matching_page`** | Zero candidates, not truncated, yields `no_matching_page` with zero model calls. |
+| **Empty-and-truncated short-circuits to `uncertain`** | Zero candidates *with* truncation yields `uncertain` with zero model calls — never `no_matching_page`, never `Incomplete`. |
+| **One redirect hop resolves** | A search hit that is a redirect is replaced by its namespace/dab-filtered terminal page as a candidate. |
 | **A second hop is dropped, not chased** | A redirect-to-a-redirect does not produce a third HTTP call and does not appear as a candidate. |
+| **A redirect terminating off-namespace or on a dab page is discarded** | The redirect-resolution pass applies the same namespace/disambiguation filter as the initial search hits; a terminal page that fails it does not become a candidate. |
 | **`selected_page_id` pairing** | `matching_page` without a `selected_page_id`, or any other outcome with one set, is `MatchInvalid`. |
 | **Fact-id grounding** | A cited supporting or conflicting fact id not among the supplied candidates' ids is `MatchInvalid`. |
 | **Discovery TTL governs MediaWiki** | A MediaWiki call past `discovery_ttl_seconds` re-requests rather than replays; within it, replays. |
