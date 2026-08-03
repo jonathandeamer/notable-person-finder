@@ -1,0 +1,157 @@
+# Versioned source policy for English-language visual arts coverage research.
+# Manually reviewed; never auto-synced from Wikipedia Perennial Sources at runtime.
+# First matching rule in file order wins. No match ⇒ unclassified (default.unclassified).
+
+schema_version = 1
+key = "visual-arts-en-sources"
+label = "English visual arts publisher policy"
+
+# --- Pilot discovery publishers (curated eligible for investigation) ---
+
+[[rules]]
+id = "eligible.theartnewspaper"
+status = "curated_eligible"
+match = { host_suffix = "theartnewspaper.com" }
+rationale = "Pilot discovery feed; specialist arts news"
+
+[[rules]]
+id = "eligible.artnews"
+status = "curated_eligible"
+match = { host_suffix = "artnews.com" }
+rationale = "Pilot discovery feed; specialist arts news"
+
+[[rules]]
+id = "eligible.artnet"
+status = "curated_eligible"
+match = { host_suffix = "artnet.com" }
+rationale = "Pilot discovery feed; specialist arts news and market"
+
+[[rules]]
+id = "eligible.artforum"
+status = "curated_eligible"
+match = { host_suffix = "artforum.com" }
+rationale = "Pilot discovery feed; specialist arts criticism"
+
+[[rules]]
+id = "eligible.nytimes"
+status = "curated_eligible"
+match = { host_suffix = "nytimes.com" }
+rationale = "Major news publisher; pilot Art & Design feed"
+
+[[rules]]
+id = "eligible.theguardian"
+status = "curated_eligible"
+match = { host_suffix = "theguardian.com" }
+rationale = "Major news publisher; pilot Art & Design feed"
+
+[[rules]]
+id = "eligible.artreview"
+status = "curated_eligible"
+match = { host_suffix = "artreview.com" }
+rationale = "Pilot discovery feed; specialist arts magazine"
+
+[[rules]]
+id = "eligible.telegraph"
+status = "curated_eligible"
+match = { host_suffix = "telegraph.co.uk" }
+rationale = "Major news publisher; pilot art section"
+
+[[rules]]
+id = "eligible.bbc"
+status = "curated_eligible"
+match = { host_suffix = "bbc.co.uk" }
+rationale = "Major news publisher; pilot arts coverage"
+
+[[rules]]
+id = "eligible.bbc.com"
+status = "curated_eligible"
+match = { host_suffix = "bbc.com" }
+rationale = "Major news publisher (bbc.com mirror of BBC News)"
+
+[[rules]]
+id = "eligible.hyperallergic"
+status = "curated_eligible"
+match = { host_suffix = "hyperallergic.com" }
+rationale = "Pilot discovery feed; specialist arts criticism"
+
+# --- Wire services frequently discovered by search ---
+
+[[rules]]
+id = "eligible.reuters"
+status = "curated_eligible"
+match = { host_suffix = "reuters.com" }
+rationale = "Wire service; eligible when search discovers coverage"
+
+[[rules]]
+id = "eligible.apnews"
+status = "curated_eligible"
+match = { host_suffix = "apnews.com" }
+rationale = "Wire service; eligible when search discovers coverage"
+
+# --- Clear curated-ineligible classes (social / UGC / PR wires) ---
+
+[[rules]]
+id = "ineligible.twitter"
+status = "curated_ineligible"
+match = { host_suffix = "twitter.com" }
+rationale = "Social / UGC; not durable independent coverage"
+
+[[rules]]
+id = "ineligible.x.com"
+status = "curated_ineligible"
+match = { host_suffix = "x.com" }
+rationale = "Social / UGC"
+
+[[rules]]
+id = "ineligible.facebook"
+status = "curated_ineligible"
+match = { host_suffix = "facebook.com" }
+rationale = "Social / UGC"
+
+[[rules]]
+id = "ineligible.instagram"
+status = "curated_ineligible"
+match = { host_suffix = "instagram.com" }
+rationale = "Social / UGC"
+
+[[rules]]
+id = "ineligible.tiktok"
+status = "curated_ineligible"
+match = { host_suffix = "tiktok.com" }
+rationale = "Social / UGC"
+
+[[rules]]
+id = "ineligible.youtube"
+status = "curated_ineligible"
+match = { host_suffix = "youtube.com" }
+rationale = "UGC video platform; not treated as publisher coverage in m5"
+
+[[rules]]
+id = "ineligible.linkedin"
+status = "curated_ineligible"
+match = { host_suffix = "linkedin.com" }
+rationale = "Social / professional network UGC"
+
+[[rules]]
+id = "ineligible.prnewswire"
+status = "curated_ineligible"
+match = { host_suffix = "prnewswire.com" }
+rationale = "Press-release distribution wire"
+
+[[rules]]
+id = "ineligible.businesswire"
+status = "curated_ineligible"
+match = { host_suffix = "businesswire.com" }
+rationale = "Press-release distribution wire"
+
+[[rules]]
+id = "ineligible.globenewswire"
+status = "curated_ineligible"
+match = { host_suffix = "globenewswire.com" }
+rationale = "Press-release distribution wire"
+
+[[rules]]
+id = "ineligible.medium"
+status = "curated_ineligible"
+match = { host_suffix = "medium.com" }
+rationale = "UGC / self-publishing platform"
