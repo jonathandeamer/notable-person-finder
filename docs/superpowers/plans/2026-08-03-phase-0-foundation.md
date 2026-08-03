@@ -20,7 +20,7 @@ Copied verbatim from `docs/superpowers/specs/2026-08-03-mvp-core-loop-design.md`
 - **The application never writes Wikipedia content, drafts an article, or decides that a person satisfies Wikipedia policy.** Hard invariant, not a milestone boundary.
 - **Secrets never appear** in snapshots, fingerprints, diagnostics, terminal output, tests, or cache keys.
 - **Commit messages follow Conventional Commits** (`.githooks/commit-msg` enforces `^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\(scope\))?: description`).
-- **The legacy prototype at the repository root** (`run_pipeline.py`, `name_utils.py`, `scripts/`, `ingest/`, `prompts/`, `state/`, `output/`, `tests/test_*.py`) is the operational fallback. Do not import, reorganize, remove, run, or repair it.
+- **The legacy prototype at the repository root** (`run_pipeline.py`, `name_utils.py`, `scripts/`, `ingest/`, `prompts/`, `state/`, `output/`, `tests/test_*.py`) is the operational fallback, together with its untracked local configuration (`config/notable.toml`, `config/discovery-feeds.toml`, `config/discovery_profiles/`, `config/feeds*.md`). Do not import, reorganize, remove, run, or repair any of it. The MVP ships its own `config/*.example.toml` beside these and never reads theirs.
 
 ---
 
@@ -58,7 +58,16 @@ Copied verbatim from `docs/superpowers/specs/2026-08-03-mvp-core-loop-design.md`
 - Consumes: nothing.
 - Produces: `notable.cli.main(argv: list[str] | None = None) -> int` — the console-script entry point, returning a process exit code. `notable.__version__: str`.
 
-- [ ] **Step 1: Create the package files**
+- [ ] **Step 1: Create `pyproject.toml` and the package marker**
+
+The test runner has to exist before a test can fail for the right reason, and
+`uv sync` builds and installs this project by default — so `packages =
+["src/notable"]` must point at a directory that exists, or the build fails
+before pytest ever runs and the "failing" test fails for the wrong reason.
+
+Creating `src/notable/__init__.py` now, and `cli.py` only in Step 4, makes the
+red step land exactly where it should: the package imports, the module under
+test does not.
 
 `src/notable/__init__.py`:
 
@@ -67,77 +76,6 @@ Copied verbatim from `docs/superpowers/specs/2026-08-03-mvp-core-loop-design.md`
 
 __version__ = "0.1.0"
 ```
-
-`src/notable/cli.py`:
-
-```python
-"""Argument parsing and command dispatch."""
-
-from __future__ import annotations
-
-import argparse
-
-from notable import __version__
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="notable",
-        description="Find inspectable Wikipedia biography leads from RSS feeds.",
-    )
-    parser.add_argument("--version", action="version", version=__version__)
-    commands = parser.add_subparsers(dest="command", required=True)
-    run = commands.add_parser("run", help="Fetch feeds and write a digest.")
-    run.add_argument(
-        "--fresh-feeds",
-        action="store_true",
-        help="Bypass the feed cache and refetch every feed.",
-    )
-    return parser
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if args.command == "run":
-        raise SystemExit("notable run is not implemented until Phase 1")
-    parser.error(f"unknown command: {args.command}")
-    return 2
-```
-
-`tests/mvp/__init__.py` — empty file.
-
-- [ ] **Step 2: Write the failing test**
-
-`tests/mvp/test_cli.py`:
-
-```python
-import pytest
-
-from notable import __version__
-from notable.cli import build_parser, main
-
-
-def test_version_flag_reports_the_package_version(capsys):
-    with pytest.raises(SystemExit) as exit_info:
-        main(["--version"])
-    assert exit_info.value.code == 0
-    assert capsys.readouterr().out.strip() == __version__
-
-
-def test_run_accepts_fresh_feeds_flag():
-    args = build_parser().parse_args(["run", "--fresh-feeds"])
-    assert args.command == "run"
-    assert args.fresh_feeds is True
-
-
-def test_no_command_is_an_error():
-    with pytest.raises(SystemExit) as exit_info:
-        build_parser().parse_args([])
-    assert exit_info.value.code == 2
-```
-
-- [ ] **Step 3: Create `pyproject.toml`**
 
 ```toml
 [build-system]
@@ -194,6 +132,9 @@ extend-exclude = [
     "state",
     "tests/test_*",
     "tests/conftest.py",
+    # The workspace retains linked worktrees for the prior programme and
+    # feature branches. They are not this package and must not be linted.
+    ".worktrees",
     # `ruff format` rewrites Python code blocks inside Markdown. Specs and plans
     # are authorities: their code blocks are illustrative and must not be
     # silently reformatted into looking canonical.
@@ -220,17 +161,39 @@ include = ["src", "tests/mvp"]
 exclude = ["**/__pycache__", ".venv", ".worktrees"]
 ```
 
-- [ ] **Step 4: Append to `.gitignore`**
+Also create `tests/mvp/__init__.py` — empty file.
 
-Append these lines:
+- [ ] **Step 2: Write the failing test**
 
-```gitignore
-# MVP runtime data
-/data/
-/digests/
+`tests/mvp/test_cli.py`:
+
+```python
+import pytest
+
+from notable import __version__
+from notable.cli import build_parser, main
+
+
+def test_version_flag_reports_the_package_version(capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--version"])
+    assert exit_info.value.code == 0
+    assert capsys.readouterr().out.strip() == __version__
+
+
+def test_run_accepts_fresh_feeds_flag():
+    args = build_parser().parse_args(["run", "--fresh-feeds"])
+    assert args.command == "run"
+    assert args.fresh_feeds is True
+
+
+def test_no_command_is_an_error():
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args([])
+    assert exit_info.value.code == 2
 ```
 
-- [ ] **Step 5: Install and run the tests to verify they pass**
+- [ ] **Step 3: Install and run the tests to verify they fail**
 
 ```bash
 uv sync
@@ -238,7 +201,70 @@ git config core.hooksPath .githooks
 uv run pytest tests/mvp -v
 ```
 
-Expected: 3 passed. If `uv sync` reports a resolution failure, that is a real blocker — report it rather than loosening a version bound.
+Expected: FAIL — `ModuleNotFoundError: No module named 'notable.cli'`. If the
+failure is instead a Hatch build error, `src/notable/__init__.py` from Step 1
+is missing. If `uv sync` reports a resolution failure, that is a real blocker —
+report it rather than loosening a version bound.
+
+- [ ] **Step 4: Write the CLI**
+
+`src/notable/cli.py`:
+
+```python
+"""Argument parsing and command dispatch."""
+
+from __future__ import annotations
+
+import argparse
+
+from notable import __version__
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="notable",
+        description="Find inspectable Wikipedia biography leads from RSS feeds.",
+    )
+    parser.add_argument("--version", action="version", version=__version__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    run = commands.add_parser("run", help="Fetch feeds and write a digest.")
+    run.add_argument(
+        "--fresh-feeds",
+        action="store_true",
+        help="Bypass the feed cache and refetch every feed.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "run":
+        raise SystemExit("notable run is not implemented until Phase 1")
+    parser.error(f"unknown command: {args.command}")
+    return 2
+```
+
+- [ ] **Step 5: Append to `.gitignore` and run the tests to verify they pass**
+
+Runtime paths resolve relative to the configuration file, and the shipped
+example puts them one level up so they land at the repository root — which is
+what these patterns match. Phase 1 Task 1 Step 5 sets those values; if they are
+ever changed to bare `data`/`digests`/`cache`, these three lines stop matching
+and a live run's state becomes committable. They are a matched pair.
+
+```gitignore
+# MVP runtime data
+/data/
+/digests/
+/cache/
+```
+
+```bash
+uv run pytest tests/mvp -v
+```
+
+Expected: 3 passed.
 
 - [ ] **Step 6: Verify the console script and the linters**
 
@@ -252,10 +278,19 @@ uv run pyright
 Expected: the version prints; ruff and pyright report no errors. Confirm the prototype is excluded:
 
 ```bash
-uv run ruff check . --show-files | grep -c "^scripts/"
+# Ruff prints absolute paths, so anchor on the path segment rather than the
+# repository-relative prefix. The same check also proves linked worktrees are
+# absent from the lint set.
+set -o pipefail
+paths="$(uv run ruff check . --show-files)" || exit $?
+if printf '%s\n' "$paths" | rg -q '/(scripts|ingest|tests/test_|\.worktrees)/'; then
+  printf '%s\n' "$paths" | rg '/(scripts|ingest|tests/test_|\.worktrees)/'
+  exit 1
+fi
 ```
 
-Expected: `0`.
+Expected: no output. The `|| true` only prevents ripgrep's no-match status from
+masking the actual assertion; any printed path is a failure to investigate.
 
 - [ ] **Step 7: Commit**
 
@@ -281,7 +316,16 @@ git commit -m "build: scaffold the notable package and its tooling"
 - Consumes: `notable.__version__` from Task 1.
 - Produces: prompt files readable via `importlib.resources.files("notable.prompts")`. Phase 1 Task 7 reads `detect_people.md`.
 
-These are copied byte-for-byte from `refactor/rearchitecture`. They are tuned against real content and expensive to rediscover; **do not edit them**, including whitespace.
+**Only the three prompts are byte-for-byte.** They are tuned against real
+content and expensive to rediscover; **do not edit them**, including
+whitespace.
+
+`visual_arts.toml` is different. The spec ports it "as curated data, minus the
+`review_date`, `provenance_url`, and fingerprinting bookkeeping"
+(`docs/superpowers/specs/2026-08-03-mvp-core-loop-design.md`, *Publisher
+policy*). Those fields belong to the prior programme's policy-versioning
+machinery, which the MVP deleted. Copying them back would reintroduce the
+bookkeeping as dead data that a later reader takes for a live contract.
 
 - [ ] **Step 1: Copy the assets from the frozen branch**
 
@@ -291,12 +335,31 @@ git show refactor/rearchitecture:src/notable_person_finder/people/prompts/detect
 git show refactor/rearchitecture:src/notable_person_finder/wikipedia/prompts/match_wikipedia_identity.md > src/notable/prompts/match_wikipedia_identity.md
 git show refactor/rearchitecture:src/notable_person_finder/coverage/prompts/assess_article.md > src/notable/prompts/assess_article.md
 git show refactor/rearchitecture:config/discovery-feeds.example.toml > config/feeds.example.toml
-git show refactor/rearchitecture:config/source_policies/visual_arts.toml > config/source_policies/visual_arts.toml
 ```
 
 `resolve_person_entity.md` is deliberately **not** ported. It belongs to durable person identity, which is deferred.
 
-- [ ] **Step 2: Make the prompts package data**
+- [ ] **Step 2: Port the publisher policy, minus the bookkeeping**
+
+```bash
+git show refactor/rearchitecture:config/source_policies/visual_arts.toml \
+  | grep -vE '^\s*(review_date|provenance_url)\s*=' \
+  > config/source_policies/visual_arts.toml
+```
+
+Then read the result. The frozen file carries 30 such lines; confirm the
+remaining `[[rules]]` entries each still have their `status` and matching
+fields, and that no rule table was left empty by the strip.
+
+```bash
+git show refactor/rearchitecture:config/source_policies/visual_arts.toml | wc -l
+wc -l config/source_policies/visual_arts.toml
+grep -cE 'review_date|provenance_url' config/source_policies/visual_arts.toml
+```
+
+Expected: the second count is 30 lower than the first, and the third is `0`.
+
+- [ ] **Step 3: Make the prompts package data**
 
 Add to `pyproject.toml` after the `[tool.hatch.build.targets.wheel]` block:
 
@@ -311,7 +374,7 @@ Create `src/notable/prompts/__init__.py` so `importlib.resources` can address it
 """Ported model prompts. Tuned against real content — do not edit."""
 ```
 
-- [ ] **Step 3: Write the failing test**
+- [ ] **Step 4: Write the failing test**
 
 `tests/mvp/test_assets.py`:
 
@@ -354,17 +417,41 @@ def test_source_policy_parses_and_carries_rules():
     assert data["key"] == "visual-arts-en-sources"
     statuses = {rule["status"] for rule in data["rules"]}
     assert "curated_eligible" in statuses
+
+
+def test_source_policy_carries_no_policy_bookkeeping():
+    # The spec ports this as curated data minus the prior programme's
+    # policy-versioning fields. Left in, they read as a live contract.
+    data = tomllib.loads(
+        Path("config/source_policies/visual_arts.toml").read_text("utf-8")
+    )
+    for rule in data["rules"]:
+        assert "review_date" not in rule
+        assert "provenance_url" not in rule
+
+
+def test_every_source_policy_rule_still_has_a_status():
+    # Guards the strip: a rule table emptied by grep would parse and pass the
+    # test above while silently dropping a publisher classification.
+    data = tomllib.loads(
+        Path("config/source_policies/visual_arts.toml").read_text("utf-8")
+    )
+    assert data["rules"], "the policy has no rules"
+    for rule in data["rules"]:
+        assert rule.get("status"), f"rule without a status: {rule}"
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 5: Run the tests to verify they pass**
 
 ```bash
 uv sync && uv run pytest tests/mvp -v
 ```
 
-Expected: 8 passed. If the prompt tests fail with `ModuleNotFoundError: notable.prompts`, Step 2's `__init__.py` is missing.
+Expected: 11 passed (3 from Task 1, 8 here — the three prompt parametrizations
+count separately). If the prompt tests fail with `ModuleNotFoundError:
+notable.prompts`, Step 3's `__init__.py` is missing.
 
-- [ ] **Step 5: Confirm the prompts are byte-identical to their source**
+- [ ] **Step 6: Confirm the prompts are byte-identical to their source**
 
 ```bash
 for p in detect_people match_wikipedia_identity assess_article; do
@@ -378,9 +465,10 @@ for p in detect_people match_wikipedia_identity assess_article; do
 done
 ```
 
-Expected: three `OK` lines and no diff output.
+Expected: three `OK` lines and no diff output. `visual_arts.toml` is
+deliberately not in this loop — it is a filtered port, not a byte copy.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/notable/prompts config/feeds.example.toml config/source_policies pyproject.toml tests/mvp/test_assets.py
@@ -423,6 +511,14 @@ Two prior versions exist and **neither is a base for this one**:
   `name_utils.py`, `scripts/`, `ingest/`, `prompts/`, `state/`, `output/`,
   `tests/test_*.py`) is the operational fallback until cutover. Do not import,
   reorganize, remove, run, or repair it. Its tests are not a gate.
+  Its untracked local configuration — `config/notable.toml`,
+  `config/discovery-feeds.toml`, `config/discovery_profiles/`,
+  `config/feeds*.md` — belongs to it too. `config/notable.toml` uses a
+  different schema and the MVP's strict loader rejects it by design; that is
+  not a bug to fix. MVP configuration is `config/*.example.toml`, copied to
+  `config/mvp.local.toml`.
+  **These files are untracked, so `git status` is never empty.** "Clean"
+  means nothing you created is left uncommitted.
 - The **`refactor/rearchitecture` branch** is a complete, working rewrite that
   succumbed to the second-system effect: 38,608 lines of source, 71,334 of
   tests, 45 SQLite tables. It is frozen reference. Consult it for product
@@ -533,8 +629,28 @@ git status --short
 git diff --check
 ```
 
-Expected: 8 tests pass, no lint or type errors, the version prints, and the
-working tree is clean.
+Expected: 11 tests pass, no lint or type errors, and the version prints.
+
+**"Clean" means nothing this phase created is left uncommitted**, not an empty
+`git status`. The prior programme left untracked files in the workspace —
+`config/notable.toml`, `config/discovery-feeds.toml`,
+`config/discovery_profiles/`, `config/feeds*.md`, and `.worktrees/` — and they
+stay until product cutover. They are the operational fallback; do not commit
+them, add them to `.gitignore`, or delete them to make this command quiet.
+
+```bash
+# Only the phase's own work should appear here.
+git status --short -- src tests pyproject.toml uv.lock CLAUDE.md \
+  .gitignore 'config/*.example.toml' config/source_policies
+```
+
+Expected: no output.
+
+**Deliberately unassigned:** the spec's `cli.py` line lists `notable feeds
+check` alongside `notable run`. It is a convenience for validating a feed list
+without spending anything, it has no dependants, and neither Phase 0 nor Phase
+1 builds it. It belongs in Phase 2 at the earliest. Recorded here so its
+absence reads as a decision rather than an oversight.
 
 Source line count (should be roughly 60 — the skeleton only):
 
