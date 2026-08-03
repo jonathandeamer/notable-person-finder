@@ -3,6 +3,7 @@ English Wikipedia biography already describe this person?"""
 
 from __future__ import annotations
 
+import json
 import logging
 from functools import cache
 from importlib import resources
@@ -91,6 +92,31 @@ def match(
     return _ask_model(mention, candidates, truncated, config, llm)
 
 
+def _parsed_json(response: Any, *, context: str) -> dict[str, Any]:
+    """Parse a MediaWiki response body, converting every way it can fail
+    into `ProviderFailure` -- malformed JSON, a non-object body, and the
+    top-level `error` envelope MediaWiki returns with HTTP 200 for a real
+    class of failures (bad params, `readapidenied`, some throttling paths).
+    Left unchecked, that error body reads as zero hits and turns a technical
+    failure into a semantic verdict cached for the discovery TTL."""
+    try:
+        data = response.json()
+    except (json.JSONDecodeError, TypeError) as error:
+        raise ProviderFailure(
+            f"unreadable MediaWiki {context} response: {error}", permanent=False
+        ) from error
+    if not isinstance(data, dict):
+        raise ProviderFailure(
+            f"unreadable MediaWiki {context} response: not an object", permanent=False
+        )
+    error_body = data.get("error")
+    if error_body:
+        raise ProviderFailure(
+            f"MediaWiki {context} returned an error: {error_body}", permanent=False
+        )
+    return data
+
+
 def _search(
     name: str, config: Config, transport: Transport
 ) -> tuple[tuple[int, ...], bool]:
@@ -109,8 +135,13 @@ def _search(
         },
         ttl_seconds=config.cache.discovery_ttl_seconds,
     )
-    data = response.json()
-    hits = tuple(hit["pageid"] for hit in data.get("query", {}).get("search", []))
+    data = _parsed_json(response, context="search")
+    try:
+        hits = tuple(hit["pageid"] for hit in data.get("query", {}).get("search", []))
+    except (KeyError, TypeError) as error:
+        raise ProviderFailure(
+            f"malformed MediaWiki search response: {error}", permanent=False
+        ) from error
     return hits, "continue" in data
 
 
@@ -123,6 +154,13 @@ def _facts(
 ) -> tuple[PageFact, ...]:
     if not page_ids:
         return ()
+    # `exlimit` defaults to 1 and only the first candidate's extract would
+    # come back without raising it; `exlimit=max` is compatible with the
+    # `explaintext` mode already in use below.
+    # `cllimit` is a per-QUERY total, not a per-page limit, so the
+    # configured max_categories_per_page is scaled by batch size here rather
+    # than sent as-is (which would starve every page after the first few).
+    cllimit = min(config.mediawiki.max_categories_per_page * len(page_ids), 500)
     params: dict[str, Any] = {
         "action": "query",
         "format": "json",
@@ -130,8 +168,9 @@ def _facts(
         "pageids": "|".join(str(page_id) for page_id in page_ids),
         "prop": "info|description|extracts|categories|pageprops",
         "explaintext": 1,
+        "exlimit": "max",
         "exchars": config.mediawiki.max_extract_characters,
-        "cllimit": config.mediawiki.max_categories_per_page,
+        "cllimit": cllimit,
         "ppprop": "disambiguation",
         "maxlag": config.mediawiki.maxlag_seconds,
     }
@@ -144,8 +183,15 @@ def _facts(
         params=params,
         ttl_seconds=config.cache.discovery_ttl_seconds,
     )
-    data = response.json()
-    return tuple(_parse_page(page) for page in data.get("query", {}).get("pages", []))
+    data = _parsed_json(response, context="facts")
+    try:
+        return tuple(
+            _parse_page(page) for page in data.get("query", {}).get("pages", [])
+        )
+    except (KeyError, TypeError) as error:
+        raise ProviderFailure(
+            f"malformed MediaWiki facts response: {error}", permanent=False
+        ) from error
 
 
 def _parse_page(page: dict[str, Any]) -> PageFact:
