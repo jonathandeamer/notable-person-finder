@@ -39,6 +39,9 @@ endpoint = "https://openrouter.ai/api/v1"
 
 [tasks.detect_people]
 model = "openai/gpt-5.4-mini"
+
+[tasks.match_wikipedia_identity]
+model = "openai/gpt-5.4-mini"
 """
 
 
@@ -92,6 +95,14 @@ def test_defaults_match_the_spec(tmp_path, monkeypatch):
     assert config.detect.max_people == 8
     assert config.detect.max_completion_tokens == 4096
     assert config.budget_usd is None
+    assert config.match.model == "openai/gpt-5.4-mini"
+    assert config.match.max_completion_tokens == 4096
+    assert config.match.reasoning_effort == "low"
+    assert config.mediawiki.endpoint == "https://en.wikipedia.org/w/api.php"
+    assert config.mediawiki.max_candidates == 15
+    assert config.mediawiki.max_extract_characters == 1200
+    assert config.mediawiki.max_categories_per_page == 20
+    assert config.mediawiki.maxlag_seconds == 5
 
 
 def test_budget_parses_as_decimal(tmp_path, monkeypatch):
@@ -121,3 +132,12 @@ def test_shipped_example_writes_runtime_state_where_gitignore_covers_it(monkeypa
     ignored = Path(".gitignore").read_text("utf-8").splitlines()
     for pattern in ("/data/", "/digests/", "/cache/"):
         assert pattern in ignored, f"{pattern} missing from .gitignore"
+
+
+def test_missing_match_task_is_a_clear_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_OR_KEY", "sk-test")
+    body = BASE.replace(
+        '[tasks.match_wikipedia_identity]\nmodel = "openai/gpt-5.4-mini"\n', ""
+    )
+    with pytest.raises(ValueError, match="tasks.match_wikipedia_identity"):
+        load_config(_write(tmp_path, body))

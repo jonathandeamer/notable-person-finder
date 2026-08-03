@@ -11,6 +11,8 @@ from notable.config import (
     Config,
     DetectConfig,
     Feed,
+    MediaWikiConfig,
+    ModelTaskConfig,
     OpenRouterConfig,
     TransportConfig,
 )
@@ -34,6 +36,8 @@ def make_config(tmp_path) -> Callable[..., Config]:
             transport=TRANSPORT,
             cache=CacheConfig(dir=tmp_path / "cache"),
             detect=DetectConfig(model="m"),
+            match=ModelTaskConfig(model="m"),
+            mediawiki=MediaWikiConfig(),
             openrouter=OpenRouterConfig(),
             budget_usd=None,
             openrouter_api_key="sk-test",

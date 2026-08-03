@@ -55,3 +55,15 @@ max_people = 8
 max_title_characters = 500
 max_summary_characters = 4000
 reasoning_effort = "low"
+
+[tasks.match_wikipedia_identity]
+model = "openai/gpt-5.4-mini"
+max_completion_tokens = 4096
+reasoning_effort = "low"
+
+[mediawiki]
+endpoint = "https://en.wikipedia.org/w/api.php"
+max_candidates = 15
+max_extract_characters = 1200
+max_categories_per_page = 20
+maxlag_seconds = 5
