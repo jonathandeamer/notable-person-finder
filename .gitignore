@@ -52,3 +52,6 @@ what-is-openclaw.md
 /cache-phase1/
 /data-phase1/
 /digests-phase1/
+
+# Git worktrees
+/.worktrees/
