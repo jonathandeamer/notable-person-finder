@@ -40,3 +40,8 @@ state/
 
 # External agent platform documentation
 what-is-openclaw.md
+
+# MVP runtime data
+/data/
+/digests/
+/cache/

@@ -1,0 +1,81 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "notable"
+version = "0.1.0"
+description = "A personal batch tool for finding inspectable Wikipedia biography leads"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { file = "LICENSE" }
+dependencies = [
+  "feedparser>=6.0,<7",
+  "httpx>=0.28,<0.29",
+  "pydantic>=2.11,<3",
+  "python-dotenv>=1.1,<2",
+  "tzdata>=2025.2",
+]
+
+[project.scripts]
+notable = "notable.cli:main"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.390",
+    "pytest>=8.4,<9",
+    "ruff>=0.9.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/notable"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/mvp"]
+addopts = "-ra -m 'not live'"
+markers = ["live: explicitly invoked tests that contact external providers"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+# The legacy prototype is historical evidence and the operational fallback
+# until product cutover; it is never linted or formatted. These patterns match
+# by path segment at any depth, which is why MVP tests live in `tests/mvp/`
+# rather than `tests/test_*.py`. Verify with `uv run ruff check . --show-files`.
+extend-exclude = [
+    "run_pipeline.py",
+    "name_utils.py",
+    "scripts",
+    "ingest",
+    "prompts",
+    "output",
+    "state",
+    "tests/test_*",
+    "tests/conftest.py",
+    # The workspace retains linked worktrees for the prior programme and
+    # feature branches. They are not this package and must not be linted.
+    ".worktrees",
+    # `ruff format` rewrites Python code blocks inside Markdown. Specs and plans
+    # are authorities: their code blocks are illustrative and must not be
+    # silently reformatted into looking canonical.
+    "docs",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # Pyflakes
+    "I",   # isort (import sorting)
+    "UP",  # pyupgrade (modern Python syntax)
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["notable"]
+
+[tool.pyright]
+pythonVersion = "3.13"
+typeCheckingMode = "standard"
+include = ["src", "tests/mvp"]
+exclude = ["**/__pycache__", ".venv", ".worktrees"]
