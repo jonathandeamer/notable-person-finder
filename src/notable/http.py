@@ -215,7 +215,9 @@ class Transport:
                     )
                 if raw.status_code == 429:
                     self._count(rate_limited=1)
-                last = ProviderFailure(f"HTTP {raw.status_code} from {url}", permanent=False)
+                last = ProviderFailure(
+                    f"HTTP {raw.status_code} from {url}", permanent=False
+                )
             finally:
                 # Do not carry Set-Cookie state into a later request, including
                 # after failures and redirects handled by httpx.
@@ -224,13 +226,18 @@ class Transport:
             if attempt < self._config.max_attempts:
                 logger.info(
                     "retrying %s after %s (attempt %d/%d)",
-                    url, last, attempt, self._config.max_attempts,
+                    url,
+                    last,
+                    attempt,
+                    self._config.max_attempts,
                 )
                 self._sleep(backoff)
                 backoff *= 2
         raise last or ProviderFailure(f"no response from {url}", permanent=False)
 
-    def _count(self, *, attempts: int = 0, retries: int = 0, rate_limited: int = 0) -> None:
+    def _count(
+        self, *, attempts: int = 0, retries: int = 0, rate_limited: int = 0
+    ) -> None:
         self.stats = RetryStats(
             attempts=self.stats.attempts + attempts,
             retries=self.stats.retries + retries,

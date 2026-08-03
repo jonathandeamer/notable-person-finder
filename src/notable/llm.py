@@ -69,7 +69,9 @@ class LlmClient:
                 {
                     "role": "user",
                     "content": json.dumps(
-                        user_payload, sort_keys=True, separators=(",", ":"),
+                        user_payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
                         ensure_ascii=False,
                     ),
                 },

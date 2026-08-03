@@ -92,7 +92,7 @@ def test_fresh_bypasses_the_feed_cache(make_config, make_transport, store):
     transport = make_transport(handler)
     config = make_config()
     list(fetch_new(config, transport, store))
-    list(fetch_new(config, transport, store))          # cached
+    list(fetch_new(config, transport, store))  # cached
     list(fetch_new(config, transport, store, fresh=True))
     assert len(calls) == 2, "only --fresh-feeds refetches within the TTL"
     list(fetch_new(config, transport, store))
@@ -106,7 +106,9 @@ def test_an_unparseable_feed_is_not_cached(make_config, make_transport, store):
 
     def handler(request):
         calls.append(request)
-        return httpx.Response(200, text="<rss><channel><item" if len(calls) < 2 else FEED_XML)
+        return httpx.Response(
+            200, text="<rss><channel><item" if len(calls) < 2 else FEED_XML
+        )
 
     transport = make_transport(handler)
     config = make_config()
@@ -116,10 +118,12 @@ def test_an_unparseable_feed_is_not_cached(make_config, make_transport, store):
     assert len(calls) == 2, "the bad response must not have been cached"
 
 
-def test_a_valid_feed_with_minor_xml_defects_is_still_used(make_config, make_transport, store):
+def test_a_valid_feed_with_minor_xml_defects_is_still_used(
+    make_config, make_transport, store
+):
     # feedparser sets bozo for defects real feeds routinely carry. Rejecting
     # on bozo alone would discard working publishers.
-    bozo_but_usable = FEED_XML.replace("<?xml version=\"1.0\"?>", "")
+    bozo_but_usable = FEED_XML.replace('<?xml version="1.0"?>', "")
     items = list(
         fetch_new(
             make_config(),
