@@ -50,9 +50,10 @@ Two separate causes made valid model output look ungrounded:
    passage — was rejected in 3 of 3 replays. Grounding must search **every
    supplied passage**, not just cited ones.
 
-Neither widening admits invention: the text must still appear verbatim in
-application-supplied text, and an unknown passage id must still be rejected.
-Name grounding stays **case-sensitive** on purpose.
+Neither widening admits invention. The value must still appear in
+application-supplied text as a **contiguous run of characters differing only in
+case** — no reordering, no gaps, no paraphrase — and an unknown passage id must
+still be rejected. Name grounding stays **case-sensitive** on purpose.
 
 ## Candidate truncation skews Wikipedia verdicts
 
