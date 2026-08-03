@@ -53,5 +53,10 @@ what-is-openclaw.md
 /data-phase1/
 /digests-phase1/
 
+# Phase 2 live recording (local only)
+/cache-phase2/
+/data-phase2/
+/digests-phase2/
+
 # Git worktrees
 /.worktrees/
