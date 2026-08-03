@@ -15,9 +15,11 @@ def test_prompt_is_packaged_and_non_empty(name):
 
 def test_resolve_person_entity_prompt_is_not_ported():
     # Durable person identity is deferred; its prompt returns with it.
-    assert not resources.files("notable.prompts").joinpath(
-        "resolve_person_entity.md"
-    ).is_file()
+    assert (
+        not resources.files("notable.prompts")
+        .joinpath("resolve_person_entity.md")
+        .is_file()
+    )
 
 
 def test_feed_list_parses_and_has_ten_feeds():
