@@ -303,9 +303,6 @@ alternative — pre-call reservation — is what produced the prior system's
 documented 4–9x over-reservation defect, and buying a hard bound at that price
 is a bad trade for a personal tool.
 
-This deletes by construction the prior system's documented 4–9x
-over-reservation defect: there is nothing to over-reserve.
-
 ## Lead policy
 
 The prior programme's decision table is real product logic and carries over.
@@ -331,11 +328,33 @@ An assessed article **qualifies** when all five hold:
 - **`possible_lead`** — below that threshold, and any one of:
   - at least one qualifying article;
   - a `same_person` article with `significant` depth from an **unclassified**
-    publisher;
+    publisher; or
   - a `same_person` article with `significant` or `passing` depth that is
-    `content_qualifying` but not fully qualifying; or
-  - at least one **transferable attention signal**.
+    `content_qualifying` but not fully qualifying.
 - **`insufficient_evidence`** — a *terminal* assessment with none of the above.
+
+### Consume less than the prompt emits
+
+The ported `assess_article` prompt and schema are richer than these rules: they
+also return attention and caution signals, content-type detail, and evidence
+visibility. **All of it is stored in `lead.detail_json`. None of it is consumed
+by the MVP's outcome or ranking rules.**
+
+This is the standing discipline for the rebuild, and it is what keeps a tuned
+prompt from dragging its whole downstream apparatus back in. Ported prompts are
+free; *code that consumes their output* is not, and every consumed field is a
+concept the reader must hold and a branch the tests must cover.
+
+The prior programme had a fourth `possible_lead` reason — "at least one
+transferable attention signal" — dropped here. The recall it adds over the
+three rules above is narrow: an article that is *not* `content_qualifying` (a
+listing or announcement) but carries an award or major-show signal. That is
+weak evidence, and reasons two and three already catch the substantive cases.
+
+Because the signals are still in `detail_json`, this is reversible from real
+run data rather than from argument: query the stored leads, count how many
+`insufficient_evidence` results carried a transferable signal, and re-add the
+rule if the number justifies it.
 
 ### Incompleteness is operational, not semantic
 
@@ -363,20 +382,24 @@ nothing.
 ### Ranking
 
 Ordering is a lexicographic tuple, never a scalar score, so that every
-comparison is explicable. Ascending; the prior programme's queue-lifecycle
-terms (starvation guard, eligibility reason) are dropped with the queue:
+comparison is explicable. Ascending:
 
 ```python
 (
     OUTCOME_RANK[outcome],              # promising 0, possible 1
     WIKIPEDIA_RANK[wikipedia_outcome],  # no_matching_page 0, uncertain 1, else 2
     -qualifying_domain_count,
-    -positive_signal_count,             # transferable attention signals
-    EVIDENCE_VISIBILITY_RANK[best],     # full 0, partial 1, snippet 2
-    -freshest_qualifying_article_at,    # ISO-8601 UTC, sorts chronologically
     identity_key,                       # stable tie-breaker only
 )
 ```
+
+Four terms, not the prior programme's nine. Two of its terms (starvation guard,
+eligibility reason) die with the digest queue. Three more —
+`positive_signal_count`, evidence visibility, and article freshness — are
+dropped under the rule above: each demanded that a consumed field be threaded
+from the assessment through to ranking, and all three only order the *tail* of
+a shortlist that runs to a handful of entries. They order nothing a reader of
+the digest would notice.
 
 `insufficient_evidence` leads are never ranked or rendered; they are stored for
 inspection.
