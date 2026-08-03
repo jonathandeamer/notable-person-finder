@@ -15,7 +15,8 @@ Copied verbatim from `docs/superpowers/specs/2026-08-03-mvp-core-loop-design.md`
 - **Source stays under 3,000 lines.** No new table without deleting one — four is the budget. `pipeline.py`'s main loop fits on one screen. No new cross-run state without leaving MVP scope.
 - **Secrets never appear** in diagnostics, terminal output, tests, or **cache keys**.
 - **`http.py` sends one fixed header set and keeps no cookie jar.** No per-request header override is offered.
-- **Only validated successes are cached.** Transport failures, timeouts, 429s, 5xx, and model responses failing schema or domain validation are never stored.
+- **Only validated successes are cached.** Transport failures, timeouts, 429s, 5xx, and model responses failing schema or domain validation are never stored. Because validation happens downstream of the transport, this requires a deferred cache write — see Task 4.
+- **TTLs govern production only.** Recorded responses remain valid fixtures however old they are.
 - **A validation failure is not retried within a run.** It raises `Incomplete`; the item retries on a later run, bounded by the attempt cap.
 - **`run` and `lead` are append-only logs the pipeline never reads**, written by `store.log` in a separate transaction *after* the state tables commit, with failures warned rather than raised.
 - **Commit ordering:** digest temp file → `os.replace` → `os.replace` `latest.md` → commit state → write logs.
@@ -39,14 +40,14 @@ The spec describes the finished loop. Phase 1 builds the skeleton it hangs on, s
 | Path | Responsibility | Est. lines |
 | --- | --- | --- |
 | `src/notable/config.py` | One pydantic model; load TOML + `.env` secrets; resolve paths | 150 |
-| `src/notable/cache.py` | `cache_key`, atomic write, TTL classes, corrupt-is-miss | 90 |
+| `src/notable/cache.py` | `cache_key`, atomic write, TTL classes, replay mode, corrupt-is-miss | 100 |
 | `src/notable/store.py` | SQLite: four tables, item lifecycle, commit and log | 130 |
-| `src/notable/http.py` | One httpx client: fixed headers, retry, pacing, cache | 140 |
-| `src/notable/llm.py` | OpenRouter structured output, spend counter, `BudgetExceeded` | 140 |
+| `src/notable/http.py` | One httpx client: fixed headers, retry, pacing, deferred cache | 175 |
+| `src/notable/llm.py` | OpenRouter structured output, spend counter, `BudgetExceeded` | 175 |
 | `src/notable/feeds.py` | feedparser → `SourceItem`; URL canonicalization; `fetch_new` | 120 |
 | `src/notable/detect_contract.py` | Detection models, wire schema, domain validation | 180 |
 | `src/notable/detect.py` | Prompt render, model call, `people_in` | 90 |
-| `src/notable/digest.py` | Markdown render, atomic file write | 110 |
+| `src/notable/digest.py` | Markdown render, atomic file write | 115 |
 | `src/notable/pipeline.py` | The loop | 90 |
 | `src/notable/errors.py` | `Incomplete`, `ProviderFailure`, `BudgetExceeded` | 25 |
 | `src/notable/cli.py` | Wire everything (modify) | 80 |
@@ -209,6 +210,23 @@ def test_shipped_example_config_is_loadable(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
     config = load_config(EXAMPLE)
     assert len(config.feeds) == 10
+
+
+def test_shipped_example_writes_runtime_state_where_gitignore_covers_it(monkeypatch):
+    # Paths resolve relative to the config file, which lives in config/. The
+    # example therefore uses `../`, and .gitignore matches `/data/`,
+    # `/digests/`, `/cache/` at the repository root. If either side changes
+    # alone, a live run's database and digests become committable.
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    config = load_config(EXAMPLE)
+    root = EXAMPLE.resolve().parent.parent
+    assert config.data_dir == root / "data"
+    assert config.digest_dir == root / "digests"
+    assert config.cache.dir == root / "cache"
+
+    ignored = Path(".gitignore").read_text("utf-8").splitlines()
+    for pattern in ("/data/", "/digests/", "/cache/"):
+        assert pattern in ignored, f"{pattern} missing from .gitignore"
 ```
 
 - [ ] **Step 3: Run the tests to verify they fail**
@@ -390,9 +408,13 @@ def load_config(path: Path) -> Config:
 schema_version = 1
 feeds_file = "feeds.example.toml"
 
-# Runtime paths, resolved relative to this file.
-data_dir = "data"
-digest_dir = "digests"
+# Runtime paths, resolved relative to *this file*, which lives in config/.
+# Hence the `../`: without it a run writes its database, digests and cache
+# under config/, where Phase 0's .gitignore patterns (`/data/`, `/digests/`,
+# `/cache/`) do not match them and a live run's state becomes committable.
+# These two lines and those three patterns are a matched pair.
+data_dir = "../data"
+digest_dir = "../digests"
 
 # How many people the digest shows. Leads below the cut are logged, not
 # queued: there is no backlog. Set this generously.
@@ -417,7 +439,7 @@ initial_backoff_seconds = 1.0
 per_host_min_interval_ms = 900
 
 [cache]
-dir = "cache"
+dir = "../cache"
 # Longer than a full run, so a crash-and-restart does not get a different feed
 # snapshot; far shorter than a day, so the daily run sees fresh content.
 feed_ttl_seconds = 43200
@@ -445,7 +467,7 @@ reasoning_effort = "low"
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/mvp/test_config.py -v`
-Expected: 8 passed.
+Expected: 9 passed.
 
 - [ ] **Step 7: Commit**
 
@@ -466,9 +488,18 @@ git commit -m "feat(config): add strict file-first configuration and shared erro
 - Consumes: nothing.
 - Produces:
   - `notable.cache.cache_key(*, provider: str, method: str, url: str, body: object, transport_profile: str, extra: dict[str, object] | None = None) -> str`
-  - `notable.cache.Cache(root: Path, clock: Callable[[], float] = time.time)` with `get(key: str, *, ttl_seconds: int | None) -> dict | None` and `put(key: str, payload: dict) -> None`.
+  - `notable.cache.Cache(root: Path, clock: Callable[[], float] = time.time, *, ignore_ttl: bool = False)` with `get(key: str, *, ttl_seconds: int | None) -> dict | None` and `put(key: str, payload: dict) -> None`.
 
 This carries the entire recovery guarantee. Atomic writes are not optional: without them the exact event the cache exists to survive can leave a truncated entry that poisons every subsequent replay.
+
+**On `ignore_ttl`:** the spec states that "TTLs govern production only;
+recorded responses remain valid fixtures". Without a replay mode, a committed
+fixture cache stops working the moment its entries age past the feed TTL — the
+recorded `stored_at` timestamps keep receding while the test clock does not.
+`test_recorded_run_replays_offline_with_no_network` would pass for twelve hours
+after recording and then fail permanently, presenting as a mystery regression
+in whatever change happened to land next. Replay sets `ignore_ttl=True`;
+production never does.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -545,6 +576,28 @@ def test_ttl_none_never_expires(tmp_path):
     assert cache.get("k", ttl_seconds=None) == {"v": 1}
 
 
+def test_replay_mode_ignores_a_ttl_that_has_passed(tmp_path):
+    # A committed fixture must not rot. Its entries keep their original
+    # stored_at while the clock moves on; without this the phase 1 replay test
+    # passes for twelve hours and then fails forever.
+    now = [1000.0]
+    Cache(tmp_path, clock=lambda: now[0]).put("k", {"v": 1})
+    now[0] = 1000.0 + 999_999
+    assert Cache(tmp_path, clock=lambda: now[0]).get("k", ttl_seconds=60) is None
+    replay = Cache(tmp_path, clock=lambda: now[0], ignore_ttl=True)
+    assert replay.get("k", ttl_seconds=60) == {"v": 1}
+
+
+def test_replay_mode_still_rejects_a_corrupt_entry(tmp_path):
+    # Ignoring the TTL must not weaken anything else: a fixture entry that
+    # fails to parse is still a miss, which the replay transport turns into a
+    # loud "unexpected network call" rather than silent bad data.
+    cache = Cache(tmp_path, ignore_ttl=True)
+    cache.put("k", {"v": 1})
+    cache.path_for("k").write_text("{truncated", "utf-8")
+    assert cache.get("k", ttl_seconds=60) is None
+
+
 def test_truncated_entry_is_a_miss_and_is_removed(tmp_path):
     cache = Cache(tmp_path)
     cache.put("k", {"v": 1})
@@ -561,6 +614,14 @@ def test_entry_missing_required_envelope_fields_is_a_miss(tmp_path):
     assert cache.get("k", ttl_seconds=None) is None
 
 
+def test_corrupt_entry_is_a_miss_even_if_cleanup_fails(tmp_path, monkeypatch):
+    cache = Cache(tmp_path)
+    cache.put("k", {"v": 1})
+    cache.path_for("k").write_text("{truncated", "utf-8")
+    monkeypatch.setattr(type(cache.path_for("k")), "unlink", _unlink_boom)
+    assert cache.get("k", ttl_seconds=None) is None
+
+
 def test_no_partial_file_is_left_when_writing_fails(tmp_path, monkeypatch):
     cache = Cache(tmp_path)
     monkeypatch.setattr("notable.cache.os.replace", _boom)
@@ -571,6 +632,10 @@ def test_no_partial_file_is_left_when_writing_fails(tmp_path, monkeypatch):
 
 def _boom(*_args, **_kwargs):
     raise OSError("replace failed")
+
+
+def _unlink_boom(*_args, **_kwargs):
+    raise OSError("cleanup failed")
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -631,9 +696,18 @@ def cache_key(
 class Cache:
     """Content-addressed response storage on disk."""
 
-    def __init__(self, root: Path, clock: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self,
+        root: Path,
+        clock: Callable[[], float] = time.time,
+        *,
+        ignore_ttl: bool = False,
+    ) -> None:
         self._root = root
         self._clock = clock
+        # Replay only. TTLs govern production; a recorded fixture stays valid
+        # indefinitely, or it decays into a timed test failure.
+        self._ignore_ttl = ignore_ttl
 
     def path_for(self, key: str) -> Path:
         # Shard by the first two hex characters: a year of daily runs would
@@ -658,10 +732,19 @@ class Cache:
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             # A cache is an optimization; it may never be a source of failure.
             # Delete rather than leave a poisoned entry to be re-read forever.
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                # A corrupt cache is still a miss if cleanup itself is
+                # unavailable; the optimization must never become a failure.
+                pass
             return None
 
-        if ttl_seconds is not None and self._clock() - stored_at > ttl_seconds:
+        if (
+            not self._ignore_ttl
+            and ttl_seconds is not None
+            and self._clock() - stored_at > ttl_seconds
+        ):
             return None
         return payload
 
@@ -685,14 +768,17 @@ class Cache:
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
         except BaseException:
-            temporary.unlink(missing_ok=True)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
             raise
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/mvp/test_cache.py -v`
-Expected: 15 passed.
+Expected: 18 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -1009,7 +1095,7 @@ class Store:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/mvp/test_store.py -v`
-Expected: 13 passed.
+Expected: 12 passed (the parametrized case contributes three).
 
 - [ ] **Step 5: Commit**
 
@@ -1029,15 +1115,42 @@ git commit -m "feat(store): add four-table SQLite store with best-effort logging
 **Interfaces:**
 - Consumes: `notable.config.TransportConfig`, `notable.cache.Cache`, `notable.cache.cache_key`, `notable.errors.ProviderFailure`.
 - Produces:
-  - `notable.http.TRANSPORT_PROFILE: str`
-  - `notable.http.Response(status: int, text: str, from_cache: bool)` frozen dataclass with a `json()` method.
-  - `notable.http.Transport(config, cache, *, client, sleep=time.sleep)` with `request(*, provider, method, url, params=None, json_body=None, ttl_seconds, timeout=None, extra_key=None, auth_token=None, auth_header="Authorization") -> Response`.
+  - `notable.http.transport_profile(user_agent: str) -> str`
+  - `notable.http.Response(status: int, text: str, from_cache: bool, commit: Callable[[], None])` frozen dataclass with a `json()` method.
+  - `notable.http.RetryStats(attempts: int, retries: int, rate_limited: int)` — the run's observed transport behaviour, exposed as `Transport.stats`.
+  - `notable.http.Transport(config, cache, *, client, sleep=time.sleep)` with `request(*, provider, method, url, params=None, json_body=None, ttl_seconds, timeout=None, extra_key=None, auth_token=None, auth_header="Authorization", bypass_cache=False, defer_cache=False) -> Response`.
 
 **`from_cache` is load-bearing, not diagnostic.** A cache hit costs nothing, so `llm.py` must not add its recorded cost to the run's spend. Without this flag, replaying a crashed run reports money it never spent and can falsely trip the budget cap on a free replay — which would break the crash-recovery guarantee this whole design rests on.
 
+**`defer_cache` is the validation boundary.** The spec's rule is "only
+validated successes are cached", and a transport that writes on every HTTP 200
+cannot honour it: JSON parsing lives in `llm.py` and domain validation in
+`detect_contract.py`, both downstream. A malformed 200 stored on arrival
+becomes a permanent cache hit — rejected identically on every retry, driving
+the item to the attempt cap without ever re-calling the provider, and then
+recorded into the fixture that later phases are graded against. With
+`defer_cache=True` nothing is written until the caller invokes
+`response.commit()`, which it does only after the response has survived *every*
+check. `commit()` is idempotent and a no-op on a cache hit.
+
+**`bypass_cache` is what `--fresh-feeds` actually needs.** Passing
+`ttl_seconds=None` does not mean "ignore the cache" — it means "never expires",
+so the flag would make feed entries *more* permanent, the exact opposite of the
+intent. A bypass skips the read and still stores the fresh response.
+
+**`stats` exists so the live gate can measure rather than grep.** A 429 that
+the retry loop recovers from never reaches a log line or an exception, so it is
+invisible to any post-hoc inspection of run output. Counting it here is the
+only place it can be seen.
+
 `client` is an injected `httpx.Client`, which is what makes these tests fast and offline.
 
-**On `TRANSPORT_PROFILE`:** it covers the fixed *response-affecting* headers (`Accept`, `Accept-Language`). `User-Agent` is deliberately excluded even though it is fixed: it carries the operator's `contact_url`, and including it would invalidate the entire cache whenever that changes, for no change in any response. Authorization is excluded because no secret may reach disk.
+**On `TRANSPORT_PROFILE`:** it covers every fixed response-affecting header,
+including `Accept`, `Accept-Language`, `Accept-Encoding`, and the contactable
+`User-Agent`. Authorization is excluded because no secret may reach disk. The
+transport uses the profile containing the actual User-Agent value, so changing
+`contact_url` cannot reuse a response produced under a different request
+profile.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1050,7 +1163,7 @@ import pytest
 from notable.cache import Cache
 from notable.config import TransportConfig
 from notable.errors import ProviderFailure
-from notable.http import TRANSPORT_PROFILE, Transport
+from notable.http import Transport
 
 CONFIG = TransportConfig(
     contact_url="https://example.com/c", per_host_min_interval_ms=0, initial_backoff_seconds=0
@@ -1081,18 +1194,26 @@ def test_successful_response_is_returned_and_cached(tmp_path):
 
 
 def test_sends_fixed_headers_and_no_cookies(tmp_path):
-    seen = {}
+    seen = []
 
     def handler(request):
-        seen.update(request.headers)
+        seen.append(request)
+        if len(seen) == 1:
+            return httpx.Response(
+                200, text="ok", headers={"set-cookie": "session=abc; Path=/"}
+            )
         return httpx.Response(200, text="ok")
 
-    _transport(tmp_path, handler).request(
-        provider="t", method="GET", url="https://a.test/x", ttl_seconds=None
-    )
-    assert "example.com/c" in seen["user-agent"]
-    assert seen["accept-language"].startswith("en")
-    assert "cookie" not in seen
+    transport = _transport(tmp_path, handler)
+    for _ in range(2):
+        transport.request(
+            provider="t", method="GET", url="https://a.test/x", ttl_seconds=None,
+            bypass_cache=True,
+        )
+    assert "example.com/c" in seen[0].headers["user-agent"]
+    assert seen[0].headers["accept-language"].startswith("en")
+    assert "accept-encoding" in seen[0].headers
+    assert "cookie" not in seen[1].headers
 
 
 def test_server_errors_are_retried_then_fail(tmp_path):
@@ -1157,9 +1278,26 @@ def test_failures_are_never_cached(tmp_path):
     assert result.text == "recovered"
 
 
-def test_transport_profile_excludes_the_contact_url(tmp_path):
-    # Changing contact_url must not invalidate the whole cache.
-    assert "example.com" not in TRANSPORT_PROFILE
+def test_contact_url_is_part_of_the_request_profile(tmp_path):
+    # User-Agent is sent on the wire and can affect a provider response, so it
+    # must participate in the cache discriminator even though it is not secret.
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, text="ok")
+
+    first = _transport(tmp_path, handler)
+    first.request(provider="t", method="GET", url="https://a.test/x", ttl_seconds=None)
+    second_client = httpx.Client(transport=httpx.MockTransport(handler))
+    second = Transport(
+        TransportConfig(contact_url="https://other.test/c", per_host_min_interval_ms=0),
+        Cache(tmp_path),
+        client=second_client,
+        sleep=lambda _s: None,
+    )
+    second.request(provider="t", method="GET", url="https://a.test/x", ttl_seconds=None)
+    assert len(calls) == 2
 
 
 def test_a_cache_hit_is_flagged_so_callers_can_skip_charging_for_it(tmp_path):
@@ -1167,6 +1305,77 @@ def test_a_cache_hit_is_flagged_so_callers_can_skip_charging_for_it(tmp_path):
     kwargs = {"provider": "t", "method": "GET", "url": "https://a.test/x", "ttl_seconds": None}
     assert transport.request(**kwargs).from_cache is False
     assert transport.request(**kwargs).from_cache is True
+
+
+def test_a_deferred_response_is_not_cached_until_commit(tmp_path):
+    # The spec's "only validated successes are cached" rule. Validation lives
+    # downstream, so the transport must not write on arrival.
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, text="hello")
+
+    transport = _transport(tmp_path, handler)
+    kwargs = {
+        "provider": "t", "method": "GET", "url": "https://a.test/x",
+        "ttl_seconds": None, "defer_cache": True,
+    }
+    transport.request(**kwargs)
+    transport.request(**kwargs)
+    assert len(calls) == 2, "an uncommitted response must not be served from cache"
+
+    transport.request(**kwargs).commit()
+    assert transport.request(**kwargs).from_cache is True
+    assert len(calls) == 3
+
+
+def test_committing_twice_is_harmless(tmp_path):
+    transport = _transport(tmp_path, lambda r: httpx.Response(200, text="ok"))
+    response = transport.request(
+        provider="t", method="GET", url="https://a.test/x",
+        ttl_seconds=None, defer_cache=True,
+    )
+    response.commit()
+    response.commit()  # must not raise
+
+
+def test_committing_a_cache_hit_is_a_no_op(tmp_path):
+    transport = _transport(tmp_path, lambda r: httpx.Response(200, text="ok"))
+    kwargs = {"provider": "t", "method": "GET", "url": "https://a.test/x", "ttl_seconds": None}
+    transport.request(**kwargs)
+    hit = transport.request(**kwargs)
+    assert hit.from_cache is True
+    hit.commit()  # must not raise or rewrite
+
+
+def test_bypass_skips_the_read_but_still_stores(tmp_path):
+    # What --fresh-feeds needs. ttl_seconds=None means "never expires", so it
+    # cannot express this: it would make the entry more permanent, not less.
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, text=f"body {len(calls)}")
+
+    transport = _transport(tmp_path, handler)
+    kwargs = {"provider": "t", "method": "GET", "url": "https://a.test/x", "ttl_seconds": 3600}
+    assert transport.request(**kwargs).text == "body 1"
+    assert transport.request(**kwargs).text == "body 1"      # cached
+    assert transport.request(**kwargs | {"bypass_cache": True}).text == "body 2"
+    assert transport.request(**kwargs).text == "body 2", "the bypass refreshed the entry"
+    assert len(calls) == 2
+
+
+def test_recovered_rate_limits_are_counted(tmp_path):
+    # A 429 the retry loop survives raises nothing and logs nothing, so it is
+    # invisible to the live gate unless it is counted here.
+    responses = [httpx.Response(429, text="slow down"), httpx.Response(200, text="ok")]
+
+    transport = _transport(tmp_path, lambda r: responses.pop(0))
+    transport.request(provider="t", method="GET", url="https://a.test/x", ttl_seconds=None)
+    assert transport.stats.rate_limited == 1
+    assert transport.stats.retries == 1
 
 
 def test_pacing_sleeps_between_calls_to_one_host(tmp_path):
@@ -1196,6 +1405,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'notable.http'`.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -1208,12 +1418,28 @@ from notable.cache import Cache, cache_key
 from notable.config import TransportConfig
 from notable.errors import ProviderFailure
 
-# Fixed response-affecting headers, folded into every cache key. `User-Agent`
-# is excluded on purpose: it carries the operator's contact URL, and including
-# it would invalidate the whole cache when that changes without changing any
-# response. Authorization is excluded because no secret may reach disk.
-_FIXED_HEADERS = {"Accept": "*/*", "Accept-Language": "en"}
-TRANSPORT_PROFILE = json.dumps(_FIXED_HEADERS, sort_keys=True, separators=(",", ":"))
+logger = logging.getLogger(__name__)
+
+# Fixed response-affecting headers. Authorization is excluded because no
+# secret may reach disk; the actual User-Agent is folded into the per-client
+# transport profile below.
+_FIXED_HEADERS = {
+    "Accept": "*/*",
+    "Accept-Language": "en",
+    "Accept-Encoding": "gzip, deflate",
+}
+
+
+def transport_profile(user_agent: str) -> str:
+    return json.dumps(
+        {**_FIXED_HEADERS, "User-Agent": user_agent},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _noop() -> None:
+    """Commit for a response that is already stored, or must never be."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1224,9 +1450,26 @@ class Response:
     # out of the run's spend: counting them would report money that was never
     # spent and could trip the budget cap during a free crash replay.
     from_cache: bool = False
+    # Stores this response. A no-op unless the call was made with
+    # `defer_cache=True` and has not been committed yet. The caller invokes it
+    # once the response has passed every downstream check.
+    commit: Callable[[], None] = _noop
 
     def json(self) -> Any:
         return json.loads(self.text)
+
+
+@dataclass(frozen=True, slots=True)
+class RetryStats:
+    """What the transport actually did, for the run report.
+
+    Recovered failures raise nothing and log nothing. Counting is the only way
+    the live gate can see them.
+    """
+
+    attempts: int = 0
+    retries: int = 0
+    rate_limited: int = 0
 
 
 class Transport:
@@ -1244,6 +1487,15 @@ class Transport:
         self._sleep = sleep
         self._last_call: dict[str, float] = {}
         self._user_agent = f"notable/0.1 (+{config.contact_url})"
+        self._transport_profile = transport_profile(self._user_agent)
+        # The client is a transport seam for tests, not a source of headers or
+        # cookies. Clear both so client-level defaults cannot vary a response
+        # without appearing in the cache profile.
+        self._client.headers.clear()
+        self._client.cookies.clear()
+        self.stats = RetryStats()
+        self.cache_hits = 0
+        self.cache_misses = 0
 
     def request(
         self,
@@ -1258,20 +1510,30 @@ class Transport:
         extra_key: dict[str, object] | None = None,
         auth_token: str | None = None,
         auth_header: str = "Authorization",
+        bypass_cache: bool = False,
+        defer_cache: bool = False,
     ) -> Response:
         key = cache_key(
             provider=provider,
             method=method,
             url=url,
             body={"params": params or {}, "json": json_body},
-            transport_profile=TRANSPORT_PROFILE,
+            transport_profile=self._transport_profile,
             extra=extra_key,
         )
-        cached = self._cache.get(key, ttl_seconds=ttl_seconds)
-        if cached is not None:
-            return Response(
-                status=int(cached["status"]), text=str(cached["text"]), from_cache=True
-            )
+        # `bypass_cache` skips the *read* only; the fresh response is still
+        # stored. `ttl_seconds=None` cannot express this -- it means "never
+        # expires", so using it for --fresh-feeds does the opposite.
+        if not bypass_cache:
+            cached = self._cache.get(key, ttl_seconds=ttl_seconds)
+            if cached is not None:
+                self.cache_hits += 1
+                return Response(
+                    status=int(cached["status"]),
+                    text=str(cached["text"]),
+                    from_cache=True,
+                )
+        self.cache_misses += 1
 
         headers = dict(_FIXED_HEADERS)
         headers["User-Agent"] = self._user_agent
@@ -1286,10 +1548,29 @@ class Transport:
             headers=headers,
             timeout=timeout or self._config.read_timeout_seconds,
         )
-        # Only durable successes are cached. A cached failure would make a
-        # transient problem permanent and poison the fixture set.
-        self._cache.put(key, {"status": response.status, "text": response.text})
-        return response
+
+        stored = False
+
+        def commit() -> None:
+            # Idempotent: callers may commit on a path that also runs on a
+            # cache hit, and a double commit must not rewrite the entry.
+            nonlocal stored
+            if stored:
+                return
+            stored = True
+            self._cache.put(key, {"status": response.status, "text": response.text})
+
+        # Only *validated* successes are cached. A transport-level 200 is not
+        # yet a success: JSON parsing and domain validation are downstream, and
+        # a malformed response stored here becomes a permanent cache hit that
+        # is re-rejected on every retry until the item is abandoned -- and is
+        # then recorded into the fixture later phases are graded against.
+        if not defer_cache:
+            commit()
+            return response
+        return Response(
+            status=response.status, text=response.text, from_cache=False, commit=commit
+        )
 
     def _send(
         self,
@@ -1305,33 +1586,56 @@ class Transport:
         last: Exception | None = None
         for attempt in range(1, self._config.max_attempts + 1):
             self._pace(url)
+            self._count(attempts=1, retries=1 if attempt > 1 else 0)
+            self._client.cookies.clear()
             try:
-                raw = self._client.request(
+                request = httpx.Request(
                     method,
                     url,
                     params=params,
                     json=json_body,
                     headers=headers,
-                    timeout=httpx.Timeout(
-                        timeout, connect=self._config.connect_timeout_seconds
-                    ),
-                    follow_redirects=True,
                 )
+                request.extensions["timeout"] = httpx.Timeout(
+                    timeout, connect=self._config.connect_timeout_seconds
+                ).as_dict()
+                # send() transmits this fully-formed request as-is. Using
+                # client.request() would merge client-level headers/cookies
+                # back into the request and undermine the cache profile.
+                raw = self._client.send(request, follow_redirects=True)
             except httpx.HTTPError as error:
                 last = ProviderFailure(f"{type(error).__name__}: {error}", permanent=False)
             else:
                 if raw.status_code < 400:
+                    self._client.cookies.clear()
                     return Response(status=raw.status_code, text=raw.text)
                 if raw.status_code < 500 and raw.status_code != 429:
                     raise ProviderFailure(
                         f"HTTP {raw.status_code} from {url}", permanent=True
                     )
+                if raw.status_code == 429:
+                    self._count(rate_limited=1)
                 last = ProviderFailure(f"HTTP {raw.status_code} from {url}", permanent=False)
+            finally:
+                # Do not carry Set-Cookie state into a later request, including
+                # after failures and redirects handled by httpx.
+                self._client.cookies.clear()
 
             if attempt < self._config.max_attempts:
+                logger.info(
+                    "retrying %s after %s (attempt %d/%d)",
+                    url, last, attempt, self._config.max_attempts,
+                )
                 self._sleep(backoff)
                 backoff *= 2
         raise last or ProviderFailure(f"no response from {url}", permanent=False)
+
+    def _count(self, *, attempts: int = 0, retries: int = 0, rate_limited: int = 0) -> None:
+        self.stats = RetryStats(
+            attempts=self.stats.attempts + attempts,
+            retries=self.stats.retries + retries,
+            rate_limited=self.stats.rate_limited + rate_limited,
+        )
 
     def _pace(self, url: str) -> None:
         interval = self._config.per_host_min_interval_ms / 1000
@@ -1350,7 +1654,7 @@ class Transport:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/mvp/test_http.py -v`
-Expected: 9 passed.
+Expected: 14 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -1369,9 +1673,39 @@ git commit -m "feat(http): add caching transport with fixed headers and bounded 
 
 **Interfaces:**
 - Consumes: `notable.http.Transport`, `notable.config.OpenRouterConfig`, `notable.errors.BudgetExceeded`, `notable.errors.ProviderFailure`.
-- Produces: `notable.llm.LlmClient(transport, config, *, api_key, budget_usd)` with `structured(*, task, model, system, user_payload, schema, max_completion_tokens, reasoning_effort, timeout) -> dict` and `spend() -> Decimal`.
+- Produces: `notable.llm.LlmClient(transport, config, *, api_key, budget_usd)` with `structured(*, task, model, system, user_payload, schema, max_completion_tokens, reasoning_effort, timeout, validate=None) -> dict`, `spend() -> Decimal`, and `calls: int` / `truncations: int` counters for the run report.
 
-**Model responses are cached permanently** (the "stable" TTL class): a model's answer to a fixed prompt is treated as fixed.
+**Model responses are cached permanently** (the "stable" TTL class): a model's answer to a fixed prompt is treated as fixed — but only *after* validation. See the `validate` parameter below.
+
+**Three wire-format details are not free choices.** All three come from the
+frozen `refactor/rearchitecture` implementation, which is the only version of
+this request that has ever worked against the real router:
+
+1. **`max_completion_tokens`, not `max_tokens`.** `providers/openrouter.py:458`
+   sends the former. The two are not reliably interchangeable across the
+   endpoints OpenRouter routes to, and the parameter name is what item 2 filters
+   on.
+2. **`provider.require_parameters: true`** (`:218`). This makes OpenRouter
+   exclude every endpoint that does not declare support for a supplied
+   parameter — which is what guarantees the strict schema is honoured rather
+   than quietly ignored by whatever endpoint the router picked. It is also the
+   *reason* `temperature` and `top_p` must be omitted rather than sent as
+   null: reasoning models declare neither, so supplying them leaves no eligible
+   endpoint and the router answers 404. Dropping `require_parameters` while
+   keeping the omission, as an earlier draft of this plan did, keeps the
+   workaround and discards the thing it was working around.
+3. **`finish_reason` is checked.** `docs/findings.md` records truncation as the
+   programme's single most expensive defect, and it presented as
+   `malformed_response` — a JSON parse error — because nothing looked at
+   `finish_reason`. One equality check names it directly instead of leaving it
+   to be inferred from a log grep.
+
+**Missing cost is an error, not zero.** The frozen implementation is explicit:
+"Missing cost stays `None` (never invented as zero)". Treating an absent or
+unparseable `usage.cost` as zero silently disables the spend cap for the rest
+of the run, which is exactly the protection the first live run depends on. When
+a cap is configured this raises; with no cap it warns, because there is then
+nothing to protect.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1396,11 +1730,13 @@ TRANSPORT_CONFIG = TransportConfig(
 )
 
 
-def _reply(content: dict, cost: str = "0.01") -> httpx.Response:
+def _reply(content: dict, cost: str = "0.01", finish: str = "stop") -> httpx.Response:
     return httpx.Response(
         200,
         json={
-            "choices": [{"message": {"content": json.dumps(content)}}],
+            "choices": [
+                {"message": {"content": json.dumps(content)}, "finish_reason": finish}
+            ],
             "usage": {"cost": cost},
         },
     )
@@ -1452,10 +1788,209 @@ def test_request_carries_strict_schema_and_no_temperature(tmp_path):
     assert fmt["type"] == "json_schema"
     assert fmt["json_schema"]["strict"] is True
     assert fmt["json_schema"]["schema"] == SCHEMA
-    # The default models' endpoints declare support for neither, and routing
-    # requires an endpoint supporting every supplied parameter (HTTP 404).
+    # Reasoning models' endpoints declare neither, and require_parameters
+    # excludes every endpoint missing a supplied parameter (HTTP 404).
     assert "temperature" not in captured
     assert "top_p" not in captured
+
+
+def test_request_uses_the_wire_fields_the_frozen_implementation_proved(tmp_path):
+    # Both assertions are load-bearing and neither is stylistic. See the task
+    # preamble: refactor/rearchitecture:providers/openrouter.py lines 458, 218.
+    captured = {}
+
+    def handler(request):
+        captured.update(json.loads(request.content))
+        return _reply({"ok": True})
+
+    _call(_client(tmp_path, handler))
+    assert captured["max_completion_tokens"] == 256
+    assert "max_tokens" not in captured
+    # Without this, the router may pick an endpoint that ignores the strict
+    # schema -- and the omission of temperature/top_p above stops meaning
+    # anything.
+    assert captured["provider"]["require_parameters"] is True
+
+
+def test_a_truncated_response_is_named_as_truncation(tmp_path):
+    # findings.md's most expensive defect. Shipped at 1024 against max_people
+    # 8, responses were cut off mid-string and rejected as "malformed" --
+    # which sent the diagnosis after the model instead of the token budget.
+    handler = lambda r: _reply({"ok": True}, finish="length")
+    with pytest.raises(ProviderFailure, match="truncat"):
+        _call(_client(tmp_path, handler))
+
+
+def test_a_missing_finish_reason_is_a_failure(tmp_path):
+    # Absence of completion evidence is not evidence of completion, and the
+    # cost of guessing wrong is a permanently cached partial response.
+    handler = lambda r: httpx.Response(
+        200,
+        json={
+            "choices": [{"message": {"content": '{"ok": true}'}}],
+            "usage": {"cost": "0.01"},
+        },
+    )
+    with pytest.raises(ProviderFailure, match="finish_reason"):
+        _call(_client(tmp_path, handler))
+
+
+def test_cost_is_recorded_when_the_response_envelope_is_unreadable(tmp_path):
+    # OpenRouter can bill a request even when the response is missing choices.
+    # Spend must be counted before choice/content validation or the cap is
+    # silently undercounted.
+    handler = lambda r: httpx.Response(
+        200, json={"usage": {"cost": "0.30"}, "choices": []}
+    )
+    client = _client(tmp_path, handler)
+    with pytest.raises(ProviderFailure):
+        _call(client)
+    assert client.spend() == Decimal("0.30")
+
+
+def test_a_provider_error_finish_reason_is_a_failure(tmp_path):
+    # OpenRouter reports upstream errors as finish_reason "error" with partial
+    # content. That content can parse and pass the domain rules, and would
+    # then be cached permanently as a success.
+    handler = lambda r: _reply({"ok": True}, finish="error")
+    with pytest.raises(ProviderFailure, match="finish_reason"):
+        _call(_client(tmp_path, handler))
+
+
+def test_an_error_completion_is_not_cached(tmp_path):
+    replies = [_reply({"ok": True}, finish="error"), _reply({"ok": True})]
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return replies.pop(0)
+
+    client = _client(tmp_path, handler)
+    with pytest.raises(ProviderFailure):
+        _call(client, 1)
+    assert _call(client, 1) == {"ok": True}
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("cost", ["-0.50", "NaN", "Infinity"])
+def test_an_implausible_cost_is_refused(tmp_path, cost):
+    # A negative cost refunds the run; a NaN makes every later
+    # `spend >= budget` comparison false, so the cap stops binding silently.
+    with pytest.raises(ProviderFailure, match="implausible"):
+        _call(_client(tmp_path, lambda r: _reply({"ok": True}, cost=cost),
+                      budget=Decimal("1.00")))
+
+
+def test_a_truncated_response_is_counted_for_the_run_report(tmp_path):
+    client = _client(tmp_path, lambda r: _reply({"ok": True}, finish="length"))
+    with pytest.raises(ProviderFailure):
+        _call(client)
+    assert client.truncations == 1
+
+
+def test_missing_cost_raises_when_a_cap_is_configured(tmp_path):
+    # Treating absent cost as zero disables the cap for the rest of the run --
+    # silently, and precisely when the cap is what is protecting the spend.
+    handler = lambda r: httpx.Response(
+        200,
+        json={
+            "choices": [
+                {"message": {"content": "{}"}, "finish_reason": "stop"}
+            ],
+            "usage": {},
+        },
+    )
+    with pytest.raises(ProviderFailure, match="cost"):
+        _call(_client(tmp_path, handler, budget=Decimal("1.00")))
+
+
+def test_missing_cost_only_warns_when_there_is_no_cap(tmp_path, caplog):
+    handler = lambda r: httpx.Response(
+        200,
+        json={
+            "choices": [
+                {"message": {"content": '{"ok": true}'}, "finish_reason": "stop"}
+            ],
+            "usage": {},
+        },
+    )
+    assert _call(_client(tmp_path, handler)) == {"ok": True}
+    assert "cost" in caplog.text
+
+
+def test_cost_is_recorded_even_when_the_content_is_unusable(tmp_path):
+    # The call was billed whether or not its output parsed. Recording cost
+    # only on the success path undercounts a run made of failures.
+    handler = lambda r: httpx.Response(
+        200,
+        json={
+            "choices": [
+                {"message": {"content": "{not json"}, "finish_reason": "stop"}
+            ],
+            "usage": {"cost": "0.30"},
+        },
+    )
+    client = _client(tmp_path, handler)
+    with pytest.raises(ProviderFailure):
+        _call(client)
+    assert client.spend() == Decimal("0.30")
+
+
+def test_an_invalid_response_is_not_cached_and_the_retry_calls_again(tmp_path):
+    # The whole point of the deferred cache write. Without it a malformed 200
+    # is a permanent cache hit: re-rejected on every retry, never re-requested,
+    # and then recorded into the fixture later phases are graded against.
+    replies = [
+        httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": "{not json"}, "finish_reason": "stop"}
+                ],
+                "usage": {"cost": "0.01"},
+            },
+        ),
+        _reply({"ok": True}),
+    ]
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return replies.pop(0)
+
+    client = _client(tmp_path, handler)
+    with pytest.raises(ProviderFailure):
+        _call(client, 1)
+    assert _call(client, 1) == {"ok": True}, "identical payload must be re-requested"
+    assert len(calls) == 2
+
+
+def test_a_response_rejected_by_the_domain_validator_is_not_cached(tmp_path):
+    # Domain validation lives downstream in detect_contract.py, so `structured`
+    # takes the validator rather than assuming JSON-parseable means valid.
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return _reply({"ok": True})
+
+    def reject(_parsed):
+        raise ValueError("domain says no")
+
+    client = _client(tmp_path, handler)
+    with pytest.raises(ValueError):
+        client.structured(
+            task="detect_people", model="m", system="s", user_payload={"a": 1},
+            schema=SCHEMA, max_completion_tokens=256, reasoning_effort="low",
+            timeout=5.0, validate=reject,
+        )
+    with pytest.raises(ValueError):
+        client.structured(
+            task="detect_people", model="m", system="s", user_payload={"a": 1},
+            schema=SCHEMA, max_completion_tokens=256, reasoning_effort="low",
+            timeout=5.0, validate=reject,
+        )
+    assert len(calls) == 2, "a domain rejection must not become a permanent cache hit"
 
 
 def test_api_key_is_sent_but_never_reaches_the_cache(tmp_path):
@@ -1542,12 +2077,16 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'notable.llm'`.
 from __future__ import annotations
 
 import json
+import logging
+from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from notable.config import OpenRouterConfig
 from notable.errors import BudgetExceeded, ProviderFailure
 from notable.http import Transport
+
+logger = logging.getLogger(__name__)
 
 
 class LlmClient:
@@ -1564,6 +2103,10 @@ class LlmClient:
         self._api_key = api_key
         self._budget = budget_usd
         self._spend = Decimal("0")
+        # Counters for the run report. A live gate that cannot say how many
+        # calls it made or how many were truncated is not measuring anything.
+        self.calls = 0
+        self.truncations = 0
 
     def spend(self) -> Decimal:
         return self._spend
@@ -1579,8 +2122,15 @@ class LlmClient:
         max_completion_tokens: int,
         reasoning_effort: str | None,
         timeout: float,
+        validate: Callable[[dict[str, Any]], Any] | None = None,
     ) -> dict[str, Any]:
-        """One focused decision. Raises BudgetExceeded before spending past the cap."""
+        """One focused decision. Raises BudgetExceeded before spending past the cap.
+
+        `validate` is the caller's domain validator. It runs before the
+        response is committed to cache, so that a response the domain rejects
+        is never stored and the next run genuinely re-requests it. Whatever it
+        raises propagates unchanged.
+        """
         if self._budget is not None and self._spend >= self._budget:
             raise BudgetExceeded(
                 f"run spend {self._spend} reached the cap {self._budget}"
@@ -1602,9 +2152,20 @@ class LlmClient:
                 "type": "json_schema",
                 "json_schema": {"name": task, "strict": True, "schema": schema},
             },
-            "max_tokens": max_completion_tokens,
+            # Not `max_tokens`. The frozen implementation sends this field, and
+            # under require_parameters below the field name is what routing
+            # filters on. See docs/findings.md on the completion budget.
+            "max_completion_tokens": max_completion_tokens,
             "usage": {"include": True},
-            "provider": {"allow_fallbacks": True, "data_collection": "deny"},
+            "provider": {
+                "allow_fallbacks": True,
+                "data_collection": "deny",
+                # Excludes any endpoint not declaring support for every
+                # parameter sent. This is what makes the strict schema binding
+                # rather than advisory -- and it is the reason temperature and
+                # top_p are omitted rather than sent as null.
+                "require_parameters": True,
+            },
         }
         if reasoning_effort:
             body["reasoning"] = {"effort": reasoning_effort}
@@ -1614,27 +2175,71 @@ class LlmClient:
             method="POST",
             url=f"{self._config.endpoint}/chat/completions",
             json_body=body,
-            # A model's answer to a fixed prompt is treated as fixed.
+            # A model's answer to a fixed prompt is treated as fixed -- once
+            # it has been validated. `defer_cache` holds the write until then.
             ttl_seconds=None,
             timeout=timeout,
             # The model and schema must discriminate the key: the same prompt
             # under a different schema is a different call.
             extra_key={"model": model, "schema": schema, "task": task},
             auth_token=f"Bearer {self._api_key}",
+            defer_cache=True,
         )
+        if not response.from_cache:
+            self.calls += 1
 
+        # Recorded before any further check: the call was billed whether or not
+        # its content turns out to be usable. A replayed call cost nothing, so
+        # charging for it would report money never spent and could trip the cap
+        # during a free crash replay.
         try:
             envelope = response.json()
-            content = envelope["choices"][0]["message"]["content"]
-        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
+        except (json.JSONDecodeError, TypeError) as error:
+            raise ProviderFailure(
+                f"unreadable OpenRouter envelope for {task}: {error}", permanent=False
+            ) from error
+        if not response.from_cache:
+            if not isinstance(envelope, dict):
+                raise ProviderFailure(
+                    f"unreadable OpenRouter envelope for {task}: not an object",
+                    permanent=False,
+                )
+            self._record_cost(envelope.get("usage") or {}, task=task)
+
+        try:
+            choice = envelope["choices"][0]
+            content = choice["message"]["content"]
+        except (KeyError, IndexError, TypeError) as error:
             raise ProviderFailure(
                 f"unreadable OpenRouter envelope for {task}: {error}", permanent=False
             ) from error
 
-        # A replayed call cost nothing. Charging for it would report money that
-        # was never spent, and would let a free crash replay trip the cap.
-        if not response.from_cache:
-            self._record_cost(envelope.get("usage") or {})
+        # Truncation is named directly rather than left to surface as a JSON
+        # parse error. This is findings.md's costliest defect, and it is one
+        # comparison.
+        finish_reason = choice.get("finish_reason")
+        if finish_reason == "length":
+            self.truncations += 1
+            raise ProviderFailure(
+                f"{task} response was truncated at max_completion_tokens "
+                f"({max_completion_tokens}); raise it together with max_people",
+                permanent=False,
+            )
+        # Only a clean stop is evidence of completion, and only evidence of
+        # completion may be cached permanently. OpenRouter reports upstream
+        # provider errors as `finish_reason: "error"` with partial content
+        # attached; that content can parse and can satisfy the domain rules.
+        #
+        # A missing reason fails too. An earlier draft allowed `None` on the
+        # theory that some endpoint might omit it -- but that is a guess, and
+        # the cost of being wrong is a permanently cached partial response.
+        # If a real provider does omit it, the first live run says so loudly
+        # and the exception gets made against evidence.
+        if finish_reason != "stop":
+            raise ProviderFailure(
+                f"{task} did not complete: finish_reason={finish_reason!r}",
+                permanent=False,
+            )
 
         try:
             parsed = json.loads(content)
@@ -1644,22 +2249,57 @@ class LlmClient:
             ) from error
         if not isinstance(parsed, dict):
             raise ProviderFailure(f"{task} returned a non-object", permanent=True)
+
+        # The domain validator is the last gate. Only once it passes does the
+        # response become a cacheable success.
+        if validate is not None:
+            validate(parsed)
+        response.commit()
         return parsed
 
-    def _record_cost(self, usage: dict[str, Any]) -> None:
+    def _record_cost(self, usage: dict[str, Any], *, task: str) -> None:
+        """Missing cost is never invented as zero.
+
+        Silently treating an absent or unparseable cost as zero disables the
+        spend cap for the rest of the run. When a cap is configured that is a
+        failure; with no cap there is nothing to protect, so it is a warning.
+        """
         raw = usage.get("cost")
+        error: str | None = None
         if raw is None:
+            error = f"{task} response reported no usage.cost"
+        else:
+            try:
+                amount = Decimal(str(raw))
+            except (InvalidOperation, ValueError):
+                error = f"{task} reported an unparseable usage.cost: {raw!r}"
+            else:
+                # `Decimal("NaN")` and `Decimal("-1")` both parse. A NaN in the
+                # accumulator makes every later `spend >= budget` comparison
+                # false, so the cap silently stops binding; a negative value
+                # refunds the run. Neither is a cost.
+                if not amount.is_finite() or amount < 0:
+                    error = f"{task} reported an implausible usage.cost: {raw!r}"
+                else:
+                    self._spend += amount
+        if error is None:
             return
-        try:
-            self._spend += Decimal(str(raw))
-        except InvalidOperation:
-            return
+        if self._budget is not None:
+            raise ProviderFailure(f"{error}; the spend cap cannot be enforced", permanent=False)
+        logger.warning("%s; run spend is an undercount", error)
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/mvp/test_llm.py -v`
-Expected: 9 passed.
+Expected: 24 passed.
+
+- [ ] **Step 4a: Confirm the cache boundary actually discriminates**
+
+Delete `defer_cache=True` from the transport call and re-run. Both
+`test_an_invalid_response_is_not_cached_and_the_retry_calls_again` and
+`test_a_response_rejected_by_the_domain_validator_is_not_cached` must fail.
+Restore it. A boundary that survives its own removal is not tested.
 
 - [ ] **Step 5: Commit**
 
@@ -1857,6 +2497,39 @@ def test_fresh_bypasses_the_feed_cache(make_config, make_transport, store):
     list(fetch_new(config, transport, store))          # cached
     list(fetch_new(config, transport, store, fresh=True))
     assert len(calls) == 2, "only --fresh-feeds refetches within the TTL"
+    list(fetch_new(config, transport, store))
+    assert len(calls) == 2, "the fresh fetch replaced the cached entry"
+
+
+def test_an_unparseable_feed_is_not_cached(make_config, make_transport, store):
+    # Cached on arrival, a malformed 200 is a twelve-hour "success" that
+    # yields nothing and reports no error -- the quietest possible failure.
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, text="<rss><channel><item" if len(calls) < 2 else FEED_XML)
+
+    transport = make_transport(handler)
+    config = make_config()
+    assert list(fetch_new(config, transport, store)) == []
+    urls = [i.url for i in fetch_new(config, transport, store)]
+    assert urls == ["https://a.test/one", "https://a.test/two"]
+    assert len(calls) == 2, "the bad response must not have been cached"
+
+
+def test_a_valid_feed_with_minor_xml_defects_is_still_used(make_config, make_transport, store):
+    # feedparser sets bozo for defects real feeds routinely carry. Rejecting
+    # on bozo alone would discard working publishers.
+    bozo_but_usable = FEED_XML.replace("<?xml version=\"1.0\"?>", "")
+    items = list(
+        fetch_new(
+            make_config(),
+            make_transport(lambda r: httpx.Response(200, text=bozo_but_usable)),
+            store,
+        )
+    )
+    assert [i.url for i in items] == ["https://a.test/one", "https://a.test/two"]
 ```
 
 - [ ] **Step 3: Run the tests to verify they fail**
@@ -1943,13 +2616,35 @@ def fetch_new(
                 provider="feed",
                 method="GET",
                 url=feed.url,
-                ttl_seconds=None if fresh else config.cache.feed_ttl_seconds,
+                ttl_seconds=config.cache.feed_ttl_seconds,
+                # Not `ttl_seconds=None`: that means "never expires", so it
+                # would make the cached feed *more* permanent. A bypass skips
+                # the read and stores the fresh response over the stale one.
+                bypass_cache=fresh,
+                # A feed is not a success until feedparser can read it. Cached
+                # on arrival, a truncated or malformed 200 becomes a twelve-
+                # hour "success" that silently yields no items -- the same
+                # defect as caching an unvalidated model response, and harder
+                # to notice because it produces no error at all.
+                defer_cache=True,
             )
         except ProviderFailure:
             logger.warning("feed fetch failed: %s", feed.key, exc_info=True)
             continue
 
         parsed = feedparser.parse(response.text)
+        if parsed.bozo and not parsed.entries:
+            # Bozo alone is not disqualifying -- real feeds carry minor XML
+            # defects and parse fine. Bozo *and* nothing extracted means the
+            # response was not usable, so it must not be stored.
+            logger.warning(
+                "feed did not parse and yielded no entries: %s (%s)",
+                feed.key,
+                parsed.get("bozo_exception"),
+            )
+            continue
+        response.commit()
+
         for entry in parsed.entries:
             url = canonical_url(getattr(entry, "link", "") or "")
             if url is None or url in emitted:
@@ -1970,7 +2665,7 @@ def fetch_new(
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/mvp/test_feeds.py -v`
-Expected: 13 passed.
+Expected: 15 passed.
 
 - [ ] **Step 6: Commit**
 
@@ -1996,6 +2691,42 @@ git commit -m "feat(feeds): add feed fetching, URL canonicalization, and eligibi
   - `validate_detection(raw: dict, *, passages, max_people) -> DetectionOutput` raising `DetectionInvalid(ValueError)`.
 
 **The wire schema is written by hand, not derived from pydantic.** Pydantic emits `$ref`/`$defs`, `pattern`, and length constraints that strict structured output handles inconsistently. Writing it by hand keeps the wire contract to the subset that is known to work, and pydantic then validates what came back. `docs/findings.md` records that a root-level `anyOf` is rejected outright — the root here is a plain object.
+
+**Express every rule the schema can carry.** `docs/findings.md` names this as
+"the governing pattern behind five separate defects: the schema systematically
+under-constrained rules the domain validator enforced, and every rule left
+unexpressed is *paid for* before it is rejected." Three consequences here:
+
+- **Signals use a nested `anyOf`** pairing `kind` with its permitted
+  `category`. Independent enums make `{"kind": "attention", "category":
+  "single_event_only"}` representable, so the model can emit it, be billed for
+  it, and be rejected afterwards. findings.md is explicit that a union *nested
+  on a property* — "detection's signal category/kind pairing" — works and
+  should be used. Only the **root** may not be a union.
+- **`grounding` is `["source_text"]` in Phase 1**, a one-value enum. Phase 1
+  supplies no domain profile, so `domain_profile` is unusable; offering it and
+  then rejecting it in the validator is the same paid-for-then-refused pattern.
+  The validator keeps its check as a belt-and-braces assertion, but it should
+  now be unreachable.
+- **`overflow` is checked against the cap.** `overflow: true` asserts there
+  were more people than `max_people`, which cannot be true unless the list is
+  full. This one genuinely cannot go in the schema — it is a dependency between
+  two root-level properties, which findings.md records as inexpressible under
+  strict mode — so it is a validator rule.
+
+**Name grounding matches on word boundaries, not substrings.** `"Ana" in
+"Anastasia Poy"` is true, so plain containment accepts a name the text does not
+actually contain. The check has to work for names that are not Latin-script and
+not space-delimited, so it brackets the match with a "neither side is a word
+character" test rather than using `\b`, which is meaningless where there are no
+word characters to bound.
+
+**One rule deliberately not added.** An earlier review asked for
+`item_outcome: "uncertain"` to require an uncertain mention. It should not:
+"there may or may not be a person here" with zero mentions is coherent and
+correct output, and the rule would reject it. `research_people` and
+`do_not_research` both make positive claims about the mention list and are
+checked; `uncertain` claims nothing.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2096,6 +2827,35 @@ def test_schema_forbids_additional_properties_everywhere():
     walk(detection_schema(max_people=8))
 
 
+def _signal_schema():
+    mention = detection_schema(max_people=8)["properties"]["mentions"]["items"]
+    return mention["properties"]["signals"]["items"]
+
+
+def test_signal_kind_and_category_are_paired_in_the_schema():
+    # A nested union is accepted by strict mode and is what findings.md says
+    # to use here. Independent enums let the model emit a caution category
+    # under kind "attention" -- billable, then rejected.
+    variants = {
+        arm["properties"]["kind"]["enum"][0]: set(
+            arm["properties"]["category"]["enum"]
+        )
+        for arm in _signal_schema()["anyOf"]
+    }
+    assert set(variants) == {"attention", "caution"}
+    assert "single_event_only" in variants["caution"]
+    assert "single_event_only" not in variants["attention"]
+    assert "major_achievement" in variants["attention"]
+    assert "major_achievement" not in variants["caution"]
+
+
+def test_schema_does_not_offer_domain_profile_grounding():
+    # Phase 1 supplies no profile. Offering the value means paying for it
+    # before the validator refuses it.
+    for arm in _signal_schema()["anyOf"]:
+        assert arm["properties"]["grounding"]["enum"] == ["source_text"]
+
+
 # -- validation ----------------------------------------------------------
 
 def test_valid_output_parses():
@@ -2155,6 +2915,86 @@ def test_invented_name_is_rejected():
     with pytest.raises(DetectionInvalid, match="not grounded"):
         validate_detection(
             _output(mentions=[_mention(exact_name="Someone Else")]),
+            passages=PASSAGES,
+            max_people=8,
+        )
+
+
+def test_a_name_inside_a_longer_word_is_not_grounded():
+    # Plain substring containment accepts "Ana" for "Anastasia Poy" -- a name
+    # the supplied text does not contain.
+    passages = build_passages(
+        _item(title="Anastasia Poyner wins", summary="Anastasia Poyner in Paris."),
+        DetectConfig(model="m"),
+    )
+    with pytest.raises(DetectionInvalid, match="not grounded"):
+        validate_detection(
+            _output(
+                mentions=[_mention(exact_name="Ana", supporting_passage_ids=["p1"])]
+            ),
+            passages=passages,
+            max_people=8,
+        )
+
+
+def test_a_name_adjacent_to_punctuation_is_still_grounded():
+    # The boundary test must not reject a name that the text quotes or
+    # parenthesizes -- a far more common shape than the case above.
+    passages = build_passages(
+        _item(title='"Ana Poy" wins', summary="The winner (Ana Poy) spoke."),
+        DetectConfig(model="m"),
+    )
+    result = validate_detection(
+        _output(mentions=[_mention(identity_facts=[], supporting_passage_ids=["p1"])]),
+        passages=passages,
+        max_people=8,
+    )
+    assert result.mentions[0].exact_name == "Ana Poy"
+
+
+def test_overflow_requires_a_full_mention_list():
+    # overflow claims there were more people than the cap allowed, which
+    # cannot be true of a list with room left in it.
+    with pytest.raises(DetectionInvalid, match="overflow"):
+        validate_detection(
+            _output(mentions=[_mention()], overflow=True),
+            passages=PASSAGES,
+            max_people=8,
+        )
+
+
+def test_overflow_is_accepted_when_the_list_is_full():
+    result = validate_detection(
+        _output(mentions=[_mention()], overflow=True), passages=PASSAGES, max_people=1
+    )
+    assert result.overflow is True
+
+
+def test_item_outcome_uncertain_may_carry_no_mentions():
+    # The ported prompt permits this explicitly: "either no mentions are
+    # returned or at least one mention is `uncertain`". A rule requiring an
+    # uncertain mention would reject valid output.
+    result = validate_detection(
+        _output(item_outcome="uncertain", mentions=[]), passages=PASSAGES, max_people=8
+    )
+    assert result.mentions == ()
+
+
+def test_item_outcome_uncertain_may_carry_an_uncertain_mention():
+    result = validate_detection(
+        _output(item_outcome="uncertain", mentions=[_mention(outcome="uncertain")]),
+        passages=PASSAGES,
+        max_people=8,
+    )
+    assert result.mentions[0].research_worthy is True
+
+
+def test_item_outcome_uncertain_contradicts_a_research_mention():
+    # "Item `uncertain` iff no mention is `research`". Without this the model
+    # can return an internally inconsistent answer that is cached permanently.
+    with pytest.raises(DetectionInvalid, match="uncertain"):
+        validate_detection(
+            _output(item_outcome="uncertain", mentions=[_mention(outcome="research")]),
             passages=PASSAGES,
             max_people=8,
         )
@@ -2228,6 +3068,9 @@ def test_ungrounded_identity_fact_value_is_rejected():
 
 
 def test_domain_profile_grounding_is_rejected_since_no_profile_is_supplied():
+    # Belt and braces. The schema no longer offers this value, so a conforming
+    # model cannot produce it; the validator rule stays because the schema is
+    # the provider's promise and this is ours.
     with pytest.raises(DetectionInvalid, match="domain_profile"):
         validate_detection(
             _output(
@@ -2390,6 +3233,26 @@ def _object(properties: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _signal_variant(kind: str, categories: tuple[str, ...]) -> dict[str, Any]:
+    """One arm of the signal union: a kind welded to its own category set."""
+    return _object(
+        {
+            "kind": _string(enum=[kind]),
+            "category": _string(enum=list(categories)),
+            "claim": _string(maxLength=1000),
+            "supporting_passage_ids": {
+                "type": "array",
+                "items": {"type": "string", "enum": list(PASSAGE_IDS)},
+                "minItems": 1,
+            },
+            # Phase 1 supplies no domain profile, so `domain_profile` is not
+            # offered. Making it representable means paying for it before the
+            # validator refuses it.
+            "grounding": _string(enum=["source_text"]),
+        }
+    )
+
+
 def detection_schema(*, max_people: int) -> dict[str, object]:
     """The wire schema, capped at `max_people`.
 
@@ -2429,22 +3292,17 @@ def detection_schema(*, max_people: int) -> dict[str, object]:
                         },
                         "signals": {
                             "type": "array",
-                            "items": _object(
-                                {
-                                    "kind": _string(enum=["attention", "caution"]),
-                                    "category": _string(
-                                        enum=[
-                                            *ATTENTION_CATEGORIES,
-                                            *CAUTION_CATEGORIES,
-                                        ]
-                                    ),
-                                    "claim": _string(maxLength=1000),
-                                    "supporting_passage_ids": passage_ids,
-                                    "grounding": _string(
-                                        enum=["source_text", "domain_profile"]
-                                    ),
-                                }
-                            ),
+                            # A union nested on a property, which strict mode
+                            # accepts -- only the root may not be one. Paired
+                            # this way, a caution category under kind
+                            # "attention" is unrepresentable rather than
+                            # billable-then-rejected (docs/findings.md).
+                            "items": {
+                                "anyOf": [
+                                    _signal_variant("attention", ATTENTION_CATEGORIES),
+                                    _signal_variant("caution", CAUTION_CATEGORIES),
+                                ]
+                            },
                         },
                         "rationale": _string(maxLength=1000),
                     }
@@ -2460,6 +3318,29 @@ def _contains(haystack: str, needle: str, *, fold_case: bool) -> bool:
     if fold_case:
         return needle.casefold() in haystack.casefold()
     return needle in haystack
+
+
+def _contains_whole(haystack: str, needle: str) -> bool:
+    """Containment that will not accept `Ana` for `Anastasia Poy`.
+
+    Case-sensitive, because a name is an identity. Bounded by "the adjacent
+    character is not a word character" rather than by `\\b`: names are not all
+    Latin-script and not all space-delimited, and `\\b` means nothing where
+    there are no word characters to bound.
+    """
+    if not needle:
+        return False
+    start = 0
+    while (index := haystack.find(needle, start)) != -1:
+        before = haystack[index - 1] if index > 0 else ""
+        after_index = index + len(needle)
+        after = haystack[after_index] if after_index < len(haystack) else ""
+        if not (before.isalnum() or before == "_") and not (
+            after.isalnum() or after == "_"
+        ):
+            return True
+        start = index + 1
+    return False
 
 
 def validate_detection(
@@ -2479,10 +3360,21 @@ def validate_detection(
     known = {passage.id for passage in passages}
     corpus = "\n".join(passage.text for passage in passages)
 
+    if output.overflow and len(output.mentions) < max_people:
+        # overflow asserts there were more people than the cap allowed, which
+        # cannot be true of a list that is not full. Not expressible in the
+        # schema: it relates two root-level properties, and strict mode has no
+        # `if`/`then` and rejects a root-level union (docs/findings.md).
+        raise DetectionInvalid(
+            f"overflow is set but only {len(output.mentions)} of {max_people} "
+            "mention slots were used"
+        )
+
     for mention in output.mentions:
         _check_references(mention.supporting_passage_ids, known)
-        # A name is an identity: grounding stays case-sensitive on purpose.
-        if not _contains(corpus, mention.exact_name, fold_case=False):
+        # A name is an identity: grounding stays case-sensitive, and matches
+        # whole words so `Ana` is not accepted for `Anastasia Poy`.
+        if not _contains_whole(corpus, mention.exact_name):
             raise DetectionInvalid("mention name is not grounded in supplied text")
 
         for fact in mention.identity_facts:
@@ -2532,12 +3424,21 @@ def _check_item_outcome(output: DetectionOutput) -> None:
         raise DetectionInvalid(
             "item_outcome do_not_research requires every mention to be do_not_research"
         )
+    # The ported prompt: "Item `uncertain` iff no mention is `research` and
+    # either no mentions are returned or at least one mention is `uncertain`."
+    # Only the first clause is enforced. The prompt's three rules overlap --
+    # an empty result satisfies both `do_not_research` and `uncertain` -- so
+    # enforcing them as full biconditionals would reject valid output.
+    if output.item_outcome == "uncertain" and "research" in outcomes:
+        raise DetectionInvalid(
+            "item_outcome uncertain contradicts a research mention"
+        )
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/mvp/test_detect_contract.py -v`
-Expected: 21 passed.
+Expected: 27 passed.
 
 - [ ] **Step 5: Verify the grounding rules actually discriminate**
 
@@ -2545,14 +3446,49 @@ Each of these must turn a passing test red. Restore after each.
 
 ```bash
 cp src/notable/detect_contract.py /tmp/dc.bak
-# 1. Make name grounding case-insensitive -> test_name_grounding_is_case_sensitive fails
-# 2. Make fact grounding case-sensitive   -> test_identity_fact_value_grounding_is_case_insensitive fails
-# 3. Drop the maxItems line               -> test_schema_caps_mentions_at_max_people fails
+# 1. Make name grounding case-insensitive    -> test_name_grounding_is_case_sensitive fails
+# 2. Make fact grounding case-sensitive      -> test_identity_fact_value_grounding_is_case_insensitive fails
+# 3. Drop the maxItems line                  -> test_schema_caps_mentions_at_max_people fails
+# 4. Swap _contains_whole for _contains       -> test_a_name_inside_a_longer_word_is_not_grounded fails
+# 5. Replace the signal anyOf with flat enums -> test_signal_kind_and_category_are_paired_in_the_schema fails
+# 6. Drop the overflow check                  -> test_overflow_requires_a_full_mention_list fails
+# 7. Drop the uncertain/research check        -> test_item_outcome_uncertain_contradicts_a_research_mention fails
 PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/mvp/test_detect_contract.py -q
 cp /tmp/dc.bak src/notable/detect_contract.py && diff /tmp/dc.bak src/notable/detect_contract.py
 ```
 
 Report which mutation killed which test. A rule that survives its own removal is untested.
+
+**Then verify the schema against the live router before Task 11 spends real
+money on it.** The nested `anyOf` is the one construct here that findings.md
+records as probed but that this exact schema has never sent. A single cheap
+call settles it:
+
+```bash
+set -a && . ./.env && set +a
+uv run python -c "
+import json, os, urllib.request
+from notable.detect_contract import detection_schema
+body = {
+  'model': 'openai/gpt-5.4-mini',
+  'messages': [{'role':'user','content':'Return an empty detection for a test.'}],
+  'response_format': {'type':'json_schema','json_schema':
+      {'name':'detect_people','strict':True,'schema':detection_schema(max_people=3)}},
+  'max_completion_tokens': 512,
+  'provider': {'require_parameters': True},
+}
+req = urllib.request.Request(
+  'https://openrouter.ai/api/v1/chat/completions',
+  data=json.dumps(body).encode(),
+  headers={'Authorization': f\"Bearer {os.environ['OPENROUTER_API_KEY']}\",
+           'Content-Type': 'application/json'})
+print(urllib.request.urlopen(req).status)
+"
+```
+
+Expected: `200`. An HTTP 400 means strict mode rejected the nested union after
+all — report it rather than working around it, because findings.md would then
+be wrong about something it paid to learn.
 
 - [ ] **Step 6: Commit**
 
@@ -2611,6 +3547,13 @@ GOOD = {
 
 
 class FakeLlm:
+    """Stands in for LlmClient, including its validation contract.
+
+    The real client calls `validate` before committing the response to cache,
+    so a fake that ignores it would let `people_in` pass while the production
+    path caches unvalidated output.
+    """
+
     def __init__(self, result=None, error=None):
         self.result, self.error, self.calls = result, error, []
 
@@ -2618,7 +3561,19 @@ class FakeLlm:
         self.calls.append(kwargs)
         if self.error:
             raise self.error
+        validate = kwargs.get("validate")
+        if validate is not None:
+            validate(self.result)
         return self.result
+
+
+def test_the_validator_is_passed_to_the_client_not_applied_after(make_config):
+    # Validating the return value instead would cache responses the domain
+    # rejects, so every retry replays the same bad answer for free until the
+    # item hits its attempt cap.
+    llm = FakeLlm(result=GOOD)
+    people_in(ITEM, make_config(), llm)
+    assert callable(llm.calls[0]["validate"])
 
 
 def test_returns_validated_mentions(make_config):
@@ -2684,6 +3639,7 @@ from notable.config import Config
 from notable.detect_contract import (
     DetectedMention,
     DetectionInvalid,
+    DetectionOutput,
     build_passages,
     detection_schema,
     validate_detection,
@@ -2728,8 +3684,23 @@ def people_in(
         "max_people": config.detect.max_people,
     }
 
+    # The validator is handed to the client rather than applied to its return
+    # value, so that domain rejection happens *before* the response is cached.
+    # Applied afterwards, a rejected response is already stored: every later
+    # retry replays the same bad answer without re-calling the provider, the
+    # item burns its attempt cap without a single new request, and the bad
+    # response lands in the fixture later phases are graded against.
+    held: list[DetectionOutput] = []
+
+    def _validate(raw: dict) -> None:
+        held.append(
+            validate_detection(
+                raw, passages=passages, max_people=config.detect.max_people
+            )
+        )
+
     try:
-        raw = llm.structured(
+        llm.structured(
             task="detect_people",
             model=config.detect.model,
             system=_system_prompt(),
@@ -2738,28 +3709,24 @@ def people_in(
             max_completion_tokens=config.detect.max_completion_tokens,
             reasoning_effort=config.detect.reasoning_effort,
             timeout=config.transport.llm_read_timeout_seconds,
+            validate=_validate,
         )
     except ProviderFailure as error:
         logger.warning("detect_people failed for %s: %s", item.url, error)
         raise Incomplete(f"detect_people failed for {item.url}") from error
-
-    try:
-        output = validate_detection(
-            raw, passages=passages, max_people=config.detect.max_people
-        )
     except DetectionInvalid as error:
         # Not retried in-run: a retry re-sends identical input, and the prior
         # programme measured twelve such retries with zero recoveries.
         logger.warning("detect_people output rejected for %s: %s", item.url, error)
         raise Incomplete(f"detect_people output rejected for {item.url}") from error
 
-    return output.mentions
+    return held[0].mentions
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/mvp/test_detect.py -v`
-Expected: 6 passed.
+Expected: 7 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -2785,6 +3752,34 @@ git commit -m "feat(detect): add the detection service with Incomplete on failur
   - `notable.digest.write(entries, directory: Path, *, generated_at, status, cost_usd, n_settled, n_incomplete) -> Path` — takes the directory, not the whole `Config`, so it stays testable without one.
 
 **Phase 1 note:** entries are *detected people*, not ranked leads. The heading says so. Phase 4 replaces the body with the ranked shortlist; the atomic write and `latest.md` handling stay.
+
+**Each run replaces its day's digest; it never merges into it.** The spec is
+explicit — "the digest renders from this run only… no backlog, no pending
+queue, no rendering from history" — and it states the cost rather than hiding
+it: a lead below the cutoff is not shown, its item is settled, and it is not
+found again. It stays in the `lead` log, and `digest_size` is set generously
+so the cutoff rarely binds.
+
+A draft of this plan merged the day's runs instead, to stop a second run that
+day blanking the first's digest. That was wrong on three counts, recorded here
+so it is not reinvented:
+
+- The problem is mostly procedural. A crash before `store.commit` leaves items
+  unsettled, so the replay re-detects the same people and rewrites the same
+  digest. Real loss needs a deliberate second run — which is what the live
+  procedure below does, and it handles it by saving the first digest, not by
+  changing the product.
+- Merging needs the day's entries read back from disk, which is cross-run
+  state the guardrails forbid and which the spec's `surfaced` table already
+  covers for the thing that matters.
+- It breaks Phase 4. The digest becomes a *ranked* shortlist cut at
+  `digest_size`; carried-over entries have no rank to sort by, so a weak
+  morning entry would permanently exclude a stronger afternoon one.
+
+`render` still collapses whitespace in every interpolated field, so a
+model-supplied rationale cannot inject a heading or break the document's
+shape. Nothing reads the digest back — that is about the artifact staying
+readable.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2814,14 +3809,24 @@ COUNTS = {
 }
 
 
+def _entry(name: str, n: int = 1) -> DigestEntry:
+    return DigestEntry(
+        identity_key=identity_key(name),
+        display_name=name,
+        source_url=f"https://a.test/{n}",
+        publisher_label="Feed A",
+        rationale="Named subject.",
+    )
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
         ("Ana Poy", "ana poy"),
         ("  Ana   Poy  ", "ana poy"),
         ("ANA POY", "ana poy"),
-        ("Ana Poy", "ana poy"),      # NFKC folds the non-breaking space
-        ("Ａna Poy", "ana poy"),      # NFKC folds fullwidth Latin
+        ("Ana\u00a0Poy", "ana poy"),   # NFKC folds the non-breaking space
+        ("\uff21na Poy", "ana poy"),   # NFKC folds fullwidth Latin
     ],
 )
 def test_identity_key_normalizes(raw, expected):
@@ -2852,6 +3857,19 @@ def test_empty_digest_is_still_a_valid_document():
     assert "No people detected" in text
 
 
+def test_a_multiline_rationale_cannot_forge_a_heading():
+    # Model-supplied text reaches the artifact. Nothing parses it back, but a
+    # rationale containing a line beginning "### " would still render a
+    # heading for a person nobody detected.
+    hostile = DigestEntry(
+        "x", "Ana Poy", "https://a.test/1", "Feed A",
+        "Won a prize.\n\n### Fake Person\n\n- Source: [x](https://evil.test/)",
+    )
+    headings = [line for line in render([hostile], **COUNTS).splitlines()
+                if line.startswith("### ")]
+    assert headings == ["### Ana Poy"]
+
+
 def test_write_creates_the_dated_file_and_latest(tmp_path):
     path = write([ENTRY], tmp_path, **COUNTS)
     assert path.parent == tmp_path
@@ -2866,11 +3884,20 @@ def test_write_leaves_no_temporary_file_behind(tmp_path):
 
 
 def test_write_replaces_an_existing_digest_for_the_same_day(tmp_path):
+    # The digest renders from this run only. The spec states the cost of that
+    # directly, and the `lead` log is where a dropped entry survives.
     write([ENTRY], tmp_path, **COUNTS)
-    second = DigestEntry("bo li", "Bo Li", "https://a.test/2", "Feed A", "Named.")
-    path = write([second], tmp_path, **COUNTS)
-    assert "Bo Li" in path.read_text("utf-8")
-    assert "Ana Poy" not in path.read_text("utf-8")
+    path = write([_entry("Bo Li", 2)], tmp_path, **COUNTS)
+    text = path.read_text("utf-8")
+    assert "Bo Li" in text
+    assert "Ana Poy" not in text
+    assert (tmp_path / "latest.md").read_text("utf-8") == text
+
+
+def test_an_empty_run_writes_an_empty_digest(tmp_path):
+    path = write([], tmp_path, **COUNTS)
+    assert "No people detected" in path.read_text("utf-8")
+    assert (tmp_path / "latest.md").exists()
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -2914,6 +3941,16 @@ def identity_key(name: str) -> str:
     return " ".join(folded.split())
 
 
+def _flat(value: str) -> str:
+    """Collapse whitespace so one field cannot become two lines.
+
+    Rationale text comes from the model and reaches the artifact. One
+    containing a line that begins `### ` would otherwise render a heading for
+    a person nobody detected.
+    """
+    return " ".join(value.split())
+
+
 def render(
     entries: Sequence[DigestEntry],
     *,
@@ -2942,10 +3979,12 @@ def render(
         lines.append("No people detected in this run.")
     else:
         for entry in entries:
-            lines.append(f"### {entry.display_name}")
+            lines.append(f"### {_flat(entry.display_name)}")
             lines.append("")
-            lines.append(f"- Source: [{entry.publisher_label}]({entry.source_url})")
-            lines.append(f"- Why: {entry.rationale}")
+            lines.append(
+                f"- Source: [{_flat(entry.publisher_label)}]({_flat(entry.source_url)})"
+            )
+            lines.append(f"- Why: {_flat(entry.rationale)}")
             lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -2965,8 +4004,12 @@ def write(
     Ordering is load-bearing: the files land before any state is committed. A
     crash between them repeats a digest next run, which is recoverable. The
     reverse would mark leads surfaced that were never seen.
+
+    The digest renders from this run only -- no history, no backlog. A second
+    run the same day replaces the file, and the spec accepts that cost.
     """
     directory.mkdir(parents=True, exist_ok=True)
+    dated = directory / f"{generated_at[:10]}.md"
     text = render(
         entries,
         generated_at=generated_at,
@@ -2975,7 +4018,6 @@ def write(
         n_settled=n_settled,
         n_incomplete=n_incomplete,
     )
-    dated = directory / f"{generated_at[:10]}.md"
     _atomic_write(dated, text)
     _atomic_write(directory / "latest.md", text)
     return dated
@@ -3001,7 +4043,7 @@ def _atomic_write(path: Path, text: str) -> None:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/mvp/test_digest.py -v`
-Expected: 12 passed.
+Expected: 14 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -3023,7 +4065,14 @@ git commit -m "feat(digest): add Markdown rendering and atomic digest writing"
 - Consumes: everything above.
 - Produces:
   - `notable.pipeline.Providers(transport: Transport, llm: LlmClient)` frozen dataclass.
-  - `notable.pipeline.run(config: Config, store: Store, providers: Providers, *, fresh_feeds: bool = False) -> Path`.
+  - `notable.pipeline.RunResult(digest_path: Path, summary: RunSummary)` frozen dataclass.
+  - `notable.pipeline.run(config: Config, store: Store, providers: Providers, *, fresh_feeds: bool = False) -> RunResult`.
+
+**Why `run` returns the summary and not just the path:** the run report has to
+describe *this* run. Reading it back from the `run` table would make a
+best-effort log authoritative — and `store.log` deliberately swallows its own
+failures, so a failed log write would leave the report describing the
+*previous* run's counts and spend, with no indication anything was wrong.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3091,9 +4140,23 @@ def _returning(mapping):
 
 def test_writes_a_digest_and_settles_items(make_config, store, providers, install):
     install([_item(1)], _returning({"https://a.test/1": (_mention("Ana Poy"),)}))
-    path = run(make_config(), store, providers)
+    path = run(make_config(), store, providers).digest_path
     assert "Ana Poy" in path.read_text("utf-8")
     assert store.is_eligible("https://a.test/1", max_attempts=3) is False
+
+
+def test_the_summary_describes_this_run_even_if_logging_fails(
+    make_config, store, providers, install, monkeypatch
+):
+    # store.log swallows its own failures by design. If the run report were
+    # read back from the `run` table, a failed log write would leave it
+    # describing the *previous* run, silently.
+    install([_item(1)], _returning({"https://a.test/1": (_mention("Ana Poy"),)}))
+    monkeypatch.setattr(store, "_insert_run", _boom)
+    result = run(make_config(), store, providers)
+    assert result.summary.settled == ["https://a.test/1"]
+    assert result.summary.cost_usd == Decimal("0.10")
+    assert store.connection.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 0
 
 
 def test_non_research_worthy_mentions_are_not_shown(
@@ -3105,7 +4168,7 @@ def test_non_research_worthy_mentions_are_not_shown(
             {"https://a.test/1": (_mention("Ana Poy", outcome="do_not_research"),)}
         ),
     )
-    path = run(make_config(), store, providers)
+    path = run(make_config(), store, providers).digest_path
     assert "Ana Poy" not in path.read_text("utf-8")
     assert store.is_eligible("https://a.test/1", max_attempts=3) is False
 
@@ -3119,7 +4182,7 @@ def test_an_incomplete_item_is_not_settled_and_contributes_nothing(
         return (_mention("Bo Li"),)
 
     install([_item(1), _item(2)], detect)
-    path = run(make_config(), store, providers)
+    path = run(make_config(), store, providers).digest_path
     text = path.read_text("utf-8")
     assert "Bo Li" in text
     assert "Run status: **partial**" in text
@@ -3141,7 +4204,7 @@ def test_incomplete_discards_earlier_mentions_of_the_same_item(
         return mentions()
 
     install([_item(1)], detect)
-    path = run(make_config(), store, providers)
+    path = run(make_config(), store, providers).digest_path
     text = path.read_text("utf-8")
     assert "Ana Poy" not in text and "Bo Li" not in text
     assert "No people detected" in text
@@ -3157,7 +4220,7 @@ def test_budget_exceeded_renders_what_finished(
         return (_mention("Ana Poy"),)
 
     install([_item(1), _item(2)], detect)
-    path = run(make_config(), store, providers)
+    path = run(make_config(), store, providers).digest_path
     text = path.read_text("utf-8")
     assert "Ana Poy" in text
     assert "Run status: **partial**" in text
@@ -3174,6 +4237,37 @@ def test_a_crash_before_commit_writes_nothing(
     assert store.is_eligible("https://a.test/1", max_attempts=3) is True
     assert store.connection.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 0
     assert store.connection.execute("SELECT COUNT(*) FROM item").fetchone()[0] == 0
+
+
+def test_a_mid_run_crash_replays_completed_calls_without_duplicate_work(
+    make_config, store, providers, install
+):
+    # This is the orchestration-level recovery invariant: item 1 completed
+    # before the crash is a cache hit on replay; item 2, which never completed,
+    # performs the only new call on the second run.
+    cached = {}
+    provider_calls = []
+    crash = [True]
+
+    def detect(item, cfg, llm):
+        if item.url in cached:
+            return cached[item.url]
+        if item.url.endswith("/2") and crash[0]:
+            raise RuntimeError("crash after the first completed item")
+        # Recorded only once the call has actually happened and would settle
+        # the item — a crash below this line must not count as a provider
+        # call, or a replayed retry looks like a duplicate call it never made.
+        provider_calls.append(item.url)
+        result = (_mention("Ana Poy" if item.url.endswith("/1") else "Bo Li"),)
+        cached[item.url] = result
+        return result
+
+    install([_item(1), _item(2)], detect)
+    with pytest.raises(RuntimeError):
+        run(make_config(), store, providers)
+    crash[0] = False
+    run(make_config(), store, providers)
+    assert provider_calls == ["https://a.test/1", "https://a.test/2"]
 
 
 def _boom(*_args, **_kwargs):
@@ -3210,13 +4304,23 @@ class Providers:
     llm: LlmClient
 
 
+@dataclass(frozen=True, slots=True)
+class RunResult:
+    """This run's outputs. The summary is returned rather than re-read from
+    the `run` table, because that table is a best-effort log whose writes are
+    allowed to fail silently."""
+
+    digest_path: Path
+    summary: RunSummary
+
+
 def run(
     config: Config,
     store: Store,
     providers: Providers,
     *,
     fresh_feeds: bool = False,
-) -> Path:
+) -> RunResult:
     started_at = datetime.now(UTC).isoformat(timespec="seconds")
     entries: list[digest.DigestEntry] = []
     settled: list[str] = []
@@ -3247,8 +4351,11 @@ def run(
         capped = True                         # render what finished
 
     summary = RunSummary(settled, incomplete, capped, providers.llm.spend(), started_at)
+    # Phase 1 has no ranking or shortlist yet: the detection digest must retain
+    # every research-worthy mention so the fixture exercises the full corpus.
+    # Phase 4 applies digest_size after ranking and duplicate collapse.
     written = digest.write(
-        entries[: config.digest_size],
+        entries,
         config.digest_dir,
         generated_at=datetime.now(UTC).isoformat(timespec="seconds"),
         status=summary.status,
@@ -3261,27 +4368,36 @@ def run(
     # do not move.
     store.commit(settled, incomplete, [])
     store.log(summary, [], str(written))
-    return written
+    return RunResult(digest_path=written, summary=summary)
 ```
 
 - [ ] **Step 4: Wire the CLI**
 
 Replace the `main` function in `src/notable/cli.py`:
 
+First add these imports at module level, beside the existing `argparse` and
+`notable.__version__` imports. `_report` annotates `Providers` and `RunResult`,
+so importing them inside `main` would leave both undefined at the point pyright
+resolves the annotation:
+
+```python
+import logging
+from pathlib import Path
+
+import httpx
+
+from notable.cache import Cache
+from notable.config import load_config
+from notable.http import Transport
+from notable.llm import LlmClient
+from notable.pipeline import Providers, RunResult, run
+from notable.store import Store
+```
+
+Nothing in `notable` imports `cli`, so there is no cycle to avoid here.
+
 ```python
 def main(argv: list[str] | None = None) -> int:
-    import logging
-    from pathlib import Path
-
-    import httpx
-
-    from notable.cache import Cache
-    from notable.config import load_config
-    from notable.http import Transport
-    from notable.llm import LlmClient
-    from notable.pipeline import Providers, run
-    from notable.store import Store
-
     parser = build_parser()
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -3309,12 +4425,52 @@ def main(argv: list[str] | None = None) -> int:
                     budget_usd=config.budget_usd,
                 ),
             )
-            written = run(config, store, providers, fresh_feeds=args.fresh_feeds)
+            result = run(config, store, providers, fresh_feeds=args.fresh_feeds)
+            report = _report(providers, result)
     finally:
         store.close()
 
-    print(written.read_text(encoding="utf-8"))
+    print(result.digest_path.read_text(encoding="utf-8"))
+    print(report)
     return 0
+
+
+def _report(providers: Providers, result: RunResult) -> str:
+    """What the run actually did, in numbers.
+
+    The live gate has to measure model calls, truncations, validation
+    failures, cache hits and misses, retries, 429s and real spend. None of
+    those are recoverable by grepping run output afterwards: a recovered 429
+    raises nothing and logs nothing, and a cache-file count is not a spend
+    figure.
+
+    Every number comes from this run's in-memory state. Reading them back from
+    the `run` table would make a log whose writes may silently fail into the
+    authority on what happened, so a failed log write would print the previous
+    run's figures as though they were this one's.
+    """
+    stats = providers.transport.stats
+    summary = result.summary
+    return "\n".join(
+        [
+            "--- run report ---",
+            f"status:            {summary.status}",
+            f"items settled:     {len(summary.settled)}",
+            f"items incomplete:  {len(summary.incomplete)}",
+            # "stopped at cap", not "capped": a run *has* a cap configured
+            # (always, for the live run) and separately may or may not have
+            # *hit* it. Conflating the two makes the fixture gate ambiguous.
+            f"stopped at cap:    {summary.capped}",
+            f"model calls:       {providers.llm.calls}",
+            f"truncated:         {providers.llm.truncations}",
+            f"cache hits/misses: {providers.transport.cache_hits}/"
+            f"{providers.transport.cache_misses}",
+            f"http attempts:     {stats.attempts} ({stats.retries} retries)",
+            f"rate limited:      {stats.rate_limited}",
+            f"measured spend:    ${summary.cost_usd}",
+            f"digest:            {result.digest_path}",
+        ]
+    )
 ```
 
 Add the `--config` argument inside `build_parser`, on the `run` subparser:
@@ -3322,10 +4478,14 @@ Add the `--config` argument inside `build_parser`, on the `run` subparser:
 ```python
     run.add_argument(
         "--config",
-        default="config/notable.toml",
+        default="config/mvp.local.toml",
         help="Path to the configuration file.",
     )
 ```
+
+**Not `config/notable.toml`.** That file already exists in this workspace and
+belongs to the prior programme. Defaulting to it would make a bare `notable
+run` try to load a foreign schema.
 
 - [ ] **Step 5: Run the whole suite to verify it passes**
 
@@ -3335,10 +4495,13 @@ Expected: all pass. Then check the guardrails:
 ```bash
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 find src -name '*.py' | xargs wc -l | tail -1
-awk '/^def run\(/,/^    return written/' src/notable/pipeline.py | wc -l
+awk '/^        for item in feeds.fetch_new/,/^    except BudgetExceeded:/' \
+  src/notable/pipeline.py | wc -l
 ```
 
-Expected: no errors; source well under 3,000 lines; the loop under 40 lines.
+Expected: no errors; source well under 3,000 lines; the main item loop under
+40 lines. The check intentionally measures the loop body, not the dataclass
+definitions and digest/commit plumbing around it.
 
 - [ ] **Step 6: Commit**
 
@@ -3352,31 +4515,95 @@ git commit -m "feat(pipeline): wire the detection-only walking skeleton"
 ### Task 11: The live run and its fixture
 
 **Files:**
-- Create: `config/notable.toml` (untracked — local configuration)
+- Create: `config/mvp.local.toml`, `config/mvp.feeds.local.toml` (untracked — local configuration)
 - Create: `tests/mvp/fixtures/phase1/` (recorded cache)
+- Create: `tests/mvp/fixtures/phase1_expected.toml` (the pass/fail gate)
 - Create: `tests/mvp/test_live.py`
 - Modify: `.gitignore`
 
 **Interfaces:**
 - Consumes: everything.
-- Produces: a committed fixture cache directory that later phases replay.
+- Produces: a committed fixture cache directory *and its expected results*, which later phases replay.
 
 **A digest appearing is not the success condition.** Nothing in this phase has met a provider, and `docs/findings.md` records that the prior programme's two most expensive defects were invisible offline and survived two independent static reviews. **A fixture recorded from an unexamined run encodes its bugs as expected behaviour.**
 
 - [ ] **Step 1: Create local configuration**
 
+**`config/` already holds the prior programme's local configuration, and none
+of it is an MVP input.** These files are untracked, so nothing in them is
+recoverable from git if it is overwritten:
+
+| Path | |
+| --- | --- |
+| `config/notable.toml` | 188 lines, prior schema |
+| `config/discovery-feeds.toml` | its feed list |
+| `config/discovery_profiles/` | domain profiles, deferred from the MVP |
+| `config/feeds.md`, `feeds.corrected.md`, `feeds.md.bak` | the legacy prototype's |
+
+`config/notable.toml` carries ten top-level keys the Phase 1 loader does not
+define — `timezone`, `domain_profile_file`, `source_policy_file`,
+`concurrency`, `digest`, `logging`, `mediawiki`, `pacing`, `brave`, `retry` —
+plus `secrets.brave_api_key`. Because every config model sets `extra="forbid"`,
+`load_config` rejects it outright before it reaches the feed list.
+
+**That rejection is correct behaviour, not a bug to accommodate.** The strict
+loader is what stops a stale key being silently ignored. Do not relax
+`extra="forbid"` to make this file load, and do not migrate it — Phase 1 uses
+its own `config/mvp.local.toml`, and the CLI defaults there rather than to
+`config/notable.toml` precisely so a bare `notable run` cannot pick it up.
+
+Leave all of it in place. It belongs to the operational fallback, which stays
+until product cutover.
+
 ```bash
-cp config/notable.example.toml config/notable.toml
-cp config/feeds.example.toml config/feeds.toml
+test -e config/mvp.local.toml && { echo "exists; not overwriting"; exit 1; }
+cp config/notable.example.toml config/mvp.local.toml
+cp config/feeds.example.toml config/mvp.feeds.local.toml
 ```
 
-Edit `config/notable.toml`: set `feeds_file = "feeds.toml"`, set a real `contact_url`, and **uncomment `openrouter_usd_per_run = "1.00"`** — the first live run must be capped.
+Edit `config/mvp.local.toml`: set `feeds_file = "mvp.feeds.local.toml"`,
+**uncomment `openrouter_usd_per_run = "1.00"`** — the first live run must have
+a spend cap **configured** — and set `[cache] dir = "../cache-phase1"`.
+
+**Leave `contact_url` exactly as shipped in `config/notable.example.toml`.**
+The cache key folds in the whole request profile, including `User-Agent`,
+which is derived from `contact_url` (`Transport.__init__`, Task 4) — proven by
+`test_contact_url_is_part_of_the_request_profile`. `_replay()` in Step 6 below
+loads `config/notable.example.toml`, not `mvp.local.toml`, to build the
+`Transport` that reads the fixture. If the two configs' `contact_url` values
+differ, every replayed request computes a cache key the fixture was never
+recorded under, and the whole offline-replay suite fails with "unexpected
+network call" — this is the acceptance gate the spec names as the pass/fail
+gate for every later phase, so this is not a cosmetic detail.
+
+Configuring a cap and *hitting* one are different things, and the fixture
+gate below depends on the difference: the run must have a cap set, and must
+finish without reaching it.
+
+**The recording runtime must start empty and be used by nothing else.** The
+fixture is promoted to the pass/fail gate for every later phase, so its cache
+and SQLite state must contain this run's work and only this run's. Recording
+from shared runtime paths would either fold in responses never examined by the
+inspection step or skip provider calls because an earlier database already
+marked items settled.
+
+```bash
+rm -rf cache-phase1 data-phase1 digests-phase1
+mkdir -p cache-phase1 data-phase1 digests-phase1
+```
+
+Set `data_dir = "../data-phase1"` and `digest_dir = "../digests-phase1"` so
+runtime state is isolated for every recording attempt. Add all three runtime
+directories to `.gitignore`.
 
 Add to `.gitignore`:
 
 ```gitignore
-/config/notable.toml
-/config/feeds.toml
+/config/mvp.local.toml
+/config/mvp.feeds.local.toml
+/cache-phase1/
+/data-phase1/
+/digests-phase1/
 ```
 
 - [ ] **Step 2: Verify configuration without spending anything**
@@ -3386,56 +4613,162 @@ set -a && . ./.env && set +a
 uv run python -c "
 from pathlib import Path
 from notable.config import load_config
-c = load_config(Path('config/notable.toml'))
+c = load_config(Path('config/mvp.local.toml'))
 print(f'{len(c.feeds)} feeds, cap {c.budget_usd}, model {c.detect.model}')
+print('data:', c.data_dir, '| digests:', c.digest_dir, '| cache:', c.cache.dir)
 print('key loaded:', bool(c.openrouter_api_key))
 "
 ```
 
-Expected: 10 feeds, a cap, the model id, and `key loaded: True`. **The key itself must never print.**
+Expected: 10 feeds, a cap, the model id, three paths at the **repository
+root** (not under `config/`), and `key loaded: True`. **The key itself must
+never print.**
 
 - [ ] **Step 3: Do a first live run**
 
 ```bash
 set -a && . ./.env && set +a
-time uv run notable run 2>&1 | tee /tmp/phase1-run.log
+set -o pipefail
+time uv run notable run --config config/mvp.local.toml 2>&1 | tee /tmp/phase1-run.log
+echo "exit: $?"
 ```
+
+`pipefail` matters: without it the pipeline's status is `tee`'s, so a run that
+died reports success.
 
 - [ ] **Step 4: Examine the run before trusting it**
 
-This is the step that matters. Work through all six:
+This is the step that matters, and it is the step `docs/findings.md` says the
+prior programme skipped twice. The run report at the end of the log carries
+most of it directly — model calls, truncations, cache hits and misses, retries,
+429s, and **measured spend from `usage.cost`**, not a proxy for it.
 
 ```bash
-# 1. Raw model responses -- read three in full, not just the parsed result.
-find data/cache -name '*.json' | head -3 | xargs -I{} sh -c 'python -m json.tool {} | head -40'
-
-# 2. Validation failures and their reasons.
-grep -c "output rejected" /tmp/phase1-run.log
-grep "output rejected" /tmp/phase1-run.log | head
-
-# 3. Truncation: any response cut off mid-string is a completion-budget bug,
-#    not a model bug. Raise max_completion_tokens with max_people.
-grep -ci "unterminated\|Expecting" /tmp/phase1-run.log
-
-# 4. Cache replay actually works.
-sqlite3 data/notable.db "SELECT status, n_items_settled, n_items_incomplete, cost_usd FROM run"
-time uv run notable run          # second run: should be seconds, near-zero cost
-sqlite3 data/notable.db "SELECT cost_usd FROM run ORDER BY id DESC LIMIT 1"
-
-# 5. Measured spend against estimate.
-find data/cache -name '*.json' | wc -l
-
-# 6. Pacing and 429s.
-grep -c "429" /tmp/phase1-run.log
+# 1. The report itself. Every number below comes from instrumentation, not
+#    from inference over log text.
+sed -n '/--- run report ---/,$p' /tmp/phase1-run.log
 ```
 
-Expected: the second run costs about $0.00 and settles 0 new items. A non-zero `429` count means `per_host_min_interval_ms` is too low. Any truncation means fix `max_completion_tokens` and re-run **before** recording the fixture.
+Read it against these expectations:
+
+| Line | Expected | If not |
+| --- | --- | --- |
+| `truncated` | `0` | Raise `max_completion_tokens` **and** `max_people` together, re-run, do not record the fixture |
+| `rate limited` | `0` | `per_host_min_interval_ms` is too low |
+| `items incomplete` | `0` | Each has a reason in the log; read them. **Must be 0 to record the fixture** — a rejected response is not cached, so the replay cannot reproduce it |
+| `measured spend` | ≲ $0.30 at 10 feeds | Compare against findings.md's $1.08 for 246 items across the *full* pipeline |
+
+```bash
+# 2. Raw model responses -- read three in full. Filter to model calls: the
+#    cache also holds feed XML, and `head -3` over the whole tree mostly
+#    returns those. Do not truncate; the point is to see the whole response.
+grep -rl '"choices"' cache-phase1 --include='*.json' | head -3 | while read -r f; do
+  echo "=== $f"; python3 -m json.tool "$f"
+done
+
+# 3. Validation failures and their reasons, in full.
+grep "output rejected" /tmp/phase1-run.log || echo "none"
+
+# 4. Save the digest BEFORE running again. The digest renders from this run
+#    only, and every item is now settled -- so the second run legitimately
+#    detects nobody and replaces the file with an empty one. That is correct
+#    behaviour, not a bug, but it means the artifact you are about to judge
+#    exists only until the next run.
+cp digests-phase1/latest.md /tmp/phase1-digest.md
+
+# 5. Cache replay actually works. The second run must be seconds and free.
+sqlite3 data-phase1/notable.db "SELECT id, status, n_items_settled, n_items_incomplete, cost_usd FROM run"
+time uv run notable run --config config/mvp.local.toml 2>&1 | tail -20
+sqlite3 data-phase1/notable.db "SELECT cost_usd FROM run ORDER BY id DESC LIMIT 1"
+```
+
+Expected: the second run reports `model calls: 0`, `measured spend: $0`, and 0
+new items settled — because every item is already settled, so none is eligible
+and the loop never reaches a model call.
+
+**That is a weaker check than it looks, and it is not the cache verification.**
+A second run re-reads only the *feed* cache; it cannot exercise a single model
+cache entry, because it never asks for one. Its `cache hits` will be roughly
+the feed count, nowhere near the first run's misses. What actually proves model
+replay works is `test_recorded_run_replays_offline_with_no_network`, which
+starts from an empty store — so every item is eligible, every model call is
+requested, and all of them must be served from the fixture with
+`providers.llm.calls == 0` against a transport that raises on any network
+access.
+
+`digests-phase1/latest.md` now reads "No people detected", which is right: no item
+was eligible, so the run detected nobody and rendered that. The first run's
+digest is the copy at `/tmp/phase1-digest.md`, and that is the one to read in
+the next step.
+
+- [ ] **Step 4a: Write down what the corpus should surface**
+
+The spec makes this the pass/fail gate for every later phase: "an
+expected-results file naming each person the corpus should surface, their
+required outcome class, and the people that must *not* be surfaced." A fixture
+without one records behaviour but asserts nothing, so a regression in Phase 2
+or 3 shows up as a different digest that no test objects to.
+
+Read `/tmp/phase1-digest.md` and write `tests/mvp/fixtures/phase1_expected.toml`
+**by hand**, from your own judgement of the source items — not by transcribing
+whatever the run produced. Transcribing makes the file agree with the code by
+construction, which is what it exists to stop.
+
+```toml
+# What the phase 1 corpus should surface. Phase 1 detects people only; the
+# outcome classes arrive in Phase 4 and this file grows a column then.
+#
+# These counts are asserted, not documentation. Fill the item counts from the
+# run report and n_detected from the saved digest's entry headings.
+n_items_settled = 0
+n_items_incomplete = 0
+n_detected = 0
+
+# The people a correct run detects -- compared as an exact set against the
+# digest's entry headings, so this must list every name the digest shows. A
+# name that disappears is a regression; so is one that appears.
+must_detect = ["", ""]
+
+# People a correct run must NOT detect: passing mentions, organizations
+# mistaken for people, bylines. Redundant against the exact-set check above,
+# but a failure here names which one came back.
+must_not_detect = ["", ""]
+```
+
+`must_detect` must equal the digest exactly, so `n_detected` equals its length.
+If you disagree with a name the run produced, it goes in `must_not_detect`
+*and* stays out of `must_detect`, and the test then fails until the detection
+is fixed — that failure is the point, not something to edit away.
 
 - [ ] **Step 5: Record the fixture only once the run is clean**
 
+**The run must be fully replayable, or the fixture cannot be one.** Only
+validated successes are cached, so anything the run *failed* at left no cache
+entry — and the offline replay starts from an empty store, requests that call
+again, misses, and hits `_refuse`. A fixture recorded from a partial run is a
+test that cannot pass.
+
+Three conditions, all from the run report, all hard gates:
+
+| Condition | Why |
+| --- | --- |
+| `items incomplete: 0` | A rejected model response was deliberately not cached; the replay will request it and find nothing |
+| `stopped at cap: False` | The cap must be *configured* but not *reached*. A run that hit it stopped early, so the items after that point have no cache entries |
+| every feed fetched | A failed feed is not cached either, and `fetch_new` swallows the failure — so this one is silent |
+
+```bash
+# Feeds are only cached when feedparser could read them. Compare against the
+# configured count; fetch_new logs a warning per failure but does not fail.
+grep -c "feed fetch failed\|did not parse" /tmp/phase1-run.log
+```
+
+Expected: `0`. If any condition fails, fix the cause and re-record from an
+empty `cache-phase1` — do not record a partial run and do not paper over it by
+letting the replay reach the network.
+
 ```bash
 mkdir -p tests/mvp/fixtures/phase1
-cp -R data/cache/. tests/mvp/fixtures/phase1/
+cp -R cache-phase1/. tests/mvp/fixtures/phase1/
 grep -rl "sk-" tests/mvp/fixtures/phase1/ || echo "no secrets in fixture"
 du -sh tests/mvp/fixtures/phase1
 ```
@@ -3449,7 +4782,10 @@ The `grep` must print `no secrets in fixture`. If it lists files, **stop** — t
 ```python
 """Replay of a recorded live run, plus the opt-in live smoke."""
 
+import re
 import shutil
+import time
+import tomllib
 from pathlib import Path
 
 import httpx
@@ -3457,21 +4793,24 @@ import pytest
 
 from notable.cache import Cache
 from notable.config import load_config
+from notable.detect_contract import detection_schema
 from notable.http import Transport
 from notable.llm import LlmClient
 from notable.pipeline import Providers, run
 from notable.store import Store
 
 FIXTURE = Path("tests/mvp/fixtures/phase1")
+EXPECTED = Path("tests/mvp/fixtures/phase1_expected.toml")
+
+# The fixture is a required acceptance artifact, not an optional test input.
+# Once this file is committed, a missing directory must fail the suite loudly.
 
 
 def _refuse(request):  # pragma: no cover - only fires on a cache miss
     raise AssertionError(f"unexpected network call to {request.url}")
 
 
-@pytest.mark.skipif(not FIXTURE.exists(), reason="fixture not recorded yet")
-def test_recorded_run_replays_offline_with_no_network(tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+def _replay(tmp_path, *, clock=time.time):
     cache_dir = tmp_path / "cache"
     shutil.copytree(FIXTURE, cache_dir)
     loaded = load_config(Path("config/notable.example.toml"))
@@ -3486,29 +4825,150 @@ def test_recorded_run_replays_offline_with_no_network(tmp_path, monkeypatch):
     )
     store = Store(tmp_path / "db.sqlite")
     client = httpx.Client(transport=httpx.MockTransport(_refuse))
-    transport = Transport(config.transport, Cache(cache_dir), client=client, sleep=lambda _s: None)
+    # ignore_ttl: recorded responses stay valid fixtures indefinitely. Without
+    # it the feed entries age past feed_ttl_seconds twelve hours after
+    # recording, miss, and hit _refuse -- so this test would pass for half a
+    # day and then fail permanently, on a change that had nothing to do with it.
+    transport = Transport(
+        config.transport,
+        Cache(cache_dir, clock, ignore_ttl=True),
+        client=client,
+        sleep=lambda _s: None,
+    )
     providers = Providers(
         transport=transport,
         llm=LlmClient(transport, config.openrouter, api_key="sk-test", budget_usd=None),
     )
-    written = run(config, store, providers)
-    assert written.exists()
+    return config, store, providers
+
+
+def test_recorded_run_replays_offline_with_no_network(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    config, store, providers = _replay(tmp_path)
+    result = run(config, store, providers)
+    assert result.digest_path.exists()
     assert store.connection.execute("SELECT COUNT(*) FROM item").fetchone()[0] > 0
+    assert providers.llm.calls == 0, "a replay must make no provider call"
+    assert providers.llm.spend() == 0
     store.close()
 
 
+def _detected_names(digest_text: str) -> list[str]:
+    """The people the digest actually lists, from its entry headings.
+
+    Substring searches over the whole document do not work as a gate: a name
+    that appears only inside another entry's rationale would satisfy
+    `must_detect`, and an unexpected person passes unnoticed unless someone
+    thought to name them in `must_not_detect`.
+    """
+    return re.findall(r"^### (.+)$", digest_text, re.MULTILINE)
+
+
+def test_the_fixture_corpus_surfaces_exactly_the_people_it_should(
+    tmp_path, monkeypatch
+):
+    """The pass/fail gate the spec's acceptance criteria name.
+
+    Exact-set comparison, not containment: the gate has to fail on a person
+    who appears as much as on one who disappears. Without that, Phase 2 and 3
+    regressions show up only as a digest nobody is comparing.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    expected = tomllib.loads(EXPECTED.read_text("utf-8"))
+    config, store, providers = _replay(tmp_path)
+    result = run(config, store, providers)
+    store.close()
+
+    detected = _detected_names(result.digest_path.read_text("utf-8"))
+    assert sorted(detected) == sorted(expected["must_detect"])
+    # Redundant against the equality above, but it names the regression: a
+    # failure here says *which* person came back.
+    for name in expected["must_not_detect"]:
+        assert name not in detected, f"{name} must not be surfaced by this corpus"
+
+
+def test_the_fixture_replays_long_after_its_ttls_expire(tmp_path, monkeypatch):
+    """The fixture must not rot.
+
+    Its entries keep their original `stored_at` while the clock moves on, so
+    without `ignore_ttl` the feed entries expire twelve hours after recording,
+    miss, and hit `_refuse` -- the replay would pass for half a day and then
+    fail permanently, on a change that had nothing to do with it.
+
+    An injected clock rather than `faketime`: this must run on every machine
+    and in CI, not only where an external tool happens to be installed.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    a_month_on = time.time() + 30 * 86400
+    config, store, providers = _replay(tmp_path, clock=lambda: a_month_on)
+    result = run(config, store, providers)
+    store.close()
+    assert result.digest_path.exists()
+    assert providers.llm.calls == 0, "every call must still be served from the fixture"
+
+
+def test_the_fixture_corpus_settles_the_items_it_should(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    expected = tomllib.loads(EXPECTED.read_text("utf-8"))
+    config, store, providers = _replay(tmp_path)
+    result = run(config, store, providers)
+    store.close()
+
+    assert len(result.summary.settled) == expected["n_items_settled"]
+    assert len(result.summary.incomplete) == expected["n_items_incomplete"]
+    assert len(_detected_names(result.digest_path.read_text("utf-8"))) == (
+        expected["n_detected"]
+    )
+
+
 @pytest.mark.live
-def test_live_detection_smoke():
-    """Opt-in: uv run pytest tests/mvp -m live -v"""
-    config = load_config(Path("config/notable.toml"))
+def test_live_detection_smoke(tmp_path):
+    """Opt-in: uv run pytest tests/mvp -m live -v
+
+    This makes one real, cheap model call. A "live smoke" that only loads
+    configuration proves nothing about the provider, and findings.md is
+    explicit that a written live test is not evidence until it has run.
+    """
+    config = load_config(Path("config/mvp.local.toml"))
     assert config.budget_usd is not None, "never run live without a cap"
+
+    client = httpx.Client()
+    # A throwaway cache, not `config.cache.dir`. Against the production cache
+    # the second invocation would be served from disk, making no call at all
+    # -- so the assertions below would pass without touching the provider on
+    # the first run and fail on `spend() > 0` on every run after it.
+    transport = Transport(
+        config.transport, Cache(tmp_path / "cache"), client=client
+    )
+    llm = LlmClient(
+        transport,
+        config.openrouter,
+        api_key=config.openrouter_api_key,
+        budget_usd=config.budget_usd,
+    )
+    result = llm.structured(
+        task="detect_people",
+        model=config.detect.model,
+        system="Return a detection with no mentions.",
+        user_payload={"passages": []},
+        schema=detection_schema(max_people=3),
+        max_completion_tokens=config.detect.max_completion_tokens,
+        reasoning_effort=config.detect.reasoning_effort,
+        timeout=config.transport.llm_read_timeout_seconds,
+    )
+    # The point is that the strict schema, the nested signal union, the wire
+    # field names and usage.cost all survive contact with the real router.
+    assert "item_outcome" in result
+    assert llm.truncations == 0
+    assert llm.spend() > 0, "usage.cost must be reported, or the cap is blind"
 ```
 
 - [ ] **Step 7: Run the full suite and commit**
 
 ```bash
 uv run pytest tests/mvp -v
-git add tests/mvp/fixtures/phase1 tests/mvp/test_live.py .gitignore
+git add tests/mvp/fixtures/phase1 tests/mvp/fixtures/phase1_expected.toml \
+        tests/mvp/test_live.py .gitignore
 git commit -m "test: record the phase 1 live-run cache as a replay fixture"
 ```
 
@@ -3527,7 +4987,19 @@ git status --short
 git diff --check
 ```
 
-All must pass, the working tree must be clean, and source must be under 3,000 lines.
+All must pass and source must be under 3,000 lines.
+
+As in Phase 0, **"clean" means nothing this phase created is left
+uncommitted** — not an empty `git status`. The prior programme's untracked
+`config/` files and `.worktrees/` remain by design, and `config/mvp.local.toml`,
+`config/mvp.feeds.local.toml`, `cache-phase1/`, `data-phase1/`, and
+`digests-phase1/` are all gitignored. Check the phase's own work instead:
+
+```bash
+git status --short -- src tests pyproject.toml uv.lock .gitignore 'config/*.example.toml'
+```
+
+Expected: no output.
 
 Then confirm the four spec invariants hold in the shipped code, by reading `pipeline.py`:
 
@@ -3536,4 +5008,32 @@ Then confirm the four spec invariants hold in the shipped code, by reading `pipe
 3. `item_entries` is local to the item, so `Incomplete` discards it.
 4. `BudgetExceeded` is caught in `run`, not in `cli.py`.
 
-**Report from the live run:** items fetched, items settled, items incomplete, validation failures with reasons, measured spend, second-run replay cost, and any 429s. That report — not the digest's existence — is what says Phase 1 is done.
+And confirm the cache boundary, which is the invariant the rest of the
+programme depends on and the easiest to erode:
+
+5. `Transport.request` writes to the cache only via `commit()`, and **every**
+   caller passes `defer_cache=True` — model calls *and* feed fetches. A
+   response is not a success until whatever will parse it has parsed it.
+6. `LlmClient.structured` calls `response.commit()` **after** `validate`, and
+   nowhere else. `feeds.fetch_new` commits only after feedparser yields.
+7. The run report is built from `RunResult.summary`, never from the `run`
+   table — that table is a log whose writes are allowed to fail silently.
+8. `digest.write` reads nothing. The digest renders from this run only; the
+   pipeline reads no prior run's output except the two state tables and the
+   cache.
+
+**Report from the live run**, verbatim from the run report plus your own
+reading:
+
+- items fetched, settled, incomplete;
+- model calls, truncations, validation failures **with their reasons**;
+- cache hits and misses on both runs, confirming replay actually works;
+- measured spend from `usage.cost`, against findings.md's $1.08/246-item
+  baseline;
+- retries and 429s;
+- the people the corpus surfaced, and your judgement of which are right —
+  which becomes `phase1_expected.toml`.
+
+That report — not the digest's existence — is what says Phase 1 is done.
+`docs/findings.md`: "A written live smoke test is not evidence until it has
+actually run."
