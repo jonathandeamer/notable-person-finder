@@ -1,0 +1,57 @@
+schema_version = 1
+feeds_file = "feeds.example.toml"
+
+# Runtime paths, resolved relative to *this file*, which lives in config/.
+# Hence the `../`: without it a run writes its database, digests and cache
+# under config/, where Phase 0's .gitignore patterns (`/data/`, `/digests/`,
+# `/cache/`) do not match them and a live run's state becomes committable.
+# These two lines and those three patterns are a matched pair.
+data_dir = "../data"
+digest_dir = "../digests"
+
+# How many people the digest shows. Leads below the cut are logged, not
+# queued: there is no backlog. Set this generously.
+digest_size = 20
+resurface_after_days = 30
+# An item that fails this many times is abandoned rather than retried daily.
+max_item_attempts = 3
+
+[secrets]
+# Names of environment variables. Never put a key in this file.
+openrouter_api_key = "OPENROUTER_API_KEY"
+
+[transport]
+# Appended to the user agent so operators can contact you. Required by
+# MediaWiki's API etiquette policy.
+contact_url = "https://example.com/contact"
+connect_timeout_seconds = 10.0
+read_timeout_seconds = 30.0
+llm_read_timeout_seconds = 300.0
+max_attempts = 3
+initial_backoff_seconds = 1.0
+per_host_min_interval_ms = 900
+
+[cache]
+dir = "../cache"
+# Longer than a full run, so a crash-and-restart does not get a different feed
+# snapshot; far shorter than a day, so the daily run sees fresh content.
+feed_ttl_seconds = 43200
+# Brave and MediaWiki must not be permanent: a person who gains a Wikipedia
+# page would otherwise be judged forever on a stale snapshot.
+discovery_ttl_seconds = 86400
+
+[budget]
+# Optional soft cap as a decimal USD string. One-call overshoot is accepted.
+# openrouter_usd_per_run = "2.00"
+
+[openrouter]
+endpoint = "https://openrouter.ai/api/v1"
+
+[tasks.detect_people]
+model = "openai/gpt-5.4-mini"
+# Raise this with max_people, never independently. See docs/findings.md.
+max_completion_tokens = 4096
+max_people = 8
+max_title_characters = 500
+max_summary_characters = 4000
+reasoning_effort = "low"
