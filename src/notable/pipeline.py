@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from notable import detect, digest, feeds
+from notable import detect, digest, feeds, wiki
 from notable.config import Config
 from notable.errors import BudgetExceeded, Incomplete
 from notable.http import Transport
@@ -51,6 +51,11 @@ def run(
                 for mention in detect.people_in(item, config, providers.llm):
                     if not mention.research_worthy:
                         continue
+                    verdict = wiki.match(
+                        mention, config, providers.transport, providers.llm
+                    )
+                    if verdict.has_page:
+                        continue
                     item_entries.append(
                         digest.DigestEntry(
                             identity_key=digest.identity_key(mention.exact_name),
@@ -69,8 +74,9 @@ def run(
         capped = True  # render what finished
 
     summary = RunSummary(settled, incomplete, capped, providers.llm.spend(), started_at)
-    # Phase 1 has no ranking or shortlist yet: the detection digest must retain
-    # every research-worthy mention so the fixture exercises the full corpus.
+    # Phase 2 filters out mentions with a matching Wikipedia page but still
+    # has no ranking or shortlist: the digest retains every remaining
+    # research-worthy mention so the fixture exercises the full corpus.
     # Phase 4 applies digest_size after ranking and duplicate collapse.
     written = digest.write(
         entries,

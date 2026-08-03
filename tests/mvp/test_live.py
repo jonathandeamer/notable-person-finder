@@ -16,12 +16,17 @@ from notable.http import Transport
 from notable.llm import LlmClient
 from notable.pipeline import Providers, run
 from notable.store import Store
+from notable.wiki_contract import MatchVerdict
 
 FIXTURE = Path("tests/mvp/fixtures/phase1")
 EXPECTED = Path("tests/mvp/fixtures/phase1_expected.toml")
 
 # The fixture is a required acceptance artifact, not an optional test input.
 # Once this file is committed, a missing directory must fail the suite loudly.
+
+_NO_PAGE = MatchVerdict(
+    outcome="no_matching_page", selected_page_id=None, rationale="t"
+)
 
 
 def _refuse(request):  # pragma: no cover - only fires on a cache miss
@@ -62,6 +67,10 @@ def _replay(tmp_path, *, clock=time.time):
 
 def test_recorded_run_replays_offline_with_no_network(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setattr(
+        "notable.wiki.match",
+        lambda mention, cfg, transport, llm: _NO_PAGE,
+    )
     config, store, providers = _replay(tmp_path)
     result = run(config, store, providers)
     assert result.digest_path.exists()
@@ -92,6 +101,10 @@ def test_the_fixture_corpus_surfaces_exactly_the_people_it_should(
     regressions show up only as a digest nobody is comparing.
     """
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setattr(
+        "notable.wiki.match",
+        lambda mention, cfg, transport, llm: _NO_PAGE,
+    )
     expected = tomllib.loads(EXPECTED.read_text("utf-8"))
     config, store, providers = _replay(tmp_path)
     result = run(config, store, providers)
@@ -117,6 +130,10 @@ def test_the_fixture_replays_long_after_its_ttls_expire(tmp_path, monkeypatch):
     and in CI, not only where an external tool happens to be installed.
     """
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setattr(
+        "notable.wiki.match",
+        lambda mention, cfg, transport, llm: _NO_PAGE,
+    )
     a_month_on = time.time() + 30 * 86400
     config, store, providers = _replay(tmp_path, clock=lambda: a_month_on)
     result = run(config, store, providers)
@@ -127,6 +144,10 @@ def test_the_fixture_replays_long_after_its_ttls_expire(tmp_path, monkeypatch):
 
 def test_the_fixture_corpus_settles_the_items_it_should(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setattr(
+        "notable.wiki.match",
+        lambda mention, cfg, transport, llm: _NO_PAGE,
+    )
     expected = tomllib.loads(EXPECTED.read_text("utf-8"))
     config, store, providers = _replay(tmp_path)
     result = run(config, store, providers)

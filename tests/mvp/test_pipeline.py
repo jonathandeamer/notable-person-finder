@@ -9,6 +9,7 @@ from notable.feeds import SourceItem
 from notable.http import Transport
 from notable.llm import LlmClient
 from notable.pipeline import Providers, run
+from notable.wiki_contract import MatchVerdict
 
 
 def _item(n: int) -> SourceItem:
@@ -41,21 +42,30 @@ def providers() -> Providers:
     return Providers(transport=cast(Transport, None), llm=cast(LlmClient, FakeLlm()))
 
 
+def _returning(mapping):
+    return lambda item, cfg, llm: mapping[item.url]
+
+
+_NO_PAGE = MatchVerdict(
+    outcome="no_matching_page", selected_page_id=None, rationale="t"
+)
+
+
 @pytest.fixture
 def install(monkeypatch):
-    """Patch the two seams the pipeline calls. monkeypatch undoes both."""
+    """Patch the three seams the pipeline calls. monkeypatch undoes all three."""
 
-    def apply(items, detect_fn):
+    def apply(items, detect_fn, match_fn=None):
         monkeypatch.setattr(
             "notable.pipeline.feeds.fetch_new", lambda *a, **k: iter(items)
         )
         monkeypatch.setattr("notable.pipeline.detect.people_in", detect_fn)
+        monkeypatch.setattr(
+            "notable.pipeline.wiki.match",
+            match_fn or (lambda mention, cfg, transport, llm: _NO_PAGE),
+        )
 
     return apply
-
-
-def _returning(mapping):
-    return lambda item, cfg, llm: mapping[item.url]
 
 
 def test_writes_a_digest_and_settles_items(make_config, store, providers, install):
@@ -186,6 +196,34 @@ def test_a_mid_run_crash_replays_completed_calls_without_duplicate_work(
     crash[0] = False
     run(make_config(), store, providers)
     assert provider_calls == ["https://a.test/1", "https://a.test/2"]
+
+
+def test_a_matching_wikipedia_page_produces_no_digest_entry(
+    make_config, store, providers, install
+):
+    verdict = MatchVerdict(outcome="matching_page", selected_page_id=1, rationale="r")
+    install(
+        [_item(1)],
+        _returning({"https://a.test/1": (_mention("Ana Poy"),)}),
+        match_fn=lambda mention, cfg, transport, llm: verdict,
+    )
+    path = run(make_config(), store, providers).digest_path
+    assert "Ana Poy" not in path.read_text("utf-8")
+    assert store.is_eligible("https://a.test/1", max_attempts=3) is False
+
+
+def test_uncertain_and_no_matching_page_still_produce_entries(
+    make_config, store, providers, install
+):
+    for outcome in ("uncertain", "no_matching_page"):
+        verdict = MatchVerdict(outcome=outcome, selected_page_id=None, rationale="r")
+        install(
+            [_item(1)],
+            _returning({"https://a.test/1": (_mention("Ana Poy"),)}),
+            match_fn=lambda mention, cfg, transport, llm, v=verdict: v,
+        )
+        path = run(make_config(), store, providers).digest_path
+        assert "Ana Poy" in path.read_text("utf-8")
 
 
 def _boom(*_args, **_kwargs):
