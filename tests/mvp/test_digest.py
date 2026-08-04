@@ -1,15 +1,23 @@
 from decimal import Decimal
+from unittest.mock import MagicMock
 
 import pytest
 
-from notable.digest import DigestEntry, identity_key, render, write
+from notable.digest import identity_key, render, write
+from notable.rank import Lead
 
-ENTRY = DigestEntry(
+wiki = MagicMock()
+wiki.outcome = "no_matching_page"
+
+ENTRY = Lead(
     identity_key="ana poy",
     display_name="Ana Poy",
     source_url="https://a.test/1",
     publisher_label="Feed A",
     rationale="Named subject.",
+    outcome="promising_lead",
+    wikipedia_verdict=wiki,
+    article_assessments=(),
 )
 
 COUNTS = {
@@ -21,13 +29,16 @@ COUNTS = {
 }
 
 
-def _entry(name: str, n: int = 1) -> DigestEntry:
-    return DigestEntry(
+def _entry(name: str, n: int = 1) -> Lead:
+    return Lead(
         identity_key=identity_key(name),
         display_name=name,
         source_url=f"https://a.test/{n}",
         publisher_label="Feed A",
         rationale="Named subject.",
+        outcome="promising_lead",
+        wikipedia_verdict=wiki,
+        article_assessments=(),
     )
 
 
@@ -66,19 +77,22 @@ def test_render_reports_run_status_and_cost():
 def test_empty_digest_is_still_a_valid_document():
     text = render([], **COUNTS)
     assert text.startswith("# ")
-    assert "No people detected" in text
+    assert "No leads found" in text
 
 
 def test_a_multiline_rationale_cannot_forge_a_heading():
     # Model-supplied text reaches the artifact. Nothing parses it back, but a
     # rationale containing a line beginning "### " would still render a
     # heading for a person nobody detected.
-    hostile = DigestEntry(
-        "x",
-        "Ana Poy",
-        "https://a.test/1",
-        "Feed A",
-        "Won a prize.\n\n### Fake Person\n\n- Source: [x](https://evil.test/)",
+    hostile = Lead(
+        identity_key="x",
+        display_name="Ana Poy",
+        source_url="https://a.test/1",
+        publisher_label="Feed A",
+        rationale="Won a prize.\n\n### Fake Person\n\n- Source: [x](https://evil.test/)",
+        outcome="promising_lead",
+        wikipedia_verdict=wiki,
+        article_assessments=(),
     )
     headings = [
         line
@@ -114,5 +128,5 @@ def test_write_replaces_an_existing_digest_for_the_same_day(tmp_path):
 
 def test_an_empty_run_writes_an_empty_digest(tmp_path):
     path = write([], tmp_path, **COUNTS)
-    assert "No people detected" in path.read_text("utf-8")
+    assert "No leads found" in path.read_text("utf-8")
     assert (tmp_path / "latest.md").exists()

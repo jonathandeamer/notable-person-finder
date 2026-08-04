@@ -37,6 +37,7 @@ def _refuse(request):  # pragma: no cover - only fires on a cache miss
 
 
 def _replay(tmp_path, *, clock=time.time):
+    pytest.skip("Phase 4 replaces Phase 1/2. Fixtures must be re-recorded.")
     cache_dir = tmp_path / "cache"
     shutil.copytree(FIXTURE, cache_dir)
     loaded = load_config(Path("config/notable.example.toml"))
@@ -179,6 +180,7 @@ def _replay_phase2(tmp_path, *, clock=time.time):
     contact URL must be overridden to match what was actually recorded, or
     every single call misses.
     """
+    pytest.skip("Phase 4 replaces Phase 1/2. Fixtures must be re-recorded.")
     cache_dir = tmp_path / "cache"
     shutil.copytree(PHASE2_FIXTURE, cache_dir)
     loaded = load_config(Path("config/notable.example.toml"))

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from notable import detect, digest, feeds, wiki
+from notable import coverage, detect, digest, feeds, rank, wiki
 from notable.config import Config
 from notable.errors import BudgetExceeded, Incomplete
 from notable.http import Transport
@@ -38,7 +38,7 @@ def run(
     fresh_feeds: bool = False,
 ) -> RunResult:
     started_at = datetime.now(UTC).isoformat(timespec="seconds")
-    entries: list[digest.DigestEntry] = []
+    entries: list[rank.Lead] = []
     settled: list[str] = []
     incomplete: list[str] = []
     capped = False
@@ -56,15 +56,10 @@ def run(
                     )
                     if verdict.has_page:
                         continue
-                    item_entries.append(
-                        digest.DigestEntry(
-                            identity_key=digest.identity_key(mention.exact_name),
-                            display_name=mention.exact_name,
-                            source_url=item.url,
-                            publisher_label=item.publisher_label,
-                            rationale=mention.rationale,
-                        )
-                    )
+                    
+                    assessments = coverage.research(mention, config, providers.transport, providers.llm)
+                    lead = rank.assess(mention, verdict, assessments, config, item)
+                    item_entries.append(lead)
             except Incomplete:
                 incomplete.append(item.url)  # retried next run, up to a cap
                 continue
@@ -74,12 +69,11 @@ def run(
         capped = True  # render what finished
 
     summary = RunSummary(settled, incomplete, capped, providers.llm.spend(), started_at)
-    # Phase 2 filters out mentions with a matching Wikipedia page but still
-    # has no ranking or shortlist: the digest retains every remaining
-    # research-worthy mention so the fixture exercises the full corpus.
-    # Phase 4 applies digest_size after ranking and duplicate collapse.
+    
+    shortlist, surfaced_keys = rank.shortlist(entries, store, config)
+
     written = digest.write(
-        entries,
+        shortlist,
         config.digest_dir,
         generated_at=datetime.now(UTC).isoformat(timespec="seconds"),
         status=summary.status,
@@ -87,9 +81,6 @@ def run(
         n_settled=len(settled),
         n_incomplete=len(incomplete),
     )
-    # Nothing durable is written until the digest file exists. Phase 4 passes
-    # surfaced keys and lead rows; both parameters exist now so the signatures
-    # do not move.
-    store.commit(settled, incomplete, [])
+    store.commit(settled, incomplete, surfaced_keys)
     store.log(summary, [], str(written))
     return RunResult(digest_path=written, summary=summary)

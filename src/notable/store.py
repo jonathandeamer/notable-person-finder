@@ -6,7 +6,7 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -93,6 +93,17 @@ class Store:
             return True
         settled_at, attempts = row
         return settled_at is None and attempts < max_attempts
+
+    def is_suppressed(self, identity_key: str, *, max_days: int) -> bool:
+        row = self.connection.execute(
+            "SELECT last_surfaced_at FROM surfaced WHERE identity_key = ?",
+            (identity_key,),
+        ).fetchone()
+        if row is None:
+            return False
+        # ISO 8601 strings sort lexicographically, so we can just compare strings
+        cutoff = (datetime.now(UTC) - timedelta(days=max_days)).isoformat(timespec="seconds")
+        return row[0] >= cutoff
 
     def attempts(self, url: str) -> int:
         row = self.connection.execute(

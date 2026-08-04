@@ -3,12 +3,14 @@ from typing import Literal, cast
 
 import pytest
 
+from notable import digest
 from notable.detect_contract import DetectedMention
 from notable.errors import BudgetExceeded, Incomplete
 from notable.feeds import SourceItem
 from notable.http import Transport
 from notable.llm import LlmClient
 from notable.pipeline import Providers, run
+from notable.rank import Lead
 from notable.wiki_contract import MatchVerdict
 
 
@@ -63,6 +65,26 @@ def install(monkeypatch):
         monkeypatch.setattr(
             "notable.pipeline.wiki.match",
             match_fn or (lambda mention, cfg, transport, llm: _NO_PAGE),
+        )
+        monkeypatch.setattr(
+            "notable.pipeline.coverage.research",
+            lambda *a, **k: ()
+        )
+        monkeypatch.setattr(
+            "notable.pipeline.rank.assess",
+            lambda mention, verdict, articles, config, item: Lead(
+                identity_key=digest.identity_key(mention.exact_name),
+                display_name=mention.exact_name,
+                source_url=getattr(item, "url", ""),
+                publisher_label=getattr(item, "publisher_label", ""),
+                wikipedia_verdict=verdict,
+                outcome="promising_lead",
+                article_assessments=(),
+                rank_tuple=(0, 0, 0, digest.identity_key(mention.exact_name)),
+                namesake_urls=(),
+                rationale=mention.rationale,
+                qualifying_domains=(),
+            )
         )
 
     return apply
@@ -137,7 +159,7 @@ def test_incomplete_discards_earlier_mentions_of_the_same_item(
     path = run(make_config(), store, providers).digest_path
     text = path.read_text("utf-8")
     assert "Ana Poy" not in text and "Bo Li" not in text
-    assert "No people detected" in text
+    assert "No leads found" in text
     assert store.is_eligible("https://a.test/1", max_attempts=3) is True
 
 
@@ -216,6 +238,8 @@ def test_uncertain_and_no_matching_page_still_produce_entries(
     make_config, store, providers, install
 ):
     for outcome in ("uncertain", "no_matching_page"):
+        store.connection.execute("DELETE FROM surfaced")
+        store.connection.execute("DELETE FROM item")
         verdict = MatchVerdict(outcome=outcome, selected_page_id=None, rationale="r")
         install(
             [_item(1)],

@@ -7,18 +7,10 @@ import os
 import tempfile
 import unicodedata
 from collections.abc import Sequence
-from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-
-@dataclass(frozen=True, slots=True)
-class DigestEntry:
-    identity_key: str
-    display_name: str
-    source_url: str
-    publisher_label: str
-    rationale: str
+from notable.rank import Lead
 
 
 def identity_key(name: str) -> str:
@@ -43,7 +35,7 @@ def _flat(value: str) -> str:
 
 
 def render(
-    entries: Sequence[DigestEntry],
+    entries: Sequence[Lead],
     *,
     generated_at: str,
     status: str,
@@ -53,36 +45,48 @@ def render(
 ) -> str:
     day = generated_at[:10]
     lines = [
-        f"# Notable — detected people, {day}",
+        f"# Notable — {day}",
         "",
         f"- Run status: **{status}**",
         f"- Items settled: {n_settled}",
         f"- Items incomplete: {n_incomplete}",
         f"- Model spend: ${cost_usd}",
         "",
-        "> Phase 2 lists people detected in feed items who do not already",
-        "> have a matching Wikipedia page. It does not yet assess coverage,",
-        "> so nothing here is a lead.",
-        "",
-        "## Detected",
+        "## Shortlist",
         "",
     ]
     if not entries:
-        lines.append("No people detected in this run.")
+        lines.append("No leads found in this run.")
     else:
-        for entry in entries:
-            lines.append(f"### {_flat(entry.display_name)}")
+        for lead in entries:
+            lines.append(f"### {_flat(lead.display_name)}")
             lines.append("")
-            lines.append(
-                f"- Source: [{_flat(entry.publisher_label)}]({_flat(entry.source_url)})"
-            )
-            lines.append(f"- Why: {_flat(entry.rationale)}")
+            lines.append(f"- Outcome: `{lead.outcome}`")
+            wiki_outcome = getattr(lead.wikipedia_verdict, "outcome", "unknown")
+            lines.append(f"- Wikipedia: `{wiki_outcome}`")
+            lines.append(f"- Source: [{_flat(lead.publisher_label)}]({_flat(lead.source_url)})")
+            
+            if lead.qualifying_domains:
+                lines.append(f"- Qualifying domains: {len(lead.qualifying_domains)} ({', '.join(lead.qualifying_domains)})")
+            else:
+                lines.append("- Qualifying domains: 0")
+                
+            if lead.article_assessments:
+                lines.append("- Coverage:")
+                for i, a in enumerate(lead.article_assessments, start=1):
+                    pub = getattr(a, "publisher", "Article")
+                    lines.append(f"  - [{_flat(pub)}]({_flat(getattr(a, 'url', ''))})")
+                    
+            lines.append(f"- Why: {_flat(lead.rationale)}")
+            
+            if lead.namesake_urls:
+                lines.append(f"- Namesakes: {len(lead.namesake_urls)} ({', '.join(lead.namesake_urls)})")
             lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
 
 def write(
-    entries: Sequence[DigestEntry],
+    entries: Sequence[Lead],
     directory: Path,
     *,
     generated_at: str,
