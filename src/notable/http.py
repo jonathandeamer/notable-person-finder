@@ -225,26 +225,37 @@ class Transport:
                 )
             else:
                 try:
-                    text = self._read_body(raw, max_bytes, url)
+                    try:
+                        text = self._read_body(raw, max_bytes, url)
+                    except httpx.HTTPError as error:
+                        # Mid-stream errors (timeouts, connection drops,
+                        # decoding failures) on the streamed path must become
+                        # retryable ProviderFailures too, matching the
+                        # non-streamed path where the whole body was read
+                        # inside the client.send() try above.
+                        last = ProviderFailure(
+                            f"{type(error).__name__}: {error}", permanent=False
+                        )
+                    else:
+                        if raw.status_code < 400:
+                            self._client.cookies.clear()
+                            return Response(
+                                status=raw.status_code,
+                                text=text,
+                                content_type=raw.headers.get("content-type"),
+                            )
+                        if raw.status_code < 500 and raw.status_code != 429:
+                            raise ProviderFailure(
+                                f"HTTP {raw.status_code} from {url}", permanent=True
+                            )
+                        if raw.status_code == 429:
+                            self._count(rate_limited=1)
+                        last = ProviderFailure(
+                            f"HTTP {raw.status_code} from {url}", permanent=False
+                        )
                 finally:
                     if max_bytes is not None:
                         raw.close()
-                if raw.status_code < 400:
-                    self._client.cookies.clear()
-                    return Response(
-                        status=raw.status_code,
-                        text=text,
-                        content_type=raw.headers.get("content-type"),
-                    )
-                if raw.status_code < 500 and raw.status_code != 429:
-                    raise ProviderFailure(
-                        f"HTTP {raw.status_code} from {url}", permanent=True
-                    )
-                if raw.status_code == 429:
-                    self._count(rate_limited=1)
-                last = ProviderFailure(
-                    f"HTTP {raw.status_code} from {url}", permanent=False
-                )
             finally:
                 # Do not carry Set-Cookie state into a later request, including
                 # after failures and redirects handled by httpx.

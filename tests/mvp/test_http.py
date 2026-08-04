@@ -333,6 +333,39 @@ def test_content_type_is_returned_and_cached(tmp_path):
     assert second.from_cache is True
 
 
+class _BrokenStream(httpx.SyncByteStream):
+    """A response body that fails partway through iteration, simulating a
+    connection that stalls or drops after headers arrive."""
+
+    def __iter__(self):
+        yield b"partial data"
+        raise httpx.ReadError("boom mid-stream")
+
+    def close(self):
+        pass
+
+
+def test_a_mid_stream_read_error_becomes_a_retryable_provider_failure(tmp_path):
+    # With max_bytes set, the body is read incrementally via raw.iter_bytes()
+    # in the streamed path. A transport-level error raised mid-iteration (e.g.
+    # ReadTimeout, ReadError, RemoteProtocolError) must convert to a
+    # ProviderFailure, exactly like a client.send() failure does, so callers
+    # such as coverage.py's per-article catch keep working instead of seeing a
+    # raw httpx exception escape.
+    def handler(request):
+        return httpx.Response(200, stream=_BrokenStream())
+
+    with pytest.raises(ProviderFailure) as info:
+        _transport(tmp_path, handler).request(
+            provider="t",
+            method="GET",
+            url="https://a.test/x",
+            ttl_seconds=None,
+            max_bytes=1000,
+        )
+    assert info.value.permanent is False
+
+
 def test_content_type_defaults_to_none_when_absent(tmp_path):
     def handler(request):
         return httpx.Response(200, content=b"ok", headers={})
