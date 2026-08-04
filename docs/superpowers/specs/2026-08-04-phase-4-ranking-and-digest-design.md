@@ -42,6 +42,10 @@ Responsibilities remain narrow:
 - `pipeline.py` owns sequencing and error boundaries. It discards all buffered
   leads for an item when that item raises `Incomplete`, catches
   `BudgetExceeded` at the run boundary, and passes settled leads to selection.
+  For each research-worthy mention without a matching page it must call
+  `coverage.research`, pass the resulting assessments to `rank.assess`, and
+  buffer the returned lead; the Phase 1/2 detection-only digest stub is
+  replaced by this end-to-end path.
 - `store.py` receives surfaced identity keys for state and serialized full
   leads for append-only logs. The application never branches on log rows.
 - `coverage.py`, `wiki.py`, and their contracts remain behaviorally unchanged;
@@ -65,8 +69,8 @@ An article qualifies only when all of these hold:
 - `coverage_depth == "significant"`;
 - `screening_status == "curated_eligible"`;
 - `subject_relationship == "editorially_independent"`;
-- none of its content types is `listing`, `announcement`, `press_release`, or
-  `sponsored`.
+- `content_qualifying` — none of its content types is `listing`,
+  `announcement`, `press_release`, or `sponsored`.
 
 Outcome assignment is deterministic:
 
@@ -77,9 +81,8 @@ Outcome assignment is deterministic:
   - there is a qualifying article;
   - a same-person article has significant depth from an unclassified
     publisher;
-  - a same-person article has significant or passing depth and content that
-    is qualifying, but its publisher status or relationship prevents full
-    qualification;
+  - a same-person article has significant or passing depth that is
+    `content_qualifying` but not fully qualifying.
 - `insufficient_evidence`: none of the above holds.
 
 An empty article tuple is a valid terminal result and therefore produces
@@ -172,8 +175,12 @@ Automated tests cover:
 - full leads logged even when not shortlisted;
 - incomplete-item buffering and budget-capped partial output;
 - an end-to-end fixture run from Phase 3 results through the final digest;
+- namesake safety: two mentions with the same identity key retain separate
+  evidence and outcomes (two `possible_lead`s, never a merged
+  `promising_lead`), while shortlist collapse makes the duplication visible;
 - regression coverage ensuring Phase 1–3 provider and cache behavior remains
-  unchanged.
+  unchanged;
+- source line count remains below 3,000 after the implementation.
 
 The automated completion gate is:
 
