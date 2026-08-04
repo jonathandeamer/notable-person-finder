@@ -134,10 +134,11 @@ def _object(properties: dict[str, Any]) -> dict[str, Any]:
 
 def assessment_schema() -> dict[str, Any]:
     """The wire schema. Root is a plain object -- a root-level `anyOf` is
-    rejected under strict mode (docs/findings.md). Every rule the prompt
-    states is expressed here directly: content_types is bounded and
-    deduplicated by minItems/maxItems/uniqueItems, and every passage-id field
-    is enum-restricted to the one passage this contract ever supplies -- so a
+    rejected under strict mode (docs/findings.md). content_types is bounded
+    by minItems/maxItems; `uniqueItems` is deliberately omitted -- OpenRouter's
+    strict mode rejects it (docs/findings.md), so deduplication is enforced
+    only by `AssessmentOutput`'s pydantic validator. Every passage-id field is
+    enum-restricted to the one passage this contract ever supplies -- so a
     model cannot cite a passage that doesn't exist."""
     passage_ids = {
         "type": "array",
@@ -153,7 +154,6 @@ def assessment_schema() -> dict[str, Any]:
                 "items": _string(enum=list(CONTENT_TYPES)),
                 "minItems": 1,
                 "maxItems": 3,
-                "uniqueItems": True,
             },
             "subject_relationship": _string(enum=list(SUBJECT_RELATIONSHIPS)),
             "signals": {

@@ -28,6 +28,15 @@ constrained rules the domain validator enforced, and every rule left
 unexpressed is *paid for* before it is rejected. Item caps belong in `maxItems`,
 not in a post-hoc length check.
 
+**`uniqueItems` is rejected with HTTP 400.** Probed live on 2026-08-04 via the
+`assess_article` schema's `content_types` array: `"'uniqueItems' is not
+permitted"` (Azure-routed `openai/gpt-5.4-mini`, `invalid_json_schema`). This
+is the one exception to "express every validator rule the schema can carry" --
+`minItems`/`maxItems` are fine, but array-uniqueness has no schema-level
+expression under strict mode. Enforce de-duplication only in the pydantic
+domain validator (a `set`-length comparison is enough; see
+`coverage_contract.AssessmentOutput`).
+
 ## Completion budget
 
 **`max_completion_tokens` must scale with the item cap it serves.** Shipped at

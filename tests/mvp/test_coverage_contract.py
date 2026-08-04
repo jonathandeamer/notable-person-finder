@@ -61,12 +61,15 @@ def test_schema_forbids_additional_properties_everywhere():
     walk(assessment_schema())
 
 
-def test_schema_bounds_content_types_to_one_through_three_unique_values():
+def test_schema_bounds_content_types_to_one_through_three_items():
     schema = assessment_schema()
     content_types = schema["properties"]["content_types"]
     assert content_types["minItems"] == 1
     assert content_types["maxItems"] == 3
-    assert content_types["uniqueItems"] is True
+    # uniqueItems is deliberately absent: OpenRouter's strict mode rejects it
+    # (docs/findings.md). Deduplication is enforced by AssessmentOutput's
+    # pydantic validator instead -- see test_duplicate_content_types_are_rejected.
+    assert "uniqueItems" not in content_types
 
 
 def test_schema_restricts_passage_ids_to_the_one_passage_this_contract_supplies():
