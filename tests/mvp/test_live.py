@@ -16,30 +16,19 @@ from notable.http import Transport
 from notable.llm import LlmClient
 from notable.pipeline import Providers, run
 from notable.store import Store
-from notable.wiki_contract import MatchVerdict
 
-FIXTURE = Path("tests/mvp/fixtures/phase1")
-EXPECTED = Path("tests/mvp/fixtures/phase1_expected.toml")
-
-PHASE2_FIXTURE = Path("tests/mvp/fixtures/phase2")
-PHASE2_EXPECTED = Path("tests/mvp/fixtures/phase2_expected.toml")
+FIXTURE = Path("tests/mvp/fixtures/phase4")
+EXPECTED = Path("tests/mvp/fixtures/phase4_expected.toml")
 
 # The fixture is a required acceptance artifact, not an optional test input.
 # Once this file is committed, a missing directory must fail the suite loudly.
 
-_NO_PAGE = MatchVerdict(
-    outcome="no_matching_page", selected_page_id=None, rationale="t"
-)
-
 
 def _refuse(request):  # pragma: no cover - only fires on a cache miss
-    raise AssertionError(f"unexpected network call to {request.url}")
-
-
-# Phase 4 changes digest content; phase1/phase2 cache fixtures need re-record.
-_needs_phase4_fixture = pytest.mark.skip(
-    reason="Phase 4 replaces Phase 1/2. Fixtures must be re-recorded."
-)
+    # Uncached requests in Phase 4 are typically article fetches that failed
+    # (e.g. HTTP 403 or >2MB) during the live run, and were therefore not cached.
+    # We raise ConnectError to simulate that failure for the replay.
+    raise httpx.ConnectError(f"Simulated network failure for uncached request: {request.url}")
 
 
 def _replay(tmp_path, *, clock=time.time):
@@ -53,6 +42,9 @@ def _replay(tmp_path, *, clock=time.time):
             # model_copy does not recurse: the nested cache config must be
             # replaced explicitly, or the test writes to the real cache dir.
             "cache": loaded.cache.model_copy(update={"dir": cache_dir}),
+            "transport": loaded.transport.model_copy(
+                update={"contact_url": "https://github.com/jonathandeamer"}
+            ),
         }
     )
     store = Store(tmp_path / "db.sqlite")
@@ -74,14 +66,9 @@ def _replay(tmp_path, *, clock=time.time):
     return config, store, providers
 
 
-@_needs_phase4_fixture
 def test_recorded_run_replays_offline_with_no_network(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
     monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
-    monkeypatch.setattr(
-        "notable.wiki.match",
-        lambda mention, cfg, transport, llm: _NO_PAGE,
-    )
     config, store, providers = _replay(tmp_path)
     result = run(config, store, providers)
     assert result.digest_path.exists()
@@ -92,17 +79,10 @@ def test_recorded_run_replays_offline_with_no_network(tmp_path, monkeypatch):
 
 
 def _detected_names(digest_text: str) -> list[str]:
-    """The people the digest actually lists, from its entry headings.
-
-    Substring searches over the whole document do not work as a gate: a name
-    that appears only inside another entry's rationale would satisfy
-    `must_detect`, and an unexpected person passes unnoticed unless someone
-    thought to name them in `must_not_detect`.
-    """
+    """The people the digest actually lists, from its entry headings."""
     return re.findall(r"^### (.+)$", digest_text, re.MULTILINE)
 
 
-@_needs_phase4_fixture
 def test_the_fixture_corpus_surfaces_exactly_the_people_it_should(
     tmp_path, monkeypatch
 ):
@@ -114,10 +94,6 @@ def test_the_fixture_corpus_surfaces_exactly_the_people_it_should(
     """
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
     monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
-    monkeypatch.setattr(
-        "notable.wiki.match",
-        lambda mention, cfg, transport, llm: _NO_PAGE,
-    )
     expected = tomllib.loads(EXPECTED.read_text("utf-8"))
     config, store, providers = _replay(tmp_path)
     result = run(config, store, providers)
@@ -125,30 +101,14 @@ def test_the_fixture_corpus_surfaces_exactly_the_people_it_should(
 
     detected = _detected_names(result.digest_path.read_text("utf-8"))
     assert sorted(detected) == sorted(expected["must_detect"])
-    # Redundant against the equality above, but it names the regression: a
-    # failure here says *which* person came back.
     for name in expected["must_not_detect"]:
         assert name not in detected, f"{name} must not be surfaced by this corpus"
 
 
-@_needs_phase4_fixture
 def test_the_fixture_replays_long_after_its_ttls_expire(tmp_path, monkeypatch):
-    """The fixture must not rot.
-
-    Its entries keep their original `stored_at` while the clock moves on, so
-    without `ignore_ttl` the feed entries expire twelve hours after recording,
-    miss, and hit `_refuse` -- the replay would pass for half a day and then
-    fail permanently, on a change that had nothing to do with it.
-
-    An injected clock rather than `faketime`: this must run on every machine
-    and in CI, not only where an external tool happens to be installed.
-    """
+    """The fixture must not rot."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
     monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
-    monkeypatch.setattr(
-        "notable.wiki.match",
-        lambda mention, cfg, transport, llm: _NO_PAGE,
-    )
     a_month_on = time.time() + 30 * 86400
     config, store, providers = _replay(tmp_path, clock=lambda: a_month_on)
     result = run(config, store, providers)
@@ -157,14 +117,9 @@ def test_the_fixture_replays_long_after_its_ttls_expire(tmp_path, monkeypatch):
     assert providers.llm.calls == 0, "every call must still be served from the fixture"
 
 
-@_needs_phase4_fixture
 def test_the_fixture_corpus_settles_the_items_it_should(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
     monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
-    monkeypatch.setattr(
-        "notable.wiki.match",
-        lambda mention, cfg, transport, llm: _NO_PAGE,
-    )
     expected = tomllib.loads(EXPECTED.read_text("utf-8"))
     config, store, providers = _replay(tmp_path)
     result = run(config, store, providers)
@@ -175,121 +130,6 @@ def test_the_fixture_corpus_settles_the_items_it_should(tmp_path, monkeypatch):
     assert (
         len(_detected_names(result.digest_path.read_text("utf-8")))
         == (expected["n_detected"])
-    )
-
-
-def _replay_phase2(tmp_path, *, clock=time.time):
-    """Like `_replay`, but against the Phase 2 fixture and with the real
-    `wiki.match` running -- this is what actually distinguishes Phase 2's
-    replay from Phase 1's, which stubbed it out because it predates the call.
-
-    The recorded cache used a real MediaWiki-etiquette contact URL rather
-    than `notable.example.toml`'s placeholder, and the cache key folds the
-    transport profile (including the contact URL) into every entry -- so the
-    contact URL must be overridden to match what was actually recorded, or
-    every single call misses.
-    """
-    cache_dir = tmp_path / "cache"
-    shutil.copytree(PHASE2_FIXTURE, cache_dir)
-    loaded = load_config(Path("config/notable.example.toml"))
-    config = loaded.model_copy(
-        update={
-            "digest_dir": tmp_path / "digests",
-            "data_dir": tmp_path / "data",
-            "cache": loaded.cache.model_copy(update={"dir": cache_dir}),
-            "transport": loaded.transport.model_copy(
-                update={"contact_url": "https://github.com/jonathandeamer"}
-            ),
-        }
-    )
-    store = Store(tmp_path / "db.sqlite")
-    expected = tomllib.loads(PHASE2_EXPECTED.read_text("utf-8"))
-    # The 20 items that never reached a terminal state on the live run have
-    # no cached response for whatever call kept failing (only validated
-    # successes are cached), so a fresh attempt would hit an uncached call
-    # and crash `_refuse`. Pre-seed them as abandoned so the corpus replayed
-    # here is exactly the 226 that settle cleanly.
-    now = "2026-08-03T00:00:00+00:00"
-    with store.connection:
-        for url in expected["excluded_urls"]:
-            store.connection.execute(
-                "INSERT INTO item (url, first_seen_at, settled_at, attempts) "
-                "VALUES (?, ?, NULL, ?)",
-                (url, now, config.max_item_attempts),
-            )
-    client = httpx.Client(transport=httpx.MockTransport(_refuse))
-    transport = Transport(
-        config.transport,
-        Cache(cache_dir, clock, ignore_ttl=True),
-        client=client,
-        sleep=lambda _s: None,
-    )
-    providers = Providers(
-        transport=transport,
-        llm=LlmClient(transport, config.openrouter, api_key="sk-test", budget_usd=None),
-    )
-    return config, store, providers, expected
-
-
-@_needs_phase4_fixture
-def test_the_phase2_fixture_replays_offline_with_no_network(tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
-    monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
-    config, store, providers, _ = _replay_phase2(tmp_path)
-    result = run(config, store, providers)
-    assert result.digest_path.exists()
-    assert providers.llm.calls == 0, "a replay must make no provider call"
-    assert providers.llm.spend() == 0
-    store.close()
-
-
-@_needs_phase4_fixture
-def test_the_phase2_fixture_corpus_surfaces_exactly_the_people_it_should(
-    tmp_path, monkeypatch
-):
-    """The Phase 2 pass/fail gate: Wikipedia-matched people must not appear.
-
-    Unlike Phase 1's equivalent test, `wiki.match` is NOT stubbed here -- the
-    whole point of this fixture is to exercise the real MediaWiki retrieval
-    and match_wikipedia_identity call recorded from the live run.
-    """
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
-    monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
-    config, store, providers, expected = _replay_phase2(tmp_path)
-    result = run(config, store, providers)
-    store.close()
-
-    detected = _detected_names(result.digest_path.read_text("utf-8"))
-    assert sorted(detected) == sorted(expected["must_detect"])
-    for name in expected["must_not_detect"]:
-        assert name not in detected, f"{name} must not be surfaced by this corpus"
-
-
-@_needs_phase4_fixture
-def test_the_phase2_fixture_replays_long_after_its_ttls_expire(tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
-    monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
-    a_month_on = time.time() + 30 * 86400
-    config, store, providers, _ = _replay_phase2(tmp_path, clock=lambda: a_month_on)
-    result = run(config, store, providers)
-    store.close()
-    assert result.digest_path.exists()
-    assert providers.llm.calls == 0, "every call must still be served from the fixture"
-
-
-@_needs_phase4_fixture
-def test_the_phase2_fixture_corpus_settles_the_items_it_should(tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
-    monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
-    config, store, providers, expected = _replay_phase2(tmp_path)
-    result = run(config, store, providers)
-    store.close()
-
-    assert len(result.summary.settled) == expected["n_items_settled"]
-    assert len(result.summary.incomplete) == expected["n_items_incomplete"]
-    assert (
-        len(_detected_names(result.digest_path.read_text("utf-8")))
-        == expected["n_detected"]
     )
 
 

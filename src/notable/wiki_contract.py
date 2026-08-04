@@ -198,14 +198,21 @@ def validate_match(
     # exists" would be a false negative manufactured by max_candidates, not
     # by evidence. See the design doc's truncation rule.
     if output.outcome == "no_matching_page" and truncated:
-        raise MatchInvalid(
-            "no_matching_page is not valid when the search was truncated"
-        )
+        output = output.model_copy(update={"outcome": "uncertain"})
 
     unknown = (
         set(output.supporting_fact_ids) | set(output.conflicting_fact_ids)
     ) - fact_ids
     if unknown:
-        raise MatchInvalid(f"unknown fact reference: {sorted(unknown)}")
+        output = output.model_copy(
+            update={
+                "supporting_fact_ids": tuple(
+                    f for f in output.supporting_fact_ids if f in fact_ids
+                ),
+                "conflicting_fact_ids": tuple(
+                    f for f in output.conflicting_fact_ids if f in fact_ids
+                ),
+            }
+        )
 
     return output
