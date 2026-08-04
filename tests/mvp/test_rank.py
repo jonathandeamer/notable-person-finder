@@ -1,190 +1,283 @@
-from notable.rank import Lead, assess
+"""Deterministic ranking and shortlist selection."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+from notable.rank import Lead, assess, identity_key, lead_to_log_dict, shortlist
+
+
+def _mention(name: str = "John Doe") -> MagicMock:
+    mention = MagicMock()
+    mention.exact_name = name
+    mention.rationale = "why"
+    return mention
+
+
+def _item(url: str = "https://feed.example/item") -> MagicMock:
+    item = MagicMock()
+    item.url = url
+    item.publisher_label = "Feed"
+    return item
+
+
+def _config(**overrides: object) -> SimpleNamespace:
+    base: dict[str, object] = {
+        "promising_domain_threshold": 2,
+        "digest_size": 10,
+        "resurface_after_days": 30,
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _wiki(outcome: str = "no_matching_page") -> MagicMock:
+    verdict = MagicMock()
+    verdict.outcome = outcome
+    return verdict
+
+
+def _article(
+    url: str,
+    *,
+    person_relation: str = "same_person",
+    coverage_depth: str = "significant",
+    screening_status: str = "curated_eligible",
+    subject_relationship: str = "editorially_independent",
+    content_types: tuple[str, ...] = ("reporting",),
+) -> MagicMock:
+    article = MagicMock()
+    article.url = url
+    article.person_relation = person_relation
+    article.coverage_depth = coverage_depth
+    article.screening_status = screening_status
+    article.subject_relationship = subject_relationship
+    article.content_types = content_types
+    return article
+
+
+def _lead(
+    key: str,
+    *,
+    outcome: str = "possible_lead",
+    rank_tuple: tuple | None = (1, 0, -1, "x"),
+    source_url: str = "https://a.test/1",
+    domains: tuple[str, ...] = (),
+) -> Lead:
+    return Lead(
+        identity_key=key,
+        display_name=key.title(),
+        source_url=source_url,
+        publisher_label="p",
+        wikipedia_verdict=None,
+        outcome=outcome,
+        article_assessments=(),
+        rank_tuple=rank_tuple if outcome != "insufficient_evidence" else None,
+        qualifying_domains=domains,
+    )
+
+
+def test_identity_key_normalizes():
+    assert identity_key("  Ana   Poy  ") == "ana poy"
+    assert identity_key("Ana\u00a0Poy") == "ana poy"
+    assert identity_key("Ana Poy") != identity_key("Ana Poye")
 
 
 def test_assess_empty_articles_returns_insufficient_evidence():
-    """An empty article tuple is a valid terminal result and produces insufficient_evidence."""
-    from unittest.mock import MagicMock
-    mention = MagicMock()
-    mention.exact_name = "John Doe"
-    mention.rationale = "why"
-    wiki = MagicMock()
-    
-    # We might need a real config, or we can just mock the fields we need
-    # But let's try just passing None if it doesn't complain yet.
-    config = None 
-    
-    lead = assess(mention, wiki, articles=(), config=config)
-    
+    lead = assess(_mention(), _wiki(), (), _config(), _item())
     assert lead.outcome == "insufficient_evidence"
+    assert lead.rank_tuple is None
+
 
 def test_assess_retains_lead_fields():
-    """Lead retains required context fields from inputs."""
-    from unittest.mock import MagicMock
-    mention = MagicMock()
-    mention.exact_name = "John Doe"
-    mention.rationale = "why"
-    
-    wiki = MagicMock()
-    item = MagicMock()
-    item.url = "https://example.com/item"
-    item.publisher_label = "Example Times"
-    
-    lead = assess(mention, wiki, articles=(), config=None, item=item)
-    
+    lead = assess(_mention(), _wiki(), (), _config(), _item("https://example.com/item"))
     assert lead.display_name == "John Doe"
     assert lead.source_url == "https://example.com/item"
-    assert lead.publisher_label == "Example Times"
-    assert lead.wikipedia_verdict == wiki
-    assert lead.article_assessments == ()
+    assert lead.publisher_label == "Feed"
+
 
 def test_assess_single_qualifying_article_is_possible_lead():
-    """A single qualifying article produces possible_lead when below threshold."""
-    from unittest.mock import MagicMock
-    mention = MagicMock()
-    mention.exact_name = "John Doe"
-    mention.rationale = "why"
-    
-    article = MagicMock()
-    article.person_relation = "same_person"
-    article.coverage_depth = "significant"
-    article.screening_status = "curated_eligible"
-    article.subject_relationship = "editorially_independent"
-    article.content_types = ("news_report",) # Not a disqualifying type
-    article.url = "https://example.com/article"
-    
-    config = MagicMock()
-    config.promising_domain_threshold = 2
-    
-    item = MagicMock()
-    item.url = "http://example.com"
-    item.publisher_label = "Example"
-    
-    lead = assess(mention, MagicMock(), articles=(article,), config=config, item=item)
-    
+    article = _article("https://example.com/a")
+    lead = assess(_mention(), _wiki(), (article,), _config(), _item())
     assert lead.outcome == "possible_lead"
+    assert lead.qualifying_domains == ("example.com",)
+
 
 def test_assess_meets_promising_domain_threshold():
-    """Returns promising_lead when qualifying articles span enough distinct domains."""
-    from unittest.mock import MagicMock
-    mention = MagicMock()
-    mention.exact_name = "John Doe"
-    mention.rationale = "why"
-    
-    # Create two qualifying articles
-    a1 = MagicMock()
-    a1.person_relation = "same_person"
-    a1.coverage_depth = "significant"
-    a1.screening_status = "curated_eligible"
-    a1.subject_relationship = "editorially_independent"
-    a1.content_types = ()
-    a1.url = "https://example.com/article1"
-    
-    a2 = MagicMock()
-    a2.person_relation = "same_person"
-    a2.coverage_depth = "significant"
-    a2.screening_status = "curated_eligible"
-    a2.subject_relationship = "editorially_independent"
-    a2.content_types = ()
-    a2.url = "https://other.com/article2"
-    
-    config = MagicMock()
-    config.promising_domain_threshold = 2
-    
-    item = MagicMock()
-    item.url = "http://example.com"
-    item.publisher_label = "Example"
-    
-    lead = assess(mention, MagicMock(), articles=(a1, a2), config=config, item=item)
-    
+    articles = (
+        _article("https://example.com/a1"),
+        _article("https://other.com/a2"),
+    )
+    lead = assess(_mention(), _wiki(), articles, _config(), _item())
     assert lead.outcome == "promising_lead"
 
+
+def test_assess_uses_config_threshold_without_hasattr_soft_fail():
+    """Real Config-shaped objects must promote; no hasattr gate."""
+    articles = (
+        _article("https://example.com/a1"),
+        _article("https://other.com/a2"),
+    )
+    lead = assess(
+        _mention(), _wiki(), articles, _config(promising_domain_threshold=2), _item()
+    )
+    assert lead.outcome == "promising_lead"
+    one_domain = assess(
+        _mention(),
+        _wiki(),
+        (_article("https://example.com/a1"),),
+        _config(promising_domain_threshold=1),
+        _item(),
+    )
+    assert one_domain.outcome == "promising_lead"
+
+
 def test_assess_unclassified_significant_is_possible_lead():
-    """A same-person significant article from an unclassified publisher is a possible_lead."""
-    from unittest.mock import MagicMock
-    mention = MagicMock()
-    mention.exact_name = "John Doe"
-    mention.rationale = "why"
-    
-    article = MagicMock()
-    article.person_relation = "same_person"
-    article.coverage_depth = "significant"
-    article.screening_status = "unclassified" # Fails fully qualifying
-    article.subject_relationship = "editorially_independent"
-    article.content_types = ()
-    article.url = "https://example.com/article"
-    
-    config = MagicMock()
-    config.promising_domain_threshold = 2
-    
-    item = MagicMock()
-    item.url = "http://example.com"
-    item.publisher_label = "Example"
-    
-    lead = assess(mention, MagicMock(), articles=(article,), config=config, item=item)
-    
+    article = _article("https://example.com/a", screening_status="unclassified")
+    lead = assess(_mention(), _wiki(), (article,), _config(), _item())
     assert lead.outcome == "possible_lead"
+
+
+def test_assess_eligible_passing_content_qualifying_is_possible_lead():
+    """Reason 3: fully eligible but passing depth is possible, not insufficient."""
+    article = _article("https://example.com/a", coverage_depth="passing")
+    lead = assess(_mention(), _wiki(), (article,), _config(), _item())
+    assert lead.outcome == "possible_lead"
+    assert lead.qualifying_domains == ()
+
 
 def test_assess_rank_tuple():
-    """Rank tuple is (outcome_rank, wikipedia_rank, -domain_count, identity_key)."""
-    from unittest.mock import MagicMock
-    mention = MagicMock()
-    mention.exact_name = "John Doe"
-    mention.rationale = "why"
-    
-    wiki = MagicMock()
-    wiki.outcome = "no_matching_page"
-    
-    a1 = MagicMock()
-    a1.person_relation = "same_person"
-    a1.coverage_depth = "significant"
-    a1.screening_status = "curated_eligible"
-    a1.subject_relationship = "editorially_independent"
-    a1.content_types = ()
-    a1.url = "https://example.com/article1"
-    
-    config = MagicMock()
-    config.promising_domain_threshold = 2
-    
-    item = MagicMock()
-    item.url = "http://example.com"
-    item.publisher_label = "Example"
-    
-    lead = assess(mention, wiki, articles=(a1,), config=config, item=item)
-    
-    assert lead.outcome == "possible_lead"
-    # outcome_rank (promising=0, possible=1), wiki_rank (no_page=0, uncertain=1), domain_count=1 -> -1, identity_key
-    expected_tuple = (1, 0, -1, "john doe")
-    assert lead.rank_tuple == expected_tuple
+    article = _article("https://example.com/a1")
+    lead = assess(_mention(), _wiki("no_matching_page"), (article,), _config(), _item())
+    assert lead.rank_tuple == (1, 0, -1, "john doe")
+
 
 def test_shortlist_removes_insufficient_and_sorts():
-    """Removes insufficient_evidence and sorts by rank_tuple."""
-    from notable.rank import shortlist
-    
-    l1 = Lead(
-        identity_key="jane doe", display_name="Jane", source_url="u1", publisher_label="p",
-        wikipedia_verdict=None, outcome="promising_lead", article_assessments=(),
-        rank_tuple=(0, 0, -2, "jane doe")
-    )
-    l2 = Lead(
-        identity_key="john doe", display_name="John", source_url="u2", publisher_label="p",
-        wikipedia_verdict=None, outcome="insufficient_evidence", article_assessments=(),
-        rank_tuple=None
-    )
-    l3 = Lead(
-        identity_key="bob smith", display_name="Bob", source_url="u3", publisher_label="p",
-        wikipedia_verdict=None, outcome="possible_lead", article_assessments=(),
-        rank_tuple=(1, 0, -1, "bob smith")
-    )
-    
-    from unittest.mock import MagicMock
-    config = MagicMock()
-    config.digest_size = 10
-    config.resurface_after_days = 30
-    
     store = MagicMock()
     store.is_suppressed.return_value = False
-    
-    leads, keys = shortlist([l3, l2, l1], store, config)
-    
-    assert [l.identity_key for l in leads] == ["jane doe", "bob smith"]
+    leads, keys = shortlist(
+        [
+            _lead(
+                "bob smith", outcome="possible_lead", rank_tuple=(1, 0, -1, "bob smith")
+            ),
+            _lead("john doe", outcome="insufficient_evidence", rank_tuple=None),
+            _lead(
+                "jane doe",
+                outcome="promising_lead",
+                rank_tuple=(0, 0, -2, "jane doe"),
+            ),
+        ],
+        store,
+        _config(),
+    )
+    assert [lead.identity_key for lead in leads] == ["jane doe", "bob smith"]
     assert keys == ["jane doe", "bob smith"]
+
+
+def test_shortlist_suppresses_recently_surfaced():
+    store = MagicMock()
+    store.is_suppressed.side_effect = lambda key, max_days: key == "ana poy"
+    leads, keys = shortlist(
+        [
+            _lead(
+                "ana poy", outcome="promising_lead", rank_tuple=(0, 0, -2, "ana poy")
+            ),
+            _lead("bo li", outcome="possible_lead", rank_tuple=(1, 0, -1, "bo li")),
+        ],
+        store,
+        _config(),
+    )
+    assert [lead.identity_key for lead in leads] == ["bo li"]
+    assert keys == ["bo li"]
+
+
+def test_shortlist_collapse_before_cut_preserves_other_people():
+    """Top-N same-name mentions must not fill the digest alone."""
+    store = MagicMock()
+    store.is_suppressed.return_value = False
+    same_name = [
+        _lead(
+            "ana poy",
+            outcome="promising_lead",
+            rank_tuple=(0, 0, -3, "ana poy"),
+            source_url=f"https://a.test/{n}",
+        )
+        for n in range(5)
+    ]
+    other = _lead(
+        "bo li",
+        outcome="possible_lead",
+        rank_tuple=(1, 0, -1, "bo li"),
+        source_url="https://b.test/1",
+    )
+    leads, keys = shortlist(same_name + [other], store, _config(digest_size=2))
+    assert [lead.identity_key for lead in leads] == ["ana poy", "bo li"]
+    assert keys == ["ana poy", "bo li"]
+    assert leads[0].namesake_urls == tuple(f"https://a.test/{n}" for n in range(1, 5))
+
+
+def test_namesake_safety_does_not_merge_outcomes():
+    """Two mentions sharing a key keep separate evidence; never union domains."""
+    a = assess(
+        _mention("Ana Poy"),
+        _wiki(),
+        (_article("https://example.com/a"),),
+        _config(),
+        _item("https://feed.example/1"),
+    )
+    b = assess(
+        _mention("Ana Poy"),
+        _wiki(),
+        (_article("https://other.com/b"),),
+        _config(),
+        _item("https://feed.example/2"),
+    )
+    assert a.outcome == "possible_lead"
+    assert b.outcome == "possible_lead"
+    assert a.qualifying_domains == ("example.com",)
+    assert b.qualifying_domains == ("other.com",)
+
+    store = MagicMock()
+    store.is_suppressed.return_value = False
+    leads, _ = shortlist([a, b], store, _config())
+    assert len(leads) == 1
+    assert leads[0].outcome == "possible_lead"
+    assert leads[0].qualifying_domains == ("example.com",)
+    assert leads[0].namesake_urls == ("https://feed.example/2",)
+
+
+def test_shortlist_does_not_mutate_input_leads():
+    store = MagicMock()
+    store.is_suppressed.return_value = False
+    original = _lead(
+        "ana poy",
+        outcome="possible_lead",
+        rank_tuple=(1, 0, -1, "ana poy"),
+        source_url="https://a.test/1",
+    )
+    other = _lead(
+        "ana poy",
+        outcome="possible_lead",
+        rank_tuple=(1, 1, -1, "ana poy"),
+        source_url="https://a.test/2",
+    )
+    shortlist([original, other], store, _config())
+    assert original.namesake_urls == ()
+
+
+def test_lead_to_log_dict_serializes_rank_key_and_detail():
+    lead = assess(
+        _mention(),
+        _wiki(),
+        (_article("https://example.com/a"),),
+        _config(),
+        _item(),
+    )
+    row = lead_to_log_dict(lead)
+    assert row["identity_key"] == "john doe"
+    assert row["outcome"] == "possible_lead"
+    assert row["rank_key"] == [1, 0, -1, "john doe"]
+    assert row["detail"]["qualifying_domains"] == ["example.com"]
+    ie = lead_to_log_dict(assess(_mention(), _wiki(), (), _config(), _item()))
+    assert ie["rank_key"] == []

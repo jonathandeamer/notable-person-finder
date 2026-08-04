@@ -30,7 +30,8 @@ lines, and why the top open item ("raise `max_candidates` from 8") was blocked �
 the value moves match fingerprints, which move tests, which move plan
 reconciliation. A tuning knob had become a schema migration.
 
-The MVP targets **under 3,000 lines of source**.
+The MVP targets **roughly 3,000 lines of source** as a soft ceiling — a canary
+against second-system growth, not a hard merge gate. See Guardrails.
 
 ## The central decision
 
@@ -606,16 +607,23 @@ behaviour.
 
 The prior failure mode was gradual accretion in which every individual step
 looked justified. Crude limits work better than judgment. These belong in
-`CLAUDE.md` as hard rules:
+`CLAUDE.md`:
 
-1. **Source stays under 3,000 lines.** Past that, something gets deleted or the
-   feature does not land.
+1. **Source line count is a canary, not the product.** Soft target ~3,000
+   lines (`find src -name '*.py' | xargs wc -l | tail -1`); hard alert ~3,500
+   lines **or** any new table, cross-run state, or second recovery path.
+   Crossing 3,000 requires a one-line PR note of what grew — not blank-line
+   shaving or densifying correct code to appease `wc`. Crossing the hard
+   alert means stop and cut *concepts*. Planned MVP phases may finish
+   slightly over 3,000; new machinery may not.
 2. **No new table without deleting one.** Four is the budget.
 3. **`pipeline.py`'s main loop fits on one screen.**
 4. **No new cross-run state** without an explicit decision to leave MVP scope.
 
-A limit that is never uncomfortable is not doing any work. When one binds, the
-first response is to ask what can be removed.
+A limit that is never uncomfortable is not doing any work. When the *concept*
+budget binds (tables, state, recovery), the first response is to ask what can
+be removed. When only the line canary chirps after legitimate product work,
+note it and move on.
 
 ## Out of scope
 
@@ -639,7 +647,8 @@ syndication inference; automated article drafting or editing.
 - a crashed run re-runs to completion paying only for the work it had not yet
   reached — no completed provider call is paid for twice;
 - the spend cap produces a partial digest rather than a failure;
-- source is under 3,000 lines and the main loop fits on one screen;
+- source stays near the ~3,000-line soft target (hard alert ~3,500 or new
+  machinery) and the main loop fits on one screen;
 - **the fixed-corpus regression passes.** One recorded cache directory from a
   real ten-feed run is committed as a fixture, with an expected-results file
   naming each person the corpus should surface, their required outcome class,

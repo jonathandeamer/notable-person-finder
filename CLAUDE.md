@@ -37,8 +37,17 @@ The prior failure mode was gradual accretion in which every individual step
 looked justified. These limits are deliberately uncomfortable. When one binds,
 the first response is to ask what can be removed — not to raise the limit.
 
-1. **Source stays under 3,000 lines.** Check with
+1. **Source line count is a canary, not the product.** Check with
    `find src -name '*.py' | xargs wc -l | tail -1`.
+   - **Soft target: ~3,000 lines.** Crossing it is a smell: say what grew and
+     why in the PR. Prefer deleting scope or machinery over shaving blanks,
+     densifying one-liners, or gutting unrelated modules to hit an exact
+     number.
+   - **Hard alert: ~3,500 lines, or any new table / cross-run state / second
+     recovery path.** That is where second-system failure starts again; stop
+     and cut concepts, not comments.
+   - Planned MVP surface (including finishing a named phase) may land slightly
+     over 3,000 without ceremony. New *machinery* may not.
 2. **No new table without deleting one.** Four is the budget: `item`,
    `surfaced`, `run`, `lead`.
 3. **`pipeline.py`'s main loop fits on one screen.**

@@ -95,6 +95,7 @@ class Config(_Strict):
     digest_dir: Path
     digest_size: int = Field(default=20, ge=1)
     resurface_after_days: int = Field(default=30, ge=1)
+    promising_domain_threshold: int = Field(default=2, ge=1)
     max_item_attempts: int = Field(default=3, ge=1, le=10)
     transport: TransportConfig
     cache: CacheConfig
@@ -126,6 +127,7 @@ class _File(_Strict):
     digest_dir: str = "digests"
     digest_size: int = 20
     resurface_after_days: int = 30
+    promising_domain_threshold: int = 2
     max_item_attempts: int = 3
     secrets: _Secrets = _Secrets()
     transport: TransportConfig
@@ -215,6 +217,7 @@ def load_config(path: Path) -> Config:
         digest_dir=(root / parsed.digest_dir).resolve(),
         digest_size=parsed.digest_size,
         resurface_after_days=parsed.resurface_after_days,
+        promising_domain_threshold=parsed.promising_domain_threshold,
         max_item_attempts=parsed.max_item_attempts,
         transport=parsed.transport,
         cache=parsed.cache.model_copy(

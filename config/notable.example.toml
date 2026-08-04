@@ -13,6 +13,8 @@ digest_dir = "../digests"
 # queued: there is no backlog. Set this generously.
 digest_size = 20
 resurface_after_days = 30
+# Distinct canonical domains of fully qualifying articles for promising_lead.
+promising_domain_threshold = 2
 # An item that fails this many times is abandoned rather than retried daily.
 max_item_attempts = 3
 

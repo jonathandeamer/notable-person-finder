@@ -3,14 +3,13 @@ from typing import Literal, cast
 
 import pytest
 
-from notable import digest
 from notable.detect_contract import DetectedMention
 from notable.errors import BudgetExceeded, Incomplete
 from notable.feeds import SourceItem
 from notable.http import Transport
 from notable.llm import LlmClient
 from notable.pipeline import Providers, run
-from notable.rank import Lead
+from notable.rank import Lead, identity_key
 from notable.wiki_contract import MatchVerdict
 
 
@@ -66,25 +65,22 @@ def install(monkeypatch):
             "notable.pipeline.wiki.match",
             match_fn or (lambda mention, cfg, transport, llm: _NO_PAGE),
         )
-        monkeypatch.setattr(
-            "notable.pipeline.coverage.research",
-            lambda *a, **k: ()
-        )
+        monkeypatch.setattr("notable.pipeline.coverage.research", lambda *a, **k: ())
         monkeypatch.setattr(
             "notable.pipeline.rank.assess",
             lambda mention, verdict, articles, config, item: Lead(
-                identity_key=digest.identity_key(mention.exact_name),
+                identity_key=identity_key(mention.exact_name),
                 display_name=mention.exact_name,
                 source_url=getattr(item, "url", ""),
                 publisher_label=getattr(item, "publisher_label", ""),
                 wikipedia_verdict=verdict,
                 outcome="promising_lead",
                 article_assessments=(),
-                rank_tuple=(0, 0, 0, digest.identity_key(mention.exact_name)),
+                rank_tuple=(0, 0, 0, identity_key(mention.exact_name)),
                 namesake_urls=(),
                 rationale=mention.rationale,
                 qualifying_domains=(),
-            )
+            ),
         )
 
     return apply
@@ -248,6 +244,64 @@ def test_uncertain_and_no_matching_page_still_produce_entries(
         )
         path = run(make_config(), store, providers).digest_path
         assert "Ana Poy" in path.read_text("utf-8")
+
+
+def test_logs_all_terminal_leads_and_only_cut_survivors_are_surfaced(
+    make_config, store, providers, install, monkeypatch
+):
+    items = [_item(1), _item(2), _item(3)]
+    install(
+        items,
+        _returning(
+            {
+                "https://a.test/1": (_mention("Ana Poy"),),
+                "https://a.test/2": (_mention("Bo Li"),),
+                "https://a.test/3": (_mention("Cy Xu"),),
+            }
+        ),
+    )
+
+    def assess(mention, verdict, articles, config, item):
+        key = identity_key(mention.exact_name)
+        if mention.exact_name == "Bo Li":
+            return Lead(
+                identity_key=key,
+                display_name=mention.exact_name,
+                source_url=item.url,
+                publisher_label=item.publisher_label,
+                wikipedia_verdict=verdict,
+                outcome="insufficient_evidence",
+                article_assessments=(),
+                rank_tuple=None,
+                rationale=mention.rationale,
+            )
+        return Lead(
+            identity_key=key,
+            display_name=mention.exact_name,
+            source_url=item.url,
+            publisher_label=item.publisher_label,
+            wikipedia_verdict=verdict,
+            outcome="possible_lead",
+            article_assessments=(),
+            rank_tuple=(1, 0, -1, key),
+            rationale=mention.rationale,
+        )
+
+    monkeypatch.setattr("notable.pipeline.rank.assess", assess)
+    run(make_config(digest_size=1), store, providers)
+
+    outcomes = {
+        row[0]: row[1]
+        for row in store.connection.execute(
+            "SELECT identity_key, outcome FROM lead ORDER BY id"
+        )
+    }
+    assert set(outcomes) == {"ana poy", "bo li", "cy xu"}
+    assert outcomes["bo li"] == "insufficient_evidence"
+    surfaced = {
+        row[0] for row in store.connection.execute("SELECT identity_key FROM surfaced")
+    }
+    assert surfaced == {"ana poy"}  # digest_size=1, promising-sort order by key
 
 
 def _boom(*_args, **_kwargs):

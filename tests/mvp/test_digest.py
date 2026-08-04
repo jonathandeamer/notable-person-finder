@@ -3,8 +3,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from notable.digest import identity_key, render, write
-from notable.rank import Lead
+from notable.digest import render, write
+from notable.rank import Lead, identity_key
 
 wiki = MagicMock()
 wiki.outcome = "no_matching_page"

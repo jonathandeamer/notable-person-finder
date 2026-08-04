@@ -101,9 +101,10 @@ class Store:
         ).fetchone()
         if row is None:
             return False
-        # ISO 8601 strings sort lexicographically, so we can just compare strings
-        cutoff = (datetime.now(UTC) - timedelta(days=max_days)).isoformat(timespec="seconds")
-        return row[0] >= cutoff
+        cutoff = (datetime.now(UTC) - timedelta(days=max_days)).isoformat(
+            timespec="seconds"
+        )
+        return row[0] >= cutoff  # ISO-8601 sorts lexicographically
 
     def attempts(self, url: str) -> int:
         row = self.connection.execute(

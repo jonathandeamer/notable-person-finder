@@ -46,7 +46,7 @@ def run(
         for item in feeds.fetch_new(
             config, providers.transport, store, fresh=fresh_feeds
         ):
-            item_entries = []
+            item_entries: list[rank.Lead] = []
             try:
                 for mention in detect.people_in(item, config, providers.llm):
                     if not mention.research_worthy:
@@ -56,22 +56,22 @@ def run(
                     )
                     if verdict.has_page:
                         continue
-                    
-                    assessments = coverage.research(mention, config, providers.transport, providers.llm)
-                    lead = rank.assess(mention, verdict, assessments, config, item)
-                    item_entries.append(lead)
+                    assessments = coverage.research(
+                        mention, config, providers.transport, providers.llm
+                    )
+                    item_entries.append(
+                        rank.assess(mention, verdict, assessments, config, item)
+                    )
             except Incomplete:
-                incomplete.append(item.url)  # retried next run, up to a cap
+                incomplete.append(item.url)
                 continue
             entries.extend(item_entries)
             settled.append(item.url)
     except BudgetExceeded:
-        capped = True  # render what finished
+        capped = True
 
     summary = RunSummary(settled, incomplete, capped, providers.llm.spend(), started_at)
-    
     shortlist, surfaced_keys = rank.shortlist(entries, store, config)
-
     written = digest.write(
         shortlist,
         config.digest_dir,
@@ -82,5 +82,9 @@ def run(
         n_incomplete=len(incomplete),
     )
     store.commit(settled, incomplete, surfaced_keys)
-    store.log(summary, [], str(written))
+    store.log(
+        summary,
+        [rank.lead_to_log_dict(lead) for lead in entries],
+        str(written),
+    )
     return RunResult(digest_path=written, summary=summary)

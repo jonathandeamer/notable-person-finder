@@ -108,6 +108,7 @@ def test_defaults_match_the_spec(tmp_path, monkeypatch):
     assert config.max_item_attempts == 3
     assert config.resurface_after_days == 30
     assert config.digest_size == 20
+    assert config.promising_domain_threshold == 2
     assert config.detect.max_people == 8
     assert config.detect.max_completion_tokens == 4096
     assert config.budget_usd is None

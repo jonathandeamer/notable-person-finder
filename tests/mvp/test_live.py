@@ -36,8 +36,13 @@ def _refuse(request):  # pragma: no cover - only fires on a cache miss
     raise AssertionError(f"unexpected network call to {request.url}")
 
 
+# Phase 4 changes digest content; phase1/phase2 cache fixtures need re-record.
+_needs_phase4_fixture = pytest.mark.skip(
+    reason="Phase 4 replaces Phase 1/2. Fixtures must be re-recorded."
+)
+
+
 def _replay(tmp_path, *, clock=time.time):
-    pytest.skip("Phase 4 replaces Phase 1/2. Fixtures must be re-recorded.")
     cache_dir = tmp_path / "cache"
     shutil.copytree(FIXTURE, cache_dir)
     loaded = load_config(Path("config/notable.example.toml"))
@@ -69,6 +74,7 @@ def _replay(tmp_path, *, clock=time.time):
     return config, store, providers
 
 
+@_needs_phase4_fixture
 def test_recorded_run_replays_offline_with_no_network(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
     monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
@@ -96,6 +102,7 @@ def _detected_names(digest_text: str) -> list[str]:
     return re.findall(r"^### (.+)$", digest_text, re.MULTILINE)
 
 
+@_needs_phase4_fixture
 def test_the_fixture_corpus_surfaces_exactly_the_people_it_should(
     tmp_path, monkeypatch
 ):
@@ -124,6 +131,7 @@ def test_the_fixture_corpus_surfaces_exactly_the_people_it_should(
         assert name not in detected, f"{name} must not be surfaced by this corpus"
 
 
+@_needs_phase4_fixture
 def test_the_fixture_replays_long_after_its_ttls_expire(tmp_path, monkeypatch):
     """The fixture must not rot.
 
@@ -149,6 +157,7 @@ def test_the_fixture_replays_long_after_its_ttls_expire(tmp_path, monkeypatch):
     assert providers.llm.calls == 0, "every call must still be served from the fixture"
 
 
+@_needs_phase4_fixture
 def test_the_fixture_corpus_settles_the_items_it_should(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
     monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
@@ -180,7 +189,6 @@ def _replay_phase2(tmp_path, *, clock=time.time):
     contact URL must be overridden to match what was actually recorded, or
     every single call misses.
     """
-    pytest.skip("Phase 4 replaces Phase 1/2. Fixtures must be re-recorded.")
     cache_dir = tmp_path / "cache"
     shutil.copytree(PHASE2_FIXTURE, cache_dir)
     loaded = load_config(Path("config/notable.example.toml"))
@@ -223,6 +231,7 @@ def _replay_phase2(tmp_path, *, clock=time.time):
     return config, store, providers, expected
 
 
+@_needs_phase4_fixture
 def test_the_phase2_fixture_replays_offline_with_no_network(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
     monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
@@ -234,6 +243,7 @@ def test_the_phase2_fixture_replays_offline_with_no_network(tmp_path, monkeypatc
     store.close()
 
 
+@_needs_phase4_fixture
 def test_the_phase2_fixture_corpus_surfaces_exactly_the_people_it_should(
     tmp_path, monkeypatch
 ):
@@ -255,6 +265,7 @@ def test_the_phase2_fixture_corpus_surfaces_exactly_the_people_it_should(
         assert name not in detected, f"{name} must not be surfaced by this corpus"
 
 
+@_needs_phase4_fixture
 def test_the_phase2_fixture_replays_long_after_its_ttls_expire(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
     monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
@@ -266,6 +277,7 @@ def test_the_phase2_fixture_replays_long_after_its_ttls_expire(tmp_path, monkeyp
     assert providers.llm.calls == 0, "every call must still be served from the fixture"
 
 
+@_needs_phase4_fixture
 def test_the_phase2_fixture_corpus_settles_the_items_it_should(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
     monkeypatch.setenv("BRAVE_API_KEY", "sk-test")

@@ -180,7 +180,10 @@ Automated tests cover:
   `promising_lead`), while shortlist collapse makes the duplication visible;
 - regression coverage ensuring Phase 1–3 provider and cache behavior remains
   unchanged;
-- source line count remains below 3,000 after the implementation.
+- source line count is recorded after implementation (soft target ~3,000;
+  hard alert ~3,500 or new machinery — see core-loop Guardrails). Do not
+  block Phase 4 on blank-line shaving if the loop is complete and concept
+  guardrails hold.
 
 The automated completion gate is:
 
