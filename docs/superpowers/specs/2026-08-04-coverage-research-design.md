@@ -68,6 +68,20 @@ attempts, and at most that many `assess_article` model calls:
    model never re-derives screening status; the prompt is explicit that
    "screening state is an input, not a verdict to invent."**
 
+### Empty-candidate short-circuit
+
+If the surviving article set is empty after step 3 or 4 — zero Brave
+results, every result was `curated_ineligible`, or every fetch/extract
+attempt failed — `coverage.research` returns `()` immediately, making
+**zero** `assess_article` calls. This is a deterministic short-circuit, not
+`Incomplete`: an empty coverage result is not a technical failure, it is
+exactly what "the search genuinely ran and returned nothing usable" means,
+and Phase 4's `rank.assess` evaluates zero articles as `insufficient_evidence`
+by construction (an outcome computed over an empty evidence set, not a
+special case `coverage.py` has to name). This mirrors Phase 2's
+empty-candidate short-circuit for the same reason: a call that cannot
+possibly say anything useful is not made.
+
 ### What still raises `Incomplete`, whole-mention
 
 - The Brave search call itself failing (`ProviderFailure`) — nothing to
@@ -176,12 +190,40 @@ about cache pruning, not a reason to weaken this phase's caching contract.
 
 Article fetch needs one new fixed transport rule, additive to the existing
 contract: **bound response size and require an HTML-ish content-type before
-attempting extraction.** A response failing either check is simply another
-"drop this article" case in `coverage.py`, not a transport-level error —
-`http.py` itself stays provider-agnostic and does not special-case articles;
-it just enforces the same size/timeout discipline it already applies
-everywhere, and `coverage.py` reads `Response.status`/headers to decide
-whether to attempt extraction at all.
+attempting extraction.**
+
+**The size bound must not trust `Content-Length`.** Many servers omit it or
+lie, and the frozen `refactor/rearchitecture` system's own transport layer
+already had to solve exactly this (`providers/transport.py`'s
+`ResponseLimit`). `Transport.request` gains an optional `max_bytes:
+int | None = None` parameter (default `None`, meaning every existing
+provider is unaffected); when set, `_send` reads the response as a stream
+and aborts once the running byte count exceeds the limit, rather than
+downloading the full body first and checking its length afterward. An
+aborted-for-size stream is treated as a normal fetch failure — for article
+fetch specifically, that means "drop this article," not a transport-level
+crash. `coverage.py` passes `max_bytes` and reads the response's
+`Content-Type` header before invoking Trafilatura; a non-HTML content-type
+is the same "drop this article" outcome, checked before extraction is
+attempted rather than left to Trafilatura to fail on.
+
+**Failed article fetches are not cached** — a 404, paywall response, or a
+size/content-type rejection is never stored, per the shared cache contract's
+"only validated successes are cached" rule (`docs/superpowers/specs/2026-08-03-mvp-core-loop-design.md`).
+This was raised explicitly during review as a real cost: a dead URL that
+Brave keeps returning gets refetched on every retry of the mention that
+discovered it. The exposure is bounded and accepted rather than fixed: a
+dead article never makes its *mention* `Incomplete` (see the empty-candidate
+short-circuit above and the per-article-failure rule below), so an item that
+settles is never revisited regardless of the dead URL; the same URL can only
+be refetched if that item retries for an unrelated whole-mention failure,
+capped at `max_item_attempts` (3). HTTP fetches cost no money — only model
+calls do — so the waste is bounded network time, not spend. A provider-scoped
+exception to the shared cache-failure contract (caching 4xx article
+responses) was considered and rejected: it would fragment one caching rule
+into a per-provider question and contradicts the master spec's explicit
+"never cache failures" invariant for a saving that is not measured against
+any real run yet.
 
 ## Testing
 
@@ -198,6 +240,9 @@ Named invariant tests for this phase:
 | **Brave cache expires** | A Brave call past `discovery_ttl_seconds` re-requests rather than replays. |
 | **`max_articles_per_mention` bounds fetch count** | More screened results than the cap still fetches only the cap's worth. |
 | **Oversized or non-HTML responses are dropped, not crashed on** | A response failing the size/content-type check is treated as a failed fetch for that one article, not raised. |
+| **A stream over `max_bytes` aborts before full download** | Enforcement does not depend on `Content-Length`: a response streaming past the limit is caught mid-transfer, not after buffering the whole body. |
+| **Zero surviving articles short-circuits to an empty tuple** | Zero Brave results, all-ineligible screening, or every fetch/extract failing all return `()` with zero `assess_article` calls, never `Incomplete`. |
+| **Failed article fetches are never cached** | A 404 followed by a retry of the same mention re-requests the same URL rather than replaying a cached failure. |
 
 Provider-facing tests replay recorded cache fixtures, per the master spec.
 Trafilatura extraction tests use small fixture HTML strings, not live
