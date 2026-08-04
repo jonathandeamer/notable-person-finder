@@ -317,3 +317,44 @@ def test_live_detection_smoke(tmp_path):
     assert "item_outcome" in result
     assert llm.truncations == 0
     assert llm.spend() > 0, "usage.cost must be reported, or the cap is blind"
+
+
+@pytest.mark.live
+def test_live_coverage_smoke(tmp_path):
+    """Opt-in: uv run pytest tests/mvp -m live -v
+
+    Exercises coverage.research directly against real Brave, a real article
+    fetch, and a real assess_article call -- the three external surfaces
+    this phase adds that findings.md has no data on yet. A cheap, well-known
+    query is used so the run is inexpensive and reproducible.
+    """
+    from notable.coverage import research
+    from notable.detect_contract import DetectedMention
+
+    config = load_config(Path("config/mvp.local.toml"))
+    assert config.budget_usd is not None, "never run live without a cap"
+
+    client = httpx.Client(follow_redirects=True)
+    transport = Transport(config.transport, Cache(tmp_path / "cache"), client=client)
+    llm = LlmClient(
+        transport,
+        config.openrouter,
+        api_key=config.openrouter_api_key,
+        budget_usd=config.budget_usd,
+    )
+    mention = DetectedMention(
+        exact_name="David Hockney",
+        outcome="research",
+        supporting_passage_ids=("p1",),
+        identity_facts=(),
+        signals=(),
+        rationale="Live smoke.",
+    )
+    result = research(mention, config, transport, llm)
+    # The point is that Brave's real response shape, a real fetched page,
+    # Trafilatura against real HTML, and the assess_article schema all
+    # survive contact with real providers -- not any particular verdict.
+    assert llm.spend() > 0, "the assess_article call must report a real cost"
+    assert transport.cache_misses > 0
+    if result:
+        assert result[0].content_types
