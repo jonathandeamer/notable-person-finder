@@ -1,0 +1,83 @@
+# Phase 2 corpus gate. Wikipedia match applied: entries below are the
+# research-worthy mentions that do NOT already have a matching Wikipedia
+# page. must_detect is an exact multiset against digest headings (sorted).
+#
+# This fixture is trimmed from the live 246-item run to the 226 items that
+# settled cleanly. The 20 that remained genuinely incomplete after two
+# attempts (a real MediaWiki/model failure that was never cached, since only
+# validated successes are cached) are excluded from the replay corpus via
+# excluded_urls -- pre-seeding them as abandoned so a fresh replay never
+# attempts them, rather than let a replay hit an uncached call and crash.
+#
+# Known weak extraction kept for regression lock until detection improves:
+#   the bare 'Obama'/'Trump'/'Kate'/'Leonardo' names, and one role reference
+#   ('the director of the Smithsonian's National Museum of American History')
+#   that should have been marked not research-worthy.
+n_items_settled = 226
+n_items_incomplete = 0
+n_detected = 22
+
+must_detect = [
+  "Bernardo Paz",
+  "Obama",
+  "Trump",
+  "the director of the Smithsonian’s National Museum of American History",
+  "Basquiat",
+  "Michael A. Hayden",
+  "Oleksandr Dubovyk",
+  "Jessica Morgan",
+  "Jen-Hsun and Lori Huang",
+  "Na Kim",
+  "Malo Chapuy",
+  "Trump",
+  "Sade",
+  "Victor “Frenchy” Gosselin",
+  "LR Vandy",
+  "Daniel Malikyar",
+  "Attilio Fiumarella",
+  "Im Youngzoo",
+  "Kate",
+  "Sue Macartney Snape",
+  "Leonardo",
+  "Ellen Pau",
+]
+
+# Organizations / bylines / non-people that must never appear as headings.
+must_not_detect = [
+  "The Art Newspaper",
+  "Artnews",
+  "Artnet",
+  "Artforum",
+  "Hyperallergic",
+  "BBC News",
+  "RSS",
+  "Staff Writer",
+  "Editors",
+]
+
+# Source items that never reached a terminal state on the live run and were
+# left with no cached response for whatever call kept failing. Pre-seeded as
+# abandoned (attempts = max_item_attempts) before replay so the corpus is
+# exactly the 226 that settle, not a crash on an uncached call.
+excluded_urls = [
+  "https://www.theartnewspaper.com/2026/07/30/artist-starts-legal-case-against-meta-for-deleting-her-instagram-account",
+  "https://www.theartnewspaper.com/2026/07/28/environmental-art-governors-island-alan-michelson-leslie-wayne",
+  "https://www.theartnewspaper.com/2026/07/27/biennale-sydney-curator-2028-low-kee-hong",
+  "https://www.theartnewspaper.com/2026/07/21/yoko-ono-cut-piece-mpa-redcat-broad-los-angeles",
+  "https://www.theartnewspaper.com/2026/07/20/head-of-victoria-albert-museum-academic-programmes-resigned-citing-racist-and-culturally-insensitive-behaviours-letter-reveals",
+  "https://news.artnet.com/art-world/francisco-correa-cordero-lubov-gallery-founder-dead-2792229",
+  "https://news.artnet.com/art-world/capshaw-obama-chef-tafari-campbell-portrait-2792165",
+  "https://www.artforum.com/news/hong-kong-palace-museum-director-louis-ng-to-step-down-in-1234756178/",
+  "https://www.artforum.com/news/stephanie-wiles-of-yale-university-art-gallery-to-retire-1234756084/",
+  "https://www.nytimes.com/2026/07/24/arts/design/matthew-taylor-artist-filmmaker-trump-washington.html",
+  "https://www.nytimes.com/2026/07/22/arts/design/charles-ross-star-axis-land-art.html",
+  "https://www.theguardian.com/wellness/2026/aug/03/how-to-start-decorating-your-home",
+  "https://www.theguardian.com/film/2026/aug/03/atlas-of-disappearance-review-forensic-quest-for-families-robbed-of-graves-by-franco",
+  "https://artreview.com/the-politics-of-belonging-at-the-india-pavilion-venice-biennale-opinion-pallavi-surana/",
+  "https://artreview.com/low-kee-hong-named-artistic-director-of-2028-biennale-of-sydney/",
+  "https://www.telegraph.co.uk/art/artists/christo-artists-greatest-works-pictures/",
+  "https://www.bbc.co.uk/news/articles/c17157702q7o?at_campaign=rss&at_medium=RSS",
+  "https://www.bbc.co.uk/news/videos/c5y6elxrg10o?at_campaign=rss&at_medium=RSS",
+  "https://www.bbc.co.uk/news/articles/cwyrj42qk1po?at_campaign=rss&at_medium=RSS",
+  "https://hyperallergic.com/sharmistha-ray-transforms-pickleball-courts-into-stunning-artworks/",
+]

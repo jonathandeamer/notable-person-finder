@@ -44,6 +44,7 @@ def _noop() -> None:
 class Response:
     status: int
     text: str
+    content_type: str | None = None
     # A cache hit cost nothing. `llm.py` relies on this to keep replayed calls
     # out of the run's spend: counting them would report money that was never
     # spent and could trip the budget cap during a free crash replay.
@@ -105,6 +106,7 @@ class Transport:
         json_body: dict[str, Any] | None = None,
         ttl_seconds: int | None,
         timeout: float | None = None,
+        max_bytes: int | None = None,
         extra_key: dict[str, object] | None = None,
         auth_token: str | None = None,
         auth_header: str = "Authorization",
@@ -129,6 +131,7 @@ class Transport:
                 return Response(
                     status=int(cached["status"]),
                     text=str(cached["text"]),
+                    content_type=cached.get("content_type"),
                     from_cache=True,
                 )
         self.cache_misses += 1
@@ -145,6 +148,7 @@ class Transport:
             json_body=json_body,
             headers=headers,
             timeout=timeout or self._config.read_timeout_seconds,
+            max_bytes=max_bytes,
         )
 
         stored = False
@@ -156,7 +160,14 @@ class Transport:
             if stored:
                 return
             stored = True
-            self._cache.put(key, {"status": response.status, "text": response.text})
+            self._cache.put(
+                key,
+                {
+                    "status": response.status,
+                    "text": response.text,
+                    "content_type": response.content_type,
+                },
+            )
 
         # Only *validated* successes are cached. A transport-level 200 is not
         # yet a success: JSON parsing and domain validation are downstream, and
@@ -179,6 +190,7 @@ class Transport:
         json_body: dict[str, Any] | None,
         headers: dict[str, str],
         timeout: float,
+        max_bytes: int | None = None,
     ) -> Response:
         backoff = self._config.initial_backoff_seconds
         last: Exception | None = None
@@ -200,24 +212,50 @@ class Transport:
                 # send() transmits this fully-formed request as-is. Using
                 # client.request() would merge client-level headers/cookies
                 # back into the request and undermine the cache profile.
-                raw = self._client.send(request, follow_redirects=True)
+                # stream=True only when a size bound is set: reading the
+                # body incrementally is how the bound is enforced without
+                # trusting a Content-Length header that many servers omit
+                # or lie about.
+                raw = self._client.send(
+                    request, follow_redirects=True, stream=max_bytes is not None
+                )
             except httpx.HTTPError as error:
                 last = ProviderFailure(
                     f"{type(error).__name__}: {error}", permanent=False
                 )
             else:
-                if raw.status_code < 400:
-                    self._client.cookies.clear()
-                    return Response(status=raw.status_code, text=raw.text)
-                if raw.status_code < 500 and raw.status_code != 429:
-                    raise ProviderFailure(
-                        f"HTTP {raw.status_code} from {url}", permanent=True
-                    )
-                if raw.status_code == 429:
-                    self._count(rate_limited=1)
-                last = ProviderFailure(
-                    f"HTTP {raw.status_code} from {url}", permanent=False
-                )
+                try:
+                    try:
+                        text = self._read_body(raw, max_bytes, url)
+                    except httpx.HTTPError as error:
+                        # Mid-stream errors (timeouts, connection drops,
+                        # decoding failures) on the streamed path must become
+                        # retryable ProviderFailures too, matching the
+                        # non-streamed path where the whole body was read
+                        # inside the client.send() try above.
+                        last = ProviderFailure(
+                            f"{type(error).__name__}: {error}", permanent=False
+                        )
+                    else:
+                        if raw.status_code < 400:
+                            self._client.cookies.clear()
+                            return Response(
+                                status=raw.status_code,
+                                text=text,
+                                content_type=raw.headers.get("content-type"),
+                            )
+                        if raw.status_code < 500 and raw.status_code != 429:
+                            raise ProviderFailure(
+                                f"HTTP {raw.status_code} from {url}", permanent=True
+                            )
+                        if raw.status_code == 429:
+                            self._count(rate_limited=1)
+                        last = ProviderFailure(
+                            f"HTTP {raw.status_code} from {url}", permanent=False
+                        )
+                finally:
+                    if max_bytes is not None:
+                        raw.close()
             finally:
                 # Do not carry Set-Cookie state into a later request, including
                 # after failures and redirects handled by httpx.
@@ -234,6 +272,23 @@ class Transport:
                 self._sleep(backoff)
                 backoff *= 2
         raise last or ProviderFailure(f"no response from {url}", permanent=False)
+
+    @staticmethod
+    def _read_body(raw: httpx.Response, max_bytes: int | None, url: str) -> str:
+        """Read the body, enforcing `max_bytes` by streaming rather than by
+        trusting `Content-Length` -- many servers omit it or lie."""
+        if max_bytes is None:
+            return raw.text
+        total = 0
+        chunks: list[bytes] = []
+        for chunk in raw.iter_bytes():
+            total += len(chunk)
+            if total > max_bytes:
+                raise ProviderFailure(
+                    f"response exceeded {max_bytes} bytes from {url}", permanent=True
+                )
+            chunks.append(chunk)
+        return b"".join(chunks).decode(raw.encoding or "utf-8", errors="replace")
 
     def _count(
         self, *, attempts: int = 0, retries: int = 0, rate_limited: int = 0

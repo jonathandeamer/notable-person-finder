@@ -272,3 +272,105 @@ def test_pacing_sleeps_between_calls_to_one_host(tmp_path):
             provider="t", method="GET", url=f"https://a.test/{path}", ttl_seconds=None
         )
     assert slept and slept[-1] > 0
+
+
+def test_a_response_over_max_bytes_is_rejected(tmp_path):
+    def handler(request):
+        return httpx.Response(200, text="x" * 100)
+
+    with pytest.raises(ProviderFailure) as info:
+        _transport(tmp_path, handler).request(
+            provider="t",
+            method="GET",
+            url="https://a.test/x",
+            ttl_seconds=None,
+            max_bytes=10,
+        )
+    assert info.value.permanent is True
+
+
+def test_a_response_under_max_bytes_is_returned_normally(tmp_path):
+    def handler(request):
+        return httpx.Response(200, text="small")
+
+    result = _transport(tmp_path, handler).request(
+        provider="t",
+        method="GET",
+        url="https://a.test/x",
+        ttl_seconds=None,
+        max_bytes=1000,
+    )
+    assert result.text == "small"
+
+
+def test_max_bytes_is_not_applied_when_absent(tmp_path):
+    # Every existing caller omits max_bytes; a large response must still
+    # succeed for them, since the default must be "no bound."
+    def handler(request):
+        return httpx.Response(200, text="x" * 10_000)
+
+    result = _transport(tmp_path, handler).request(
+        provider="t", method="GET", url="https://a.test/x", ttl_seconds=None
+    )
+    assert len(result.text) == 10_000
+
+
+def test_content_type_is_returned_and_cached(tmp_path):
+    def handler(request):
+        return httpx.Response(
+            200, text="ok", headers={"content-type": "text/html; charset=utf-8"}
+        )
+
+    transport = _transport(tmp_path, handler)
+    first = transport.request(
+        provider="t", method="GET", url="https://a.test/x", ttl_seconds=None
+    )
+    second = transport.request(
+        provider="t", method="GET", url="https://a.test/x", ttl_seconds=None
+    )
+    assert first.content_type == "text/html; charset=utf-8"
+    assert second.content_type == "text/html; charset=utf-8"
+    assert second.from_cache is True
+
+
+class _BrokenStream(httpx.SyncByteStream):
+    """A response body that fails partway through iteration, simulating a
+    connection that stalls or drops after headers arrive."""
+
+    def __iter__(self):
+        yield b"partial data"
+        raise httpx.ReadError("boom mid-stream")
+
+    def close(self):
+        pass
+
+
+def test_a_mid_stream_read_error_becomes_a_retryable_provider_failure(tmp_path):
+    # With max_bytes set, the body is read incrementally via raw.iter_bytes()
+    # in the streamed path. A transport-level error raised mid-iteration (e.g.
+    # ReadTimeout, ReadError, RemoteProtocolError) must convert to a
+    # ProviderFailure, exactly like a client.send() failure does, so callers
+    # such as coverage.py's per-article catch keep working instead of seeing a
+    # raw httpx exception escape.
+    def handler(request):
+        return httpx.Response(200, stream=_BrokenStream())
+
+    with pytest.raises(ProviderFailure) as info:
+        _transport(tmp_path, handler).request(
+            provider="t",
+            method="GET",
+            url="https://a.test/x",
+            ttl_seconds=None,
+            max_bytes=1000,
+        )
+    assert info.value.permanent is False
+
+
+def test_content_type_defaults_to_none_when_absent(tmp_path):
+    def handler(request):
+        return httpx.Response(200, content=b"ok", headers={})
+
+    result = _transport(tmp_path, handler).request(
+        provider="t", method="GET", url="https://a.test/x", ttl_seconds=None
+    )
+    assert result.content_type is None
