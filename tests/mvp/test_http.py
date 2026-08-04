@@ -272,3 +272,72 @@ def test_pacing_sleeps_between_calls_to_one_host(tmp_path):
             provider="t", method="GET", url=f"https://a.test/{path}", ttl_seconds=None
         )
     assert slept and slept[-1] > 0
+
+
+def test_a_response_over_max_bytes_is_rejected(tmp_path):
+    def handler(request):
+        return httpx.Response(200, text="x" * 100)
+
+    with pytest.raises(ProviderFailure) as info:
+        _transport(tmp_path, handler).request(
+            provider="t",
+            method="GET",
+            url="https://a.test/x",
+            ttl_seconds=None,
+            max_bytes=10,
+        )
+    assert info.value.permanent is True
+
+
+def test_a_response_under_max_bytes_is_returned_normally(tmp_path):
+    def handler(request):
+        return httpx.Response(200, text="small")
+
+    result = _transport(tmp_path, handler).request(
+        provider="t",
+        method="GET",
+        url="https://a.test/x",
+        ttl_seconds=None,
+        max_bytes=1000,
+    )
+    assert result.text == "small"
+
+
+def test_max_bytes_is_not_applied_when_absent(tmp_path):
+    # Every existing caller omits max_bytes; a large response must still
+    # succeed for them, since the default must be "no bound."
+    def handler(request):
+        return httpx.Response(200, text="x" * 10_000)
+
+    result = _transport(tmp_path, handler).request(
+        provider="t", method="GET", url="https://a.test/x", ttl_seconds=None
+    )
+    assert len(result.text) == 10_000
+
+
+def test_content_type_is_returned_and_cached(tmp_path):
+    def handler(request):
+        return httpx.Response(
+            200, text="ok", headers={"content-type": "text/html; charset=utf-8"}
+        )
+
+    transport = _transport(tmp_path, handler)
+    first = transport.request(
+        provider="t", method="GET", url="https://a.test/x", ttl_seconds=None
+    )
+    second = transport.request(
+        provider="t", method="GET", url="https://a.test/x", ttl_seconds=None
+    )
+    assert first.content_type == "text/html; charset=utf-8"
+    assert second.content_type == "text/html; charset=utf-8"
+    assert second.from_cache is True
+
+
+def test_content_type_defaults_to_none_when_absent(tmp_path):
+    def handler(request):
+        return httpx.Response(200, content=b"ok", headers={})
+
+    result = _transport(tmp_path, handler).request(
+        provider="t", method="GET", url="https://a.test/x", ttl_seconds=None
+    )
+    assert result.content_type is None
