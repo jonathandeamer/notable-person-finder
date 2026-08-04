@@ -70,6 +70,7 @@ def _replay(tmp_path, *, clock=time.time):
 
 def test_recorded_run_replays_offline_with_no_network(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
     monkeypatch.setattr(
         "notable.wiki.match",
         lambda mention, cfg, transport, llm: _NO_PAGE,
@@ -104,6 +105,7 @@ def test_the_fixture_corpus_surfaces_exactly_the_people_it_should(
     regressions show up only as a digest nobody is comparing.
     """
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
     monkeypatch.setattr(
         "notable.wiki.match",
         lambda mention, cfg, transport, llm: _NO_PAGE,
@@ -133,6 +135,7 @@ def test_the_fixture_replays_long_after_its_ttls_expire(tmp_path, monkeypatch):
     and in CI, not only where an external tool happens to be installed.
     """
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
     monkeypatch.setattr(
         "notable.wiki.match",
         lambda mention, cfg, transport, llm: _NO_PAGE,
@@ -147,6 +150,7 @@ def test_the_fixture_replays_long_after_its_ttls_expire(tmp_path, monkeypatch):
 
 def test_the_fixture_corpus_settles_the_items_it_should(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
     monkeypatch.setattr(
         "notable.wiki.match",
         lambda mention, cfg, transport, llm: _NO_PAGE,
@@ -219,6 +223,7 @@ def _replay_phase2(tmp_path, *, clock=time.time):
 
 def test_the_phase2_fixture_replays_offline_with_no_network(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
     config, store, providers, _ = _replay_phase2(tmp_path)
     result = run(config, store, providers)
     assert result.digest_path.exists()
@@ -237,6 +242,7 @@ def test_the_phase2_fixture_corpus_surfaces_exactly_the_people_it_should(
     and match_wikipedia_identity call recorded from the live run.
     """
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
     config, store, providers, expected = _replay_phase2(tmp_path)
     result = run(config, store, providers)
     store.close()
@@ -249,6 +255,7 @@ def test_the_phase2_fixture_corpus_surfaces_exactly_the_people_it_should(
 
 def test_the_phase2_fixture_replays_long_after_its_ttls_expire(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
     a_month_on = time.time() + 30 * 86400
     config, store, providers, _ = _replay_phase2(tmp_path, clock=lambda: a_month_on)
     result = run(config, store, providers)
@@ -259,6 +266,7 @@ def test_the_phase2_fixture_replays_long_after_its_ttls_expire(tmp_path, monkeyp
 
 def test_the_phase2_fixture_corpus_settles_the_items_it_should(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
     config, store, providers, expected = _replay_phase2(tmp_path)
     result = run(config, store, providers)
     store.close()

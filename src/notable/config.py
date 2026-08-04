@@ -67,6 +67,24 @@ class MediaWikiConfig(_Strict):
     maxlag_seconds: int = Field(default=5, ge=1)
 
 
+class BraveConfig(_Strict):
+    endpoint: str = "https://api.search.brave.com/res/v1/web/search"
+    max_search_results: int = Field(default=10, ge=1, le=20)
+    max_articles_per_mention: int = Field(default=5, ge=1)
+
+
+class CoverageConfig(_Strict):
+    source_policy_path: Path
+    max_article_characters: int = Field(default=6000, ge=1)
+    max_article_bytes: int = Field(default=2_000_000, ge=1)
+
+
+class _CoverageFile(_Strict):
+    source_policy_file: str = "source_policies/visual_arts.toml"
+    max_article_characters: int = 6000
+    max_article_bytes: int = 2_000_000
+
+
 class OpenRouterConfig(_Strict):
     endpoint: str = "https://openrouter.ai/api/v1"
 
@@ -82,14 +100,19 @@ class Config(_Strict):
     cache: CacheConfig
     detect: DetectConfig
     match: ModelTaskConfig
+    assess: ModelTaskConfig
     mediawiki: MediaWikiConfig
+    brave: BraveConfig
+    coverage: CoverageConfig
     openrouter: OpenRouterConfig
     budget_usd: Decimal | None
     openrouter_api_key: str = Field(min_length=1, repr=False)
+    brave_api_key: str = Field(min_length=1, repr=False)
 
 
 class _Secrets(_Strict):
     openrouter_api_key: str = "OPENROUTER_API_KEY"
+    brave_api_key: str = "BRAVE_API_KEY"
 
 
 class _Budget(_Strict):
@@ -108,6 +131,8 @@ class _File(_Strict):
     transport: TransportConfig
     cache: CacheConfig = CacheConfig()
     mediawiki: MediaWikiConfig = MediaWikiConfig()
+    brave: BraveConfig = BraveConfig()
+    coverage: _CoverageFile = _CoverageFile()
     openrouter: OpenRouterConfig = OpenRouterConfig()
     budget: _Budget = _Budget()
     tasks: dict[str, dict[str, Any]]
@@ -165,12 +190,21 @@ def load_config(path: Path) -> Config:
 
     detect = _task_config(parsed, "detect_people", DetectConfig, path)
     match = _task_config(parsed, "match_wikipedia_identity", ModelTaskConfig, path)
+    assess = _task_config(parsed, "assess_article", ModelTaskConfig, path)
 
-    variable = parsed.secrets.openrouter_api_key
-    api_key = os.environ.get(variable, "").strip()
-    if not api_key:
+    or_variable = parsed.secrets.openrouter_api_key
+    or_key = os.environ.get(or_variable, "").strip()
+    if not or_key:
         raise ValueError(
-            f"missing OpenRouter API key: set the {variable} environment "
+            f"missing OpenRouter API key: set the {or_variable} environment "
+            f"variable, or add it to {root / '.env'}"
+        )
+
+    brave_variable = parsed.secrets.brave_api_key
+    brave_key = os.environ.get(brave_variable, "").strip()
+    if not brave_key:
+        raise ValueError(
+            f"missing Brave API key: set the {brave_variable} environment "
             f"variable, or add it to {root / '.env'}"
         )
 
@@ -188,8 +222,16 @@ def load_config(path: Path) -> Config:
         ),
         detect=detect,
         match=match,
+        assess=assess,
         mediawiki=parsed.mediawiki,
+        brave=parsed.brave,
+        coverage=CoverageConfig(
+            source_policy_path=(root / parsed.coverage.source_policy_file).resolve(),
+            max_article_characters=parsed.coverage.max_article_characters,
+            max_article_bytes=parsed.coverage.max_article_bytes,
+        ),
         openrouter=parsed.openrouter,
         budget_usd=None if budget is None else Decimal(budget),
-        openrouter_api_key=api_key,
+        openrouter_api_key=or_key,
+        brave_api_key=brave_key,
     )

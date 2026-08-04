@@ -27,6 +27,7 @@ digest_dir = "digests"
 
 [secrets]
 openrouter_api_key = "TEST_OR_KEY"
+brave_api_key = "TEST_BRAVE_KEY"
 
 [transport]
 contact_url = "https://example.com/contact"
@@ -42,6 +43,9 @@ model = "openai/gpt-5.4-mini"
 
 [tasks.match_wikipedia_identity]
 model = "openai/gpt-5.4-mini"
+
+[tasks.assess_article]
+model = "openai/gpt-5.4-mini"
 """
 
 
@@ -49,6 +53,7 @@ def test_loads_feeds_and_resolves_paths_relative_to_the_config_file(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("TEST_OR_KEY", "sk-test")
+    monkeypatch.setenv("TEST_BRAVE_KEY", "brave-test")
     config = load_config(_write(tmp_path, BASE))
     assert [feed.key for feed in config.feeds] == ["a"]
     assert config.data_dir == tmp_path / "data"
@@ -57,6 +62,7 @@ def test_loads_feeds_and_resolves_paths_relative_to_the_config_file(
 
 def test_secret_comes_from_the_environment_not_the_file(tmp_path, monkeypatch):
     monkeypatch.setenv("TEST_OR_KEY", "sk-live")
+    monkeypatch.setenv("TEST_BRAVE_KEY", "brave-test")
     config = load_config(_write(tmp_path, BASE))
     assert config.openrouter_api_key == "sk-live"
 
@@ -67,14 +73,23 @@ def test_missing_secret_is_a_clear_error(tmp_path, monkeypatch):
         load_config(_write(tmp_path, BASE))
 
 
+def test_missing_brave_secret_is_a_clear_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_OR_KEY", "sk-test")
+    monkeypatch.delenv("TEST_BRAVE_KEY", raising=False)
+    with pytest.raises(ValueError, match="TEST_BRAVE_KEY"):
+        load_config(_write(tmp_path, BASE))
+
+
 def test_unknown_key_is_rejected(tmp_path, monkeypatch):
     monkeypatch.setenv("TEST_OR_KEY", "sk-test")
+    monkeypatch.setenv("TEST_BRAVE_KEY", "brave-test")
     with pytest.raises(ValueError):
         load_config(_write(tmp_path, BASE + '\nunexpected_key = "x"\n'))
 
 
 def test_duplicate_feed_keys_are_rejected(tmp_path, monkeypatch):
     monkeypatch.setenv("TEST_OR_KEY", "sk-test")
+    monkeypatch.setenv("TEST_BRAVE_KEY", "brave-test")
     feeds = (
         "schema_version = 1\n"
         '[[feeds]]\nkey = "a"\nlabel = "A"\nurl = "https://a.test/f"\n'
@@ -86,6 +101,7 @@ def test_duplicate_feed_keys_are_rejected(tmp_path, monkeypatch):
 
 def test_defaults_match_the_spec(tmp_path, monkeypatch):
     monkeypatch.setenv("TEST_OR_KEY", "sk-test")
+    monkeypatch.setenv("TEST_BRAVE_KEY", "brave-test")
     config = load_config(_write(tmp_path, BASE))
     assert config.cache.feed_ttl_seconds == 43200
     assert config.cache.discovery_ttl_seconds == 86400
@@ -98,6 +114,15 @@ def test_defaults_match_the_spec(tmp_path, monkeypatch):
     assert config.match.model == "openai/gpt-5.4-mini"
     assert config.match.max_completion_tokens == 4096
     assert config.match.reasoning_effort == "low"
+    assert config.assess.model == "openai/gpt-5.4-mini"
+    assert config.brave.endpoint == "https://api.search.brave.com/res/v1/web/search"
+    assert config.brave.max_search_results == 10
+    assert config.brave.max_articles_per_mention == 5
+    assert config.coverage.max_article_characters == 6000
+    assert config.coverage.max_article_bytes == 2_000_000
+    assert config.coverage.source_policy_path == (
+        tmp_path / "source_policies" / "visual_arts.toml"
+    )
     assert config.mediawiki.endpoint == "https://en.wikipedia.org/w/api.php"
     assert config.mediawiki.max_candidates == 15
     assert config.mediawiki.max_extract_characters == 1200
@@ -107,12 +132,14 @@ def test_defaults_match_the_spec(tmp_path, monkeypatch):
 
 def test_budget_parses_as_decimal(tmp_path, monkeypatch):
     monkeypatch.setenv("TEST_OR_KEY", "sk-test")
+    monkeypatch.setenv("TEST_BRAVE_KEY", "brave-test")
     body = BASE + '\n[budget]\nopenrouter_usd_per_run = "2.50"\n'
     assert load_config(_write(tmp_path, body)).budget_usd == Decimal("2.50")
 
 
 def test_shipped_example_config_is_loadable(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
     config = load_config(EXAMPLE)
     assert len(config.feeds) == 10
 
@@ -123,6 +150,7 @@ def test_shipped_example_writes_runtime_state_where_gitignore_covers_it(monkeypa
     # `/digests/`, `/cache/` at the repository root. If either side changes
     # alone, a live run's database and digests become committable.
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setenv("BRAVE_API_KEY", "sk-test")
     config = load_config(EXAMPLE)
     root = EXAMPLE.resolve().parent.parent
     assert config.data_dir == root / "data"
