@@ -130,6 +130,7 @@ def _search(
             "formatversion": 2,
             "list": "search",
             "srsearch": name,
+            "titles": name,
             "srlimit": config.mediawiki.max_candidates,
             "maxlag": config.mediawiki.maxlag_seconds,
         },
@@ -137,12 +138,16 @@ def _search(
     )
     data = _parsed_json(response, context="search")
     try:
-        hits = tuple(hit["pageid"] for hit in data.get("query", {}).get("search", []))
+        hits = [hit["pageid"] for hit in data.get("query", {}).get("search", [])]
+        for page in data.get("query", {}).get("pages", []):
+            if not page.get("missing") and "pageid" in page:
+                if page["pageid"] not in hits:
+                    hits.insert(0, page["pageid"])
     except (KeyError, TypeError) as error:
         raise ProviderFailure(
             f"malformed MediaWiki search response: {error}", permanent=False
         ) from error
-    return hits, "continue" in data
+    return tuple(hits), "continue" in data
 
 
 def _facts(
