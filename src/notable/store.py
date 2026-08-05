@@ -128,11 +128,11 @@ class Store:
         return json.loads(row[0])
 
     def commit(
-        self, 
-        settled: list[str], 
-        incomplete: list[str], 
+        self,
+        settled: list[str],
+        incomplete: list[str],
         surfaced_keys: list[str],
-        researched: dict[str, dict[str, Any]] | None = None
+        researched: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         """Commit the state tables in one transaction, after the digest lands."""
         now = _now()
@@ -165,7 +165,12 @@ class Store:
                     "INSERT OR REPLACE INTO research_cache "
                     "(identity_key, wikipedia_verdict, outcome_json, researched_at) "
                     "VALUES (?, ?, ?, ?)",
-                    (key, verdict_dict["outcome"], json.dumps(verdict_dict, sort_keys=True), now),
+                    (
+                        key,
+                        verdict_dict["outcome"],
+                        json.dumps(verdict_dict, sort_keys=True),
+                        now,
+                    ),
                 )
 
     # -- logs the pipeline never reads --------------------------------------

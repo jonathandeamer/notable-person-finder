@@ -307,3 +307,50 @@ def test_logs_all_terminal_leads_and_only_cut_survivors_are_surfaced(
 
 def _boom(*_args, **_kwargs):
     raise RuntimeError("digest write failed")
+
+
+def test_two_items_same_person_deduplicates_research(
+    make_config, store, providers, install, monkeypatch
+):
+    items = [_item(1), _item(2)]
+    # Provide mentions that differ only in exact_name vs canonical_name,
+    # or just the same canonical_name
+    m1 = _mention("Ana Poy").model_copy(
+        update={"identity_facts": ("fact1",), "signals": ("signal1",)}
+    )
+    m2 = _mention("Ana Poy").model_copy(
+        update={"identity_facts": ("fact2",), "signals": ("signal2",)}
+    )
+
+    install(
+        items,
+        _returning(
+            {
+                "https://a.test/1": (m1,),
+                "https://a.test/2": (m2,),
+            }
+        ),
+    )
+
+    research_calls = 0
+    wiki_calls = 0
+
+    def fake_research(*args, **kwargs):
+        nonlocal research_calls
+        research_calls += 1
+        return ()
+
+    def fake_wiki(*args, **kwargs):
+        nonlocal wiki_calls
+        wiki_calls += 1
+        return MatchVerdict(
+            outcome="no_matching_page", selected_page_id=None, rationale=""
+        )
+
+    monkeypatch.setattr("notable.pipeline.coverage.research", fake_research)
+    monkeypatch.setattr("notable.pipeline.wiki.match", fake_wiki)
+
+    run(make_config(), store, providers)
+
+    assert wiki_calls == 1, "Should only look up wikipedia once per identity"
+    assert research_calls == 1, "Should only run coverage research once per identity"

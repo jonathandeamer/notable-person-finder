@@ -28,7 +28,9 @@ def _refuse(request):  # pragma: no cover - only fires on a cache miss
     # Uncached requests in Phase 4 are typically article fetches that failed
     # (e.g. HTTP 403 or >2MB) during the live run, and were therefore not cached.
     # We raise ConnectError to simulate that failure for the replay.
-    raise httpx.ConnectError(f"Simulated network failure for uncached request: {request.url}")
+    raise httpx.ConnectError(
+        f"Simulated network failure for uncached request: {request.url}"
+    )
 
 
 def _replay(tmp_path, *, clock=time.time):

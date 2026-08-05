@@ -285,8 +285,9 @@ def test_lead_to_log_dict_serializes_rank_key_and_detail():
 
 
 def test_assess_wikipedia_page_found_in_coverage_is_insufficient_evidence():
-    article = _article("https://en.wikipedia.org/wiki/Agnes_Martin", person_relation="same_person")
+    article = _article(
+        "https://en.wikipedia.org/wiki/Agnes_Martin", person_relation="same_person"
+    )
     lead = assess(_mention(), _wiki(), (article,), _config(), _item())
     assert lead.outcome == "insufficient_evidence"
     assert "Wikipedia page" in lead.explanation
-

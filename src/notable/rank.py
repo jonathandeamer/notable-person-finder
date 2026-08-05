@@ -83,7 +83,10 @@ def assess(
                 outcome="insufficient_evidence",
                 article_assessments=articles,
                 rationale=getattr(mention, "rationale", ""),
-                explanation="insufficient_evidence; Wikipedia page discovered during coverage research",
+                explanation=(
+                    "insufficient_evidence; Wikipedia page discovered "
+                    "during coverage research"
+                ),
             )
 
     qualifying = [a for a in articles if is_qualifying_article(a)]

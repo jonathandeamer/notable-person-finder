@@ -140,9 +140,12 @@ def _search(
     try:
         hits = [hit["pageid"] for hit in data.get("query", {}).get("search", [])]
         for page in data.get("query", {}).get("pages", []):
-            if not page.get("missing") and "pageid" in page:
-                if page["pageid"] not in hits:
-                    hits.insert(0, page["pageid"])
+            if (
+                not page.get("missing")
+                and "pageid" in page
+                and page["pageid"] not in hits
+            ):
+                hits.insert(0, page["pageid"])
     except (KeyError, TypeError) as error:
         raise ProviderFailure(
             f"malformed MediaWiki search response: {error}", permanent=False

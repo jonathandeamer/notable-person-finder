@@ -96,3 +96,19 @@ def test_schema_creation_is_idempotent(tmp_path):
 
 def _boom(*_args, **_kwargs):
     raise RuntimeError("log write failed")
+
+
+def test_research_cache_round_trip(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    # Verify misses return None
+    assert store.cached_research("fake_id") is None
+
+    # Commit research
+    research_dict = {"fake_id": {"outcome": "no_matching_page", "foo": "bar"}}
+    store.commit([], [], [], researched=research_dict)
+
+    # Verify hits return the dictionary
+    cached = store.cached_research("fake_id")
+    assert cached is not None
+    assert cached["outcome"] == "no_matching_page"
+    assert cached["foo"] == "bar"

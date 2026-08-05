@@ -8,6 +8,7 @@ from pathlib import Path
 
 from notable import coverage, detect, digest, feeds, rank, wiki
 from notable.config import Config
+import dataclasses
 from notable.errors import BudgetExceeded, Incomplete
 from notable.http import Transport
 from notable.llm import LlmClient
@@ -45,7 +46,9 @@ def run(
     try:
         item_mentions = {}
         canonical_mentions = {}
-        for item in feeds.fetch_new(config, providers.transport, store, fresh=fresh_feeds):
+        for item in feeds.fetch_new(
+            config, providers.transport, store, fresh=fresh_feeds
+        ):
             try:
                 mentions = list(detect.people_in(item, config, providers.llm))
                 item_mentions[item.url] = (item, mentions)
@@ -57,7 +60,8 @@ def run(
                         existing = canonical_mentions[key]
                         canonical_mentions[key] = existing.model_copy(
                             update={
-                                "identity_facts": existing.identity_facts + mention.identity_facts,
+                                "identity_facts": existing.identity_facts
+                                + mention.identity_facts,
                                 "signals": existing.signals + mention.signals,
                             }
                         )
@@ -68,7 +72,14 @@ def run(
     except BudgetExceeded:
         capped = True
 
-    identity_leads = {}
+    # A single item might mention the same person multiple times (e.g. differently
+    # capitalized). The identity key de-duplicates these: we assess and research
+    # each distinct canonical name exactly once per run.
+    # Verdict/assessments per identity:
+    identity_leads: dict[
+        str, tuple[wiki.MatchVerdict, tuple[coverage.Article, ...]]
+    ] = {}
+    suppressed: set[str] = set()
     failed_identities = set()
     new_research = {}
     for key, mention in canonical_mentions.items():
@@ -77,15 +88,23 @@ def run(
             if cached:
                 verdict = wiki.MatchVerdict(**cached)
             else:
-                verdict = wiki.match(mention, config, providers.transport, providers.llm)
+                verdict = wiki.match(
+                    mention,
+                    config,
+                    providers.transport,
+                    providers.llm,
+                )
                 if verdict.outcome in ("matching_page", "no_matching_page"):
-                    import dataclasses
-                    new_research[key] = dataclasses.asdict(verdict)
-                    
-            if verdict.has_page:
-                identity_leads[key] = None
+                    cached = dataclasses.asdict(verdict)
+                    cached["outcome"] = verdict.outcome
+                    new_research[key] = cached
+
+            if verdict.outcome == "matching_page":
+                suppressed.add(key)
                 continue
-            assessments = coverage.research(mention, config, providers.transport, providers.llm)
+            assessments = coverage.research(
+                mention, config, providers.transport, providers.llm
+            )
             identity_leads[key] = (verdict, assessments)
         except Incomplete:
             failed_identities.add(key)
@@ -95,21 +114,32 @@ def run(
 
     for url, (item, mentions) in item_mentions.items():
         item_is_settled = True
+        # Write rank outputs
         item_entries = []
         for mention in mentions:
             if not mention.research_worthy:
                 continue
             key = rank.identity_key(mention.canonical_name)
-            if key in failed_identities or key not in identity_leads:
+            if key in failed_identities or (
+                key not in identity_leads and key not in suppressed
+            ):
                 item_is_settled = False
                 break
-            
-            lead_data = identity_leads[key]
+
+            if key in suppressed:
+                continue
+
+            lead_data = identity_leads.get(key)
             if lead_data is not None:
                 verdict, assessments = lead_data
-                # We pass `canonical_mentions[key]` to `assess` so it uses the accumulated signals/facts
-                item_entries.append(rank.assess(canonical_mentions[key], verdict, assessments, config, item))
-                
+                # We pass `canonical_mentions[key]` to `assess` so it uses the
+                # accumulated signals/facts
+                item_entries.append(
+                    rank.assess(
+                        canonical_mentions[key], verdict, assessments, config, item
+                    )
+                )
+
         if item_is_settled:
             settled.append(url)
             entries.extend(item_entries)

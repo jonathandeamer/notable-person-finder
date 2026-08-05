@@ -283,7 +283,9 @@ def validate_detection(
             # valid output; neither admits invention, because the value must
             # still appear as a contiguous run differing only in case.
             if not _contains(corpus, fact.value, fold_case=True):
-                raise DetectionInvalid(f"identity fact value is not grounded: {fact.value!r}")
+                raise DetectionInvalid(
+                    f"identity fact value is not grounded: {fact.value!r}"
+                )
 
         for signal in mention.signals:
             _check_references(signal.supporting_passage_ids, known)

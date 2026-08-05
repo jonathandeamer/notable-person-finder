@@ -346,3 +346,25 @@ def test_a_validation_failure_raises_incomplete_and_is_not_retried(
     with pytest.raises(Incomplete):
         match(_mention(), make_config(), transport, cast(LlmClient, llm))
     assert len(llm.calls) == 1, "a validation failure must not be re-paid for in-run"
+
+
+def test_wiki_search_injects_titles_to_exact_match(make_config, monkeypatch):
+    from notable.wiki import _search
+
+    # We want to ensure that titles= is passed to inject exact matches
+    calls = []
+
+    def fake_request(self, method, url, params=None, **kwargs):
+        calls.append(params)
+        return type("FakeResp", (), {"json": lambda self: {"query": {"search": []}}})()
+    
+    monkeypatch.setattr("notable.http.Transport.request", fake_request)
+    import notable.config
+    from notable.http import Transport
+
+    import httpx
+    transport = Transport(notable.config.TransportConfig(contact_url="test"), None, client=httpx.Client())
+    _search("Ana Poy", make_config(), transport)
+
+    assert len(calls) == 1
+    assert calls[0]["titles"] == "Ana Poy", "Must inject exact title for exact matching"

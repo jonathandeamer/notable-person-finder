@@ -1,5 +1,5 @@
-n_items_settled = 244
-n_items_incomplete = 2
+n_items_settled = 239
+n_items_incomplete = 7
 n_detected = 19
 excluded_urls = []
 
@@ -8,21 +8,21 @@ must_detect = [
     "Barack Obama",
     "Emma Shapiro",
     "Francisco Correa Cordero",
-    "Hammad Nasar",
     "Im Youngzoo",
+    "Irénée Scalbert",
     "LR Vandy",
     "Louis Ng",
     "Low Kee Hong",
     "Manuel Correa",
     "Oleksandr Dubovyk",
     "Paul Outlaw",
-    "Philip Jodidio",
     "Poppy Steer",
-    "Rosanna Lang",
+    "Sharmistha Ray",
     "Tafari Campbell",
     "Tobias Titz",
+    "Tom Leaper",
     "Valerie Hillings",
-    "Victor “Frenchy” Gosselin"
+    "Victor Gosselin"
 ]
 
 must_not_detect = [

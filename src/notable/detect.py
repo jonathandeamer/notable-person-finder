@@ -71,24 +71,17 @@ def people_in(
         )
 
     try:
-        for attempt in range(3):
-            try:
-                llm.structured(
-                    task="detect_people",
-                    model=config.detect.model,
-                    system=_system_prompt(),
-                    user_payload=payload,
-                    schema=detection_schema(max_people=config.detect.max_people),
-                    max_completion_tokens=config.detect.max_completion_tokens,
-                    reasoning_effort=config.detect.reasoning_effort,
-                    timeout=config.transport.llm_read_timeout_seconds,
-                    validate=_validate,
-                )
-                break
-            except DetectionInvalid as e:
-                if attempt == 2:
-                    raise
-                logger.warning("Retrying detect_people due to validation failure: %s", e)
+        llm.structured(
+            task="detect_people",
+            model=config.detect.model,
+            system=_system_prompt(),
+            user_payload=payload,
+            schema=detection_schema(max_people=config.detect.max_people),
+            max_completion_tokens=config.detect.max_completion_tokens,
+            reasoning_effort=config.detect.reasoning_effort,
+            timeout=config.transport.llm_read_timeout_seconds,
+            validate=_validate,
+        )
     except ProviderFailure as error:
         logger.warning("detect_people failed for %s: %s", item.url, error)
         raise Incomplete(f"detect_people failed for {item.url}") from error
