@@ -196,11 +196,11 @@ def validate_match(
 
     # A truncated search saw an incomplete candidate universe: "no page
     # exists" would be a false negative manufactured by max_candidates, not
-    # by evidence. See the design doc's truncation rule.
+    # by evidence. Coerce to "uncertain" so the item still settles; raising
+    # here would make a deterministic condition Incomplete on every run.
+    # See the design doc's truncation rule.
     if output.outcome == "no_matching_page" and truncated:
-        raise MatchInvalid(
-            "no_matching_page is not valid when the search was truncated"
-        )
+        output = output.model_copy(update={"outcome": "uncertain"})
 
     unknown = (
         set(output.supporting_fact_ids) | set(output.conflicting_fact_ids)

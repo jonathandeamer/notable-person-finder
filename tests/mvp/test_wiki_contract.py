@@ -161,14 +161,14 @@ def test_non_matching_outcomes_must_leave_selected_page_id_null():
         )
 
 
-def test_truncated_search_forbids_no_matching_page():
+def test_truncated_search_coerces_no_matching_page_to_uncertain():
     candidates = _candidates()
-    with pytest.raises(MatchInvalid, match="truncated"):
-        validate_match(
-            _good(outcome="no_matching_page", selected_page_id=None),
-            candidates=candidates,
-            truncated=True,
-        )
+    result = validate_match(
+        _good(outcome="no_matching_page", selected_page_id=None),
+        candidates=candidates,
+        truncated=True,
+    )
+    assert result.outcome == "uncertain"
 
 
 def test_uncertain_is_unaffected_by_truncation():

@@ -1,14 +1,17 @@
-n_items_settled = 225
-n_items_incomplete = 21
-n_detected = 7
+n_items_settled = 230
+n_items_incomplete = 16
+n_detected = 10
 excluded_urls = []
 
 must_detect = [
+    "Emma Shapiro",
     "Im Youngzoo",
     "Jen-Hsun and Lori Huang",
     "LR Vandy",
+    "Low Kee Hong",
     "Obama",
     "Oleksandr Dubovyk",
+    "Sharmistha Ray",
     "Trump",
     "Victor “Frenchy” Gosselin"
 ]
