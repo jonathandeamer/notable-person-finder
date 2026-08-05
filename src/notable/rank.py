@@ -73,10 +73,10 @@ def assess(
             canonical_domain(getattr(a, "url", "")).endswith("wikipedia.org")
             and getattr(a, "person_relation", "") == "same_person"
         ):
-            key = identity_key(mention.exact_name)
+            key = identity_key(mention.canonical_name)
             return Lead(
                 identity_key=key,
-                display_name=mention.exact_name,
+                display_name=mention.canonical_name,
                 source_url=getattr(item, "url", ""),
                 publisher_label=getattr(item, "publisher_label", ""),
                 wikipedia_verdict=wikipedia_verdict,
@@ -100,7 +100,7 @@ def assess(
         outcome = "possible_lead"
     else:
         outcome = "insufficient_evidence"
-    key = identity_key(mention.exact_name)
+    key = identity_key(mention.canonical_name)
     rank_tuple = None
     if outcome != "insufficient_evidence":
         wiki = (
@@ -109,7 +109,7 @@ def assess(
         rank_tuple = (0 if outcome == "promising_lead" else 1, wiki, -len(domains), key)
     return Lead(
         identity_key=key,
-        display_name=mention.exact_name,
+        display_name=mention.canonical_name,
         source_url=getattr(item, "url", ""),
         publisher_label=getattr(item, "publisher_label", ""),
         wikipedia_verdict=wikipedia_verdict,

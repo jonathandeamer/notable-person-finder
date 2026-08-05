@@ -198,6 +198,7 @@ def test_live_coverage_smoke(tmp_path):
     )
     mention = DetectedMention(
         exact_name="David Hockney",
+        canonical_name="David Hockney",
         outcome="research",
         supporting_passage_ids=("p1",),
         identity_facts=(),

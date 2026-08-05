@@ -43,32 +43,78 @@ def run(
     incomplete: list[str] = []
     capped = False
     try:
-        for item in feeds.fetch_new(
-            config, providers.transport, store, fresh=fresh_feeds
-        ):
-            item_entries: list[rank.Lead] = []
+        item_mentions = {}
+        canonical_mentions = {}
+        for item in feeds.fetch_new(config, providers.transport, store, fresh=fresh_feeds):
             try:
-                for mention in detect.people_in(item, config, providers.llm):
+                mentions = list(detect.people_in(item, config, providers.llm))
+                item_mentions[item.url] = (item, mentions)
+                for mention in mentions:
                     if not mention.research_worthy:
                         continue
-                    verdict = wiki.match(
-                        mention, config, providers.transport, providers.llm
-                    )
-                    if verdict.has_page:
-                        continue
-                    assessments = coverage.research(
-                        mention, config, providers.transport, providers.llm
-                    )
-                    item_entries.append(
-                        rank.assess(mention, verdict, assessments, config, item)
-                    )
+                    key = rank.identity_key(mention.canonical_name)
+                    if key in canonical_mentions:
+                        existing = canonical_mentions[key]
+                        canonical_mentions[key] = existing.model_copy(
+                            update={
+                                "identity_facts": existing.identity_facts + mention.identity_facts,
+                                "signals": existing.signals + mention.signals,
+                            }
+                        )
+                    else:
+                        canonical_mentions[key] = mention
             except Incomplete:
                 incomplete.append(item.url)
-                continue
-            entries.extend(item_entries)
-            settled.append(item.url)
     except BudgetExceeded:
         capped = True
+
+    identity_leads = {}
+    failed_identities = set()
+    new_research = {}
+    for key, mention in canonical_mentions.items():
+        try:
+            cached = store.cached_research(key)
+            if cached:
+                verdict = wiki.MatchVerdict(**cached)
+            else:
+                verdict = wiki.match(mention, config, providers.transport, providers.llm)
+                if verdict.outcome in ("matching_page", "no_matching_page"):
+                    import dataclasses
+                    new_research[key] = dataclasses.asdict(verdict)
+                    
+            if verdict.has_page:
+                identity_leads[key] = None
+                continue
+            assessments = coverage.research(mention, config, providers.transport, providers.llm)
+            identity_leads[key] = (verdict, assessments)
+        except Incomplete:
+            failed_identities.add(key)
+        except BudgetExceeded:
+            capped = True
+            break
+
+    for url, (item, mentions) in item_mentions.items():
+        item_is_settled = True
+        item_entries = []
+        for mention in mentions:
+            if not mention.research_worthy:
+                continue
+            key = rank.identity_key(mention.canonical_name)
+            if key in failed_identities or key not in identity_leads:
+                item_is_settled = False
+                break
+            
+            lead_data = identity_leads[key]
+            if lead_data is not None:
+                verdict, assessments = lead_data
+                # We pass `canonical_mentions[key]` to `assess` so it uses the accumulated signals/facts
+                item_entries.append(rank.assess(canonical_mentions[key], verdict, assessments, config, item))
+                
+        if item_is_settled:
+            settled.append(url)
+            entries.extend(item_entries)
+        else:
+            incomplete.append(url)
 
     summary = RunSummary(settled, incomplete, capped, providers.llm.spend(), started_at)
     shortlist, surfaced_keys = rank.shortlist(entries, store, config)
@@ -81,7 +127,7 @@ def run(
         n_settled=len(settled),
         n_incomplete=len(incomplete),
     )
-    store.commit(settled, incomplete, surfaced_keys)
+    store.commit(settled, incomplete, surfaced_keys, new_research)
     store.log(
         summary,
         [rank.lead_to_log_dict(lead) for lead in entries],

@@ -90,7 +90,7 @@ def test_schema_creation_is_idempotent(tmp_path):
             "SELECT name FROM sqlite_master "
             "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         )
-    } == {"item", "surfaced", "run", "lead"}
+    } == {"item", "surfaced", "run", "lead", "research_cache"}
     second.close()
 
 

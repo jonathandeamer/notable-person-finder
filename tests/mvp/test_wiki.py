@@ -12,6 +12,7 @@ from notable.wiki import match
 def _mention(name: str = "Ana Poy") -> DetectedMention:
     return DetectedMention(
         exact_name=name,
+        canonical_name=name,
         outcome="research",
         supporting_passage_ids=("p1",),
         identity_facts=(),

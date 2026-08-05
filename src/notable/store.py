@@ -24,6 +24,12 @@ CREATE TABLE IF NOT EXISTS surfaced (
     identity_key     TEXT PRIMARY KEY,
     last_surfaced_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS research_cache (
+    identity_key      TEXT PRIMARY KEY,
+    wikipedia_verdict TEXT NOT NULL,
+    outcome_json      TEXT NOT NULL,
+    researched_at     TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS run (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at         TEXT NOT NULL,
@@ -112,11 +118,25 @@ class Store:
         ).fetchone()
         return 0 if row is None else int(row[0])
 
+    def cached_research(self, identity_key: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT outcome_json FROM research_cache WHERE identity_key = ?",
+            (identity_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0])
+
     def commit(
-        self, settled: list[str], incomplete: list[str], surfaced_keys: list[str]
+        self, 
+        settled: list[str], 
+        incomplete: list[str], 
+        surfaced_keys: list[str],
+        researched: dict[str, dict[str, Any]] | None = None
     ) -> None:
         """Commit the state tables in one transaction, after the digest lands."""
         now = _now()
+        researched = researched or {}
         with self.connection:
             for url in settled:
                 self.connection.execute(
@@ -139,6 +159,13 @@ class Store:
                     "ON CONFLICT(identity_key) DO UPDATE SET "
                     "last_surfaced_at = excluded.last_surfaced_at",
                     (key, now),
+                )
+            for key, verdict_dict in researched.items():
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO research_cache "
+                    "(identity_key, wikipedia_verdict, outcome_json, researched_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (key, verdict_dict["outcome"], json.dumps(verdict_dict, sort_keys=True), now),
                 )
 
     # -- logs the pipeline never reads --------------------------------------

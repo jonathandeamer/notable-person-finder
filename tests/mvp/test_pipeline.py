@@ -23,6 +23,7 @@ def _mention(
 ) -> DetectedMention:
     return DetectedMention(
         exact_name=name,
+        canonical_name=name,
         outcome=outcome,
         supporting_passage_ids=("p1",),
         identity_facts=(),

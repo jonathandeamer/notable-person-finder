@@ -48,7 +48,7 @@ def match(
     propagates unchanged -- it ends the whole pass, not just this mention.
     """
     try:
-        hit_ids, truncated = _search(mention.exact_name, config, transport)
+        hit_ids, truncated = _search(mention.canonical_name, config, transport)
         pages = _facts(config, transport, hit_ids)
         redirect_ids = tuple(
             page.page_id for page in pages if page.is_redirect and not page.missing

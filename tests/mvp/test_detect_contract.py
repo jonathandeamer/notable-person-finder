@@ -29,6 +29,7 @@ def _item(
 def _mention(**overrides):
     base = {
         "exact_name": "Ana Poy",
+        "canonical_name": "Ana Poy",
         "outcome": "research",
         "supporting_passage_ids": ["p1"],
         "identity_facts": [

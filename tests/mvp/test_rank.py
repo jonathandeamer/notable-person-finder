@@ -11,6 +11,7 @@ from notable.rank import Lead, assess, identity_key, lead_to_log_dict, shortlist
 def _mention(name: str = "John Doe") -> MagicMock:
     mention = MagicMock()
     mention.exact_name = name
+    mention.canonical_name = name
     mention.rationale = "why"
     return mention
 
