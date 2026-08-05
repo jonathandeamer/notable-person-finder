@@ -68,6 +68,24 @@ def assess(
     config: Any,
     item: Any,
 ) -> Lead:
+    for a in articles:
+        if (
+            canonical_domain(getattr(a, "url", "")).endswith("wikipedia.org")
+            and getattr(a, "person_relation", "") == "same_person"
+        ):
+            key = identity_key(mention.exact_name)
+            return Lead(
+                identity_key=key,
+                display_name=mention.exact_name,
+                source_url=getattr(item, "url", ""),
+                publisher_label=getattr(item, "publisher_label", ""),
+                wikipedia_verdict=wikipedia_verdict,
+                outcome="insufficient_evidence",
+                article_assessments=articles,
+                rationale=getattr(mention, "rationale", ""),
+                explanation="insufficient_evidence; Wikipedia page discovered during coverage research",
+            )
+
     qualifying = [a for a in articles if is_qualifying_article(a)]
     domains = sorted(
         {d for a in qualifying if (d := canonical_domain(getattr(a, "url", "")))}

@@ -1,29 +1,16 @@
-n_items_settled = 246
-n_items_incomplete = 0
-n_detected = 20
+n_items_settled = 224
+n_items_incomplete = 22
+n_detected = 7
 excluded_urls = []
 
 must_detect = [
-    "Oleksandr Dubovyk",
-    "Victor “Frenchy” Gosselin",
     "Im Youngzoo",
     "Jen-Hsun and Lori Huang",
     "LR Vandy",
-    "Alan Michelson",
-    "Jessica Morgan",
-    "Low Kee Hong",
-    "Agnes Martin",
-    "Bernardo Paz",
-    "Charli xcx",
-    "Christo",
-    "Clara Wu Tsai",
-    "Darren Vargas",
-    "Drew Michael Scott",
-    "Emma Shapiro",
-    "Francisco Correa Cordero",
-    "Jen Catron",
-    "Joe Lycett",
-    "Kandinsky"
+    "Obama",
+    "Oleksandr Dubovyk",
+    "Trump",
+    "Victor “Frenchy” Gosselin"
 ]
 
 must_not_detect = [
