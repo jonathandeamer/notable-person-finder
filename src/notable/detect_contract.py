@@ -74,6 +74,7 @@ class GroundedSignal(_Strict):
 
 class DetectedMention(_Strict):
     exact_name: str = Field(min_length=1, max_length=300)
+    canonical_name: str = Field(min_length=1, max_length=300)
     outcome: Literal["research", "do_not_research", "uncertain"]
     supporting_passage_ids: tuple[str, ...] = Field(min_length=1)
     identity_facts: tuple[IdentityFact, ...]
@@ -171,6 +172,7 @@ def detection_schema(*, max_people: int) -> dict[str, object]:
                 "items": _object(
                     {
                         "exact_name": _string(maxLength=300),
+                        "canonical_name": _string(maxLength=300),
                         "outcome": _string(enum=list(MENTION_OUTCOMES)),
                         "supporting_passage_ids": passage_ids,
                         "identity_facts": {
@@ -281,7 +283,7 @@ def validate_detection(
             # valid output; neither admits invention, because the value must
             # still appear as a contiguous run differing only in case.
             if not _contains(corpus, fact.value, fold_case=True):
-                raise DetectionInvalid("identity fact value is not grounded")
+                raise DetectionInvalid(f"identity fact value is not grounded: {fact.value!r}")
 
         for signal in mention.signals:
             _check_references(signal.supporting_passage_ids, known)

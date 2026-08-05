@@ -31,6 +31,8 @@ Two prior versions exist and **neither is a base for this one**:
   tests, 45 SQLite tables. It is frozen reference. Consult it for product
   reasoning; do not port its code.
 
+**Important Note**: Now that the original plan for the MVP is feature complete, the focus should be on ensuring better outputs without adding scope or unnecessary complexity. Additionally, determine the right time to focus on prompt engineering and evals instead of the code and core loop logic.
+
 ## Hard Guardrails
 
 The prior failure mode was gradual accretion in which every individual step
@@ -111,3 +113,6 @@ review it.
 
 Do not push, open or modify pull requests, merge, or target `main` without
 explicit user authorization. `main` remains the operational fallback.
+
+## Current Focus (as of Phase 4 MVP Feature Complete)
+Now the original plan for the MVP is feature complete, the focus should be on ensuring better outputs without adding scope or unnecessary complexity, and determining the right time to focus on prompt engineering and evals instead of the code and core loop logic.
